@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const { generateTokens } = require('../utils/jwt');
 const ResetToken = require('../models/ResetToken');
 const { sendEmail, sendVerificationCodeEmail, sendPasswordResetCodeEmail } = require('../utils/emailService');
+const { verifyGoogleToken } = require('../middleware/auth');
 
 // Auto-increment userId
 async function getNextUserId() {
@@ -470,6 +471,88 @@ const resetPassword = async (req, res) => {
   }
 };
 
+// ─── GOOGLE OAUTH ──────────────────────────────────────────────
+
+const googleAuth = async (req, res) => {
+  try {
+    const { credential } = req.body;
+
+    if (!credential) {
+      return res.status(400).json({ error: 'Google credential is required' });
+    }
+
+    const googleUser = await verifyGoogleToken(credential);
+    const { email, name, picture, googleId } = googleUser;
+
+    let user = await User.findOne({
+      $or: [
+        { 'socialAccounts.google.email': email },
+        { email: email.toLowerCase() },
+      ],
+    });
+
+    let isNewUser = false;
+
+    if (user) {
+      // Update Google account info
+      user.socialAccounts = user.socialAccounts || {};
+      user.socialAccounts.google = {
+        id: googleId,
+        email,
+        connected: new Date(),
+        lastLogin: new Date(),
+      };
+      if (!user.profile?.name) {
+        user.profile = user.profile || {};
+        user.profile.name = name;
+      }
+      if (picture) {
+        user.profile = user.profile || {};
+        user.profile.picture = picture;
+      }
+      user.verified = true;
+      await user.save();
+    } else {
+      // Create new user
+      isNewUser = true;
+      const userId = await getNextUserId();
+      user = await User.create({
+        userId,
+        email: email.toLowerCase(),
+        profile: { name: name || email.split('@')[0], picture },
+        socialAccounts: {
+          google: { id: googleId, email, connected: new Date() },
+        },
+        verified: true,
+      });
+    }
+
+    const session = await Session.create({
+      userId: user._id,
+      userAgent: req.headers['user-agent'],
+      ip: req.ip,
+    });
+
+    const tokens = generateTokens(user, session._id);
+
+    res.json({
+      user: {
+        id: user._id,
+        userId: user.userId,
+        email: user.email,
+        name: user.profile?.name,
+        picture: user.profile?.picture,
+        verified: user.verified,
+      },
+      ...tokens,
+      isNewUser,
+    });
+  } catch (error) {
+    console.error('Google auth error:', error);
+    res.status(500).json({ error: 'Google authentication failed' });
+  }
+};
+
 module.exports = {
   emailSignup,
   emailLogin,
@@ -480,4 +563,5 @@ module.exports = {
   verifyResetCode,
   validateResetToken,
   resetPassword,
+  googleAuth,
 };

@@ -3,7 +3,8 @@ const Session = require('../models/Session');
 const Counter = require('../models/Counter');
 const VerificationCode = require('../models/VerificationCode');
 const crypto = require('crypto');
-const { generateTokens } = require('../utils/jwt');
+const jwt = require('jsonwebtoken');
+const { generateTokens, generateAccessToken } = require('../utils/jwt');
 const ResetToken = require('../models/ResetToken');
 const { sendEmail, sendVerificationCodeEmail, sendPasswordResetCodeEmail } = require('../utils/emailService');
 const { verifyGoogleToken } = require('../middleware/auth');
@@ -553,6 +554,137 @@ const googleAuth = async (req, res) => {
   }
 };
 
+// ─── REFRESH TOKEN ─────────────────────────────────────────────
+
+const refreshToken = async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+
+    if (!refreshToken) {
+      return res.status(400).json({ error: 'Refresh token is required' });
+    }
+
+    const decoded = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET);
+
+    const user = await User.findById(decoded.userId);
+    if (!user) {
+      return res.status(401).json({ error: 'User not found' });
+    }
+
+    if (user.tokenVersion !== decoded.tokenVersion) {
+      return res.status(401).json({ error: 'Token has been revoked' });
+    }
+
+    const session = await Session.findById(decoded.sessionId);
+    if (session) {
+      session.lastActivity = new Date();
+      await session.save();
+    }
+
+    const accessToken = generateAccessToken(user, decoded.sessionId);
+
+    res.json({
+      accessToken,
+      user: {
+        id: user._id,
+        userId: user.userId,
+        email: user.email,
+        name: user.profile?.name,
+        picture: user.profile?.picture,
+        verified: user.verified,
+        connectedProviders: user.getConnectedProviders(),
+        socialAccounts: {
+          google: user.socialAccounts?.google
+            ? { email: user.socialAccounts.google.email, connected: !!user.socialAccounts.google.id }
+            : null,
+        },
+      },
+    });
+  } catch (error) {
+    console.error('Refresh token error:', error);
+    res.status(401).json({ error: 'Invalid refresh token' });
+  }
+};
+
+// ─── LOGOUT ────────────────────────────────────────────────────
+
+const logout = async (req, res) => {
+  try {
+    if (req.user?.sessionId) {
+      await Session.findByIdAndUpdate(req.user.sessionId, {
+        status: 'ended',
+      });
+    }
+    res.json({ message: 'Logged out successfully' });
+  } catch (error) {
+    console.error('Logout error:', error);
+    res.status(500).json({ error: 'Logout failed' });
+  }
+};
+
+// ─── GET PROFILE ───────────────────────────────────────────────
+
+const getProfile = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      id: user._id,
+      userId: user.userId,
+      email: user.email,
+      name: user.profile?.name,
+      picture: user.profile?.picture,
+      timezone: user.preferences?.timezone,
+      verified: user.verified,
+      connectedProviders: user.getConnectedProviders(),
+      socialAccounts: {
+        google: user.socialAccounts?.google
+          ? { email: user.socialAccounts.google.email, connected: !!user.socialAccounts.google.id }
+          : null,
+      },
+      createdAt: user.createdAt,
+    });
+  } catch (error) {
+    console.error('Get profile error:', error);
+    res.status(500).json({ error: 'Failed to get profile' });
+  }
+};
+
+// ─── VERIFY TOKEN ──────────────────────────────────────────────
+
+const verify = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      valid: true,
+      user: {
+        id: user._id,
+        userId: user.userId,
+        email: user.email,
+        name: user.profile?.name,
+        picture: user.profile?.picture,
+        verified: user.verified,
+        connectedProviders: user.getConnectedProviders(),
+        socialAccounts: {
+          google: user.socialAccounts?.google
+            ? { email: user.socialAccounts.google.email, connected: !!user.socialAccounts.google.id }
+            : null,
+        },
+      },
+    });
+  } catch (error) {
+    console.error('Verify error:', error);
+    res.status(500).json({ error: 'Verification failed' });
+  }
+};
+
 module.exports = {
   emailSignup,
   emailLogin,
@@ -564,4 +696,8 @@ module.exports = {
   validateResetToken,
   resetPassword,
   googleAuth,
+  refreshToken,
+  logout,
+  getProfile,
+  verify,
 };

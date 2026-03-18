@@ -4,7 +4,8 @@ const Counter = require('../models/Counter');
 const VerificationCode = require('../models/VerificationCode');
 const crypto = require('crypto');
 const { generateTokens } = require('../utils/jwt');
-const { sendEmail, sendVerificationCodeEmail } = require('../utils/emailService');
+const ResetToken = require('../models/ResetToken');
+const { sendEmail, sendVerificationCodeEmail, sendPasswordResetCodeEmail } = require('../utils/emailService');
 
 // Auto-increment userId
 async function getNextUserId() {
@@ -310,10 +311,173 @@ const sendVerificationCode = async (req, res) => {
   }
 };
 
+// ─── FORGOT PASSWORD ───────────────────────────────────────────
+
+const forgotPassword = async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    // Always return success (security)
+    const user = await User.findOne({ email: email?.toLowerCase() });
+    if (!user) {
+      return res.json({ message: 'If an account exists, a reset code has been sent' });
+    }
+
+    // Rate limit: 1 code per 60s per email
+    const recentCode = await VerificationCode.findOne({
+      email: email.toLowerCase(),
+      type: 'password_reset',
+      lastSentAt: { $gt: new Date(Date.now() - 60 * 1000) },
+    });
+
+    if (recentCode) {
+      const elapsed = Math.floor((Date.now() - recentCode.lastSentAt.getTime()) / 1000);
+      const retryAfter = Math.max(60 - elapsed, 1);
+      return res.status(429).json({
+        error: `Please wait ${retryAfter} seconds before requesting a new code`,
+        code: 'rate_limited',
+        retryAfter,
+      });
+    }
+
+    const code = generateCode();
+
+    await VerificationCode.findOneAndUpdate(
+      { email: email.toLowerCase(), type: 'password_reset' },
+      {
+        email: email.toLowerCase(),
+        code,
+        type: 'password_reset',
+        expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+        lastSentAt: new Date(),
+        attempts: 0,
+      },
+      { upsert: true, new: true }
+    );
+
+    await sendPasswordResetCodeEmail(email, code);
+
+    res.json({ message: 'If an account exists, a reset code has been sent' });
+  } catch (error) {
+    console.error('Forgot password error:', error);
+    res.status(500).json({ error: 'Failed to process request' });
+  }
+};
+
+// ─── VERIFY RESET CODE → returns a reset token ────────────────
+
+const verifyResetCode = async (req, res) => {
+  try {
+    const { email, code } = req.body;
+
+    const record = await VerificationCode.findOne({
+      email: email?.toLowerCase(),
+      type: 'password_reset',
+      expiresAt: { $gt: Date.now() },
+    });
+
+    if (!record) {
+      return res.status(400).json({ error: 'Invalid or expired code' });
+    }
+
+    if (record.attempts >= 5) {
+      await VerificationCode.deleteOne({ _id: record._id });
+      return res.status(400).json({ error: 'Too many attempts. Request a new code.' });
+    }
+
+    if (record.code !== code) {
+      record.attempts += 1;
+      await record.save();
+      return res.status(400).json({ error: 'Invalid code' });
+    }
+
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (!user) {
+      return res.status(400).json({ error: 'User not found' });
+    }
+
+    // Generate reset token
+    const resetToken = await user.generatePasswordResetToken();
+
+    // Delete used verification code
+    await VerificationCode.deleteOne({ _id: record._id });
+
+    res.json({ resetToken });
+  } catch (error) {
+    console.error('Verify reset code error:', error);
+    res.status(500).json({ error: 'Verification failed' });
+  }
+};
+
+// ─── VALIDATE RESET TOKEN ──────────────────────────────────────
+
+const validateResetToken = async (req, res) => {
+  try {
+    const { token } = req.query;
+
+    if (!token) {
+      return res.json({ valid: false });
+    }
+
+    const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
+    const resetTokenDoc = await ResetToken.findOne({
+      hashedToken,
+      expiresAt: { $gt: Date.now() },
+    });
+
+    res.json({ valid: !!resetTokenDoc });
+  } catch (error) {
+    res.json({ valid: false });
+  }
+};
+
+// ─── RESET PASSWORD ────────────────────────────────────────────
+
+const resetPassword = async (req, res) => {
+  try {
+    const { token, password } = req.body;
+
+    if (!token || !password) {
+      return res.status(400).json({ error: 'Token and password are required' });
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+
+    const user = await User.findByResetToken(token);
+    if (!user) {
+      return res.status(400).json({ error: 'Invalid or expired reset token' });
+    }
+
+    user.password = password; // hashed by pre-save hook
+    await user.invalidateTokens();
+
+    // End all sessions
+    await Session.updateMany(
+      { userId: user._id, status: 'active' },
+      { status: 'ended' }
+    );
+
+    // Clean up reset token
+    const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
+    await ResetToken.deleteOne({ hashedToken });
+
+    res.json({ message: 'Password reset successful' });
+  } catch (error) {
+    console.error('Reset password error:', error);
+    res.status(500).json({ error: 'Failed to reset password' });
+  }
+};
+
 module.exports = {
   emailSignup,
   emailLogin,
   verifyEmail,
   resendVerification,
   sendVerificationCode,
+  forgotPassword,
+  verifyResetCode,
+  validateResetToken,
+  resetPassword,
 };

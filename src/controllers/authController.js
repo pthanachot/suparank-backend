@@ -108,7 +108,9 @@ const emailSignup = async (req, res) => {
         userId: user.userId,
         email: user.email,
         name: user.profile.name,
+        picture: user.profile?.picture,
         verified: user.verified,
+        connectedProviders: user.getConnectedProviders(),
       },
       ...tokens,
       isNewUser: true,
@@ -166,6 +168,7 @@ const emailLogin = async (req, res) => {
         name: user.profile?.name,
         picture: user.profile?.picture,
         verified: user.verified,
+        connectedProviders: user.getConnectedProviders(),
       },
       ...tokens,
     });
@@ -544,6 +547,7 @@ const googleAuth = async (req, res) => {
         name: user.profile?.name,
         picture: user.profile?.picture,
         verified: user.verified,
+        connectedProviders: user.getConnectedProviders(),
       },
       ...tokens,
       isNewUser,
@@ -576,10 +580,12 @@ const refreshToken = async (req, res) => {
     }
 
     const session = await Session.findById(decoded.sessionId);
-    if (session) {
-      session.lastActivity = new Date();
-      await session.save();
+    if (!session || session.status === 'ended') {
+      return res.status(401).json({ error: 'Session has been revoked' });
     }
+
+    session.lastActivity = new Date();
+    await session.save();
 
     const accessToken = generateAccessToken(user, decoded.sessionId);
 
@@ -657,6 +663,11 @@ const getProfile = async (req, res) => {
 
 const verify = async (req, res) => {
   try {
+    const session = await Session.findById(req.user.sessionId);
+    if (!session || session.status === 'ended') {
+      return res.status(401).json({ error: 'Session has been revoked' });
+    }
+
     const user = await User.findById(req.user.userId);
     if (!user) {
       return res.status(404).json({ error: 'User not found' });

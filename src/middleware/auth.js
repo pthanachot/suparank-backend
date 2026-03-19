@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const { OAuth2Client } = require('google-auth-library');
 const User = require('../models/User');
+const Session = require('../models/Session');
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
@@ -32,6 +33,14 @@ const authenticateToken = (req, res, next) => {
 
       if (user.status !== 'active') {
         return res.status(401).json({ error: 'Account is not active' });
+      }
+
+      // Check session is still active (not revoked)
+      if (decoded.sessionId) {
+        const session = await Session.findById(decoded.sessionId);
+        if (!session || session.status === 'ended') {
+          return res.status(401).json({ error: 'Session has been revoked' });
+        }
       }
 
       req.user = {

@@ -8,5 +8,9 @@ router.use(authenticateToken);
 
 router.put('/profile', userController.updateProfile);
 router.post('/change-password', userController.changePassword);
+router.get('/sessions', userController.getSessions);
+router.delete('/sessions/:sessionId', userController.revokeSession);
+router.post('/accounts/:provider/connect', userController.connectAccount);
+router.delete('/accounts/:provider', userController.disconnectAccount);
 
 module.exports = router;

@@ -10,5 +10,6 @@ router.get('/subscription', billingController.getSubscription);
 router.post('/checkout', billingController.createCheckoutSession);
 router.post('/customer-portal', billingController.createCustomerPortal);
 router.post('/revoke-schedule', billingController.revokeScheduledChange);
+router.post('/cancel', billingController.cancelSubscription);
 
 module.exports = router;

@@ -343,9 +343,48 @@ const revokeScheduledChange = async (req, res) => {
   }
 };
 
+// ─── CANCEL SUBSCRIPTION ─────────────────────────────────────
+
+const cancelSubscription = async (req, res) => {
+  try {
+    const sub = await Subscription.findOne({
+      userId: req.user.userId,
+      status: { $in: ['active', 'trialing'] },
+    });
+
+    if (!sub) {
+      return res.status(404).json({ error: 'No active subscription found' });
+    }
+
+    // If there's a pending schedule (e.g. downgrade), release it first
+    try {
+      const stripeSub = await stripe.subscriptions.retrieve(sub.stripeSubscriptionId);
+      if (stripeSub.schedule) {
+        await stripe.subscriptionSchedules.release(stripeSub.schedule);
+        console.log(`Released schedule ${stripeSub.schedule} before cancellation`);
+      }
+    } catch (err) {
+      console.error('Failed to release schedule before cancel:', err.message);
+    }
+
+    // Always cancel at period end — user keeps access until billing period expires
+    await stripe.subscriptions.update(sub.stripeSubscriptionId, {
+      cancel_at_period_end: true,
+    });
+    sub.cancelAtPeriodEnd = true;
+    sub.canceledAt = new Date();
+    await sub.save();
+    res.json({ message: 'Subscription will cancel at end of billing period' });
+  } catch (error) {
+    console.error('Cancel subscription error:', error);
+    res.status(500).json({ error: 'Failed to cancel subscription' });
+  }
+};
+
 module.exports = {
   getSubscription,
   createCheckoutSession,
   createCustomerPortal,
   revokeScheduledChange,
+  cancelSubscription,
 };

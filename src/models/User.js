@@ -43,6 +43,8 @@ const userSchema = new mongoose.Schema(
       google: socialAccountSchema,
     },
 
+    stripeCustomerId: String,
+
     lastLogin: Date,
     lastActive: Date,
     failedLoginAttempts: { type: Number, default: 0 },
@@ -53,6 +55,7 @@ const userSchema = new mongoose.Schema(
 
 // Indexes
 userSchema.index({ 'socialAccounts.google.email': 1 });
+userSchema.index({ stripeCustomerId: 1 }, { sparse: true });
 
 // Hash password before save
 userSchema.pre('save', async function (next) {

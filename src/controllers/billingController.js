@@ -314,8 +314,38 @@ const createCustomerPortal = async (req, res) => {
   }
 };
 
+// ─── REVOKE SCHEDULED CHANGE ─────────────────────────────────
+
+const revokeScheduledChange = async (req, res) => {
+  try {
+    const sub = await Subscription.findOne({
+      userId: req.user.userId,
+      status: { $in: ['active', 'trialing'] },
+      stripeSubscriptionId: { $exists: true, $ne: null },
+    });
+
+    if (!sub) {
+      return res.status(404).json({ error: 'No active subscription found' });
+    }
+
+    const stripeSub = await stripe.subscriptions.retrieve(sub.stripeSubscriptionId);
+    if (!stripeSub.schedule) {
+      return res.status(400).json({ error: 'No pending plan change to revoke' });
+    }
+
+    // Release the schedule — keeps current plan, removes the pending change
+    await stripe.subscriptionSchedules.release(stripeSub.schedule);
+
+    res.json({ message: 'Pending plan change revoked' });
+  } catch (error) {
+    console.error('Revoke scheduled change error:', error);
+    res.status(500).json({ error: 'Failed to revoke scheduled change' });
+  }
+};
+
 module.exports = {
   getSubscription,
   createCheckoutSession,
   createCustomerPortal,
+  revokeScheduledChange,
 };

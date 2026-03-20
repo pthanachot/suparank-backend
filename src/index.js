@@ -36,6 +36,10 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 
+// Stripe webhook (needs raw body — must be before JSON parsing)
+const { handleWebhook } = require('./controllers/webhookController');
+app.post('/api/billing/webhooks', express.raw({ type: 'application/json' }), handleWebhook);
+
 // Body parsing
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));

@@ -7,5 +7,6 @@ const { authenticateToken } = require('../middleware/auth');
 router.use(authenticateToken);
 
 router.get('/subscription', billingController.getSubscription);
+router.post('/checkout', billingController.createCheckoutSession);
 
 module.exports = router;

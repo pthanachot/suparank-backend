@@ -176,6 +176,91 @@ const getSubscription = async (req, res) => {
   }
 };
 
+// ─── CREATE CHECKOUT SESSION ──────────────────────────────────
+
+const createCheckoutSession = async (req, res) => {
+  try {
+    const { priceId } = req.body;
+
+    if (!priceId) {
+      return res.status(400).json({ error: 'Price ID is required' });
+    }
+
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Create or retrieve Stripe customer
+    let customerId = user.stripeCustomerId;
+
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: user.email,
+        name: user.profile?.name || undefined,
+        metadata: { userId: user._id.toString() },
+      });
+      customerId = customer.id;
+      user.stripeCustomerId = customerId;
+      await user.save();
+    }
+
+    // Block checkout if user already has an active subscription
+    const existingSub = await Subscription.findOne({
+      userId: user._id,
+      status: { $in: ['active', 'trialing'] },
+      stripeSubscriptionId: { $exists: true, $ne: null },
+    });
+
+    if (existingSub) {
+      return res.status(400).json({
+        error: 'You already have an active subscription. Please cancel your current plan first to switch plans.',
+        existingSubscription: {
+          planId: existingSub.planId,
+          status: existingSub.status,
+        },
+      });
+    }
+
+    // Also check Stripe directly (handles race condition when webhook hasn't processed yet)
+    const stripeSubscriptions = await stripe.subscriptions.list({
+      customer: customerId,
+      status: 'active',
+      limit: 1,
+    });
+
+    if (stripeSubscriptions.data.length > 0) {
+      return res.status(400).json({
+        error: 'You already have an active subscription. Please cancel your current plan first to switch plans.',
+      });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      customer: customerId,
+      mode: 'subscription',
+      payment_method_types: ['card'],
+      payment_method_collection: 'if_required',
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: `${APP_URL}/settings/billing?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${APP_URL}/settings/billing/plans`,
+      metadata: {
+        userId: user._id.toString(),
+      },
+      subscription_data: {
+        metadata: {
+          userId: user._id.toString(),
+        },
+      },
+    });
+
+    res.json({ url: session.url, sessionId: session.id });
+  } catch (error) {
+    console.error('Create checkout session error:', error);
+    res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+};
+
 module.exports = {
   getSubscription,
+  createCheckoutSession,
 };

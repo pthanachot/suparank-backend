@@ -52,8 +52,10 @@ app.use('/api/', apiLimiter);
 // Routes
 const authRoutes = require('./routes/authRoutes');
 const userRoutes = require('./routes/userRoutes');
+const billingRoutes = require('./routes/billingRoutes');
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/billing', billingRoutes);
 
 // Health check
 app.get('/health', (req, res) => {

@@ -420,6 +420,69 @@ const reactivateSubscription = async (req, res) => {
   }
 };
 
+// ─── GET INVOICES ─────────────────────────────────────────────
+
+const getInvoices = async (req, res) => {
+  try {
+    const sub = await Subscription.findOne({ userId: req.user.userId });
+
+    // No subscription at all
+    if (!sub) {
+      return res.json({ invoices: [] });
+    }
+
+    // If paymentHistory is empty but user has a Stripe customer, backfill once from Stripe
+    if (sub.paymentHistory.length === 0 && sub.stripeCustomerId) {
+      try {
+        const stripeInvoices = await stripe.invoices.list({
+          customer: sub.stripeCustomerId,
+          limit: 24,
+        });
+
+        for (const inv of stripeInvoices.data) {
+          sub.paymentHistory.push({
+            invoiceId: inv.id,
+            number: inv.number || inv.id,
+            amount: (inv.amount_paid || 0) / 100,
+            currency: (inv.currency || 'usd').toUpperCase(),
+            status: inv.status === 'paid' ? 'paid' : inv.status === 'void' ? 'refunded' : inv.status,
+            description: inv.lines?.data?.[0]?.description || 'Subscription',
+            invoiceUrl: inv.hosted_invoice_url || null,
+            pdfUrl: inv.invoice_pdf || null,
+            date: new Date(inv.created * 1000),
+          });
+        }
+
+        if (sub.paymentHistory.length > 0) {
+          await sub.save();
+          console.log(`Backfilled ${sub.paymentHistory.length} invoices from Stripe for user=${req.user.userId}`);
+        }
+      } catch (err) {
+        console.error('Failed to backfill invoices from Stripe:', err.message);
+      }
+    }
+
+    // Sort by date descending and return
+    const invoices = sub.paymentHistory
+      .sort((a, b) => new Date(b.date) - new Date(a.date))
+      .map((inv) => ({
+        id: inv.number || inv.invoiceId,
+        date: inv.date?.toISOString(),
+        description: inv.description,
+        amount: inv.amount?.toFixed(2),
+        currency: inv.currency || 'USD',
+        status: inv.status,
+        invoiceUrl: inv.invoiceUrl,
+        pdfUrl: inv.pdfUrl,
+      }));
+
+    res.json({ invoices });
+  } catch (error) {
+    console.error('Get invoices error:', error);
+    res.status(500).json({ error: 'Failed to get invoices' });
+  }
+};
+
 module.exports = {
   getSubscription,
   createCheckoutSession,
@@ -427,4 +490,5 @@ module.exports = {
   revokeScheduledChange,
   cancelSubscription,
   reactivateSubscription,
+  getInvoices,
 };

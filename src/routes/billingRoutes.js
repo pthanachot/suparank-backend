@@ -12,5 +12,6 @@ router.post('/customer-portal', billingController.createCustomerPortal);
 router.post('/revoke-schedule', billingController.revokeScheduledChange);
 router.post('/cancel', billingController.cancelSubscription);
 router.post('/reactivate', billingController.reactivateSubscription);
+router.get('/invoices', billingController.getInvoices);
 
 module.exports = router;

@@ -381,10 +381,50 @@ const cancelSubscription = async (req, res) => {
   }
 };
 
+// ─── REACTIVATE SUBSCRIPTION ──────────────────────────────────
+
+const reactivateSubscription = async (req, res) => {
+  try {
+    const sub = await Subscription.findOne({
+      userId: req.user.userId,
+      status: { $in: ['active', 'trialing'] },
+      cancelAtPeriodEnd: true,
+    });
+
+    if (!sub) {
+      return res.status(404).json({ error: 'No canceled subscription found' });
+    }
+
+    // Verify the subscription still exists and is active on Stripe
+    const stripeSub = await stripe.subscriptions.retrieve(sub.stripeSubscriptionId);
+    if (stripeSub.status === 'canceled') {
+      // Stripe already deleted it — clean up local record
+      sub.status = 'canceled';
+      sub.cancelAtPeriodEnd = false;
+      await sub.save();
+      return res.status(404).json({ error: 'Subscription has already been canceled and cannot be reactivated' });
+    }
+
+    await stripe.subscriptions.update(sub.stripeSubscriptionId, {
+      cancel_at_period_end: false,
+    });
+
+    sub.cancelAtPeriodEnd = false;
+    sub.canceledAt = undefined;
+    await sub.save();
+
+    res.json({ message: 'Subscription reactivated' });
+  } catch (error) {
+    console.error('Reactivate subscription error:', error);
+    res.status(500).json({ error: 'Failed to reactivate subscription' });
+  }
+};
+
 module.exports = {
   getSubscription,
   createCheckoutSession,
   createCustomerPortal,
   revokeScheduledChange,
   cancelSubscription,
+  reactivateSubscription,
 };

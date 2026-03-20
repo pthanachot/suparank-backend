@@ -260,7 +260,62 @@ const createCheckoutSession = async (req, res) => {
   }
 };
 
+// ─── CREATE CUSTOMER PORTAL ───────────────────────────────────
+
+const createCustomerPortal = async (req, res) => {
+  try {
+    const { flow } = req.body || {};
+
+    const user = await User.findById(req.user.userId);
+    if (!user?.stripeCustomerId) {
+      return res.status(400).json({ error: 'No billing account found' });
+    }
+
+    const portalParams = {
+      customer: user.stripeCustomerId,
+      return_url: `${APP_URL}/settings/billing`,
+    };
+
+    // If flow is 'subscription_update', go directly to plan switching
+    if (flow === 'subscription_update') {
+      const sub = await Subscription.findOne({
+        userId: user._id,
+        status: { $in: ['active', 'trialing'] },
+        stripeSubscriptionId: { $exists: true, $ne: null },
+      });
+
+      if (sub) {
+        // Release any pending schedule first — Stripe blocks flow_data when a schedule exists
+        try {
+          const stripeSub = await stripe.subscriptions.retrieve(sub.stripeSubscriptionId);
+          if (stripeSub.schedule) {
+            await stripe.subscriptionSchedules.release(stripeSub.schedule);
+            console.log(`Released schedule ${stripeSub.schedule} before portal update flow`);
+          }
+        } catch (err) {
+          console.error('Failed to release schedule before portal:', err.message);
+        }
+
+        portalParams.flow_data = {
+          type: 'subscription_update',
+          subscription_update: {
+            subscription: sub.stripeSubscriptionId,
+          },
+        };
+      }
+    }
+
+    const session = await stripe.billingPortal.sessions.create(portalParams);
+
+    res.json({ url: session.url });
+  } catch (error) {
+    console.error('Create customer portal error:', error);
+    res.status(500).json({ error: 'Failed to create customer portal' });
+  }
+};
+
 module.exports = {
   getSubscription,
   createCheckoutSession,
+  createCustomerPortal,
 };

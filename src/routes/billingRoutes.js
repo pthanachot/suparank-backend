@@ -8,5 +8,6 @@ router.use(authenticateToken);
 
 router.get('/subscription', billingController.getSubscription);
 router.post('/checkout', billingController.createCheckoutSession);
+router.post('/customer-portal', billingController.createCustomerPortal);
 
 module.exports = router;

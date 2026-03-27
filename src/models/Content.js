@@ -86,7 +86,13 @@ const contentSchema = new mongoose.Schema(
     blocks: [blockSchema],
 
     // SEO & metrics
-    targetKeyword: { type: String, default: '' },
+    targetKeywords: {
+      type: [String],
+      default: [],
+      validate: [arr => arr.length <= 5, 'Maximum 5 keywords allowed'],
+    },
+    country: { type: String, default: '' },
+    device: { type: String, enum: ['desktop', 'mobile', ''], default: '' },
     score: { type: Number, default: 0, min: 0, max: 100 },
     wordCount: { type: Number, default: 0 },
 
@@ -154,7 +160,7 @@ contentSchema.statics.findSummariesByWorkspace = function (workspaceId, { status
   if (status) query.status = status;
   if (folder) query.folder = folder;
   return this.find(query)
-    .select('contentNumber title slug description targetKeyword score wordCount status folder platform publishedAt scheduledAt createdAt updatedAt')
+    .select('contentNumber title slug description targetKeywords country device score wordCount status folder platform publishedAt scheduledAt createdAt updatedAt')
     .sort({ updatedAt: -1 });
 };
 

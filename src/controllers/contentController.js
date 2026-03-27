@@ -57,7 +57,7 @@ const createContent = async (req, res) => {
     if (!workspace) return;
 
     const contentNumber = await Content.getNextContentNumber();
-    const { title, slug, description, blocks, targetKeyword, score, wordCount, status, folder, platform, versions } = req.body;
+    const { title, slug, description, blocks, targetKeywords, country, device, score, wordCount, status, folder, platform, versions } = req.body;
 
     const content = await Content.create({
       userId: req.user.userId,
@@ -67,7 +67,9 @@ const createContent = async (req, res) => {
       slug,
       description,
       blocks: blocks || [],
-      targetKeyword,
+      targetKeywords: targetKeywords || [],
+      country,
+      device,
       score,
       wordCount,
       status,
@@ -91,8 +93,8 @@ const updateContent = async (req, res) => {
     if (!workspace) return;
 
     const allowedFields = [
-      'title', 'slug', 'description', 'blocks', 'targetKeyword',
-      'score', 'wordCount', 'status', 'folder', 'platform',
+      'title', 'slug', 'description', 'blocks', 'targetKeywords',
+      'country', 'device', 'score', 'wordCount', 'status', 'folder', 'platform',
       'versions', 'publishedAt', 'scheduledAt',
     ];
 

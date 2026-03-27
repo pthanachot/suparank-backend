@@ -103,9 +103,10 @@ function buildProminenceMap(htmlContent) {
  * @param {string} keyword - Primary target keyword
  * @param {object} benchmark - Saved benchmark from DB (camelCase fields)
  * @param {object|null} intent - Saved intent classification from DB
+ * @param {object|null} aiFormatData - AI format recommend data (enriched NLP terms)
  * @returns {object} Score result matching Go engine's ContentScore shape
  */
-function scoreContent(htmlContent, keyword, benchmark, intent) {
+function scoreContent(htmlContent, keyword, benchmark, intent, aiFormatData) {
   if (!benchmark) {
     return { overallScore: 0, signals: [], recommendations: [{ priority: 'high', message: 'No benchmark data. Run analysis first.' }] };
   }
@@ -220,7 +221,18 @@ function scoreContent(htmlContent, keyword, benchmark, intent) {
   const missingNlpTerms = [];
   const nlpTermDetails = [];
 
-  const topNlpTerms = benchmark.topNlpTerms || [];
+  // Prefer AI-enriched terms when available, fall back to benchmark terms
+  const aiTerms = aiFormatData?.nlpTerms || [];
+  const topNlpTerms = aiTerms.length > 0
+    ? aiTerms.map((t) => ({
+        term: t.term,
+        count: t.benchmarkCount || 1,
+        docFrequency: 0,
+        usageRange: null, // AI terms use benchmarkCount via ratio-based scoring
+        prominence: t.position === 'top' ? 'first_paragraph' : '',
+      }))
+    : (benchmark.topNlpTerms || []);
+
   if (topNlpTerms.length > 0) {
     let totalCoverage = 0;
 
@@ -281,7 +293,13 @@ function scoreContent(htmlContent, keyword, benchmark, intent) {
     signals.push({ signal: 'NLP Term Coverage', yourValue: Math.round(nlpCoverage * 10) / 10, avgValue: 70, score: nlpScore, status: nlpStatus });
 
     if (missingNlpTerms.length > 0) {
-      const highPri = missingNlpTerms.filter((t) => (t.docFrequency || 0) >= (benchmark.pageCount || 1) / 2);
+      const highPri = missingNlpTerms.filter((t) => {
+        // Benchmark terms: high priority if in 50%+ of competitor pages
+        if ((t.docFrequency || 0) >= (benchmark.pageCount || 1) / 2) return true;
+        // AI terms (docFrequency=0): high priority if benchmarkCount >= 3
+        if (t.docFrequency === 0 && (t.count || 0) >= 3) return true;
+        return false;
+      });
       if (highPri.length > 0) {
         const labels = highPri.slice(0, 10).map((t) => t.usageRange ? `${t.term} (${t.usageRange.min}-${t.usageRange.max} times)` : t.term);
         recs.push({ priority: 'high', message: `Missing key terms used by most competitors: ${labels.join(', ')}` });

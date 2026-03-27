@@ -145,6 +145,10 @@ const contentSchema = new mongoose.Schema(
       type: [mongoose.Schema.Types.Mixed],
       default: [],
     },
+    aiFormatData: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
 
     // Scheduling
     publishedAt: Date,

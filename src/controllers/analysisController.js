@@ -87,6 +87,33 @@ function curateCompetitors(raw) {
   }));
 }
 
+// Curate AI format recommend data
+function curateAiFormatData(raw) {
+  if (!raw) return null;
+  return {
+    keyword: raw.keyword || '',
+    recommendedFormat: raw.recommended_format || 'guide',
+    formatConfidence: raw.format_confidence || 0,
+    formatDistribution: raw.format_distribution || {},
+    recommendedStructure: raw.recommended_structure ? {
+      targetWordCount: raw.recommended_structure.target_word_count || null,
+      targetSections: raw.recommended_structure.target_sections || null,
+      targetSectionLength: raw.recommended_structure.target_section_length || null,
+      suggestedHeadings: raw.recommended_structure.suggested_headings || [],
+      mustIncludeElements: raw.recommended_structure.must_include_elements || [],
+      frontLoadingGuidance: raw.recommended_structure.front_loading_guidance || '',
+    } : null,
+    nlpTerms: (raw.nlp_terms || []).map((t) => ({
+      term: t.term,
+      group: t.group || 'mention',
+      benchmarkCount: t.benchmark_count || 0,
+      position: t.position || 'any',
+      proximityPartners: t.proximity_partners || [],
+      volatile: t.volatile || false,
+    })),
+  };
+}
+
 // ─── RUN ANALYSIS (background) ─────────────────────────────────
 
 async function runAnalysis(contentId) {
@@ -145,7 +172,24 @@ async function runAnalysis(contentId) {
       return;
     }
 
-    // Step 3: Save curated results to DB
+    // Step 3: AI Format Recommend (optional — needs AI engine keys)
+    let aiFormatData = null;
+    try {
+      const aiFormatRes = await fetch(`${ENGINE_URL}/api/ai-format-recommend`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ keywords }),
+        signal: AbortSignal.timeout(90000),
+      });
+      if (aiFormatRes.ok) {
+        aiFormatData = await aiFormatRes.json();
+        console.log(`[analysis] ai-format-recommend returned ${(aiFormatData.nlp_terms || []).length} NLP terms`);
+      }
+    } catch (err) {
+      console.error('[analysis] ai-format-recommend failed (non-fatal):', err.message);
+    }
+
+    // Step 4: Save curated results to DB
     const updates = {
       analysisStatus: 'ready',
       analysisError: '',
@@ -156,6 +200,7 @@ async function runAnalysis(contentId) {
       relatedSearches: discoverData.related_searches || [],
       peopleAlsoAsk: discoverData.people_also_ask || [],
       keywordVolumes: discoverData.keyword_volumes || [],
+      aiFormatData: aiFormatData ? curateAiFormatData(aiFormatData) : null,
     };
 
     await Content.findByIdAndUpdate(contentId, { $set: updates });
@@ -210,6 +255,7 @@ const getBenchmark = async (req, res) => {
       relatedSearches: content.relatedSearches || [],
       peopleAlsoAsk: content.peopleAlsoAsk || [],
       keywordVolumes: content.keywordVolumes || [],
+      aiFormatData: content.aiFormatData || null,
     });
   } catch (err) {
     console.error('getBenchmark error:', err.message);
@@ -259,7 +305,7 @@ const computeScore = async (req, res) => {
     }
 
     const keyword = (content.targetKeywords && content.targetKeywords[0]) || '';
-    const result = scoreContent(htmlContent, keyword, content.benchmark, content.intent);
+    const result = scoreContent(htmlContent, keyword, content.benchmark, content.intent, content.aiFormatData);
 
     // Update the stored score on the content document
     await Content.findByIdAndUpdate(content._id, { $set: { score: result.overallScore } });

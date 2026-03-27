@@ -119,8 +119,14 @@ contentSchema.index({ workspaceId: 1, status: 1 });
 contentSchema.index({ workspaceId: 1, folder: 1 });
 contentSchema.index({ workspaceId: 1, updatedAt: -1 });
 
-// Generate next 8-digit content number (10000000–99999999)
+// Generate random 8-digit content number (10000000–99999999)
 contentSchema.statics.getNextContentNumber = async function () {
+  for (let i = 0; i < 10; i++) {
+    const num = Math.floor(10000000 + Math.random() * 90000000);
+    const exists = await this.findOne({ contentNumber: num });
+    if (!exists) return num;
+  }
+  // Extremely unlikely fallback: use counter
   const counter = await Counter.findByIdAndUpdate(
     'contentNumber',
     { $inc: { seq: 1 } },

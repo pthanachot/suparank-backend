@@ -17,8 +17,14 @@ const workspaceSchema = new mongoose.Schema(
 
 workspaceSchema.index({ userId: 1, workspaceNumber: 1 });
 
-// Generate next 6-digit workspace number (100000–999999)
+// Generate random 6-digit workspace number (100000–999999)
 workspaceSchema.statics.getNextNumber = async function () {
+  for (let i = 0; i < 10; i++) {
+    const num = Math.floor(100000 + Math.random() * 900000);
+    const exists = await this.findOne({ workspaceNumber: num });
+    if (!exists) return num;
+  }
+  // Extremely unlikely fallback: use counter
   const counter = await Counter.findByIdAndUpdate(
     'workspaceNumber',
     { $inc: { seq: 1 } },

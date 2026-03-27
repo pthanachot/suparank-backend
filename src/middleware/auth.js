@@ -1,4 +1,5 @@
 const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 const { OAuth2Client } = require('google-auth-library');
 const User = require('../models/User');
 const Session = require('../models/Session');
@@ -44,7 +45,7 @@ const authenticateToken = (req, res, next) => {
       }
 
       req.user = {
-        userId: decoded.userId,
+        userId: new mongoose.Types.ObjectId(decoded.userId),
         email: decoded.email,
         roles: decoded.roles,
         sessionId: decoded.sessionId,
@@ -91,7 +92,10 @@ const optionalAuth = (req, res, next) => {
         return next();
       }
 
-      req.user = decoded;
+      req.user = {
+        ...decoded,
+        userId: new mongoose.Types.ObjectId(decoded.userId),
+      };
       next();
     } catch {
       req.user = null;

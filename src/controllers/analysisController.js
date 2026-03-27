@@ -23,68 +23,138 @@ async function resolveContent(req, res) {
   return content;
 }
 
-// Curate benchmark: extract only what the frontend needs
-function curateBenchmark(raw) {
-  if (!raw) return null;
+// Curate benchmark: map engine content_brief to scorer-compatible format
+function curateBenchmark(brief) {
+  if (!brief) return null;
+
+  const stats = brief.competitor_stats || {};
+  const terms = brief.terms || [];
+  const clusters = brief.clusters || [];
+  const structure = brief.structure || [];
+
+  // Estimate page count from max doc_freq across terms
+  const pageCount = terms.reduce((max, t) => Math.max(max, t.doc_freq || 0), 0) || 10;
+
   return {
-    keywords: raw.keywords || [],
-    pageCount: raw.page_count || 0,
-    avgWordCount: raw.avg_word_count || 0,
-    minWordCount: raw.min_word_count || 0,
-    maxWordCount: raw.max_word_count || 0,
-    avgH1Count: raw.avg_h1_count || 0,
-    avgH2Count: raw.avg_h2_count || 0,
-    avgH3Count: raw.avg_h3_count || 0,
-    avgInternalLinks: raw.avg_internal_links || 0,
-    avgExternalLinks: raw.avg_external_links || 0,
-    avgImages: raw.avg_images || 0,
-    avgTitleLength: raw.avg_title_length || 0,
-    avgDescLength: raw.avg_desc_length || 0,
-    avgKeywordDensity: raw.avg_keyword_density_pct || 0,
-    keywordInH2Rate: raw.keyword_in_h2_rate || 0,
-    keywordInFirst100Rate: raw.keyword_in_first_100_rate || 0,
-    avgListCount: raw.avg_list_count || 0,
-    avgTableCount: raw.avg_table_count || 0,
-    avgFaqCount: raw.avg_faq_count || 0,
-    avgSentenceLength: raw.avg_sentence_length || 0,
-    avgReadingLevel: raw.avg_reading_level || 0,
-    topNlpTerms: (raw.top_nlp_terms || []).map((t) => ({
+    keywords: brief.keyword ? [brief.keyword] : [],
+    pageCount,
+    avgWordCount: stats.avg_word_count || 0,
+    minWordCount: 0,
+    maxWordCount: 0,
+    avgH1Count: 1,
+    avgH2Count: stats.avg_sections || 0,
+    avgH3Count: 0,
+    avgInternalLinks: 0,
+    avgExternalLinks: 0,
+    avgImages: 0,
+    avgTitleLength: 0,
+    avgDescLength: 0,
+    avgKeywordDensity: 0,
+    keywordInH2Rate: 0,
+    keywordInFirst100Rate: 0,
+    avgListCount: 0,
+    avgTableCount: 0,
+    avgFaqCount: 0,
+    avgSentenceLength: 0,
+    avgReadingLevel: 0,
+    topNlpTerms: terms.map((t) => ({
       term: t.term,
-      count: t.count,
-      tfidf: t.tfidf,
-      bm25: t.bm25,
-      docFrequency: t.doc_frequency,
-      prominence: t.prominence || '',
-      usageRange: t.usage_range || null,
+      count: t.freq || t.doc_freq || 1,
+      tfidf: 0,
+      bm25: t.bm25 || 0,
+      docFrequency: t.doc_freq || 0,
+      prominence: t.layer === 'awareness' ? 'first_paragraph' : '',
+      usageRange: Array.isArray(t.uses) ? { min: t.uses[0], recommended: Math.round((t.uses[0] + t.uses[1]) / 2), max: t.uses[1] } : null,
     })),
-    topicClusters: (raw.topic_clusters || []).map((c) => ({
-      topic: c.topic,
+    topicClusters: clusters.map((c) => ({
+      topic: c.label,
       terms: c.terms || [],
-      importance: c.importance,
-      docFrequency: c.doc_frequency,
+      importance: 0,
+      docFrequency: 0,
     })),
-    subtopics: (raw.subtopics || []).map((s) => ({
-      label: s.label,
-      stemmedForm: s.stemmed_form,
-      variants: s.variants || [],
-      docFrequency: s.doc_frequency,
-      docPercent: s.doc_percent,
-    })),
+    subtopics: structure.map((s) => {
+      const parts = (s.prevalence || '0/0').split('/').map(Number);
+      return {
+        label: (s.name || '').replace(/_/g, ' '),
+        stemmedForm: '',
+        variants: [],
+        docFrequency: parts[0] || 0,
+        docPercent: parts[1] > 0 ? parts[0] / parts[1] : 0,
+      };
+    }),
   };
 }
 
-// Curate competitors: summaries only
-function curateCompetitors(raw) {
-  if (!Array.isArray(raw)) return [];
-  return raw.map((c) => ({
+// Curate competitors from discover candidates
+function curateCompetitors(candidates) {
+  if (!Array.isArray(candidates)) return [];
+  return candidates.map((c) => ({
     url: c.url,
     title: c.title,
-    position: c.position,
-    wordCount: c.word_count,
-    qualityScore: c.quality_score,
+    position: c.best_position || 0,
+    wordCount: 0,
+    qualityScore: 0,
     keywords: c.keywords || [],
     selected: c.selected || false,
   }));
+}
+
+// Curate full content brief for frontend (snake_case → camelCase)
+function curateContentBrief(brief) {
+  if (!brief) return null;
+  return {
+    briefId: brief.brief_id || '',
+    keyword: brief.keyword || '',
+    createdAt: brief.created_at || null,
+    archetype: brief.archetype || '',
+    sophistication: brief.sophistication || '',
+    audiences: brief.audiences || [],
+    structure: (brief.structure || []).map((s) => ({
+      id: s.id,
+      name: s.name,
+      priority: s.priority,
+      words: s.words || [],
+      prevalence: s.prevalence || '',
+      paaMapped: s.paa_mapped || false,
+      snippetTarget: s.snippet_target || false,
+      source: s.source || '',
+    })),
+    serpAnalysis: brief.serp_analysis ? {
+      featuredSnippet: brief.serp_analysis.featured_snippet || null,
+      peopleAlsoAsk: brief.serp_analysis.people_also_ask || [],
+    } : null,
+    competitorStats: brief.competitor_stats || {},
+    layerTargets: brief.layer_targets || {},
+    gaps: brief.gaps ? {
+      conceptGaps: (brief.gaps.concept_gaps || []).map((g) => ({
+        id: g.id, concept: g.concept, coverage: g.coverage,
+        score: g.score, terms: g.terms || [], angle: g.angle || '',
+      })),
+      layerGaps: (brief.gaps.layer_gaps || []).map((g) => ({
+        id: g.id, layer: g.layer, current: g.current, target: g.target,
+        score: g.score, terms: g.terms || [], angle: g.angle || '',
+      })),
+      paaGaps: (brief.gaps.paa_gaps || []).map((g) => ({
+        id: g.id, question: g.question,
+        answeredWellByCompetitors: g.answered_well_by_competitors,
+        score: g.score, terms: g.terms || [], angle: g.angle || '',
+      })),
+    } : null,
+    terms: (brief.terms || []).map((t) => ({
+      term: t.term, score: t.score, centrality: t.centrality,
+      type: t.type, layer: t.layer, section: t.section,
+      uses: t.uses || [], cluster: t.cluster || '',
+      source: t.source || '', gapRef: t.gap_ref || '',
+      guidance: t.guidance || '', bm25: t.bm25 || 0,
+      docFreq: t.doc_freq || 0, freq: t.freq || 0,
+      volatile: t.volatile || false,
+    })),
+    clusters: (brief.clusters || []).map((c) => ({
+      id: c.id, label: c.label, terms: c.terms || [],
+    })),
+    competitorWeaknesses: brief.competitor_weaknesses || [],
+    pipelineCost: brief.pipeline_cost || 0,
+  };
 }
 
 // Curate AI format recommend data
@@ -149,17 +219,26 @@ async function runAnalysis(contentId) {
       console.error('[analysis] discover failed:', err.message);
     }
 
-    // Step 2: Analyze (full crawl + benchmark + intent)
-    let analyzeData = {};
+    // Extract selected URLs from discover candidates to feed into analyze
+    const candidates = discoverData.candidates || [];
+    const selectedUrls = candidates.filter((c) => c.selected).map((c) => c.url);
+
+    // Step 2: Analyze (full pipeline — 5 min timeout to match engine)
+    let contentBrief = {};
     try {
+      const analyzeBody = { keywords };
+      if (selectedUrls.length > 0) {
+        analyzeBody.selected_urls = selectedUrls;
+      }
       const analyzeRes = await fetch(`${ENGINE_URL}/api/analyze`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keywords }),
-        signal: AbortSignal.timeout(180000),
+        body: JSON.stringify(analyzeBody),
+        signal: AbortSignal.timeout(300000),
       });
       if (analyzeRes.ok) {
-        analyzeData = await analyzeRes.json();
+        const analyzeData = await analyzeRes.json();
+        contentBrief = analyzeData.content_brief || {};
       } else {
         const errBody = await analyzeRes.text();
         throw new Error(`Engine returned ${analyzeRes.status}: ${errBody}`);
@@ -194,9 +273,10 @@ async function runAnalysis(contentId) {
       analysisStatus: 'ready',
       analysisError: '',
       analyzedAt: new Date(),
-      benchmark: curateBenchmark(analyzeData.benchmark),
-      intent: analyzeData.intent || null,
-      competitors: curateCompetitors(analyzeData.competitors),
+      benchmark: curateBenchmark(contentBrief),
+      intent: contentBrief.intent || null,
+      competitors: curateCompetitors(candidates),
+      contentBrief: curateContentBrief(contentBrief),
       relatedSearches: discoverData.related_searches || [],
       peopleAlsoAsk: discoverData.people_also_ask || [],
       keywordVolumes: discoverData.keyword_volumes || [],
@@ -252,6 +332,7 @@ const getBenchmark = async (req, res) => {
       benchmark: content.benchmark || null,
       intent: content.intent || null,
       competitors: content.competitors || [],
+      contentBrief: content.contentBrief || null,
       relatedSearches: content.relatedSearches || [],
       peopleAlsoAsk: content.peopleAlsoAsk || [],
       keywordVolumes: content.keywordVolumes || [],

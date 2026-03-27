@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const Counter = require('./Counter');
 
 /* ───────────── sub-schemas (match frontend editor types) ───────────── */
 
@@ -70,6 +71,13 @@ const contentSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    workspaceId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Workspace',
+      required: true,
+      index: true,
+    },
+    contentNumber: { type: Number, required: true, unique: true },
 
     // Core content
     title: { type: String, default: 'Untitled' },
@@ -106,25 +114,41 @@ const contentSchema = new mongoose.Schema(
 );
 
 // Compound indexes
-contentSchema.index({ userId: 1, status: 1 });
-contentSchema.index({ userId: 1, folder: 1 });
-contentSchema.index({ userId: 1, updatedAt: -1 });
+contentSchema.index({ workspaceId: 1, contentNumber: 1 });
+contentSchema.index({ workspaceId: 1, status: 1 });
+contentSchema.index({ workspaceId: 1, folder: 1 });
+contentSchema.index({ workspaceId: 1, updatedAt: -1 });
 
-// List contents for a user (used by workspace dashboard)
-contentSchema.statics.findByUser = function (userId, { status, folder } = {}) {
-  const query = { userId };
+// Generate next 8-digit content number (10000000–99999999)
+contentSchema.statics.getNextContentNumber = async function () {
+  const counter = await Counter.findByIdAndUpdate(
+    'contentNumber',
+    { $inc: { seq: 1 } },
+    { new: true, upsert: true }
+  );
+  return counter.seq + 10000000;
+};
+
+// Find by workspace and contentNumber
+contentSchema.statics.findByNumber = function (workspaceId, contentNumber) {
+  return this.findOne({ workspaceId, contentNumber: Number(contentNumber) });
+};
+
+// List contents for a workspace (used by workspace dashboard)
+contentSchema.statics.findByWorkspace = function (workspaceId, { status, folder } = {}) {
+  const query = { workspaceId };
   if (status) query.status = status;
   if (folder) query.folder = folder;
   return this.find(query).sort({ updatedAt: -1 });
 };
 
 // Summary projection (for listing, excludes heavy blocks/versions)
-contentSchema.statics.findSummariesByUser = function (userId, { status, folder } = {}) {
-  const query = { userId };
+contentSchema.statics.findSummariesByWorkspace = function (workspaceId, { status, folder } = {}) {
+  const query = { workspaceId };
   if (status) query.status = status;
   if (folder) query.folder = folder;
   return this.find(query)
-    .select('title slug description targetKeyword score wordCount status folder platform publishedAt scheduledAt createdAt updatedAt')
+    .select('contentNumber title slug description targetKeyword score wordCount status folder platform publishedAt scheduledAt createdAt updatedAt')
     .sort({ updatedAt: -1 });
 };
 

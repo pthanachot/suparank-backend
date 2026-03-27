@@ -1,5 +1,6 @@
 const Workspace = require('../models/Workspace');
 const Content = require('../models/Content');
+const { runAnalysis } = require('./analysisController');
 
 // Middleware-style: resolve workspace from :workspaceNumber param
 async function resolveWorkspace(req, res) {
@@ -77,6 +78,12 @@ const createContent = async (req, res) => {
       platform,
       versions: versions || [],
     });
+
+    // Auto-trigger analysis if keywords are provided
+    if (content.targetKeywords && content.targetKeywords.length > 0) {
+      await Content.findByIdAndUpdate(content._id, { $set: { analysisStatus: 'pending' } });
+      runAnalysis(content._id);
+    }
 
     res.status(201).json({ content });
   } catch (err) {

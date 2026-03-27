@@ -112,6 +112,40 @@ const contentSchema = new mongoose.Schema(
       validate: [arr => arr.length <= 10, 'Maximum 10 version snapshots allowed'],
     },
 
+    // Engine analysis results (persisted from Go engine)
+    analysisStatus: {
+      type: String,
+      enum: ['idle', 'pending', 'analyzing', 'ready', 'failed'],
+      default: 'idle',
+    },
+    analysisError: { type: String, default: '' },
+    analyzedAt: Date,
+
+    benchmark: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
+    intent: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
+    competitors: {
+      type: [mongoose.Schema.Types.Mixed],
+      default: [],
+    },
+    relatedSearches: {
+      type: [mongoose.Schema.Types.Mixed],
+      default: [],
+    },
+    peopleAlsoAsk: {
+      type: [mongoose.Schema.Types.Mixed],
+      default: [],
+    },
+    keywordVolumes: {
+      type: [mongoose.Schema.Types.Mixed],
+      default: [],
+    },
+
     // Scheduling
     publishedAt: Date,
     scheduledAt: Date,
@@ -160,7 +194,7 @@ contentSchema.statics.findSummariesByWorkspace = function (workspaceId, { status
   if (status) query.status = status;
   if (folder) query.folder = folder;
   return this.find(query)
-    .select('contentNumber title slug description targetKeywords country device score wordCount status folder platform publishedAt scheduledAt createdAt updatedAt')
+    .select('contentNumber title slug description targetKeywords country device score wordCount status folder platform analysisStatus analyzedAt publishedAt scheduledAt createdAt updatedAt')
     .sort({ updatedAt: -1 });
 };
 

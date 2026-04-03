@@ -7,7 +7,10 @@ async function resolveWorkspace(req, res) {
   const { workspaceNumber } = req.params;
   const workspace = await Workspace.findOne({
     workspaceNumber: Number(workspaceNumber),
-    userId: req.user.userId,
+    $or: [
+      { userId: req.user.userId },
+      { 'members.userId': req.user.userId },
+    ],
   });
   if (!workspace) {
     res.status(404).json({ error: 'Workspace not found' });

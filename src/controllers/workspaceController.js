@@ -39,10 +39,19 @@ async function ensureDefaultWorkspace(userId) {
 const listWorkspaces = async (req, res) => {
   try {
     await ensureDefaultWorkspace(req.user.userId);
-    const workspaces = await Workspace.find({ userId: req.user.userId })
+    const workspaces = await Workspace.find({
+      $or: [
+        { userId: req.user.userId },
+        { 'members.userId': req.user.userId },
+      ],
+    })
       .sort({ isDefault: -1, createdAt: 1 })
       .lean();
-    res.json({ workspaces });
+    const enriched = workspaces.map((ws) => ({
+      ...ws,
+      role: ws.userId.equals(req.user.userId) ? 'owner' : 'member',
+    }));
+    res.json({ workspaces: enriched });
   } catch (error) {
     console.error('List workspaces error:', error);
     res.status(500).json({ error: 'Failed to list workspaces' });
@@ -134,7 +143,13 @@ const deleteWorkspace = async (req, res) => {
 const setActiveWorkspace = async (req, res) => {
   try {
     const { workspaceId } = req.params;
-    const workspace = await Workspace.findOne({ _id: workspaceId, userId: req.user.userId });
+    const workspace = await Workspace.findOne({
+      _id: workspaceId,
+      $or: [
+        { userId: req.user.userId },
+        { 'members.userId': req.user.userId },
+      ],
+    });
     if (!workspace) {
       return res.status(404).json({ error: 'Workspace not found' });
     }
@@ -149,4 +164,109 @@ const setActiveWorkspace = async (req, res) => {
   }
 };
 
-module.exports = { getWorkspace, listWorkspaces, createWorkspace, updateWorkspace, deleteWorkspace, setActiveWorkspace };
+// ─── GET MEMBERS ──────────────────────────────────────────────
+const getMembers = async (req, res) => {
+  try {
+    const { workspaceId } = req.params;
+    const workspace = await Workspace.findOne({
+      _id: workspaceId,
+      $or: [
+        { userId: req.user.userId },
+        { 'members.userId': req.user.userId },
+      ],
+    });
+    if (!workspace) {
+      return res.status(404).json({ error: 'Workspace not found' });
+    }
+    const owner = await User.findById(workspace.userId).select('email profile.name profile.picture').lean();
+    res.json({
+      owner: {
+        userId: workspace.userId,
+        email: owner?.email || '',
+        name: owner?.profile?.name || '',
+        picture: owner?.profile?.picture || '',
+      },
+      members: (workspace.members || []).map((m) => ({
+        userId: m.userId,
+        email: m.email,
+        addedAt: m.addedAt,
+      })),
+      isOwner: workspace.userId.equals(req.user.userId),
+    });
+  } catch (error) {
+    console.error('Get members error:', error);
+    res.status(500).json({ error: 'Failed to get members' });
+  }
+};
+
+// ─── ADD MEMBER ───────────────────────────────────────────────
+const addMember = async (req, res) => {
+  try {
+    const { workspaceId } = req.params;
+    const { email } = req.body;
+    if (!email || !email.trim()) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+    // Only owner can add members
+    const workspace = await Workspace.findOne({ _id: workspaceId, userId: req.user.userId });
+    if (!workspace) {
+      return res.status(404).json({ error: 'Workspace not found or you are not the owner' });
+    }
+    if ((workspace.members || []).length >= 3) {
+      return res.status(400).json({ error: 'Maximum 3 members allowed per workspace' });
+    }
+    const targetUser = await User.findOne({ email: email.trim().toLowerCase() });
+    if (!targetUser) {
+      return res.status(404).json({ error: 'No user found with that email' });
+    }
+    if (targetUser._id.equals(req.user.userId)) {
+      return res.status(400).json({ error: 'You are already the owner of this workspace' });
+    }
+    const alreadyMember = (workspace.members || []).some((m) => m.userId.equals(targetUser._id));
+    if (alreadyMember) {
+      return res.status(409).json({ error: 'This user is already a member' });
+    }
+    workspace.members.push({
+      userId: targetUser._id,
+      email: targetUser.email,
+      addedAt: new Date(),
+    });
+    await workspace.save();
+    res.status(201).json({
+      member: {
+        userId: targetUser._id,
+        email: targetUser.email,
+        addedAt: new Date(),
+      },
+    });
+  } catch (error) {
+    console.error('Add member error:', error);
+    res.status(500).json({ error: 'Failed to add member' });
+  }
+};
+
+// ─── REMOVE MEMBER ────────────────────────────────────────────
+const removeMember = async (req, res) => {
+  try {
+    const { workspaceId, memberId } = req.params;
+    // Only owner can remove members
+    const workspace = await Workspace.findOne({ _id: workspaceId, userId: req.user.userId });
+    if (!workspace) {
+      return res.status(404).json({ error: 'Workspace not found or you are not the owner' });
+    }
+    const memberIndex = (workspace.members || []).findIndex(
+      (m) => m.userId.toString() === memberId
+    );
+    if (memberIndex === -1) {
+      return res.status(404).json({ error: 'Member not found' });
+    }
+    workspace.members.splice(memberIndex, 1);
+    await workspace.save();
+    res.json({ message: 'Member removed' });
+  } catch (error) {
+    console.error('Remove member error:', error);
+    res.status(500).json({ error: 'Failed to remove member' });
+  }
+};
+
+module.exports = { getWorkspace, listWorkspaces, createWorkspace, updateWorkspace, deleteWorkspace, setActiveWorkspace, getMembers, addMember, removeMember };

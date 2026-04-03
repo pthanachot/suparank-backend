@@ -58,10 +58,12 @@ const authRoutes = require('./routes/authRoutes');
 const userRoutes = require('./routes/userRoutes');
 const billingRoutes = require('./routes/billingRoutes');
 const workspaceRoutes = require('./routes/workspaceRoutes');
+const workspaceCrudRoutes = require('./routes/workspaceCrudRoutes');
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/billing', billingRoutes);
 app.use('/api/workspace', workspaceRoutes);
+app.use('/api/workspaces', workspaceCrudRoutes);
 
 // Health check
 app.get('/health', (req, res) => {

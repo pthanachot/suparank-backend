@@ -44,6 +44,7 @@ const userSchema = new mongoose.Schema(
     },
 
     stripeCustomerId: String,
+    activeWorkspaceId: { type: mongoose.Schema.Types.ObjectId, ref: 'Workspace', default: null },
 
     lastLogin: Date,
     lastActive: Date,

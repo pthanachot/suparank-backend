@@ -111,6 +111,7 @@ const emailSignup = async (req, res) => {
         picture: user.profile?.picture,
         verified: user.verified,
         connectedProviders: user.getConnectedProviders(),
+        activeWorkspaceId: user.activeWorkspaceId || null,
       },
       ...tokens,
       isNewUser: true,
@@ -169,6 +170,7 @@ const emailLogin = async (req, res) => {
         picture: user.profile?.picture,
         verified: user.verified,
         connectedProviders: user.getConnectedProviders(),
+        activeWorkspaceId: user.activeWorkspaceId || null,
       },
       ...tokens,
     });
@@ -548,6 +550,7 @@ const googleAuth = async (req, res) => {
         picture: user.profile?.picture,
         verified: user.verified,
         connectedProviders: user.getConnectedProviders(),
+        activeWorkspaceId: user.activeWorkspaceId || null,
       },
       ...tokens,
       isNewUser,
@@ -604,6 +607,7 @@ const refreshToken = async (req, res) => {
             ? { email: user.socialAccounts.google.email, connected: !!user.socialAccounts.google.id }
             : null,
         },
+        activeWorkspaceId: user.activeWorkspaceId || null,
       },
     });
   } catch (error) {
@@ -651,6 +655,7 @@ const getProfile = async (req, res) => {
           ? { email: user.socialAccounts.google.email, connected: !!user.socialAccounts.google.id }
           : null,
       },
+      activeWorkspaceId: user.activeWorkspaceId || null,
       createdAt: user.createdAt,
     });
   } catch (error) {
@@ -688,6 +693,7 @@ const verify = async (req, res) => {
             ? { email: user.socialAccounts.google.email, connected: !!user.socialAccounts.google.id }
             : null,
         },
+        activeWorkspaceId: user.activeWorkspaceId || null,
       },
     });
   } catch (error) {

@@ -99,7 +99,7 @@ const contentSchema = new mongoose.Schema(
     // Organization
     status: {
       type: String,
-      enum: ['draft', 'optimizing', 'published', 'scheduled'],
+      enum: ['draft', 'optimizing', 'done', 'published', 'scheduled'],
       default: 'draft',
     },
     folder: { type: String, default: '' },

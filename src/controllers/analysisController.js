@@ -227,6 +227,7 @@ async function runAnalysis(contentId) {
 
     // Step 2: Analyze (full pipeline — 5 min timeout to match engine)
     let contentBrief = {};
+    let competitorPages = [];
     try {
       const analyzeBody = { keywords };
       if (selectedUrls.length > 0) {
@@ -241,6 +242,7 @@ async function runAnalysis(contentId) {
       if (analyzeRes.ok) {
         const analyzeData = await analyzeRes.json();
         contentBrief = analyzeData.content_brief || {};
+        competitorPages = analyzeData.competitor_pages || [];
       } else {
         const errBody = await analyzeRes.text();
         throw new Error(`Engine returned ${analyzeRes.status}: ${errBody}`);
@@ -283,6 +285,16 @@ async function runAnalysis(contentId) {
       peopleAlsoAsk: discoverData.people_also_ask || [],
       keywordVolumes: discoverData.keyword_volumes || [],
       aiFormatData: aiFormatData ? curateAiFormatData(aiFormatData) : null,
+      competitorPages: competitorPages.map((p) => ({
+        url: p.url || '',
+        title: p.title || '',
+        position: p.position || 0,
+        wordCount: p.word_count || 0,
+        h1s: p.h1s || [],
+        h2s: p.h2s || [],
+        h3s: p.h3s || [],
+        h4s: p.h4s || [],
+      })),
     };
 
     await Content.findByIdAndUpdate(contentId, { $set: updates });
@@ -339,6 +351,7 @@ const getBenchmark = async (req, res) => {
       peopleAlsoAsk: content.peopleAlsoAsk || [],
       keywordVolumes: content.keywordVolumes || [],
       aiFormatData: content.aiFormatData || null,
+      competitorPages: content.competitorPages || [],
     });
   } catch (err) {
     console.error('getBenchmark error:', err.message);

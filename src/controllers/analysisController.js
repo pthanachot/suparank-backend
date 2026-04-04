@@ -186,6 +186,22 @@ function curateAiFormatData(raw) {
   };
 }
 
+// Curate recommended outline from engine
+function curateRecommendedOutline(raw) {
+  if (!raw) return null;
+  return {
+    h1: raw.h1 || '',
+    sections: (raw.sections || []).map((s) => ({
+      h2: s.h2 || '',
+      rationale: s.rationale || '',
+      children: (s.children || []).map((c) => ({
+        h3: c.h3 || '',
+        rationale: c.rationale || '',
+      })),
+    })),
+  };
+}
+
 // ─── RUN ANALYSIS (background) ─────────────────────────────────
 
 async function runAnalysis(contentId) {
@@ -272,7 +288,31 @@ async function runAnalysis(contentId) {
       console.error('[analysis] ai-format-recommend failed (non-fatal):', err.message);
     }
 
-    // Step 4: Save curated results to DB
+    // Step 4: Recommend Outline (optional — needs OpenRouter key)
+    let recommendedOutline = null;
+    try {
+      const outlineRes = await fetch(`${ENGINE_URL}/api/recommend-outline`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          keyword: keywords[0],
+          competitor_pages: competitorPages,
+          people_also_ask: discoverData.people_also_ask || [],
+          related_searches: discoverData.related_searches || [],
+          structure: contentBrief.structure || [],
+          terms: (contentBrief.terms || []).slice(0, 30),
+        }),
+        signal: AbortSignal.timeout(90000),
+      });
+      if (outlineRes.ok) {
+        recommendedOutline = await outlineRes.json();
+        console.log(`[analysis] recommend-outline returned H1 + ${(recommendedOutline.sections || []).length} sections`);
+      }
+    } catch (err) {
+      console.error('[analysis] recommend-outline failed (non-fatal):', err.message);
+    }
+
+    // Step 5: Save curated results to DB
     const updates = {
       analysisStatus: 'ready',
       analysisError: '',
@@ -295,6 +335,7 @@ async function runAnalysis(contentId) {
         h3s: p.h3s || [],
         h4s: p.h4s || [],
       })),
+      recommendedOutline: curateRecommendedOutline(recommendedOutline),
     };
 
     await Content.findByIdAndUpdate(contentId, { $set: updates });
@@ -352,6 +393,7 @@ const getBenchmark = async (req, res) => {
       keywordVolumes: content.keywordVolumes || [],
       aiFormatData: content.aiFormatData || null,
       competitorPages: content.competitorPages || [],
+      recommendedOutline: content.recommendedOutline || null,
     });
   } catch (err) {
     console.error('getBenchmark error:', err.message);

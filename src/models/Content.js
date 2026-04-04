@@ -157,6 +157,10 @@ const contentSchema = new mongoose.Schema(
       type: [mongoose.Schema.Types.Mixed],
       default: [],
     },
+    recommendedOutline: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
 
     // Scheduling
     publishedAt: Date,

@@ -244,7 +244,7 @@ async function runAnalysis(contentId) {
     // Step 2: Analyze (full pipeline — 5 min timeout to match engine)
     let contentBrief = {};
     let competitorPages = [];
-    let aiConversations = [];
+    let analyzeData = {};
     try {
       const analyzeBody = { keywords };
       if (selectedUrls.length > 0) {
@@ -257,14 +257,9 @@ async function runAnalysis(contentId) {
         signal: AbortSignal.timeout(300000),
       });
       if (analyzeRes.ok) {
-        const analyzeData = await analyzeRes.json();
+        analyzeData = await analyzeRes.json();
         contentBrief = analyzeData.content_brief || {};
         competitorPages = analyzeData.competitor_pages || [];
-        aiConversations = (analyzeData.ai_analysis?.conversations || []).map((c) => ({
-          engine: c.engine || '',
-          answer: c.answer || '',
-          citations: c.citations || [],
-        }));
       } else {
         const errBody = await analyzeRes.text();
         throw new Error(`Engine returned ${analyzeRes.status}: ${errBody}`);
@@ -294,7 +289,18 @@ async function runAnalysis(contentId) {
       console.error('[analysis] ai-format-recommend failed (non-fatal):', err.message);
     }
 
-    // Step 4: Recommend Outline (optional — needs OpenRouter key)
+    // AI conversations come from the analyze response (bare keyword + targeted prompts)
+    const aiConversations = (analyzeData.conversations || []).map((c) => ({
+      engine: c.engine || '',
+      prompt: c.prompt || '',
+      answer: c.answer || '',
+      citations: c.citations || [],
+    }));
+    if (aiConversations.length > 0) {
+      console.log(`[analysis] received ${aiConversations.length} AI conversations`);
+    }
+
+    // Step 4: Recommend Outline (with AI conversations for AI Search optimization)
     let recommendedOutline = null;
     try {
       const outlineRes = await fetch(`${ENGINE_URL}/api/recommend-outline`, {
@@ -307,6 +313,7 @@ async function runAnalysis(contentId) {
           related_searches: discoverData.related_searches || [],
           structure: contentBrief.structure || [],
           terms: (contentBrief.terms || []).slice(0, 30),
+          ai_conversations: aiConversations,
         }),
         signal: AbortSignal.timeout(90000),
       });

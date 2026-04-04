@@ -161,6 +161,10 @@ const contentSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.Mixed,
       default: null,
     },
+    aiConversations: {
+      type: [mongoose.Schema.Types.Mixed],
+      default: [],
+    },
 
     // Scheduling
     publishedAt: Date,

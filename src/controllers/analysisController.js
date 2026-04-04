@@ -244,6 +244,7 @@ async function runAnalysis(contentId) {
     // Step 2: Analyze (full pipeline — 5 min timeout to match engine)
     let contentBrief = {};
     let competitorPages = [];
+    let aiConversations = [];
     try {
       const analyzeBody = { keywords };
       if (selectedUrls.length > 0) {
@@ -259,6 +260,11 @@ async function runAnalysis(contentId) {
         const analyzeData = await analyzeRes.json();
         contentBrief = analyzeData.content_brief || {};
         competitorPages = analyzeData.competitor_pages || [];
+        aiConversations = (analyzeData.ai_analysis?.conversations || []).map((c) => ({
+          engine: c.engine || '',
+          answer: c.answer || '',
+          citations: c.citations || [],
+        }));
       } else {
         const errBody = await analyzeRes.text();
         throw new Error(`Engine returned ${analyzeRes.status}: ${errBody}`);
@@ -336,6 +342,7 @@ async function runAnalysis(contentId) {
         h4s: p.h4s || [],
       })),
       recommendedOutline: curateRecommendedOutline(recommendedOutline),
+      aiConversations,
     };
 
     await Content.findByIdAndUpdate(contentId, { $set: updates });
@@ -394,6 +401,7 @@ const getBenchmark = async (req, res) => {
       aiFormatData: content.aiFormatData || null,
       competitorPages: content.competitorPages || [],
       recommendedOutline: content.recommendedOutline || null,
+      aiConversations: content.aiConversations || [],
     });
   } catch (err) {
     console.error('getBenchmark error:', err.message);

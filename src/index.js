@@ -1,3 +1,4 @@
+// Suparank Express backend — single source of truth for all data persistence
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');

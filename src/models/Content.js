@@ -105,6 +105,21 @@ const contentSchema = new mongoose.Schema(
     folder: { type: String, default: '' },
     platform: { type: String, default: '' },
 
+    // Wizard selections (from article creation flow)
+    contentType: {
+      type: String,
+      enum: ['serp-based', 'blog-post', 'landing-page', 'comparison', 'listicle',
+             'product-page', 'category-page', 'service-page', 'llm-optimized', ''],
+      default: '',
+    },
+    contentContext: { type: String, default: '' },
+    targetWordCount: { type: Number, default: 0 },
+    writingMode: {
+      type: String,
+      enum: ['write', 'generate', ''],
+      default: '',
+    },
+
     // Version history
     versions: {
       type: [versionSnapshotSchema],

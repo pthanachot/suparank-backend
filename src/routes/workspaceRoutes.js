@@ -24,6 +24,7 @@ router.post('/:workspaceNumber/content/:contentNumber/analyze', analysisControll
 router.get('/:workspaceNumber/content/:contentNumber/benchmark', analysisController.getBenchmark);
 router.post('/:workspaceNumber/content/:contentNumber/reanalyze', analysisController.reanalyze);
 router.post('/:workspaceNumber/content/:contentNumber/score', analysisController.computeScore);
+router.post('/:workspaceNumber/content/:contentNumber/readability-check', analysisController.readabilityCheck);
 
 // AI writing under content: /api/workspace/:workspaceNumber/content/:contentNumber/ai/...
 router.post('/:workspaceNumber/content/:contentNumber/ai/chat', aiController.chat);

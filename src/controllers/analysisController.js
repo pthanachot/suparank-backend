@@ -483,4 +483,44 @@ const computeScore = async (req, res) => {
   }
 };
 
-module.exports = { triggerAnalysis, getBenchmark, reanalyze, runAnalysis, computeScore };
+// ─── POST /:contentNumber/readability-check — run AI readability check ───
+
+const readabilityCheck = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+
+    const { keyword, contentText, headings, aiAnswers, intent, archetype } = req.body;
+    if (!keyword || !contentText) {
+      return res.status(400).json({ error: 'keyword and contentText are required' });
+    }
+
+    const engineRes = await fetch(`${ENGINE_URL}/api/readability-check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        keyword,
+        content: contentText,
+        headings: headings || [],
+        ai_answers: aiAnswers || [],
+        intent: intent || '',
+        archetype: archetype || '',
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+
+    if (!engineRes.ok) {
+      const errBody = await engineRes.text();
+      console.error(`[readability-check] engine returned ${engineRes.status}: ${errBody}`);
+      return res.status(engineRes.status).json({ error: 'Readability check failed' });
+    }
+
+    const result = await engineRes.json();
+    res.json(result);
+  } catch (err) {
+    console.error('readabilityCheck error:', err.message);
+    res.status(500).json({ error: 'Failed to run readability check' });
+  }
+};
+
+module.exports = { triggerAnalysis, getBenchmark, reanalyze, runAnalysis, computeScore, readabilityCheck };

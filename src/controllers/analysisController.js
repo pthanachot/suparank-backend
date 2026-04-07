@@ -305,6 +305,12 @@ async function runAnalysis(contentId) {
       console.log(`[analysis] received ${aiConversations.length} AI conversations`);
     }
 
+    // AI Answer Analysis (v2 citability) — pass through from engine
+    const aiAnswerAnalysis = analyzeData.ai_answer_analysis || null;
+    if (aiAnswerAnalysis) {
+      console.log(`[analysis] received AI answer analysis with ${(aiAnswerAnalysis.query_groups || []).length} query groups`);
+    }
+
     // Step 4: Recommend Outline (with AI conversations for AI Search optimization)
     let recommendedOutline = null;
     try {
@@ -355,6 +361,7 @@ async function runAnalysis(contentId) {
       })),
       recommendedOutline: curateRecommendedOutline(recommendedOutline),
       aiConversations,
+      aiAnswerAnalysis,
     };
 
     await Content.findByIdAndUpdate(contentId, { $set: updates });
@@ -414,6 +421,7 @@ const getBenchmark = async (req, res) => {
       competitorPages: content.competitorPages || [],
       recommendedOutline: content.recommendedOutline || null,
       aiConversations: content.aiConversations || [],
+      aiAnswerAnalysis: content.aiAnswerAnalysis || null,
     });
   } catch (err) {
     console.error('getBenchmark error:', err.message);

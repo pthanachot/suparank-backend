@@ -62,97 +62,32 @@ async function pushBrief(sessionId, brief) {
 }
 
 /**
- * Send a chat message to the Writing Engine via WebSocket.
+ * Send a chat message to the Writing Engine via REST.
+ * Uses the synchronous POST /api/session/{id}/chat endpoint.
  * Returns the final response with text + document content.
  *
  * @param {string} sessionId
  * @param {string} prompt
- * @param {number} [timeoutMs=120000]
- * @returns {Promise<{text: string, documentContent: string, edits: Array}>}
+ * @returns {Promise<{text: string, documentContent: string}>}
  */
-async function sendChatMessage(sessionId, prompt, timeoutMs = 120000) {
-  return new Promise((resolve, reject) => {
-    let WebSocket;
-    try {
-      WebSocket = require('ws');
-    } catch {
-      reject(new Error('ws package not installed. Run: npm install ws'));
-      return;
-    }
-
-    const wsUrl = WRITING_ENGINE_URL.replace(/^http/, 'ws') + '/ws';
-    const ws = new WebSocket(wsUrl);
-
-    const timeout = setTimeout(() => {
-      ws.close();
-      reject(new Error('Writing Engine: chat timeout'));
-    }, timeoutMs);
-
-    let fullText = '';
-    let documentContent = '';
-    const edits = [];
-
-    ws.on('open', () => {
-      ws.send(JSON.stringify({
-        type: 'message',
-        sessionId,
-        content: prompt,
-      }));
-    });
-
-    ws.on('message', (data) => {
-      try {
-        const event = JSON.parse(data.toString());
-
-        if (event.type === 'text_delta') {
-          fullText += event.textDelta || '';
-        }
-        if (event.type === 'document_diff') {
-          documentContent = event.documentContent || '';
-          // Extract the edit from the diff if available
-          if (event.documentDiff) {
-            edits.push(event.documentDiff);
-          }
-        }
-        if (event.type === 'document_update') {
-          documentContent = event.documentContent || '';
-        }
-        if (event.type === 'tool_result' && !event.toolError) {
-          // Track tool results for edit extraction
-          if (event.toolName === 'EditTool' || event.toolName === 'WriteTool') {
-            edits.push({ toolName: event.toolName, result: event.toolResult });
-          }
-        }
-        if (event.type === 'complete') {
-          clearTimeout(timeout);
-          ws.close();
-          resolve({
-            text: event.fullText || fullText,
-            documentContent,
-            edits,
-          });
-        }
-        if (event.type === 'error') {
-          clearTimeout(timeout);
-          ws.close();
-          reject(new Error(event.error || 'Writing Engine error'));
-        }
-      } catch (e) {
-        // Ignore parse errors for non-JSON messages
-      }
-    });
-
-    ws.on('error', (err) => {
-      clearTimeout(timeout);
-      reject(new Error(`Writing Engine WebSocket error: ${err.message}`));
-    });
-
-    ws.on('close', () => {
-      clearTimeout(timeout);
-      // If we didn't resolve yet, resolve with what we have
-      resolve({ text: fullText, documentContent, edits });
-    });
+async function sendChatMessage(sessionId, prompt) {
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt }),
+    signal: AbortSignal.timeout(300000), // 5 minute timeout
   });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Writing Engine chat failed (${res.status}): ${body}`);
+  }
+
+  const data = await res.json();
+  return {
+    text: data.text || '',
+    documentContent: data.documentContent || '',
+  };
 }
 
 /**

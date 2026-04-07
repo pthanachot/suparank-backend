@@ -295,6 +295,11 @@ async function runAnalysis(contentId) {
       prompt: c.prompt || '',
       answer: c.answer || '',
       citations: c.citations || [],
+      fanout_queries: (c.fanout_queries || []).map((f) => ({
+        query: f.query || '',
+        answer: f.answer || '',
+        engine: f.engine || '',
+      })),
     }));
     if (aiConversations.length > 0) {
       console.log(`[analysis] received ${aiConversations.length} AI conversations`);

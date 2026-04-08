@@ -29,5 +29,6 @@ router.post('/:workspaceNumber/content/:contentNumber/readability-check', analys
 // AI writing under content: /api/workspace/:workspaceNumber/content/:contentNumber/ai/...
 router.post('/:workspaceNumber/content/:contentNumber/ai/chat', aiController.chat);
 router.post('/:workspaceNumber/content/:contentNumber/ai/agent', aiController.agent);
+router.post('/:workspaceNumber/content/:contentNumber/ai/generate-image', aiController.generateImage);
 
 module.exports = router;

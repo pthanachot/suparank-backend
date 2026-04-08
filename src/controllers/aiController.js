@@ -501,4 +501,33 @@ function extractEditsFromMarkdownDiff(oldMd, newMd) {
   return edits.filter((e) => e.old_string || e.new_string);
 }
 
-module.exports = { chat, agent };
+// ─────────────────────────────────────────────────────────────
+// POST /:workspaceNumber/content/:contentNumber/ai/generate-image
+// Direct image generation (SVG or PNG) — no chat loop
+// ─────────────────────────────────────────────────────────────
+const generateImage = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+
+    const { description, format, style } = req.body;
+    if (!description || typeof description !== 'string' || description.length < 5) {
+      return res.status(400).json({ error: 'description is required (min 5 chars)' });
+    }
+
+    const { sessionId } = await setupSession(content);
+
+    const result = await writingEngine.generateImage(sessionId, {
+      description,
+      format: format || 'svg',
+      style: style || 'flat',
+    });
+
+    return res.json(result);
+  } catch (err) {
+    console.error('Image generation error:', err);
+    return res.status(500).json({ error: err.message || 'Image generation failed' });
+  }
+};
+
+module.exports = { chat, agent, generateImage };

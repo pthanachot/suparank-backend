@@ -114,11 +114,34 @@ async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5) 
   return res;
 }
 
+/**
+ * Generate an image directly (no chat loop).
+ * Uses the Writing Engine's /generate-image endpoint.
+ *
+ * @param {string} sessionId
+ * @param {{ description: string, format: 'svg' | 'png', style?: string }} params
+ * @returns {Promise<{ format: string, url?: string, svg?: string }>}
+ */
+async function generateImage(sessionId, { description, format, style }) {
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/generate-image`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ description, format, style }),
+    signal: AbortSignal.timeout(60000),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Writing Engine: image generation failed (${res.status}): ${body}`);
+  }
+  return res.json();
+}
+
 module.exports = {
   createSession,
   pushDocument,
   pushBrief,
   sendChatMessage,
   startAgent,
+  generateImage,
   WRITING_ENGINE_URL,
 };

@@ -168,6 +168,22 @@ const contentSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.Mixed,
       default: null,
     },
+    competitorPages: {
+      type: [mongoose.Schema.Types.Mixed],
+      default: [],
+    },
+    recommendedOutline: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
+    aiConversations: {
+      type: [mongoose.Schema.Types.Mixed],
+      default: [],
+    },
+    aiAnswerAnalysis: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
 
     // Scheduling
     publishedAt: Date,

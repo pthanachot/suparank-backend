@@ -42,32 +42,34 @@ function curateBenchmark(brief) {
     keywords: brief.keyword ? [brief.keyword] : [],
     pageCount,
     avgWordCount: stats.avg_word_count || 0,
-    minWordCount: 0,
-    maxWordCount: 0,
+    minWordCount: Math.round((stats.avg_word_count || 0) * 0.7),
+    maxWordCount: Math.round((stats.avg_word_count || 0) * 1.3),
     avgH1Count: 1,
     avgH2Count: stats.avg_sections || 0,
-    avgH3Count: 0,
-    avgInternalLinks: 0,
-    avgExternalLinks: 0,
-    avgImages: 0,
+    avgH3Count: stats.avg_h3_count || 0,
+    avgInternalLinks: stats.avg_internal_links || 0,
+    avgExternalLinks: stats.avg_external_links || 0,
+    avgImages: stats.avg_images || 0,
     avgTitleLength: 0,
     avgDescLength: 0,
-    avgKeywordDensity: 0,
-    keywordInH2Rate: 0,
-    keywordInFirst100Rate: 0,
-    avgListCount: 0,
-    avgTableCount: 0,
-    avgFaqCount: 0,
+    avgKeywordDensity: stats.avg_keyword_density || 0,
+    keywordInH2Rate: stats.keyword_in_h2_rate || 0,
+    keywordInFirst100Rate: stats.keyword_in_first100_rate || 0,
+    avgListCount: stats.avg_lists || 0,
+    avgTableCount: stats.avg_tables || 0,
+    avgFaqCount: stats.avg_faqs || 0,
+    avgParagraphs: stats.avg_paragraphs || 0,
     avgSentenceLength: 0,
-    avgReadingLevel: 0,
+    avgReadingLevel: stats.avg_reading_level || 0,
     topNlpTerms: terms.map((t) => ({
       term: t.term,
       count: t.freq || t.doc_freq || 1,
       tfidf: 0,
       bm25: t.bm25 || 0,
       docFrequency: t.doc_freq || 0,
-      prominence: t.layer === 'awareness' ? 'first_paragraph' : '',
+      prominence: t.section ? 'heading' : t.layer === 'awareness' ? 'first_paragraph' : '',
       usageRange: Array.isArray(t.uses) ? { min: t.uses[0], recommended: Math.round((t.uses[0] + t.uses[1]) / 2), max: t.uses[1] } : null,
+      category: t.section ? 'headings' : 'nlp',
     })),
     topicClusters: clusters.map((c) => ({
       topic: c.label,
@@ -187,6 +189,22 @@ function curateAiFormatData(raw) {
   };
 }
 
+// Curate recommended outline from engine
+function curateRecommendedOutline(raw) {
+  if (!raw) return null;
+  return {
+    h1: raw.h1 || '',
+    sections: (raw.sections || []).map((s) => ({
+      h2: s.h2 || '',
+      rationale: s.rationale || '',
+      children: (s.children || []).map((c) => ({
+        h3: c.h3 || '',
+        rationale: c.rationale || '',
+      })),
+    })),
+  };
+}
+
 // ─── RUN ANALYSIS (background) ─────────────────────────────────
 
 async function runAnalysis(contentId) {
@@ -228,6 +246,8 @@ async function runAnalysis(contentId) {
 
     // Step 2: Analyze (full pipeline — 5 min timeout to match engine)
     let contentBrief = {};
+    let competitorPages = [];
+    let analyzeData = {};
     try {
       const analyzeBody = { keywords };
       if (selectedUrls.length > 0) {
@@ -240,8 +260,9 @@ async function runAnalysis(contentId) {
         signal: AbortSignal.timeout(300000),
       });
       if (analyzeRes.ok) {
-        const analyzeData = await analyzeRes.json();
+        analyzeData = await analyzeRes.json();
         contentBrief = analyzeData.content_brief || {};
+        competitorPages = analyzeData.competitor_pages || [];
       } else {
         const errBody = await analyzeRes.text();
         throw new Error(`Engine returned ${analyzeRes.status}: ${errBody}`);
@@ -271,7 +292,54 @@ async function runAnalysis(contentId) {
       console.error('[analysis] ai-format-recommend failed (non-fatal):', err.message);
     }
 
-    // Step 4: Save curated results to DB
+    // AI conversations come from the analyze response (bare keyword + targeted prompts)
+    const aiConversations = (analyzeData.conversations || []).map((c) => ({
+      engine: c.engine || '',
+      prompt: c.prompt || '',
+      answer: c.answer || '',
+      citations: c.citations || [],
+      fanout_queries: (c.fanout_queries || []).map((f) => ({
+        query: f.query || '',
+        answer: f.answer || '',
+        engine: f.engine || '',
+      })),
+    }));
+    if (aiConversations.length > 0) {
+      console.log(`[analysis] received ${aiConversations.length} AI conversations`);
+    }
+
+    // AI Answer Analysis (v2 citability) — pass through from engine
+    const aiAnswerAnalysis = analyzeData.ai_answer_analysis || null;
+    if (aiAnswerAnalysis) {
+      console.log(`[analysis] received AI answer analysis with ${(aiAnswerAnalysis.query_groups || []).length} query groups`);
+    }
+
+    // Step 4: Recommend Outline (with AI conversations for AI Search optimization)
+    let recommendedOutline = null;
+    try {
+      const outlineRes = await fetch(`${ENGINE_URL}/api/recommend-outline`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          keyword: keywords[0],
+          competitor_pages: competitorPages,
+          people_also_ask: discoverData.people_also_ask || [],
+          related_searches: discoverData.related_searches || [],
+          structure: contentBrief.structure || [],
+          terms: (contentBrief.terms || []).slice(0, 30),
+          ai_conversations: aiConversations,
+        }),
+        signal: AbortSignal.timeout(90000),
+      });
+      if (outlineRes.ok) {
+        recommendedOutline = await outlineRes.json();
+        console.log(`[analysis] recommend-outline returned H1 + ${(recommendedOutline.sections || []).length} sections`);
+      }
+    } catch (err) {
+      console.error('[analysis] recommend-outline failed (non-fatal):', err.message);
+    }
+
+    // Step 5: Save curated results to DB
     const updates = {
       analysisStatus: 'ready',
       analysisError: '',
@@ -284,6 +352,19 @@ async function runAnalysis(contentId) {
       peopleAlsoAsk: discoverData.people_also_ask || [],
       keywordVolumes: discoverData.keyword_volumes || [],
       aiFormatData: aiFormatData ? curateAiFormatData(aiFormatData) : null,
+      competitorPages: competitorPages.map((p) => ({
+        url: p.url || '',
+        title: p.title || '',
+        position: p.position || 0,
+        wordCount: p.word_count || 0,
+        h1s: p.h1s || [],
+        h2s: p.h2s || [],
+        h3s: p.h3s || [],
+        h4s: p.h4s || [],
+      })),
+      recommendedOutline: curateRecommendedOutline(recommendedOutline),
+      aiConversations,
+      aiAnswerAnalysis,
     };
 
     await Content.findByIdAndUpdate(contentId, { $set: updates });
@@ -340,6 +421,10 @@ const getBenchmark = async (req, res) => {
       peopleAlsoAsk: content.peopleAlsoAsk || [],
       keywordVolumes: content.keywordVolumes || [],
       aiFormatData: content.aiFormatData || null,
+      competitorPages: content.competitorPages || [],
+      recommendedOutline: content.recommendedOutline || null,
+      aiConversations: content.aiConversations || [],
+      aiAnswerAnalysis: content.aiAnswerAnalysis || null,
     });
   } catch (err) {
     console.error('getBenchmark error:', err.message);
@@ -401,4 +486,44 @@ const computeScore = async (req, res) => {
   }
 };
 
-module.exports = { triggerAnalysis, getBenchmark, reanalyze, runAnalysis, computeScore };
+// ─── POST /:contentNumber/readability-check — run AI readability check ───
+
+const readabilityCheck = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+
+    const { keyword, contentText, headings, aiAnswers, intent, archetype } = req.body;
+    if (!keyword || !contentText) {
+      return res.status(400).json({ error: 'keyword and contentText are required' });
+    }
+
+    const engineRes = await fetch(`${ENGINE_URL}/api/readability-check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        keyword,
+        content: contentText,
+        headings: headings || [],
+        ai_answers: aiAnswers || [],
+        intent: intent || '',
+        archetype: archetype || '',
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+
+    if (!engineRes.ok) {
+      const errBody = await engineRes.text();
+      console.error(`[readability-check] engine returned ${engineRes.status}: ${errBody}`);
+      return res.status(engineRes.status).json({ error: 'Readability check failed' });
+    }
+
+    const result = await engineRes.json();
+    res.json(result);
+  } catch (err) {
+    console.error('readabilityCheck error:', err.message);
+    res.status(500).json({ error: 'Failed to run readability check' });
+  }
+};
+
+module.exports = { triggerAnalysis, getBenchmark, reanalyze, runAnalysis, computeScore, readabilityCheck };

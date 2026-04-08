@@ -10,7 +10,7 @@
  * 5. Session is discarded
  */
 
-const WRITING_ENGINE_URL = process.env.WRITING_ENGINE_URL || 'http://localhost:8080';
+const WRITING_ENGINE_URL = process.env.WRITING_ENGINE_URL || 'http://localhost:8090';
 
 /**
  * Create a new Writing Engine session.

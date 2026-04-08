@@ -24,17 +24,24 @@ function benchmarkToContentBrief(content) {
     searchIntent: intent.primary || 'informational',
 
     // Content structure
-    targetWordCount: benchmark.avgWordCount || 2000,
+    targetWordCount: content.targetWordCount || benchmark.avgWordCount || 2000,
     serpQuestions: extractSerpQuestions(peopleAlsoAsk),
     competitorHeadings: extractCompetitorHeadings(competitorPages),
     suggestedOutline: extractSuggestedOutline(recommendedOutline),
 
-    // Content type from intent
-    contentType: mapContentType(intent),
+    // Content type — prefer user's wizard selection over inferred intent
+    contentType: content.contentType || mapContentType(intent),
+
+    // User instructions from wizard step 3
+    authorContext: content.contentContext || '',
+
+    // Top NLP terms the content should include
+    nlpTerms: extractNlpTerms(benchmark),
   };
 
   return brief;
 }
+
 
 /**
  * Extract SERP "People Also Ask" questions.
@@ -79,6 +86,20 @@ function extractCompetitorHeadings(pages) {
 function extractSuggestedOutline(outline) {
   if (!outline || !outline.sections) return [];
   return outline.sections.map((s) => s.h2).filter(Boolean);
+}
+
+/**
+ * Extract top NLP terms from benchmark for the Writing Engine.
+ * @param {Object} benchmark
+ * @returns {string[]}
+ */
+function extractNlpTerms(benchmark) {
+  const terms = benchmark.topNlpTerms || [];
+  if (!Array.isArray(terms)) return [];
+  return terms
+    .slice(0, 30)
+    .map((t) => t.term)
+    .filter(Boolean);
 }
 
 /**

@@ -37,6 +37,35 @@ function benchmarkToContentBrief(content) {
 
     // Top NLP terms the content should include
     nlpTerms: extractNlpTerms(benchmark),
+
+    // Benchmark averages for competitive scoring (mirrors frontend BenchmarkData)
+    benchmarkAverages: {
+      wordCount: benchmark.avgWordCount || 2000,
+      h2Count: benchmark.avgH2Count || 6,
+      h3Count: benchmark.avgH3Count || 4,
+      images: benchmark.avgImages || 3,
+      listCount: benchmark.avgListCount || 1,
+      tableCount: benchmark.avgTableCount || 0,
+      faqCount: benchmark.avgFaqCount || 0,
+      paragraphs: benchmark.avgParagraphs || 20,
+      keywordDensity: benchmark.avgKeywordDensity || 1.5,
+      readingLevel: benchmark.avgReadingLevel || 60,
+      keywordInH2Rate: benchmark.keywordInH2Rate || 0,
+      keywordInFirst100Rate: benchmark.keywordInFirst100Rate || 0,
+      pageCount: benchmark.pageCount || 0,
+    },
+
+    // Topic clusters and subtopics for coverage scoring
+    topicClusters: (benchmark.topicClusters || []).map((c) => ({
+      label: c.topic || c.label || '',
+      terms: c.terms || [],
+      docFrequency: c.docFrequency || 0,
+    })),
+    subtopics: (benchmark.subtopics || []).map((s) => ({
+      label: s.label || '',
+      docFrequency: s.docFrequency || 0,
+      docPercent: s.docPercent || 0,
+    })),
   };
 
   return brief;
@@ -103,6 +132,7 @@ function extractNlpTerms(benchmark) {
       term: t.term,
       min: t.usageRange?.min ?? 1,
       max: t.usageRange?.max ?? Math.max(t.count || 1, 5),
+      category: t.category || 'nlp',
     }));
 }
 

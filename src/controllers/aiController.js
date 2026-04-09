@@ -158,6 +158,7 @@ const agent = async (req, res) => {
     const reader = agentRes.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let eventCount = 0;
 
     const processEvents = async () => {
       while (true) {
@@ -172,17 +173,22 @@ const agent = async (req, res) => {
           if (!line.startsWith('data: ')) continue;
           const data = line.slice(6).trim();
           if (data === '[DONE]') {
+            console.log(`[agent-sse] stream complete after ${eventCount} events`);
             res.write('data: [DONE]\n\n');
             return;
           }
 
           try {
             const event = JSON.parse(data);
+            eventCount++;
+            console.log(`[agent-sse] #${eventCount} type=${event.type}${event.toolName ? ' tool=' + event.toolName : ''}${event.toolError ? ' ERROR' : ''}${event.documentContent ? ' docLen=' + event.documentContent.length : ''}`);
+
             const transformed = transformAgentEvent(event, currentBlocks, lastMarkdown);
 
             if (transformed) {
               // Update tracking state if document changed
               if (transformed._newBlocks) {
+                console.log(`[agent-sse] → ${transformed.type} with ${transformed._newBlocks.length} blocks`);
                 currentBlocks = transformed._newBlocks;
                 lastMarkdown = blocksToMarkdown(currentBlocks);
                 delete transformed._newBlocks;
@@ -194,7 +200,8 @@ const agent = async (req, res) => {
 
               res.write(`data: ${JSON.stringify(transformed)}\n\n`);
             }
-          } catch {
+          } catch (transformErr) {
+            console.error(`[agent-sse] transform error:`, transformErr.message);
             // Forward unparseable events as-is
             res.write(`data: ${data}\n\n`);
           }

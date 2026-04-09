@@ -98,8 +98,12 @@ function extractNlpTerms(benchmark) {
   if (!Array.isArray(terms)) return [];
   return terms
     .slice(0, 30)
-    .map((t) => t.term)
-    .filter(Boolean);
+    .filter((t) => t.term)
+    .map((t) => ({
+      term: t.term,
+      min: t.usageRange?.min ?? 1,
+      max: t.usageRange?.max ?? Math.max(t.count || 1, 5),
+    }));
 }
 
 /**

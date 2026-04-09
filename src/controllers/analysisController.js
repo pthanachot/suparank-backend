@@ -68,7 +68,7 @@ function curateBenchmark(brief) {
       bm25: t.bm25 || 0,
       docFrequency: t.doc_freq || 0,
       prominence: t.section ? 'heading' : t.layer === 'awareness' ? 'first_paragraph' : '',
-      usageRange: Array.isArray(t.uses) ? { min: t.uses[0], recommended: Math.round((t.uses[0] + t.uses[1]) / 2), max: t.uses[1] } : null,
+      usageRange: Array.isArray(t.uses) ? { min: Math.max(t.uses[0], 1), recommended: Math.max(Math.round((t.uses[0] + t.uses[1]) / 2), 2), max: Math.max(t.uses[1], t.uses[0] + 2, 3) } : null,
       category: t.section ? 'headings' : 'nlp',
     })),
     topicClusters: clusters.map((c) => ({

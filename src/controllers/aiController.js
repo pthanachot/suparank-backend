@@ -281,6 +281,7 @@ function transformAgentEvent(event, currentBlocks, lastMarkdown) {
 
     case 'agent_progress':
     case 'text_delta':
+    case 'thinking_delta':
     case 'usage':
     case 'complete':
     case 'error':

@@ -51,7 +51,8 @@ async function setupSession(content) {
 
 // ─────────────────────────────────────────────────────────────
 // POST /:workspaceNumber/content/:contentNumber/ai/chat
-// Synchronous chat — send prompt, receive patches
+// SSE streaming chat — streams thinking_delta, text_delta, tool events,
+// and final draft/patch events so the UI can show live progress.
 // ─────────────────────────────────────────────────────────────
 const chat = async (req, res) => {
   try {
@@ -66,57 +67,111 @@ const chat = async (req, res) => {
     // Set up Writing Engine session
     const { sessionId } = await setupSession(content);
 
-    // Send chat message and wait for response
-    const response = await writingEngine.sendChatMessage(sessionId, prompt);
+    // AbortController tied to the client request so that if the browser
+    // disconnects (user pressed Stop / Esc), we abort the fetch to the Go
+    // engine — which in turn cancels the handler's r.Context(), stopping
+    // the query loop mid-turn.
+    const abortCtrl = new AbortController();
+    let clientDisconnected = false;
+    req.on('close', () => {
+      clientDisconnected = true;
+      abortCtrl.abort();
+    });
 
-    // Determine response type:
-    // - If documentContent changed and was empty before → initial draft (WriteTool)
-    // - If documentContent changed and was non-empty → edits (EditTool)
-    const hadContent = (content.blocks || []).length > 0 &&
-      content.blocks.some((b) => b.text && b.text.trim().length > 0);
+    // Start streaming request to the engine
+    const chatRes = await writingEngine.sendChatMessageStream(sessionId, prompt, abortCtrl.signal);
 
-    let result;
+    // Set up SSE headers for the client
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
 
-    if (response.documentContent && !hadContent) {
-      // Initial draft — convert full markdown to blocks
-      const newBlocks = markdownToBlocks(response.documentContent);
-      result = {
-        type: 'draft',
-        message: response.text,
-        blocks: newBlocks,
-      };
-    } else if (response.documentContent && hadContent) {
-      // Edits — compare old blocks with new blocks to produce patches.
-      // Convert the returned markdown to blocks, then diff against originals.
-      const newBlocks = markdownToBlocks(response.documentContent);
-      const patches = diffBlocksToPatches(content.blocks, newBlocks);
+    // Track document state for patch generation — same pattern as agent.
+    let currentBlocks = JSON.parse(JSON.stringify(content.blocks || []));
+    let lastMarkdown = blocksToMarkdown(currentBlocks);
 
-      if (patches.length > 0) {
-        result = {
-          type: 'patch',
-          message: response.text,
-          patches,
-        };
-      } else {
-        // Fallback: if no patches could be computed, send full blocks
-        result = {
-          type: 'draft',
-          message: response.text,
-          blocks: newBlocks,
-        };
+    const reader = chatRes.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let eventCount = 0;
+
+    const processEvents = async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6).trim();
+          if (data === '[DONE]') {
+            console.log(`[chat-sse] stream complete after ${eventCount} events`);
+            res.write('data: [DONE]\n\n');
+            return;
+          }
+
+          try {
+            const event = JSON.parse(data);
+            eventCount++;
+
+            // Reuse the same transform as the agent path so the frontend
+            // sees identical event shapes (draft / patch / text_delta / etc.).
+            const transformed = transformAgentEvent(event, currentBlocks, lastMarkdown);
+
+            if (transformed) {
+              if (transformed._newBlocks) {
+                currentBlocks = transformed._newBlocks;
+                lastMarkdown = blocksToMarkdown(currentBlocks);
+                delete transformed._newBlocks;
+              }
+              if (transformed._newMarkdown) {
+                lastMarkdown = transformed._newMarkdown;
+                delete transformed._newMarkdown;
+              }
+              res.write(`data: ${JSON.stringify(transformed)}\n\n`);
+            }
+          } catch (transformErr) {
+            console.error('[chat-sse] transform error:', transformErr.message);
+            res.write(`data: ${data}\n\n`);
+          }
+        }
       }
-    } else {
-      // Text-only response (no document change)
-      result = {
-        type: 'text',
-        message: response.text,
-      };
-    }
+    };
 
-    return res.json(result);
+    // Cancel reader on abort (belt-and-braces — the fetch signal already
+    // aborts the upstream, but cancel() releases the reader lock cleanly).
+    abortCtrl.signal.addEventListener('abort', () => {
+      reader.cancel().catch(() => {});
+    });
+
+    try {
+      await processEvents();
+    } catch (streamErr) {
+      if (clientDisconnected || abortCtrl.signal.aborted) {
+        console.log('[chat-sse] stream aborted by client disconnect');
+      } else {
+        throw streamErr;
+      }
+    }
+    if (!clientDisconnected) res.end();
   } catch (err) {
+    // AbortError from fetch when client disconnected — silent.
+    if (err.name === 'AbortError') {
+      console.log('[chat-sse] upstream fetch aborted');
+      return;
+    }
     console.error('AI chat error:', err);
-    return res.status(500).json({ error: err.message || 'AI chat failed' });
+    if (!res.headersSent) {
+      return res.status(500).json({ error: err.message || 'AI chat failed' });
+    }
+    res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`);
+    res.end();
   }
 };
 
@@ -137,9 +192,20 @@ const agent = async (req, res) => {
     // Set up Writing Engine session
     const { sessionId } = await setupSession(content);
 
+    // AbortController tied to the client request so that if the browser
+    // disconnects (user pressed Stop / Esc), we abort the fetch to the Go
+    // engine — which in turn cancels the handler's r.Context(), stopping
+    // the agent mid-turn.
+    const abortCtrl = new AbortController();
+    let clientDisconnected = false;
+    req.on('close', () => {
+      clientDisconnected = true;
+      abortCtrl.abort();
+    });
+
     // Start agent — returns a raw SSE response from the Writing Engine
     const agentRes = await writingEngine.startAgent(
-      sessionId, goal, targetScore || 75, maxIterations || 5
+      sessionId, goal, targetScore || 75, maxIterations || 5, abortCtrl.signal
     );
 
     // Set up SSE headers for the client
@@ -209,14 +275,28 @@ const agent = async (req, res) => {
       }
     };
 
-    // Handle client disconnect
-    req.on('close', () => {
+    // Cancel reader on abort (belt-and-braces — the fetch signal already
+    // aborts the upstream, but cancel() releases the reader lock cleanly).
+    abortCtrl.signal.addEventListener('abort', () => {
       reader.cancel().catch(() => {});
     });
 
-    await processEvents();
-    res.end();
+    try {
+      await processEvents();
+    } catch (streamErr) {
+      if (clientDisconnected || abortCtrl.signal.aborted) {
+        console.log('[agent-sse] stream aborted by client disconnect');
+      } else {
+        throw streamErr;
+      }
+    }
+    if (!clientDisconnected) res.end();
   } catch (err) {
+    // AbortError from fetch when client disconnected — silent.
+    if (err.name === 'AbortError') {
+      console.log('[agent-sse] upstream fetch aborted');
+      return;
+    }
     console.error('AI agent error:', err);
     if (!res.headersSent) {
       return res.status(500).json({ error: err.message || 'AI agent failed' });

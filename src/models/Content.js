@@ -119,6 +119,11 @@ const contentSchema = new mongoose.Schema(
       enum: ['write', 'generate', ''],
       default: '',
     },
+    // Optional writing-style reference — the contentNumber of another draft in
+    // the SAME workspace whose markdown will be appended to the engine brief's
+    // authorContext with a "STYLE ONLY" instruction. Lets users keep the voice
+    // consistent across articles without copying any facts or topics.
+    styleReferenceContentNumber: { type: Number, default: null },
 
     // Version history
     versions: {
@@ -233,7 +238,7 @@ contentSchema.statics.findSummariesByWorkspace = function (workspaceId, { status
   if (status) query.status = status;
   if (folder) query.folder = folder;
   return this.find(query)
-    .select('contentNumber title slug description targetKeywords country device score wordCount status folder platform analysisStatus analyzedAt publishedAt scheduledAt createdAt updatedAt')
+    .select('contentNumber title slug description targetKeywords country device score wordCount status folder platform contentType analysisStatus analyzedAt publishedAt scheduledAt createdAt updatedAt')
     .sort({ updatedAt: -1 });
 };
 

@@ -44,6 +44,33 @@ async function setupSession(content) {
 
   // 3. Convert benchmark → brief and push
   const brief = benchmarkToContentBrief(content);
+
+  // 3b. If the wizard picked another draft as a writing-style reference,
+  // append its markdown to authorContext with a strict "STYLE ONLY" header.
+  // The Go engine already feeds authorContext into the system prompt, so
+  // this needs zero engine changes. Reference is scoped to the same
+  // workspace (lookup via findByNumber + content.workspaceId).
+  if (content.styleReferenceContentNumber) {
+    const ref = await Content.findByNumber(
+      content.workspaceId,
+      content.styleReferenceContentNumber,
+    );
+    if (ref && Array.isArray(ref.blocks) && ref.blocks.length > 0) {
+      const refMd = blocksToMarkdown(ref.blocks);
+      if (refMd.trim()) {
+        const styleBlock =
+          `\n\n---\n## Writing style reference (STYLE ONLY — do NOT copy topics or facts)\n` +
+          `Match the tone, voice, sentence rhythm, paragraph pacing, and formality of ` +
+          `the following reference article written by the same author. The reference is ` +
+          `about a DIFFERENT topic — do NOT reuse any of its facts, examples, structure, ` +
+          `headings, or subject matter. Only emulate HOW it's written.\n\n` +
+          `### Reference: "${ref.title || 'Untitled'}"\n\n` +
+          refMd;
+        brief.authorContext = (brief.authorContext || '') + styleBlock;
+      }
+    }
+  }
+
   await writingEngine.pushBrief(sessionId, brief);
 
   return { sessionId, markdown };

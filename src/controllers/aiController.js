@@ -336,11 +336,17 @@ function transformAgentEvent(event, currentBlocks, lastMarkdown) {
       const patches = diffBlocksToPatches(currentBlocks, newBlocks);
 
       if (patches.length > 0) {
-        // Apply patches to currentBlocks for tracking
+        // Apply patches to currentBlocks for tracking. Images carry src/alt
+        // on the patch instead of text, so merge those through when present.
         const updatedBlocks = [...currentBlocks];
         for (const p of patches) {
           const idx = updatedBlocks.findIndex((b) => b.id === p.blockId);
-          if (idx !== -1) updatedBlocks[idx] = { ...updatedBlocks[idx], text: p.text };
+          if (idx !== -1) {
+            const merged = { ...updatedBlocks[idx], text: p.text };
+            if (p.src !== undefined) merged.src = p.src;
+            if (p.alt !== undefined) merged.alt = p.alt;
+            updatedBlocks[idx] = merged;
+          }
         }
         return {
           type: 'patch',
@@ -393,9 +399,20 @@ function transformAgentEvent(event, currentBlocks, lastMarkdown) {
  * @returns {Array<{op: string, blockId: string, text: string}>}
  */
 function diffBlocksToPatches(oldBlocks, newBlocks) {
-  // Build signatures: type + first 100 chars of plain text
-  const oldSigs = oldBlocks.map((b) => b.type + ':' + stripHtml(b.text || '').slice(0, 100).trim());
-  const newSigs = newBlocks.map((b) => b.type + ':' + stripHtml(b.text || '').slice(0, 100).trim());
+  // Signature helper: for text blocks use stripped text; for img blocks use
+  // src+alt because .text is always empty on images. Without this, an image
+  // swap (![alt](oldUrl) → ![alt](newUrl)) would be silently "matched" and
+  // never emitted as a patch, so the UI would keep showing the old picture.
+  const sigOf = (b) => {
+    if (b.type === 'img') {
+      return 'img:' + (b.src || '') + '|' + (b.alt || '');
+    }
+    return b.type + ':' + stripHtml(b.text || '').trim();
+  };
+
+  // Build signatures
+  const oldSigs = oldBlocks.map(sigOf);
+  const newSigs = newBlocks.map(sigOf);
 
   // If lengths differ significantly, it's a structural change → fallback to draft
   if (Math.abs(oldBlocks.length - newBlocks.length) > 2) {
@@ -410,16 +427,25 @@ function diffBlocksToPatches(oldBlocks, newBlocks) {
   if (oldBlocks.length === newBlocks.length) {
     // Same structure — compare position by position
     for (let i = 0; i < oldBlocks.length; i++) {
-      const oldPlain = stripHtml(oldBlocks[i].text || '').trim();
-      const newPlain = stripHtml(newBlocks[i].text || '').trim();
+      const oldB = oldBlocks[i];
+      const newB = newBlocks[i];
 
-      if (oldPlain === newPlain) {
+      if (sigOf(oldB) === sigOf(newB)) {
         matched++;
+      } else if (oldB.type === 'img' && newB.type === 'img') {
+        // Image swap — carry src/alt on the patch so the frontend can apply it.
+        patches.push({
+          op: 'replace',
+          blockId: oldB.id,
+          text: newB.text || '',
+          src: newB.src || '',
+          alt: newB.alt || '',
+        });
       } else {
         patches.push({
           op: 'replace',
-          blockId: oldBlocks[i].id,
-          text: newBlocks[i].text,
+          blockId: oldB.id,
+          text: newB.text,
         });
       }
     }
@@ -431,11 +457,9 @@ function diffBlocksToPatches(oldBlocks, newBlocks) {
   }
 
   // Different lengths → structural change (insertions or deletions)
-  // Find blocks in old that have exact matches in new (by type + text)
-  const newPlains = newBlocks.map((b) => b.type + ':' + stripHtml(b.text || '').trim());
+  // Find blocks in old that have exact matches in new (by signature)
   for (let i = 0; i < oldBlocks.length; i++) {
-    const sig = oldBlocks[i].type + ':' + stripHtml(oldBlocks[i].text || '').trim();
-    if (newPlains.includes(sig)) {
+    if (newSigs.includes(oldSigs[i])) {
       matched++;
     }
   }
@@ -444,34 +468,39 @@ function diffBlocksToPatches(oldBlocks, newBlocks) {
   if (matched >= oldBlocks.length * 0.7) {
     // Match each old block to the closest new block with same type
     for (let i = 0; i < oldBlocks.length; i++) {
-      const oldPlain = stripHtml(oldBlocks[i].text || '').trim();
-      const oldType = oldBlocks[i].type;
+      const oldB = oldBlocks[i];
+      const oldType = oldB.type;
 
-      // Find the new block with same type and closest text
+      // Find the new block with same type and identical signature
       let bestMatch = -1;
       for (let j = 0; j < newBlocks.length; j++) {
-        if (newBlocks[j].type === oldType) {
-          const newPlain = stripHtml(newBlocks[j].text || '').trim();
-          if (newPlain === oldPlain) {
-            bestMatch = j;
-            break;
-          }
+        if (newBlocks[j].type === oldType && sigOf(newBlocks[j]) === sigOf(oldB)) {
+          bestMatch = j;
+          break;
         }
       }
 
       if (bestMatch === -1) {
         // Old block was modified — find the closest new block by type at similar position
         for (let j = Math.max(0, i - 2); j < Math.min(newBlocks.length, i + 3); j++) {
-          if (newBlocks[j].type === oldType) {
-            const newPlain = stripHtml(newBlocks[j].text || '').trim();
-            if (newPlain !== oldPlain) {
+          if (newBlocks[j].type === oldType && sigOf(newBlocks[j]) !== sigOf(oldB)) {
+            const newB = newBlocks[j];
+            if (oldType === 'img') {
               patches.push({
                 op: 'replace',
-                blockId: oldBlocks[i].id,
-                text: newBlocks[j].text,
+                blockId: oldB.id,
+                text: newB.text || '',
+                src: newB.src || '',
+                alt: newB.alt || '',
               });
-              break;
+            } else {
+              patches.push({
+                op: 'replace',
+                blockId: oldB.id,
+                text: newB.text,
+              });
             }
+            break;
           }
         }
       }

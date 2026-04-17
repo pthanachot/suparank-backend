@@ -334,6 +334,48 @@ const agent = async (req, res) => {
 };
 
 /**
+ * Carry forward UI-only metadata from old blocks to matching new blocks.
+ * Preserves image width/align and re-inserts editor-only blocks (toc, cta)
+ * that the LLM cannot produce.
+ */
+function mergeUiMetadata(oldBlocks, newBlocks) {
+  const result = [...newBlocks];
+
+  // 1. Carry forward image width/align from old blocks to matching new blocks
+  for (const newB of result) {
+    if (newB.type === 'img' && newB.src) {
+      const oldB = oldBlocks.find(
+        (ob) => ob.type === 'img' && ob.src === newB.src,
+      );
+      if (oldB) {
+        if (oldB.width) newB.width = oldB.width;
+        if (oldB.align) newB.align = oldB.align;
+      }
+    }
+  }
+
+  // 2. Re-insert toc blocks (editor-only, LLM never produces them)
+  const tocBlocks = oldBlocks.filter((b) => b.type === 'toc');
+  if (tocBlocks.length > 0 && !result.some((b) => b.type === 'toc')) {
+    const h1Idx = result.findIndex((b) => b.type === 'h1');
+    const insertIdx = h1Idx >= 0 ? h1Idx + 1 : 0;
+    for (const toc of tocBlocks) {
+      result.splice(insertIdx, 0, { ...toc });
+    }
+  }
+
+  // 3. Re-insert cta blocks at their original relative position (end of doc)
+  const ctaBlocks = oldBlocks.filter((b) => b.type === 'cta');
+  if (ctaBlocks.length > 0 && !result.some((b) => b.type === 'cta')) {
+    for (const cta of ctaBlocks) {
+      result.push({ ...cta });
+    }
+  }
+
+  return result;
+}
+
+/**
  * Transform a Writing Engine agent event into a frontend-friendly format.
  * Converts document_diff events into block patches.
  */
@@ -384,10 +426,12 @@ function transformAgentEvent(event, currentBlocks, lastMarkdown) {
       }
 
       // Fallback: full block replacement if structure changed (new sections added/removed)
+      // Carry forward UI-only metadata (width, align, toc, cta) from old blocks
+      const merged = mergeUiMetadata(currentBlocks, newBlocks);
       return {
         type: 'draft',
-        blocks: newBlocks,
-        _newBlocks: newBlocks,
+        blocks: merged,
+        _newBlocks: merged,
         _newMarkdown: newMarkdown,
       };
     }

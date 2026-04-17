@@ -1,6 +1,7 @@
 const Workspace = require('../models/Workspace');
 const Content = require('../models/Content');
 const { runAnalysis } = require('./analysisController');
+const imageStorage = require('../services/imageStorage');
 
 // Middleware-style: resolve workspace from :workspaceNumber param
 async function resolveWorkspace(req, res) {
@@ -46,6 +47,17 @@ const getContent = async (req, res) => {
     if (!content) {
       return res.status(404).json({ error: 'Content not found' });
     }
+
+    // Migrate old public B2 URLs to new /api/b2-image/ path format
+    if (content.blocks && Array.isArray(content.blocks)) {
+      for (const block of content.blocks) {
+        if (block.type === 'img' && block.src) {
+          const migrated = imageStorage.migratePublicUrl(block.src);
+          if (migrated) block.src = migrated;
+        }
+      }
+    }
+
     res.json({ content });
   } catch (err) {
     console.error('getContent error:', err.message);
@@ -114,6 +126,26 @@ const updateContent = async (req, res) => {
     for (const field of allowedFields) {
       if (req.body[field] !== undefined) {
         updates[field] = req.body[field];
+      }
+    }
+
+    // Upload any remaining base64/temp-URL images to B2 before saving
+    if (updates.blocks && Array.isArray(updates.blocks) && imageStorage.isEnabled()) {
+      for (const block of updates.blocks) {
+        if (block.type !== 'img' || !block.src) continue;
+        try {
+          if (block.src.startsWith('data:image/')) {
+            block.src = await imageStorage.uploadFromDataUri(
+              block.src, workspace._id.toString(), req.params.contentNumber,
+            );
+          } else if (block.src.includes('/api/images/img_')) {
+            block.src = await imageStorage.uploadFromUrl(
+              block.src, workspace._id.toString(), req.params.contentNumber,
+            );
+          }
+        } catch (err) {
+          console.error(`B2 upload failed for block ${block.id} (non-fatal):`, err.message);
+        }
       }
     }
 

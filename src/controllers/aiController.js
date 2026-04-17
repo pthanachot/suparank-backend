@@ -5,6 +5,7 @@ const { markdownToBlocks } = require('../services/markdownToBlocks');
 const { benchmarkToContentBrief } = require('../services/benchmarkToContentBrief');
 const { mapEditsToPatches } = require('../services/mapEditsToPatches');
 const writingEngine = require('../services/writingEngine');
+const imageStorage = require('../services/imageStorage');
 
 /**
  * Shared helper: resolve workspace + content from route params.
@@ -711,6 +712,25 @@ const generateImage = async (req, res) => {
       style: style || 'flat',
     });
 
+    // Upload generated image to B2 if available
+    if (imageStorage.isEnabled()) {
+      const wsId = content.workspaceId.toString();
+      const cn = content.contentNumber;
+      try {
+        if (result.dataUri && result.dataUri.startsWith('data:image/')) {
+          result.dataUri = await imageStorage.uploadFromDataUri(result.dataUri, wsId, cn);
+        } else if (result.dataUri && result.dataUri.includes('/api/images/img_')) {
+          result.dataUri = await imageStorage.uploadFromUrl(result.dataUri, wsId, cn);
+        }
+        if (result.svg) {
+          const svgDataUri = `data:image/svg+xml;base64,${Buffer.from(result.svg).toString('base64')}`;
+          result.svgUrl = await imageStorage.uploadFromDataUri(svgDataUri, wsId, cn);
+        }
+      } catch (uploadErr) {
+        console.error('B2 upload failed (non-fatal):', uploadErr.message);
+      }
+    }
+
     return res.json(result);
   } catch (err) {
     console.error('Image generation error:', err);
@@ -718,4 +738,35 @@ const generateImage = async (req, res) => {
   }
 };
 
-module.exports = { chat, agent, generateImage };
+// ─────────────────────────────────────────────────────────────
+// POST /:workspaceNumber/content/:contentNumber/ai/upload-image
+// Upload a base64 image to Backblaze B2
+// ─────────────────────────────────────────────────────────────
+const uploadImage = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+
+    const { dataUri } = req.body;
+    if (!dataUri || typeof dataUri !== 'string' || !dataUri.startsWith('data:image/')) {
+      return res.status(400).json({ error: 'dataUri is required (must be a data:image/* URI)' });
+    }
+
+    if (!imageStorage.isEnabled()) {
+      // B2 not configured — return the data URI as-is
+      return res.json({ url: dataUri });
+    }
+
+    const url = await imageStorage.uploadFromDataUri(
+      dataUri,
+      content.workspaceId.toString(),
+      content.contentNumber,
+    );
+    return res.json({ url });
+  } catch (err) {
+    console.error('Image upload error:', err);
+    return res.status(500).json({ error: err.message || 'Image upload failed' });
+  }
+};
+
+module.exports = { chat, agent, generateImage, uploadImage };

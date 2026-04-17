@@ -31,5 +31,6 @@ router.post('/:workspaceNumber/content/:contentNumber/regenerate-outline', analy
 router.post('/:workspaceNumber/content/:contentNumber/ai/chat', aiController.chat);
 router.post('/:workspaceNumber/content/:contentNumber/ai/agent', aiController.agent);
 router.post('/:workspaceNumber/content/:contentNumber/ai/generate-image', aiController.generateImage);
+router.post('/:workspaceNumber/content/:contentNumber/ai/upload-image', aiController.uploadImage);
 
 module.exports = router;

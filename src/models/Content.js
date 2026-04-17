@@ -99,11 +99,31 @@ const contentSchema = new mongoose.Schema(
     // Organization
     status: {
       type: String,
-      enum: ['draft', 'optimizing', 'published', 'scheduled'],
+      enum: ['draft', 'optimizing', 'done', 'published', 'scheduled'],
       default: 'draft',
     },
     folder: { type: String, default: '' },
     platform: { type: String, default: '' },
+
+    // Wizard selections (from article creation flow)
+    contentType: {
+      type: String,
+      enum: ['serp-based', 'blog-post', 'landing-page', 'comparison', 'listicle',
+             'product-page', 'category-page', 'service-page', 'llm-optimized', ''],
+      default: '',
+    },
+    contentContext: { type: String, default: '' },
+    targetWordCount: { type: Number, default: 0 },
+    writingMode: {
+      type: String,
+      enum: ['write', 'generate', ''],
+      default: '',
+    },
+    // Optional writing-style reference — the contentNumber of another draft in
+    // the SAME workspace whose markdown will be appended to the engine brief's
+    // authorContext with a "STYLE ONLY" instruction. Lets users keep the voice
+    // consistent across articles without copying any facts or topics.
+    styleReferenceContentNumber: { type: Number, default: null },
 
     // Version history
     versions: {
@@ -218,7 +238,7 @@ contentSchema.statics.findSummariesByWorkspace = function (workspaceId, { status
   if (status) query.status = status;
   if (folder) query.folder = folder;
   return this.find(query)
-    .select('contentNumber title slug description targetKeywords country device score wordCount status folder platform analysisStatus analyzedAt publishedAt scheduledAt createdAt updatedAt')
+    .select('contentNumber title slug description targetKeywords country device score wordCount status folder platform contentType analysisStatus analyzedAt publishedAt scheduledAt createdAt updatedAt')
     .sort({ updatedAt: -1 });
 };
 

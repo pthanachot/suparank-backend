@@ -10,7 +10,7 @@
  * 5. Session is discarded
  */
 
-const WRITING_ENGINE_URL = process.env.WRITING_ENGINE_URL || 'http://localhost:8080';
+const WRITING_ENGINE_URL = process.env.WRITING_ENGINE_URL || 'http://localhost:8090';
 
 /**
  * Create a new Writing Engine session.
@@ -62,32 +62,31 @@ async function pushBrief(sessionId, brief) {
 }
 
 /**
- * Send a chat message to the Writing Engine via REST.
- * Uses the synchronous POST /api/session/{id}/chat endpoint.
- * Returns the final response with text + document content.
+ * Send a chat message to the Writing Engine via SSE streaming.
+ * The engine's /chat endpoint streams every event (thinking_delta,
+ * text_delta, tool_start, document_diff, complete, error) so the UI
+ * can render the model's reasoning and draft text live.
+ *
+ * Returns the raw fetch Response — caller is responsible for reading
+ * the SSE stream from response.body.
  *
  * @param {string} sessionId
  * @param {string} prompt
- * @returns {Promise<{text: string, documentContent: string}>}
+ * @param {AbortSignal} [signal] - optional signal to abort the stream when the client disconnects
+ * @returns {Promise<Response>} The raw fetch response (SSE stream)
  */
-async function sendChatMessage(sessionId, prompt) {
+async function sendChatMessageStream(sessionId, prompt, signal) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ prompt }),
-    signal: AbortSignal.timeout(300000), // 5 minute timeout
+    signal,
   });
-
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`Writing Engine chat failed (${res.status}): ${body}`);
   }
-
-  const data = await res.json();
-  return {
-    text: data.text || '',
-    documentContent: data.documentContent || '',
-  };
+  return res;
 }
 
 /**
@@ -98,13 +97,15 @@ async function sendChatMessage(sessionId, prompt) {
  * @param {string} goal
  * @param {number} [targetScore=75]
  * @param {number} [maxIterations=5]
+ * @param {AbortSignal} [signal] - optional signal to abort the stream when the client disconnects
  * @returns {Promise<Response>} The raw fetch response (SSE stream)
  */
-async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5) {
+async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5, signal) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/agent`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ goal, targetScore, maxIterations }),
+    signal,
   });
   if (!res.ok) {
     const body = await res.text();
@@ -114,11 +115,34 @@ async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5) 
   return res;
 }
 
+/**
+ * Generate an image directly (no chat loop).
+ * Uses the Writing Engine's /generate-image endpoint.
+ *
+ * @param {string} sessionId
+ * @param {{ description: string, format: 'svg' | 'png', style?: string }} params
+ * @returns {Promise<{ format: string, url?: string, svg?: string }>}
+ */
+async function generateImage(sessionId, { description, format, style }) {
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/generate-image`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ description, format, style }),
+    signal: AbortSignal.timeout(60000),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Writing Engine: image generation failed (${res.status}): ${body}`);
+  }
+  return res.json();
+}
+
 module.exports = {
   createSession,
   pushDocument,
   pushBrief,
-  sendChatMessage,
+  sendChatMessageStream,
   startAgent,
+  generateImage,
   WRITING_ENGINE_URL,
 };

@@ -2,14 +2,17 @@ const Content = require('../models/Content');
 const Workspace = require('../models/Workspace');
 const { scoreContent } = require('../services/scorer');
 
-const ENGINE_URL = process.env.ENGINE_URL || 'http://localhost:8080';
+const ENGINE_URL = process.env.WRITING_ENGINE_URL || 'http://localhost:8090';
 
 // Shared helper: resolve workspace + content from route params
 async function resolveContent(req, res) {
   const { workspaceNumber, contentNumber } = req.params;
   const workspace = await Workspace.findOne({
     workspaceNumber: Number(workspaceNumber),
-    userId: req.user.userId,
+    $or: [
+      { userId: req.user.userId },
+      { 'members.userId': req.user.userId },
+    ],
   });
   if (!workspace) {
     res.status(404).json({ error: 'Workspace not found' });
@@ -65,7 +68,7 @@ function curateBenchmark(brief) {
       bm25: t.bm25 || 0,
       docFrequency: t.doc_freq || 0,
       prominence: t.section ? 'heading' : t.layer === 'awareness' ? 'first_paragraph' : '',
-      usageRange: Array.isArray(t.uses) ? { min: t.uses[0], recommended: Math.round((t.uses[0] + t.uses[1]) / 2), max: t.uses[1] } : null,
+      usageRange: Array.isArray(t.uses) ? { min: Math.max(t.uses[0], 1), recommended: Math.max(Math.round((t.uses[0] + t.uses[1]) / 2), 2), max: Math.max(t.uses[1], t.uses[0] + 2, 3) } : null,
       category: t.section ? 'headings' : 'nlp',
     })),
     topicClusters: clusters.map((c) => ({
@@ -237,9 +240,9 @@ async function runAnalysis(contentId) {
       console.error('[analysis] discover failed:', err.message);
     }
 
-    // Extract selected URLs from discover candidates to feed into analyze
+    // Extract selected URLs from discover candidates to feed into analyze (cap at 5)
     const candidates = discoverData.candidates || [];
-    const selectedUrls = candidates.filter((c) => c.selected).map((c) => c.url);
+    const selectedUrls = candidates.filter((c) => c.selected).map((c) => c.url).slice(0, 5);
 
     // Step 2: Analyze (full pipeline — 5 min timeout to match engine)
     let contentBrief = {};
@@ -254,7 +257,7 @@ async function runAnalysis(contentId) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(analyzeBody),
-        signal: AbortSignal.timeout(300000),
+        signal: AbortSignal.timeout(120000),
       });
       if (analyzeRes.ok) {
         analyzeData = await analyzeRes.json();
@@ -270,23 +273,6 @@ async function runAnalysis(contentId) {
         $set: { analysisStatus: 'failed', analysisError: err.message },
       });
       return;
-    }
-
-    // Step 3: AI Format Recommend (optional — needs AI engine keys)
-    let aiFormatData = null;
-    try {
-      const aiFormatRes = await fetch(`${ENGINE_URL}/api/ai-format-recommend`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keywords }),
-        signal: AbortSignal.timeout(90000),
-      });
-      if (aiFormatRes.ok) {
-        aiFormatData = await aiFormatRes.json();
-        console.log(`[analysis] ai-format-recommend returned ${(aiFormatData.nlp_terms || []).length} NLP terms`);
-      }
-    } catch (err) {
-      console.error('[analysis] ai-format-recommend failed (non-fatal):', err.message);
     }
 
     // AI conversations come from the analyze response (bare keyword + targeted prompts)
@@ -311,10 +297,27 @@ async function runAnalysis(contentId) {
       console.log(`[analysis] received AI answer analysis with ${(aiAnswerAnalysis.query_groups || []).length} query groups`);
     }
 
-    // Step 4: Recommend Outline (with AI conversations for AI Search optimization)
+    // Steps 3+4: Run AI Format Recommend + Recommend Outline in PARALLEL
+    let aiFormatData = null;
     let recommendedOutline = null;
-    try {
-      const outlineRes = await fetch(`${ENGINE_URL}/api/recommend-outline`, {
+
+    const [formatResult, outlineResult] = await Promise.allSettled([
+      // Step 3: AI Format Recommend
+      fetch(`${ENGINE_URL}/api/ai-format-recommend`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ keywords }),
+        signal: AbortSignal.timeout(60000),
+      }).then(async (res) => {
+        if (res.ok) {
+          const data = await res.json();
+          console.log(`[analysis] ai-format-recommend returned ${(data.nlp_terms || []).length} NLP terms`);
+          return data;
+        }
+        return null;
+      }),
+      // Step 4: Recommend Outline
+      fetch(`${ENGINE_URL}/api/recommend-outline`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -323,17 +326,30 @@ async function runAnalysis(contentId) {
           people_also_ask: discoverData.people_also_ask || [],
           related_searches: discoverData.related_searches || [],
           structure: contentBrief.structure || [],
-          terms: (contentBrief.terms || []).slice(0, 30),
+          terms: (contentBrief.terms || []).slice(0, 15),
           ai_conversations: aiConversations,
         }),
-        signal: AbortSignal.timeout(90000),
-      });
-      if (outlineRes.ok) {
-        recommendedOutline = await outlineRes.json();
-        console.log(`[analysis] recommend-outline returned H1 + ${(recommendedOutline.sections || []).length} sections`);
-      }
-    } catch (err) {
-      console.error('[analysis] recommend-outline failed (non-fatal):', err.message);
+        signal: AbortSignal.timeout(60000),
+      }).then(async (res) => {
+        if (res.ok) {
+          const data = await res.json();
+          console.log(`[analysis] recommend-outline returned H1 + ${(data.sections || []).length} sections`);
+          return data;
+        }
+        return null;
+      }),
+    ]);
+
+    if (formatResult.status === 'fulfilled') {
+      aiFormatData = formatResult.value;
+    } else {
+      console.error('[analysis] ai-format-recommend failed (non-fatal):', formatResult.reason?.message);
+    }
+
+    if (outlineResult.status === 'fulfilled') {
+      recommendedOutline = outlineResult.value;
+    } else {
+      console.error('[analysis] recommend-outline failed (non-fatal):', outlineResult.reason?.message);
     }
 
     // Step 5: Save curated results to DB
@@ -523,4 +539,62 @@ const readabilityCheck = async (req, res) => {
   }
 };
 
-module.exports = { triggerAnalysis, getBenchmark, reanalyze, runAnalysis, computeScore, readabilityCheck };
+// ─── POST /:contentNumber/regenerate-outline — re-run outline only (~5s) ───
+
+const regenerateOutline = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+
+    if (!content.benchmark) {
+      return res.status(400).json({ error: 'No analysis data. Run analysis first.' });
+    }
+
+    const keyword = (content.benchmark.keywords && content.benchmark.keywords[0]) || '';
+    const competitorPages = (content.competitorPages || []).map((p) => ({
+      url: p.url || '',
+      title: p.title || '',
+      position: p.position || 0,
+      word_count: p.wordCount || 0,
+      h1s: p.h1s || [],
+      h2s: p.h2s || [],
+      h3s: p.h3s || [],
+      h4s: p.h4s || [],
+    }));
+
+    const outlineRes = await fetch(`${ENGINE_URL}/api/recommend-outline`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        keyword,
+        competitor_pages: competitorPages,
+        people_also_ask: (content.peopleAlsoAsk || []).slice(0, 5),
+        related_searches: (content.relatedSearches || []).slice(0, 5),
+        structure: (content.contentBrief && content.contentBrief.structure) || [],
+        terms: ((content.contentBrief && content.contentBrief.terms) || []).slice(0, 15),
+        ai_conversations: (content.aiConversations || []).slice(0, 3),
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+
+    if (!outlineRes.ok) {
+      const errBody = await outlineRes.text();
+      console.error(`[regenerate-outline] engine returned ${outlineRes.status}: ${errBody}`);
+      return res.status(outlineRes.status).json({ error: 'Outline generation failed' });
+    }
+
+    const raw = await outlineRes.json();
+    const curated = curateRecommendedOutline(raw);
+
+    // Persist to DB
+    await Content.findByIdAndUpdate(content._id, { $set: { recommendedOutline: curated } });
+
+    console.log(`[regenerate-outline] new outline: H1 + ${(curated?.sections || []).length} sections`);
+    res.json(curated);
+  } catch (err) {
+    console.error('regenerateOutline error:', err.message);
+    res.status(500).json({ error: 'Failed to regenerate outline' });
+  }
+};
+
+module.exports = { triggerAnalysis, getBenchmark, reanalyze, runAnalysis, computeScore, readabilityCheck, regenerateOutline };

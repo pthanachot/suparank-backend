@@ -44,6 +44,33 @@ async function setupSession(content) {
 
   // 3. Convert benchmark → brief and push
   const brief = benchmarkToContentBrief(content);
+
+  // 3b. If the wizard picked another draft as a writing-style reference,
+  // append its markdown to authorContext with a strict "STYLE ONLY" header.
+  // The Go engine already feeds authorContext into the system prompt, so
+  // this needs zero engine changes. Reference is scoped to the same
+  // workspace (lookup via findByNumber + content.workspaceId).
+  if (content.styleReferenceContentNumber) {
+    const ref = await Content.findByNumber(
+      content.workspaceId,
+      content.styleReferenceContentNumber,
+    );
+    if (ref && Array.isArray(ref.blocks) && ref.blocks.length > 0) {
+      const refMd = blocksToMarkdown(ref.blocks);
+      if (refMd.trim()) {
+        const styleBlock =
+          `\n\n---\n## Writing style reference (STYLE ONLY — do NOT copy topics or facts)\n` +
+          `Match the tone, voice, sentence rhythm, paragraph pacing, and formality of ` +
+          `the following reference article written by the same author. The reference is ` +
+          `about a DIFFERENT topic — do NOT reuse any of its facts, examples, structure, ` +
+          `headings, or subject matter. Only emulate HOW it's written.\n\n` +
+          `### Reference: "${ref.title || 'Untitled'}"\n\n` +
+          refMd;
+        brief.authorContext = (brief.authorContext || '') + styleBlock;
+      }
+    }
+  }
+
   await writingEngine.pushBrief(sessionId, brief);
 
   return { sessionId, markdown };
@@ -51,7 +78,8 @@ async function setupSession(content) {
 
 // ─────────────────────────────────────────────────────────────
 // POST /:workspaceNumber/content/:contentNumber/ai/chat
-// Synchronous chat — send prompt, receive patches
+// SSE streaming chat — streams thinking_delta, text_delta, tool events,
+// and final draft/patch events so the UI can show live progress.
 // ─────────────────────────────────────────────────────────────
 const chat = async (req, res) => {
   try {
@@ -66,57 +94,111 @@ const chat = async (req, res) => {
     // Set up Writing Engine session
     const { sessionId } = await setupSession(content);
 
-    // Send chat message and wait for response
-    const response = await writingEngine.sendChatMessage(sessionId, prompt);
+    // AbortController tied to the client request so that if the browser
+    // disconnects (user pressed Stop / Esc), we abort the fetch to the Go
+    // engine — which in turn cancels the handler's r.Context(), stopping
+    // the query loop mid-turn.
+    const abortCtrl = new AbortController();
+    let clientDisconnected = false;
+    req.on('close', () => {
+      clientDisconnected = true;
+      abortCtrl.abort();
+    });
 
-    // Determine response type:
-    // - If documentContent changed and was empty before → initial draft (WriteTool)
-    // - If documentContent changed and was non-empty → edits (EditTool)
-    const hadContent = (content.blocks || []).length > 0 &&
-      content.blocks.some((b) => b.text && b.text.trim().length > 0);
+    // Start streaming request to the engine
+    const chatRes = await writingEngine.sendChatMessageStream(sessionId, prompt, abortCtrl.signal);
 
-    let result;
+    // Set up SSE headers for the client
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
 
-    if (response.documentContent && !hadContent) {
-      // Initial draft — convert full markdown to blocks
-      const newBlocks = markdownToBlocks(response.documentContent);
-      result = {
-        type: 'draft',
-        message: response.text,
-        blocks: newBlocks,
-      };
-    } else if (response.documentContent && hadContent) {
-      // Edits — compare old blocks with new blocks to produce patches.
-      // Convert the returned markdown to blocks, then diff against originals.
-      const newBlocks = markdownToBlocks(response.documentContent);
-      const patches = diffBlocksToPatches(content.blocks, newBlocks);
+    // Track document state for patch generation — same pattern as agent.
+    let currentBlocks = JSON.parse(JSON.stringify(content.blocks || []));
+    let lastMarkdown = blocksToMarkdown(currentBlocks);
 
-      if (patches.length > 0) {
-        result = {
-          type: 'patch',
-          message: response.text,
-          patches,
-        };
-      } else {
-        // Fallback: if no patches could be computed, send full blocks
-        result = {
-          type: 'draft',
-          message: response.text,
-          blocks: newBlocks,
-        };
+    const reader = chatRes.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let eventCount = 0;
+
+    const processEvents = async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6).trim();
+          if (data === '[DONE]') {
+            console.log(`[chat-sse] stream complete after ${eventCount} events`);
+            res.write('data: [DONE]\n\n');
+            return;
+          }
+
+          try {
+            const event = JSON.parse(data);
+            eventCount++;
+
+            // Reuse the same transform as the agent path so the frontend
+            // sees identical event shapes (draft / patch / text_delta / etc.).
+            const transformed = transformAgentEvent(event, currentBlocks, lastMarkdown);
+
+            if (transformed) {
+              if (transformed._newBlocks) {
+                currentBlocks = transformed._newBlocks;
+                lastMarkdown = blocksToMarkdown(currentBlocks);
+                delete transformed._newBlocks;
+              }
+              if (transformed._newMarkdown) {
+                lastMarkdown = transformed._newMarkdown;
+                delete transformed._newMarkdown;
+              }
+              res.write(`data: ${JSON.stringify(transformed)}\n\n`);
+            }
+          } catch (transformErr) {
+            console.error('[chat-sse] transform error:', transformErr.message);
+            res.write(`data: ${data}\n\n`);
+          }
+        }
       }
-    } else {
-      // Text-only response (no document change)
-      result = {
-        type: 'text',
-        message: response.text,
-      };
-    }
+    };
 
-    return res.json(result);
+    // Cancel reader on abort (belt-and-braces — the fetch signal already
+    // aborts the upstream, but cancel() releases the reader lock cleanly).
+    abortCtrl.signal.addEventListener('abort', () => {
+      reader.cancel().catch(() => {});
+    });
+
+    try {
+      await processEvents();
+    } catch (streamErr) {
+      if (clientDisconnected || abortCtrl.signal.aborted) {
+        console.log('[chat-sse] stream aborted by client disconnect');
+      } else {
+        throw streamErr;
+      }
+    }
+    if (!clientDisconnected) res.end();
   } catch (err) {
+    // AbortError from fetch when client disconnected — silent.
+    if (err.name === 'AbortError') {
+      console.log('[chat-sse] upstream fetch aborted');
+      return;
+    }
     console.error('AI chat error:', err);
-    return res.status(500).json({ error: err.message || 'AI chat failed' });
+    if (!res.headersSent) {
+      return res.status(500).json({ error: err.message || 'AI chat failed' });
+    }
+    res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`);
+    res.end();
   }
 };
 
@@ -137,9 +219,20 @@ const agent = async (req, res) => {
     // Set up Writing Engine session
     const { sessionId } = await setupSession(content);
 
+    // AbortController tied to the client request so that if the browser
+    // disconnects (user pressed Stop / Esc), we abort the fetch to the Go
+    // engine — which in turn cancels the handler's r.Context(), stopping
+    // the agent mid-turn.
+    const abortCtrl = new AbortController();
+    let clientDisconnected = false;
+    req.on('close', () => {
+      clientDisconnected = true;
+      abortCtrl.abort();
+    });
+
     // Start agent — returns a raw SSE response from the Writing Engine
     const agentRes = await writingEngine.startAgent(
-      sessionId, goal, targetScore || 75, maxIterations || 5
+      sessionId, goal, targetScore || 75, maxIterations || 5, abortCtrl.signal
     );
 
     // Set up SSE headers for the client
@@ -158,6 +251,7 @@ const agent = async (req, res) => {
     const reader = agentRes.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let eventCount = 0;
 
     const processEvents = async () => {
       while (true) {
@@ -172,17 +266,22 @@ const agent = async (req, res) => {
           if (!line.startsWith('data: ')) continue;
           const data = line.slice(6).trim();
           if (data === '[DONE]') {
+            console.log(`[agent-sse] stream complete after ${eventCount} events`);
             res.write('data: [DONE]\n\n');
             return;
           }
 
           try {
             const event = JSON.parse(data);
+            eventCount++;
+            console.log(`[agent-sse] #${eventCount} type=${event.type}${event.toolName ? ' tool=' + event.toolName : ''}${event.toolError ? ' ERROR' : ''}${event.documentContent ? ' docLen=' + event.documentContent.length : ''}`);
+
             const transformed = transformAgentEvent(event, currentBlocks, lastMarkdown);
 
             if (transformed) {
               // Update tracking state if document changed
               if (transformed._newBlocks) {
+                console.log(`[agent-sse] → ${transformed.type} with ${transformed._newBlocks.length} blocks`);
                 currentBlocks = transformed._newBlocks;
                 lastMarkdown = blocksToMarkdown(currentBlocks);
                 delete transformed._newBlocks;
@@ -194,7 +293,8 @@ const agent = async (req, res) => {
 
               res.write(`data: ${JSON.stringify(transformed)}\n\n`);
             }
-          } catch {
+          } catch (transformErr) {
+            console.error(`[agent-sse] transform error:`, transformErr.message);
             // Forward unparseable events as-is
             res.write(`data: ${data}\n\n`);
           }
@@ -202,14 +302,28 @@ const agent = async (req, res) => {
       }
     };
 
-    // Handle client disconnect
-    req.on('close', () => {
+    // Cancel reader on abort (belt-and-braces — the fetch signal already
+    // aborts the upstream, but cancel() releases the reader lock cleanly).
+    abortCtrl.signal.addEventListener('abort', () => {
       reader.cancel().catch(() => {});
     });
 
-    await processEvents();
-    res.end();
+    try {
+      await processEvents();
+    } catch (streamErr) {
+      if (clientDisconnected || abortCtrl.signal.aborted) {
+        console.log('[agent-sse] stream aborted by client disconnect');
+      } else {
+        throw streamErr;
+      }
+    }
+    if (!clientDisconnected) res.end();
   } catch (err) {
+    // AbortError from fetch when client disconnected — silent.
+    if (err.name === 'AbortError') {
+      console.log('[agent-sse] upstream fetch aborted');
+      return;
+    }
     console.error('AI agent error:', err);
     if (!res.headersSent) {
       return res.status(500).json({ error: err.message || 'AI agent failed' });
@@ -249,11 +363,17 @@ function transformAgentEvent(event, currentBlocks, lastMarkdown) {
       const patches = diffBlocksToPatches(currentBlocks, newBlocks);
 
       if (patches.length > 0) {
-        // Apply patches to currentBlocks for tracking
+        // Apply patches to currentBlocks for tracking. Images carry src/alt
+        // on the patch instead of text, so merge those through when present.
         const updatedBlocks = [...currentBlocks];
         for (const p of patches) {
           const idx = updatedBlocks.findIndex((b) => b.id === p.blockId);
-          if (idx !== -1) updatedBlocks[idx] = { ...updatedBlocks[idx], text: p.text };
+          if (idx !== -1) {
+            const merged = { ...updatedBlocks[idx], text: p.text };
+            if (p.src !== undefined) merged.src = p.src;
+            if (p.alt !== undefined) merged.alt = p.alt;
+            updatedBlocks[idx] = merged;
+          }
         }
         return {
           type: 'patch',
@@ -274,6 +394,7 @@ function transformAgentEvent(event, currentBlocks, lastMarkdown) {
 
     case 'agent_progress':
     case 'text_delta':
+    case 'thinking_delta':
     case 'usage':
     case 'complete':
     case 'error':
@@ -305,9 +426,20 @@ function transformAgentEvent(event, currentBlocks, lastMarkdown) {
  * @returns {Array<{op: string, blockId: string, text: string}>}
  */
 function diffBlocksToPatches(oldBlocks, newBlocks) {
-  // Build signatures: type + first 100 chars of plain text
-  const oldSigs = oldBlocks.map((b) => b.type + ':' + stripHtml(b.text || '').slice(0, 100).trim());
-  const newSigs = newBlocks.map((b) => b.type + ':' + stripHtml(b.text || '').slice(0, 100).trim());
+  // Signature helper: for text blocks use stripped text; for img blocks use
+  // src+alt because .text is always empty on images. Without this, an image
+  // swap (![alt](oldUrl) → ![alt](newUrl)) would be silently "matched" and
+  // never emitted as a patch, so the UI would keep showing the old picture.
+  const sigOf = (b) => {
+    if (b.type === 'img') {
+      return 'img:' + (b.src || '') + '|' + (b.alt || '');
+    }
+    return b.type + ':' + stripHtml(b.text || '').trim();
+  };
+
+  // Build signatures
+  const oldSigs = oldBlocks.map(sigOf);
+  const newSigs = newBlocks.map(sigOf);
 
   // If lengths differ significantly, it's a structural change → fallback to draft
   if (Math.abs(oldBlocks.length - newBlocks.length) > 2) {
@@ -322,16 +454,25 @@ function diffBlocksToPatches(oldBlocks, newBlocks) {
   if (oldBlocks.length === newBlocks.length) {
     // Same structure — compare position by position
     for (let i = 0; i < oldBlocks.length; i++) {
-      const oldPlain = stripHtml(oldBlocks[i].text || '').trim();
-      const newPlain = stripHtml(newBlocks[i].text || '').trim();
+      const oldB = oldBlocks[i];
+      const newB = newBlocks[i];
 
-      if (oldPlain === newPlain) {
+      if (sigOf(oldB) === sigOf(newB)) {
         matched++;
+      } else if (oldB.type === 'img' && newB.type === 'img') {
+        // Image swap — carry src/alt on the patch so the frontend can apply it.
+        patches.push({
+          op: 'replace',
+          blockId: oldB.id,
+          text: newB.text || '',
+          src: newB.src || '',
+          alt: newB.alt || '',
+        });
       } else {
         patches.push({
           op: 'replace',
-          blockId: oldBlocks[i].id,
-          text: newBlocks[i].text,
+          blockId: oldB.id,
+          text: newB.text,
         });
       }
     }
@@ -343,11 +484,9 @@ function diffBlocksToPatches(oldBlocks, newBlocks) {
   }
 
   // Different lengths → structural change (insertions or deletions)
-  // Find blocks in old that have exact matches in new (by type + text)
-  const newPlains = newBlocks.map((b) => b.type + ':' + stripHtml(b.text || '').trim());
+  // Find blocks in old that have exact matches in new (by signature)
   for (let i = 0; i < oldBlocks.length; i++) {
-    const sig = oldBlocks[i].type + ':' + stripHtml(oldBlocks[i].text || '').trim();
-    if (newPlains.includes(sig)) {
+    if (newSigs.includes(oldSigs[i])) {
       matched++;
     }
   }
@@ -356,34 +495,39 @@ function diffBlocksToPatches(oldBlocks, newBlocks) {
   if (matched >= oldBlocks.length * 0.7) {
     // Match each old block to the closest new block with same type
     for (let i = 0; i < oldBlocks.length; i++) {
-      const oldPlain = stripHtml(oldBlocks[i].text || '').trim();
-      const oldType = oldBlocks[i].type;
+      const oldB = oldBlocks[i];
+      const oldType = oldB.type;
 
-      // Find the new block with same type and closest text
+      // Find the new block with same type and identical signature
       let bestMatch = -1;
       for (let j = 0; j < newBlocks.length; j++) {
-        if (newBlocks[j].type === oldType) {
-          const newPlain = stripHtml(newBlocks[j].text || '').trim();
-          if (newPlain === oldPlain) {
-            bestMatch = j;
-            break;
-          }
+        if (newBlocks[j].type === oldType && sigOf(newBlocks[j]) === sigOf(oldB)) {
+          bestMatch = j;
+          break;
         }
       }
 
       if (bestMatch === -1) {
         // Old block was modified — find the closest new block by type at similar position
         for (let j = Math.max(0, i - 2); j < Math.min(newBlocks.length, i + 3); j++) {
-          if (newBlocks[j].type === oldType) {
-            const newPlain = stripHtml(newBlocks[j].text || '').trim();
-            if (newPlain !== oldPlain) {
+          if (newBlocks[j].type === oldType && sigOf(newBlocks[j]) !== sigOf(oldB)) {
+            const newB = newBlocks[j];
+            if (oldType === 'img') {
               patches.push({
                 op: 'replace',
-                blockId: oldBlocks[i].id,
-                text: newBlocks[j].text,
+                blockId: oldB.id,
+                text: newB.text || '',
+                src: newB.src || '',
+                alt: newB.alt || '',
               });
-              break;
+            } else {
+              patches.push({
+                op: 'replace',
+                blockId: oldB.id,
+                text: newB.text,
+              });
             }
+            break;
           }
         }
       }
@@ -501,4 +645,33 @@ function extractEditsFromMarkdownDiff(oldMd, newMd) {
   return edits.filter((e) => e.old_string || e.new_string);
 }
 
-module.exports = { chat, agent };
+// ─────────────────────────────────────────────────────────────
+// POST /:workspaceNumber/content/:contentNumber/ai/generate-image
+// Direct image generation (SVG or PNG) — no chat loop
+// ─────────────────────────────────────────────────────────────
+const generateImage = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+
+    const { description, format, style } = req.body;
+    if (!description || typeof description !== 'string' || description.length < 5) {
+      return res.status(400).json({ error: 'description is required (min 5 chars)' });
+    }
+
+    const { sessionId } = await setupSession(content);
+
+    const result = await writingEngine.generateImage(sessionId, {
+      description,
+      format: format || 'svg',
+      style: style || 'flat',
+    });
+
+    return res.json(result);
+  } catch (err) {
+    console.error('Image generation error:', err);
+    return res.status(500).json({ error: err.message || 'Image generation failed' });
+  }
+};
+
+module.exports = { chat, agent, generateImage };

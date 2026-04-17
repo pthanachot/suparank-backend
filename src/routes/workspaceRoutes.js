@@ -25,9 +25,11 @@ router.get('/:workspaceNumber/content/:contentNumber/benchmark', analysisControl
 router.post('/:workspaceNumber/content/:contentNumber/reanalyze', analysisController.reanalyze);
 router.post('/:workspaceNumber/content/:contentNumber/score', analysisController.computeScore);
 router.post('/:workspaceNumber/content/:contentNumber/readability-check', analysisController.readabilityCheck);
+router.post('/:workspaceNumber/content/:contentNumber/regenerate-outline', analysisController.regenerateOutline);
 
 // AI writing under content: /api/workspace/:workspaceNumber/content/:contentNumber/ai/...
 router.post('/:workspaceNumber/content/:contentNumber/ai/chat', aiController.chat);
 router.post('/:workspaceNumber/content/:contentNumber/ai/agent', aiController.agent);
+router.post('/:workspaceNumber/content/:contentNumber/ai/generate-image', aiController.generateImage);
 
 module.exports = router;

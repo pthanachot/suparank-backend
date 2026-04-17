@@ -32,5 +32,6 @@ router.post('/:workspaceNumber/content/:contentNumber/ai/chat', aiController.cha
 router.post('/:workspaceNumber/content/:contentNumber/ai/agent', aiController.agent);
 router.post('/:workspaceNumber/content/:contentNumber/ai/generate-image', aiController.generateImage);
 router.post('/:workspaceNumber/content/:contentNumber/ai/upload-image', aiController.uploadImage);
+router.post('/:workspaceNumber/content/:contentNumber/ai/clarify-answer', aiController.clarifyAnswer);
 
 module.exports = router;

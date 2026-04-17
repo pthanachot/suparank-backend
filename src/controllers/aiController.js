@@ -437,6 +437,7 @@ function transformAgentEvent(event, currentBlocks, lastMarkdown) {
       };
     }
 
+    case 'clarify_request':
     case 'agent_progress':
     case 'text_delta':
     case 'thinking_delta':
@@ -769,4 +770,22 @@ const uploadImage = async (req, res) => {
   }
 };
 
-module.exports = { chat, agent, generateImage, uploadImage };
+// ─────────────────────────────────────────────────────────────
+// POST /:workspaceNumber/content/:contentNumber/ai/clarify-answer
+// Proxies the user's answer to the Writing Engine's clarify-answer endpoint.
+// ─────────────────────────────────────────────────────────────
+const clarifyAnswer = async (req, res) => {
+  try {
+    const { sessionId, answer } = req.body;
+    if (!sessionId || !answer) {
+      return res.status(400).json({ error: 'sessionId and answer are required' });
+    }
+    const result = await writingEngine.submitClarifyAnswer(sessionId, answer);
+    return res.json(result);
+  } catch (err) {
+    console.error('Clarify answer error:', err);
+    return res.status(500).json({ error: err.message || 'Failed to submit answer' });
+  }
+};
+
+module.exports = { chat, agent, generateImage, uploadImage, clarifyAnswer };

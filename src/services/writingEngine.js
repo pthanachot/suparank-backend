@@ -137,6 +137,27 @@ async function generateImage(sessionId, { description, format, style }) {
   return res.json();
 }
 
+/**
+ * Submit the user's clarify answer to the Writing Engine.
+ * Called when the user responds to an AskUserTool popup.
+ *
+ * @param {string} sessionId - Go engine session ID
+ * @param {string} answer - User's chosen answer
+ * @returns {Promise<{status: string}>}
+ */
+async function submitClarifyAnswer(sessionId, answer) {
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/clarify-answer`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ answer }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Writing Engine: clarify answer failed (${res.status}): ${body}`);
+  }
+  return res.json();
+}
+
 module.exports = {
   createSession,
   pushDocument,
@@ -144,5 +165,6 @@ module.exports = {
   sendChatMessageStream,
   startAgent,
   generateImage,
+  submitClarifyAnswer,
   WRITING_ENGINE_URL,
 };

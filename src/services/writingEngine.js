@@ -98,13 +98,18 @@ async function sendChatMessageStream(sessionId, prompt, signal) {
  * @param {number} [targetScore=75]
  * @param {number} [maxIterations=5]
  * @param {AbortSignal} [signal] - optional signal to abort the stream when the client disconnects
+ * @param {string[]} [allowedTools] - restrict agent to only these tools (e.g. ["EditTool"])
  * @returns {Promise<Response>} The raw fetch response (SSE stream)
  */
-async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5, signal) {
+async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5, signal, allowedTools) {
+  const payload = { goal, targetScore, maxIterations };
+  if (allowedTools?.length > 0) {
+    payload.allowedTools = allowedTools;
+  }
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/agent`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ goal, targetScore, maxIterations }),
+    body: JSON.stringify(payload),
     signal,
   });
   if (!res.ok) {

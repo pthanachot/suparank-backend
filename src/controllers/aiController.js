@@ -212,7 +212,7 @@ const agent = async (req, res) => {
     const content = await resolveContent(req, res);
     if (!content) return;
 
-    const { goal, targetScore, maxIterations } = req.body;
+    const { goal, targetScore, maxIterations, allowedTools } = req.body;
     if (!goal || typeof goal !== 'string') {
       return res.status(400).json({ error: 'goal is required' });
     }
@@ -233,7 +233,7 @@ const agent = async (req, res) => {
 
     // Start agent — returns a raw SSE response from the Writing Engine
     const agentRes = await writingEngine.startAgent(
-      sessionId, goal, targetScore || 75, maxIterations || 5, abortCtrl.signal
+      sessionId, goal, targetScore || 75, maxIterations || 5, abortCtrl.signal, allowedTools
     );
 
     // Set up SSE headers for the client

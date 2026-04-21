@@ -117,58 +117,16 @@ const chat = async (req, res) => {
       'X-Accel-Buffering': 'no',
     });
 
-    // Track document state for patch generation — same pattern as agent.
-    let currentBlocks = JSON.parse(JSON.stringify(content.blocks || []));
-    let lastMarkdown = blocksToMarkdown(currentBlocks);
-
+    // Raw byte pipe — forward Go engine SSE stream directly to the client.
+    // All event transformation (document_diff → patch/draft) is now handled
+    // client-side in EditorChatBar.tsx.
     const reader = chatRes.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let eventCount = 0;
 
     const processEvents = async () => {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6).trim();
-          if (data === '[DONE]') {
-            console.log(`[chat-sse] stream complete after ${eventCount} events`);
-            res.write('data: [DONE]\n\n');
-            return;
-          }
-
-          try {
-            const event = JSON.parse(data);
-            eventCount++;
-
-            // Reuse the same transform as the agent path so the frontend
-            // sees identical event shapes (draft / patch / text_delta / etc.).
-            const transformed = transformAgentEvent(event, currentBlocks, lastMarkdown);
-
-            if (transformed) {
-              if (transformed._newBlocks) {
-                currentBlocks = transformed._newBlocks;
-                lastMarkdown = blocksToMarkdown(currentBlocks);
-                delete transformed._newBlocks;
-              }
-              if (transformed._newMarkdown) {
-                lastMarkdown = transformed._newMarkdown;
-                delete transformed._newMarkdown;
-              }
-              res.write(`data: ${JSON.stringify(transformed)}\n\n`);
-            }
-          } catch (transformErr) {
-            console.error('[chat-sse] transform error:', transformErr.message);
-            res.write(`data: ${data}\n\n`);
-          }
-        }
+        res.write(Buffer.from(value));
       }
     };
 
@@ -244,62 +202,17 @@ const agent = async (req, res) => {
       'X-Accel-Buffering': 'no',
     });
 
-    // Track document state for patch generation
-    let currentBlocks = JSON.parse(JSON.stringify(content.blocks || []));
-    let lastMarkdown = blocksToMarkdown(currentBlocks);
-
-    // Read the SSE stream from Writing Engine and transform events
+    // Raw byte pipe — forward Go engine SSE stream directly to the client.
+    // All event transformation (document_diff → patch/draft) is now handled
+    // client-side in EditorChatBar.tsx. This eliminates per-event JSON
+    // parse/serialize overhead for text_delta and thinking_delta events.
     const reader = agentRes.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let eventCount = 0;
 
     const processEvents = async () => {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || ''; // Keep incomplete line in buffer
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6).trim();
-          if (data === '[DONE]') {
-            console.log(`[agent-sse] stream complete after ${eventCount} events`);
-            res.write('data: [DONE]\n\n');
-            return;
-          }
-
-          try {
-            const event = JSON.parse(data);
-            eventCount++;
-            console.log(`[agent-sse] #${eventCount} type=${event.type}${event.toolName ? ' tool=' + event.toolName : ''}${event.toolError ? ' ERROR' : ''}${event.documentContent ? ' docLen=' + event.documentContent.length : ''}`);
-
-            const transformed = transformAgentEvent(event, currentBlocks, lastMarkdown);
-
-            if (transformed) {
-              // Update tracking state if document changed
-              if (transformed._newBlocks) {
-                console.log(`[agent-sse] → ${transformed.type} with ${transformed._newBlocks.length} blocks`);
-                currentBlocks = transformed._newBlocks;
-                lastMarkdown = blocksToMarkdown(currentBlocks);
-                delete transformed._newBlocks;
-              }
-              if (transformed._newMarkdown) {
-                lastMarkdown = transformed._newMarkdown;
-                delete transformed._newMarkdown;
-              }
-
-              res.write(`data: ${JSON.stringify(transformed)}\n\n`);
-            }
-          } catch (transformErr) {
-            console.error(`[agent-sse] transform error:`, transformErr.message);
-            // Forward unparseable events as-is
-            res.write(`data: ${data}\n\n`);
-          }
-        }
+        res.write(Buffer.from(value));
       }
     };
 

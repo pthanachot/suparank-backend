@@ -187,4 +187,91 @@ const deleteContent = async (req, res) => {
   }
 };
 
-module.exports = { listContents, getContent, createContent, updateContent, deleteContent };
+// ─── ADD COMMENT ──────────────────────────────────────────────
+
+const User = require('../models/User');
+
+const addComment = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+
+    const { blockId, selectedText, text } = req.body;
+    if (!blockId || !text) return res.status(400).json({ error: 'blockId and text are required' });
+
+    const user = await User.findById(req.user.userId).select('email profile.name').lean();
+    const comment = {
+      id: 'c' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+      blockId,
+      selectedText: selectedText || undefined,
+      text,
+      authorEmail: user?.email || req.user.email,
+      authorName: user?.profile?.name || undefined,
+      createdAt: Date.now(),
+    };
+
+    const content = await Content.findOneAndUpdate(
+      { workspaceId: workspace._id, contentNumber: Number(req.params.contentNumber) },
+      { $push: { comments: comment } },
+      { new: true }
+    );
+    if (!content) return res.status(404).json({ error: 'Content not found' });
+
+    res.json({ comment });
+  } catch (err) {
+    console.error('addComment error:', err.message);
+    res.status(500).json({ error: 'Failed to add comment' });
+  }
+};
+
+// ─── UPDATE COMMENT (resolve / edit) ──────────────────────────
+
+const updateComment = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+
+    const { commentId } = req.params;
+    const update = {};
+    if (req.body.text !== undefined) update['comments.$.text'] = req.body.text;
+    if (req.body.resolvedAt !== undefined) update['comments.$.resolvedAt'] = req.body.resolvedAt;
+
+    if (Object.keys(update).length === 0) return res.status(400).json({ error: 'No fields to update' });
+
+    const content = await Content.findOneAndUpdate(
+      { workspaceId: workspace._id, contentNumber: Number(req.params.contentNumber), 'comments.id': commentId },
+      { $set: update },
+      { new: true }
+    );
+    if (!content) return res.status(404).json({ error: 'Content or comment not found' });
+
+    const updated = content.comments.find(c => c.id === commentId);
+    res.json({ comment: updated });
+  } catch (err) {
+    console.error('updateComment error:', err.message);
+    res.status(500).json({ error: 'Failed to update comment' });
+  }
+};
+
+// ─── DELETE COMMENT ───────────────────────────────────────────
+
+const deleteComment = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+
+    const content = await Content.findOneAndUpdate(
+      { workspaceId: workspace._id, contentNumber: Number(req.params.contentNumber) },
+      { $pull: { comments: { id: req.params.commentId } } },
+      { new: true }
+    );
+    if (!content) return res.status(404).json({ error: 'Content not found' });
+
+    res.json({ message: 'Comment deleted' });
+  } catch (err) {
+    console.error('deleteComment error:', err.message);
+    res.status(500).json({ error: 'Failed to delete comment' });
+  }
+};
+
+module.exports = { listContents, getContent, createContent, updateContent, deleteContent, addComment, updateComment, deleteComment };

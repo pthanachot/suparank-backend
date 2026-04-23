@@ -36,7 +36,7 @@ const blockSchema = new mongoose.Schema(
     type: {
       type: String,
       required: true,
-      enum: ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'li', 'ol', 'quote', 'img', 'toc', 'faq', 'cta', 'table', 'code', 'divider'],
+      enum: ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'li', 'ol', 'quote', 'img', 'toc', 'faq', 'cta', 'table', 'code', 'divider', 'toggle', 'embed'],
     },
     text: { type: String, default: '' },
     src: String,
@@ -57,6 +57,32 @@ const versionSnapshotSchema = new mongoose.Schema(
     label: String,
     timestamp: { type: Number, required: true },
     blocks: [blockSchema],
+  },
+  { _id: false }
+);
+
+const commentReplySchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true },
+    text: { type: String, required: true },
+    authorEmail: { type: String, required: true },
+    authorName: String,
+    createdAt: { type: Number, required: true },
+  },
+  { _id: false }
+);
+
+const commentSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true },
+    blockId: { type: String, required: true },
+    selectedText: String,
+    text: { type: String, required: true },
+    authorEmail: { type: String, required: true },
+    authorName: String,
+    createdAt: { type: Number, required: true },
+    resolvedAt: Number,
+    replies: { type: [commentReplySchema], default: [] },
   },
   { _id: false }
 );
@@ -132,6 +158,9 @@ const contentSchema = new mongoose.Schema(
       validate: [arr => arr.length <= 10, 'Maximum 10 version snapshots allowed'],
     },
 
+    // Comments
+    comments: { type: [commentSchema], default: [] },
+
     // Engine analysis results (persisted from Go engine)
     analysisStatus: {
       type: String,
@@ -139,6 +168,7 @@ const contentSchema = new mongoose.Schema(
       default: 'idle',
     },
     analysisError: { type: String, default: '' },
+    analysisWarnings: { type: [String], default: [] },
     analyzedAt: Date,
 
     benchmark: {

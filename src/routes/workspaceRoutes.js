@@ -19,6 +19,11 @@ router.get('/:workspaceNumber/content/:contentNumber', contentController.getCont
 router.put('/:workspaceNumber/content/:contentNumber', contentController.updateContent);
 router.delete('/:workspaceNumber/content/:contentNumber', contentController.deleteContent);
 
+// Comments under content
+router.post('/:workspaceNumber/content/:contentNumber/comments', contentController.addComment);
+router.put('/:workspaceNumber/content/:contentNumber/comments/:commentId', contentController.updateComment);
+router.delete('/:workspaceNumber/content/:contentNumber/comments/:commentId', contentController.deleteComment);
+
 // Analysis under content: /api/workspace/:workspaceNumber/content/:contentNumber/...
 router.post('/:workspaceNumber/content/:contentNumber/analyze', analysisController.triggerAnalysis);
 router.get('/:workspaceNumber/content/:contentNumber/benchmark', analysisController.getBenchmark);

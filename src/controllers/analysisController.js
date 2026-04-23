@@ -205,6 +205,43 @@ function curateRecommendedOutline(raw) {
   };
 }
 
+// Convert curated camelCase structure back to snake_case for engine
+function structureToSnakeCase(structure) {
+  if (!Array.isArray(structure)) return [];
+  return structure.map((s) => ({
+    id: s.id,
+    name: s.name,
+    priority: s.priority,
+    words: s.words || [],
+    prevalence: s.prevalence || '',
+    paa_mapped: s.paaMapped || false,
+    snippet_target: s.snippetTarget || false,
+    source: s.source || '',
+  }));
+}
+
+// Convert curated camelCase terms back to snake_case for engine
+function termsToSnakeCase(terms) {
+  if (!Array.isArray(terms)) return [];
+  return terms.map((t) => ({
+    term: t.term,
+    score: t.score,
+    centrality: t.centrality,
+    type: t.type,
+    layer: t.layer,
+    section: t.section,
+    uses: t.uses || [],
+    cluster: t.cluster || '',
+    source: t.source || '',
+    gap_ref: t.gapRef || '',
+    guidance: t.guidance || '',
+    bm25: t.bm25 || 0,
+    doc_freq: t.docFreq || 0,
+    freq: t.freq || 0,
+    volatile: t.volatile || false,
+  }));
+}
+
 // ─── RUN ANALYSIS (background) ─────────────────────────────────
 
 async function runAnalysis(contentId) {
@@ -257,7 +294,7 @@ async function runAnalysis(contentId) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(analyzeBody),
-        signal: AbortSignal.timeout(120000),
+        signal: AbortSignal.timeout(330000), // 5.5 min — slightly above engine's 5-min context
       });
       if (analyzeRes.ok) {
         analyzeData = await analyzeRes.json();
@@ -295,6 +332,12 @@ async function runAnalysis(contentId) {
     const aiAnswerAnalysis = analyzeData.ai_answer_analysis || null;
     if (aiAnswerAnalysis) {
       console.log(`[analysis] received AI answer analysis with ${(aiAnswerAnalysis.query_groups || []).length} query groups`);
+    }
+
+    // Engine warnings (degraded pipeline steps)
+    const analysisWarnings = analyzeData.warnings || [];
+    if (analysisWarnings.length > 0) {
+      console.log(`[analysis] engine warnings: ${analysisWarnings.join('; ')}`);
     }
 
     // Steps 3+4: Run AI Format Recommend + Recommend Outline in PARALLEL
@@ -378,6 +421,7 @@ async function runAnalysis(contentId) {
       recommendedOutline: curateRecommendedOutline(recommendedOutline),
       aiConversations,
       aiAnswerAnalysis,
+      analysisWarnings,
     };
 
     await Content.findByIdAndUpdate(contentId, { $set: updates });
@@ -438,6 +482,7 @@ const getBenchmark = async (req, res) => {
       recommendedOutline: content.recommendedOutline || null,
       aiConversations: content.aiConversations || [],
       aiAnswerAnalysis: content.aiAnswerAnalysis || null,
+      analysisWarnings: content.analysisWarnings || [],
     });
   } catch (err) {
     console.error('getBenchmark error:', err.message);
@@ -570,8 +615,8 @@ const regenerateOutline = async (req, res) => {
         competitor_pages: competitorPages,
         people_also_ask: (content.peopleAlsoAsk || []).slice(0, 5),
         related_searches: (content.relatedSearches || []).slice(0, 5),
-        structure: (content.contentBrief && content.contentBrief.structure) || [],
-        terms: ((content.contentBrief && content.contentBrief.terms) || []).slice(0, 15),
+        structure: structureToSnakeCase((content.contentBrief && content.contentBrief.structure) || []),
+        terms: termsToSnakeCase(((content.contentBrief && content.contentBrief.terms) || []).slice(0, 15)),
         ai_conversations: (content.aiConversations || []).slice(0, 3),
       }),
       signal: AbortSignal.timeout(30000),

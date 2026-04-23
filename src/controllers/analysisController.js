@@ -2,7 +2,7 @@ const Content = require('../models/Content');
 const Workspace = require('../models/Workspace');
 const { scoreContent } = require('../services/scorer');
 
-const ENGINE_URL = process.env.WRITING_ENGINE_URL || 'http://localhost:8090';
+const ENGINE_URL = process.env.ENGINE_URL || 'http://localhost:8090';
 
 // Shared helper: resolve workspace + content from route params
 async function resolveContent(req, res) {

@@ -122,8 +122,8 @@ function markdownToBlocks(markdown) {
       continue;
     }
 
-    // Image: ![alt](src)
-    const imgMatch = trimmed.match(/^!\[([^\]]*)\]\(([^)]+)\)$/);
+    // Image: ![alt](src) or ![alt](src "title")
+    const imgMatch = trimmed.match(/^!\[([^\]]*)\]\(([^\s)]+)(?:\s+"[^"]*")?\)$/);
     if (imgMatch) {
       blocks.push({
         id: nextId(),
@@ -205,7 +205,64 @@ function markdownToBlocks(markdown) {
     }
   }
 
-  return blocks;
+  return postProcessFaqBlocks(blocks);
+}
+
+/**
+ * Detect `## FAQ` followed by `### question` / paragraph pairs and
+ * re-assemble them into a single `faq` block with `faqItems[]`.
+ * This preserves the rich FAQ structure through the markdown round-trip.
+ */
+function postProcessFaqBlocks(blocks) {
+  const result = [];
+  let i = 0;
+
+  while (i < blocks.length) {
+    const b = blocks[i];
+
+    // Detect "## FAQ" or "## Frequently Asked Questions"
+    if (
+      b.type === 'h2' &&
+      /^(faq|frequently\s+asked\s+questions)$/i.test(stripHtml(b.text || '').trim())
+    ) {
+      const faqItems = [];
+      i++; // skip the h2
+
+      // Collect h3 + paragraph pairs
+      while (i < blocks.length) {
+        if (blocks[i].type === 'h3') {
+          const question = stripHtml(blocks[i].text || '');
+          i++;
+          // Collect answer paragraphs until next h3 or non-paragraph block
+          const answerParts = [];
+          while (i < blocks.length && blocks[i].type === 'p') {
+            answerParts.push(blocks[i].text || '');
+            i++;
+          }
+          faqItems.push({ question, answer: answerParts.join('\n\n') });
+        } else {
+          break; // end of FAQ section
+        }
+      }
+
+      if (faqItems.length > 0) {
+        result.push({ id: nextId(), type: 'faq', text: '', faqItems });
+      } else {
+        // No h3/p pairs found — keep the heading as-is
+        result.push(b);
+      }
+    } else {
+      result.push(b);
+      i++;
+    }
+  }
+
+  return result;
+}
+
+function stripHtml(html) {
+  if (!html) return '';
+  return html.replace(/<[^>]*>/g, '');
 }
 
 module.exports = { markdownToBlocks, mdInlineToHtml };

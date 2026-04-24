@@ -321,7 +321,7 @@ function computeContentHash(blocks) {
 function buildAuditPrompt(markdown, keyword, wordCount) {
   return `You are a senior content editor with 15 years of experience in digital publishing and SEO.
 
-Audit the following article against 9 editorial criteria. For each criterion, provide:
+Audit the following article against 8 editorial criteria. For each criterion, provide:
 - A score from 1-10
 - A status: "good" (7-10), "warning" (4-6), or "fail" (1-3)
 - Specific, actionable feedback (2-3 sentences max). Reference exact sections, headings, or paragraphs from the article. Do NOT give generic advice.
@@ -329,7 +329,7 @@ Audit the following article against 9 editorial criteria. For each criterion, pr
 Target keyword: ${keyword || '(not specified)'}
 Word count: ${wordCount}
 
-THE 9 CRITERIA (evaluate in this order):
+THE 8 CRITERIA (evaluate in this order):
 
 1. AUDIENCE-PURPOSE FIT
    - Is the target audience clearly defined through language and depth?
@@ -366,12 +366,7 @@ THE 9 CRITERIA (evaluate in this order):
    - Does it sound human and confident, not robotic or hedging?
    - Is there unnecessary jargon or filler language?
 
-8. CONVERSION & NEXT STEPS
-   - Is there a clear call-to-action or logical next step for the reader?
-   - Does the structure naturally guide toward that action?
-   - Are internal links and CTAs placed naturally, not forced?
-
-9. RISK & ACCURACY
+8. RISK & ACCURACY
    - Are there misleading claims, absolute statements without evidence?
    - Could any content create legal, factual, or reputational risk?
    - Flag any "guaranteed", "best", "always/never" language without support.
@@ -396,6 +391,209 @@ Return ONLY valid JSON (no markdown fences, no extra text) in this exact format:
 }`;
 }
 
+/**
+ * Shared streaming audit helper. Streams from OpenRouter, detects complete
+ * criterion JSON objects, emits SSE events per criterion, then a final
+ * "complete" event with the full sanitized result.
+ */
+function sanitizeCriterion(c) {
+  return {
+    name: c.name || 'Unknown',
+    score: Math.min(10, Math.max(1, Math.round(c.score || 1))),
+    status: ['good', 'warning', 'fail'].includes(c.status) ? c.status : (c.score >= 7 ? 'good' : c.score >= 4 ? 'warning' : 'fail'),
+    feedback: c.feedback || 'No feedback provided.',
+  };
+}
+
+/**
+ * Extract complete criterion objects from a partial JSON buffer.
+ * Looks for the "criteria" array and counts complete {...} objects by tracking brace depth.
+ */
+function extractCriteria(buffer) {
+  // Search for "criteria": (with colon) to avoid matching the word inside string values
+  const keyPattern = '"criteria"';
+  let arrStart = -1;
+  let searchFrom = 0;
+  while (searchFrom < buffer.length) {
+    const idx = buffer.indexOf(keyPattern, searchFrom);
+    if (idx === -1) break;
+    // Check if followed by optional whitespace then colon
+    const afterKey = buffer.slice(idx + keyPattern.length).trimStart();
+    if (afterKey.startsWith(':')) { arrStart = idx; break; }
+    searchFrom = idx + 1;
+  }
+  if (arrStart === -1) return [];
+  const bracketStart = buffer.indexOf('[', arrStart);
+  if (bracketStart === -1) return [];
+
+  const criteria = [];
+  let depth = 0;
+  let objStart = -1;
+
+  for (let i = bracketStart + 1; i < buffer.length; i++) {
+    const ch = buffer[i];
+    if (ch === '"') {
+      // Skip string content
+      i++;
+      while (i < buffer.length && buffer[i] !== '"') {
+        if (buffer[i] === '\\') i++; // skip escaped char
+        i++;
+      }
+      continue;
+    }
+    if (ch === '{') {
+      if (depth === 0) objStart = i;
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0 && objStart !== -1) {
+        const objStr = buffer.slice(objStart, i + 1);
+        try {
+          criteria.push(JSON.parse(objStr));
+        } catch { /* incomplete or malformed, skip */ }
+        objStart = -1;
+      }
+    }
+  }
+  return criteria;
+}
+
+async function streamAudit(req, res, { prompt, contentHash, contentId, dbField, errorPrefix }) {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: 'OpenRouter API key not configured' });
+
+  // Set up SSE
+  const abortCtrl = new AbortController();
+  let clientDisconnected = false;
+  req.on('close', () => { clientDisconnected = true; abortCtrl.abort(); });
+
+  // Start streaming request to OpenRouter
+  let orRes;
+  try {
+    orRes = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'moonshotai/kimi-k2-0905',
+        temperature: 0,
+        stream: true,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+      signal: abortCtrl.signal,
+    });
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    return res.status(502).json({ error: errorPrefix + ': ' + e.message });
+  }
+
+  if (!orRes.ok || !orRes.body) {
+    const err = await orRes.json().catch(() => ({}));
+    const msg = err.error?.message || `OpenRouter returned ${orRes.status}`;
+    return res.status(502).json({ error: errorPrefix + ': ' + msg });
+  }
+
+  // Start SSE response
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+
+  const reader = orRes.body.getReader();
+  const decoder = new TextDecoder();
+  let sseBuffer = '';
+  let fullContent = '';
+  let emittedCount = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      sseBuffer += decoder.decode(value, { stream: true });
+      const lines = sseBuffer.split('\n');
+      sseBuffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') continue;
+
+        try {
+          const event = JSON.parse(data);
+          const delta = event.choices?.[0]?.delta?.content || '';
+          if (delta) {
+            fullContent += delta;
+
+            // Check for newly completed criteria
+            const criteria = extractCriteria(fullContent);
+            while (emittedCount < criteria.length) {
+              const c = sanitizeCriterion(criteria[emittedCount]);
+              if (!clientDisconnected) {
+                res.write(`data: ${JSON.stringify({ type: 'criterion', index: emittedCount, criterion: c })}\n\n`);
+              }
+              emittedCount++;
+            }
+          }
+        } catch { /* skip unparseable SSE line */ }
+      }
+    }
+  } catch (e) {
+    if (clientDisconnected || abortCtrl.signal.aborted) {
+      console.log(`[${dbField}-sse] stream aborted by client disconnect`);
+      return;
+    }
+    if (!clientDisconnected) {
+      res.write(`data: ${JSON.stringify({ type: 'error', error: e.message })}\n\n`);
+      res.end();
+    }
+    return;
+  }
+
+  // Parse final result
+  const cleaned = fullContent.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
+  let parsed;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (e) {
+    console.error(`[${dbField}] final JSON parse error:`, e.message);
+    if (!clientDisconnected) {
+      res.write(`data: ${JSON.stringify({ type: 'error', error: 'AI returned invalid response.' })}\n\n`);
+      res.end();
+    }
+    return;
+  }
+
+  const auditResult = {
+    overallScore: Math.min(100, Math.max(0, Math.round(parsed.overallScore || 0))),
+    summary: parsed.summary || '',
+    criteria: (parsed.criteria || []).map(sanitizeCriterion),
+    contentHash,
+    createdAt: Date.now(),
+    model: 'moonshotai/kimi-k2-0905',
+  };
+
+  // Save to database
+  try {
+    await Content.findOneAndUpdate(
+      { _id: contentId },
+      { $push: { [dbField]: { $each: [auditResult], $slice: -10 } } }
+    );
+  } catch (e) {
+    console.error(`[${dbField}] DB save error:`, e.message);
+  }
+
+  // Emit final complete event
+  if (!clientDisconnected) {
+    res.write(`data: ${JSON.stringify({ type: 'complete', audit: auditResult })}\n\n`);
+    res.end();
+  }
+}
+
 const runAudit = async (req, res) => {
   try {
     const workspace = await resolveWorkspace(req, res);
@@ -409,85 +607,30 @@ const runAudit = async (req, res) => {
 
     const contentHash = computeContentHash(content.blocks);
 
-    // Cache check: if latest audit has same hash and not forced, return cached
+    // Cache check: return regular JSON (no streaming needed)
     const latestAudit = content.audits?.[content.audits.length - 1];
     if (latestAudit && latestAudit.contentHash === contentHash && !req.body.force) {
       return res.json({ audit: latestAudit, cached: true });
     }
 
-    // Build prompt
     const markdown = blocksToText(content.blocks);
     const keyword = content.targetKeywords?.[0] || req.body.keyword || '';
     const blocksText = (content.blocks || []).map((b) => stripTags(b.text)).join(' ');
     const wordCount = blocksText.trim().split(/\s+/).filter(Boolean).length;
-    const auditPrompt = buildAuditPrompt(markdown, keyword, wordCount);
 
-    // Call OpenRouter (Kimi K2)
-    const apiKey = process.env.OPENROUTER_API_KEY;
-    if (!apiKey) return res.status(500).json({ error: 'OpenRouter API key not configured' });
-
-    const orRes = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: 'moonshotai/kimi-k2-0905',
-        temperature: 0,
-        messages: [{ role: 'user', content: auditPrompt }],
-      }),
-    });
-
-    if (!orRes.ok) {
-      const err = await orRes.json().catch(() => ({}));
-      const msg = err.error?.message || `OpenRouter returned ${orRes.status}`;
-      console.error('runAudit OpenRouter error:', msg);
-      return res.status(502).json({ error: 'AI audit failed: ' + msg });
-    }
-
-    const orData = await orRes.json();
-    const raw = orData.choices?.[0]?.message?.content || '';
-
-    // Parse JSON (strip markdown fences if present)
-    let parsed;
-    try {
-      const cleaned = raw.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
-      parsed = JSON.parse(cleaned);
-    } catch (e) {
-      console.error('runAudit JSON parse error:', e.message, 'Raw:', raw.slice(0, 500));
-      return res.status(502).json({ error: 'AI returned invalid response. Please try again.' });
-    }
-
-    // Validate and sanitize
-    if (!parsed.criteria || !Array.isArray(parsed.criteria) || parsed.criteria.length === 0) {
-      return res.status(502).json({ error: 'AI returned incomplete audit. Please try again.' });
-    }
-
-    const auditResult = {
-      overallScore: Math.min(100, Math.max(0, Math.round(parsed.overallScore || 0))),
-      summary: parsed.summary || '',
-      criteria: parsed.criteria.map((c) => ({
-        name: c.name || 'Unknown',
-        score: Math.min(10, Math.max(1, Math.round(c.score || 1))),
-        status: ['good', 'warning', 'fail'].includes(c.status) ? c.status : (c.score >= 7 ? 'good' : c.score >= 4 ? 'warning' : 'fail'),
-        feedback: c.feedback || 'No feedback provided.',
-      })),
+    await streamAudit(req, res, {
+      prompt: buildAuditPrompt(markdown, keyword, wordCount),
       contentHash,
-      createdAt: Date.now(),
-      model: 'moonshotai/kimi-k2-0905',
-    };
-
-    // Save to database (append, keep max 10)
-    await Content.findOneAndUpdate(
-      { _id: content._id },
-      { $push: { audits: { $each: [auditResult], $slice: -10 } } }
-    );
-
-    res.json({ audit: auditResult, cached: false });
+      contentId: content._id,
+      dbField: 'audits',
+      errorPrefix: 'AI audit failed',
+    });
   } catch (err) {
+    if (err.name === 'AbortError') return;
     console.error('runAudit error:', err.message);
-    res.status(500).json({ error: 'Audit failed: ' + err.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Audit failed: ' + err.message });
+    }
   }
 };
 
@@ -556,7 +699,7 @@ const runWritingQualityAudit = async (req, res) => {
 
     const contentHash = computeContentHash(content.blocks);
 
-    // Cache check
+    // Cache check: return regular JSON
     const latest = content.writingQualityAudits?.[content.writingQualityAudits.length - 1];
     if (latest && latest.contentHash === contentHash && !req.body.force) {
       return res.json({ audit: latest, cached: true });
@@ -565,70 +708,20 @@ const runWritingQualityAudit = async (req, res) => {
     const markdown = blocksToText(content.blocks);
     const blocksText = (content.blocks || []).map((b) => stripTags(b.text)).join(' ');
     const wordCount = blocksText.trim().split(/\s+/).filter(Boolean).length;
-    const prompt = buildWritingQualityPrompt(markdown, wordCount);
 
-    const apiKey = process.env.OPENROUTER_API_KEY;
-    if (!apiKey) return res.status(500).json({ error: 'OpenRouter API key not configured' });
-
-    const orRes = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: 'moonshotai/kimi-k2-0905',
-        temperature: 0,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    });
-
-    if (!orRes.ok) {
-      const err = await orRes.json().catch(() => ({}));
-      const msg = err.error?.message || `OpenRouter returned ${orRes.status}`;
-      console.error('runWritingQualityAudit OpenRouter error:', msg);
-      return res.status(502).json({ error: 'AI writing quality check failed: ' + msg });
-    }
-
-    const orData = await orRes.json();
-    const raw = orData.choices?.[0]?.message?.content || '';
-
-    let parsed;
-    try {
-      const cleaned = raw.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
-      parsed = JSON.parse(cleaned);
-    } catch (e) {
-      console.error('runWritingQualityAudit JSON parse error:', e.message, 'Raw:', raw.slice(0, 500));
-      return res.status(502).json({ error: 'AI returned invalid response. Please try again.' });
-    }
-
-    if (!parsed.criteria || !Array.isArray(parsed.criteria) || parsed.criteria.length === 0) {
-      return res.status(502).json({ error: 'AI returned incomplete result. Please try again.' });
-    }
-
-    const auditResult = {
-      overallScore: Math.min(100, Math.max(0, Math.round(parsed.overallScore || 0))),
-      summary: parsed.summary || '',
-      criteria: parsed.criteria.map((c) => ({
-        name: c.name || 'Unknown',
-        score: Math.min(10, Math.max(1, Math.round(c.score || 1))),
-        status: ['good', 'warning', 'fail'].includes(c.status) ? c.status : (c.score >= 7 ? 'good' : c.score >= 4 ? 'warning' : 'fail'),
-        feedback: c.feedback || 'No feedback provided.',
-      })),
+    await streamAudit(req, res, {
+      prompt: buildWritingQualityPrompt(markdown, wordCount),
       contentHash,
-      createdAt: Date.now(),
-      model: 'moonshotai/kimi-k2-0905',
-    };
-
-    await Content.findOneAndUpdate(
-      { _id: content._id },
-      { $push: { writingQualityAudits: { $each: [auditResult], $slice: -10 } } }
-    );
-
-    res.json({ audit: auditResult, cached: false });
+      contentId: content._id,
+      dbField: 'writingQualityAudits',
+      errorPrefix: 'AI writing quality check failed',
+    });
   } catch (err) {
+    if (err.name === 'AbortError') return;
     console.error('runWritingQualityAudit error:', err.message);
-    res.status(500).json({ error: 'Writing quality check failed: ' + err.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Writing quality check failed: ' + err.message });
+    }
   }
 };
 

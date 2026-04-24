@@ -24,6 +24,10 @@ router.post('/:workspaceNumber/content/:contentNumber/comments', contentControll
 router.put('/:workspaceNumber/content/:contentNumber/comments/:commentId', contentController.updateComment);
 router.delete('/:workspaceNumber/content/:contentNumber/comments/:commentId', contentController.deleteComment);
 
+// Content audit
+router.post('/:workspaceNumber/content/:contentNumber/audit', contentController.runAudit);
+router.post('/:workspaceNumber/content/:contentNumber/writing-quality', contentController.runWritingQualityAudit);
+
 // Analysis under content: /api/workspace/:workspaceNumber/content/:contentNumber/...
 router.post('/:workspaceNumber/content/:contentNumber/analyze', analysisController.triggerAnalysis);
 router.get('/:workspaceNumber/content/:contentNumber/benchmark', analysisController.getBenchmark);

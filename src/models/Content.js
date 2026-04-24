@@ -87,6 +87,28 @@ const commentSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const auditCriterionSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true },
+    score: { type: Number, required: true, min: 1, max: 10 },
+    status: { type: String, enum: ['good', 'warning', 'fail'], required: true },
+    feedback: { type: String, required: true },
+  },
+  { _id: false }
+);
+
+const auditResultSchema = new mongoose.Schema(
+  {
+    overallScore: { type: Number, required: true, min: 0, max: 100 },
+    summary: { type: String, required: true },
+    criteria: { type: [auditCriterionSchema], required: true },
+    contentHash: { type: String, required: true },
+    createdAt: { type: Number, required: true },
+    model: { type: String, default: 'moonshotai/kimi-k2-0905' },
+  },
+  { _id: false }
+);
+
 /* ───────────── main content schema ───────────── */
 
 const contentSchema = new mongoose.Schema(
@@ -160,6 +182,12 @@ const contentSchema = new mongoose.Schema(
 
     // Comments
     comments: { type: [commentSchema], default: [] },
+
+    // Content audit results
+    audits: { type: [auditResultSchema], default: [] },
+
+    // Writing quality audit results
+    writingQualityAudits: { type: [auditResultSchema], default: [] },
 
     // Engine analysis results (persisted from Go engine)
     analysisStatus: {

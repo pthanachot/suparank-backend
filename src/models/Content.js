@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');
 const Counter = require('./Counter');
 
-/* ───────────── sub-schemas (match frontend editor types) ───────────── */
+/* ───────────── sub-schemas (match frontend editor types)  ───────────── */
 
 const faqItemSchema = new mongoose.Schema(
   { question: String, answer: String },
@@ -254,7 +254,7 @@ const contentSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
-
+ 
 // Compound indexes
 contentSchema.index({ workspaceId: 1, contentNumber: 1 });
 contentSchema.index({ workspaceId: 1, status: 1 });

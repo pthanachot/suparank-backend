@@ -610,17 +610,25 @@ const DEFAULT_SUGGESTIONS = [
 ];
 
 const suggestPrompts = async (req, res) => {
+  console.log('[suggest-prompts] route hit, body:', JSON.stringify(req.body));
   try {
     const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    if (!workspace) {
+      console.log('[suggest-prompts] workspace not found');
+      return;
+    }
+    console.log('[suggest-prompts] workspace resolved:', workspace.workspaceNumber);
 
     const { domain } = req.body;
     if (!domain || typeof domain !== 'string' || !domain.trim()) {
+      console.log('[suggest-prompts] missing domain');
       return res.status(400).json({ error: 'Domain is required' });
     }
 
-    const apiKey = process.env.CHATGPT_SEARCH_KEY;
+    const apiKey = process.env.CHATGPT_API_KEY;
+    console.log('[suggest-prompts] CHATGPT_API_KEY present:', !!apiKey);
     if (!apiKey) {
+      console.log('[suggest-prompts] no API key, returning default suggestions');
       return res.json({ suggestions: DEFAULT_SUGGESTIONS });
     }
 

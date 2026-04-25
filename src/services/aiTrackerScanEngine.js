@@ -25,7 +25,7 @@ const PLATFORMS = [
  * @returns {Promise<{ answer: string, citations: string[] }>}
  */
 async function searchChatGPT(query) {
-  const apiKey = process.env.CHATGPT_SEARCH_KEY;
+  const apiKey = process.env.CHATGPT_API_KEY;
   if (!apiKey) throw new Error('CHATGPT_SEARCH_KEY not configured');
 
   const controller = new AbortController();
@@ -411,7 +411,7 @@ function detectCompetitorInAnswer(answer, citations, competitorName) {
  */
 function getAvailablePlatforms() {
   const platformKeyMap = {
-    chatgpt: 'CHATGPT_SEARCH_KEY',
+    chatgpt: 'CHATGPT_API_KEY',
     gemini: 'GEMINI_API_KEY',
     claude: 'ANTHROPIC_API_KEY',
     perplexity: 'PERPLEXITY_API_KEY',

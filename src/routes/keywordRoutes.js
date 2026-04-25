@@ -15,4 +15,7 @@ router.get('/:workspaceNumber/keywords/detail', keywordController.getKeywordDeta
 // List previous searches for this workspace
 router.get('/:workspaceNumber/keywords/history', keywordController.getSearchHistory);
 
+// Get supported countries list
+router.get('/:workspaceNumber/keywords/countries', keywordController.getCountries);
+
 module.exports = router;

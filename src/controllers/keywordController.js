@@ -1,7 +1,7 @@
 const Workspace = require('../models/Workspace');
 const KeywordSearch = require('../models/KeywordSearch');
 const KeywordDetail = require('../models/KeywordDetail');
-const { resolveCountry, fetchRelatedKeywords, fetchSerpResults } = require('../services/keywordService');
+const { resolveCountry, fetchRelatedKeywords, fetchSerpResults, SUPPORTED_COUNTRIES } = require('../services/keywordService');
 
 // ─── Workspace Resolution (same pattern as aiTrackerController.js) ──────────
 
@@ -125,7 +125,7 @@ async function getKeywordDetail(req, res) {
     }
 
     // Fetch from Serper
-    const { organic, peopleAlsoAsk } = await fetchSerpResults(keyword, countryConfig.gl);
+    const { organic, peopleAlsoAsk } = await fetchSerpResults(keyword, countryConfig.gl, countryConfig.languageCode);
 
     // Upsert into cache (global)
     await KeywordDetail.findOneAndUpdate(
@@ -171,8 +171,17 @@ async function getSearchHistory(req, res) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// GET /:workspaceNumber/keywords/countries
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function getCountries(req, res) {
+  return res.json({ countries: SUPPORTED_COUNTRIES });
+}
+
 module.exports = {
   searchKeywords,
   getKeywordDetail,
   getSearchHistory,
+  getCountries,
 };

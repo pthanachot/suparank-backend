@@ -9,15 +9,59 @@
 // ─── Country Mapping ─────────────────────────────────────────────────────────
 
 const COUNTRY_MAP = {
-  'United States':  { locationName: 'United States',  gl: 'us', languageCode: 'en' },
-  'United Kingdom': { locationName: 'United Kingdom', gl: 'uk', languageCode: 'en' },
-  'Canada':         { locationName: 'Canada',         gl: 'ca', languageCode: 'en' },
-  'Australia':      { locationName: 'Australia',      gl: 'au', languageCode: 'en' },
-  'Germany':        { locationName: 'Germany',        gl: 'de', languageCode: 'de' },
-  'France':         { locationName: 'France',         gl: 'fr', languageCode: 'fr' },
-  'Thailand':       { locationName: 'Thailand',       gl: 'th', languageCode: 'th' },
-  'Japan':          { locationName: 'Japan',          gl: 'jp', languageCode: 'ja' },
-  'India':          { locationName: 'India',          gl: 'in', languageCode: 'en' },
+  'United States':       { locationName: 'United States',       gl: 'us', languageCode: 'en' },
+  'United Kingdom':      { locationName: 'United Kingdom',      gl: 'uk', languageCode: 'en' },
+  'Canada':              { locationName: 'Canada',              gl: 'ca', languageCode: 'en' },
+  'Australia':           { locationName: 'Australia',           gl: 'au', languageCode: 'en' },
+  'Germany':             { locationName: 'Germany',             gl: 'de', languageCode: 'de' },
+  'France':              { locationName: 'France',              gl: 'fr', languageCode: 'fr' },
+  'Spain':               { locationName: 'Spain',               gl: 'es', languageCode: 'es' },
+  'Italy':               { locationName: 'Italy',               gl: 'it', languageCode: 'it' },
+  'Netherlands':         { locationName: 'Netherlands',         gl: 'nl', languageCode: 'nl' },
+  'Belgium':             { locationName: 'Belgium',             gl: 'be', languageCode: 'nl' },
+  'Switzerland':         { locationName: 'Switzerland',         gl: 'ch', languageCode: 'de' },
+  'Austria':             { locationName: 'Austria',             gl: 'at', languageCode: 'de' },
+  'Sweden':              { locationName: 'Sweden',              gl: 'se', languageCode: 'sv' },
+  'Norway':              { locationName: 'Norway',              gl: 'no', languageCode: 'no' },
+  'Denmark':             { locationName: 'Denmark',             gl: 'dk', languageCode: 'da' },
+  'Finland':             { locationName: 'Finland',             gl: 'fi', languageCode: 'fi' },
+  'Poland':              { locationName: 'Poland',              gl: 'pl', languageCode: 'pl' },
+  'Czech Republic':      { locationName: 'Czechia',             gl: 'cz', languageCode: 'cs' },
+  'Romania':             { locationName: 'Romania',             gl: 'ro', languageCode: 'ro' },
+  'Hungary':             { locationName: 'Hungary',             gl: 'hu', languageCode: 'hu' },
+  'Portugal':            { locationName: 'Portugal',            gl: 'pt', languageCode: 'pt' },
+  'Greece':              { locationName: 'Greece',              gl: 'gr', languageCode: 'el' },
+  'Ireland':             { locationName: 'Ireland',             gl: 'ie', languageCode: 'en' },
+  'Turkey':              { locationName: 'Turkey',              gl: 'tr', languageCode: 'tr' },
+  'Israel':              { locationName: 'Israel',              gl: 'il', languageCode: 'he' },
+  'United Arab Emirates':{ locationName: 'United Arab Emirates',gl: 'ae', languageCode: 'ar' },
+  'Saudi Arabia':        { locationName: 'Saudi Arabia',        gl: 'sa', languageCode: 'ar' },
+  'Egypt':               { locationName: 'Egypt',               gl: 'eg', languageCode: 'ar' },
+  'South Africa':        { locationName: 'South Africa',        gl: 'za', languageCode: 'en' },
+  'Nigeria':             { locationName: 'Nigeria',             gl: 'ng', languageCode: 'en' },
+  'Kenya':               { locationName: 'Kenya',               gl: 'ke', languageCode: 'en' },
+  'India':               { locationName: 'India',               gl: 'in', languageCode: 'en' },
+  'Japan':               { locationName: 'Japan',               gl: 'jp', languageCode: 'ja' },
+  'South Korea':         { locationName: 'South Korea',         gl: 'kr', languageCode: 'ko' },
+  'China':               { locationName: 'China',               gl: 'cn', languageCode: 'zh' },
+  'Taiwan':              { locationName: 'Taiwan',              gl: 'tw', languageCode: 'zh' },
+  'Hong Kong':           { locationName: 'Hong Kong',           gl: 'hk', languageCode: 'zh' },
+  'Singapore':           { locationName: 'Singapore',           gl: 'sg', languageCode: 'en' },
+  'Malaysia':            { locationName: 'Malaysia',            gl: 'my', languageCode: 'ms' },
+  'Indonesia':           { locationName: 'Indonesia',           gl: 'id', languageCode: 'id' },
+  'Thailand':            { locationName: 'Thailand',            gl: 'th', languageCode: 'th' },
+  'Vietnam':             { locationName: 'Vietnam',             gl: 'vn', languageCode: 'vi' },
+  'Philippines':         { locationName: 'Philippines',         gl: 'ph', languageCode: 'en' },
+  'Pakistan':            { locationName: 'Pakistan',            gl: 'pk', languageCode: 'en' },
+  'Bangladesh':          { locationName: 'Bangladesh',          gl: 'bd', languageCode: 'bn' },
+  'Brazil':              { locationName: 'Brazil',              gl: 'br', languageCode: 'pt' },
+  'Mexico':              { locationName: 'Mexico',              gl: 'mx', languageCode: 'es' },
+  'Argentina':           { locationName: 'Argentina',           gl: 'ar', languageCode: 'es' },
+  'Colombia':            { locationName: 'Colombia',            gl: 'co', languageCode: 'es' },
+  'Chile':               { locationName: 'Chile',               gl: 'cl', languageCode: 'es' },
+  'Peru':                { locationName: 'Peru',                gl: 'pe', languageCode: 'es' },
+  'New Zealand':         { locationName: 'New Zealand',         gl: 'nz', languageCode: 'en' },
+  'Ukraine':             { locationName: 'Ukraine',             gl: 'ua', languageCode: 'uk' },
 };
 
 function resolveCountry(displayName) {
@@ -182,9 +226,10 @@ function mapDataForSEOKeyword(kd) {
  *
  * @param {string} keyword
  * @param {string} gl - country code, e.g. "us"
+ * @param {string} hl - language code, e.g. "en"
  * @returns {Promise<{ organic: Object[], peopleAlsoAsk: Object[] }>}
  */
-async function fetchSerpResults(keyword, gl = 'us') {
+async function fetchSerpResults(keyword, gl = 'us', hl = 'en') {
   const apiKey = process.env.SERPER_API_KEY;
   if (!apiKey) throw new Error('Serper API key not configured');
 
@@ -201,6 +246,7 @@ async function fetchSerpResults(keyword, gl = 'us') {
       body: JSON.stringify({
         q: keyword,
         gl,
+        hl,
         num: 10,
       }),
       signal: controller.signal,
@@ -246,8 +292,11 @@ async function fetchSerpResults(keyword, gl = 'us') {
   }
 }
 
+const SUPPORTED_COUNTRIES = Object.keys(COUNTRY_MAP);
+
 module.exports = {
   resolveCountry,
   fetchRelatedKeywords,
   fetchSerpResults,
+  SUPPORTED_COUNTRIES,
 };

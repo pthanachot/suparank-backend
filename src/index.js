@@ -60,13 +60,40 @@ const userRoutes = require('./routes/userRoutes');
 const billingRoutes = require('./routes/billingRoutes');
 const workspaceRoutes = require('./routes/workspaceRoutes');
 const workspaceCrudRoutes = require('./routes/workspaceCrudRoutes');
+const aiTrackerRoutes = require('./routes/aiTrackerRoutes');
 const imageRoutes = require('./routes/imageRoutes');
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/billing', billingRoutes);
 app.use('/api/b2-image', imageRoutes);
+app.use('/api/workspace', aiTrackerRoutes);
 app.use('/api/workspace', workspaceRoutes);
 app.use('/api/workspaces', workspaceCrudRoutes);
+
+// Scheduled scan: check daily at 3:00 AM for trackers due for weekly scan
+const cron = require('node-cron');
+const AiTracker = require('./models/AiTracker');
+const { executeScan } = require('./controllers/aiTrackerController');
+
+cron.schedule('0 3 * * *', async () => {
+  try {
+    const dueTrackers = await AiTracker.find({
+      scanStatus: 'ready',
+      nextScanAt: { $lte: new Date() },
+    });
+
+    if (dueTrackers.length === 0) return;
+    console.log(`[cron] Found ${dueTrackers.length} tracker(s) due for scan`);
+
+    for (const tracker of dueTrackers) {
+      executeScan(tracker._id).catch((err) => {
+        console.error(`[cron] scan failed for tracker ${tracker._id}:`, err.message);
+      });
+    }
+  } catch (err) {
+    console.error('[cron] scheduled scan check failed:', err.message);
+  }
+});
 
 // Health check
 app.get('/health', (req, res) => {

@@ -6,11 +6,15 @@ const { authenticateToken } = require('../middleware/auth');
 // All AI tracker routes require authentication
 router.use(authenticateToken);
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Legacy single-monitor routes (backward compatible)
+// ═══════════════════════════════════════════════════════════════════════════
+
 // Tracker dashboard
 router.get('/:workspaceNumber/ai-tracker', aiTrackerController.getTracker);
 router.put('/:workspaceNumber/ai-tracker', aiTrackerController.updateTracker);
 
-// Prompt suggestions (LLM-generated)
+// Prompt suggestions (LLM-generated, domain-scoped — shared by all monitors)
 router.post('/:workspaceNumber/ai-tracker/suggest-prompts', aiTrackerController.suggestPrompts);
 
 // Setup (onboarding)
@@ -29,5 +33,32 @@ router.delete('/:workspaceNumber/ai-tracker/prompts/:promptId', aiTrackerControl
 // Competitor CRUD
 router.post('/:workspaceNumber/ai-tracker/competitors', aiTrackerController.addCompetitor);
 router.delete('/:workspaceNumber/ai-tracker/competitors/:competitorId', aiTrackerController.removeCompetitor);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Multi-monitor routes
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Monitor list & create
+router.get('/:workspaceNumber/ai-tracker/monitors', aiTrackerController.listMonitors);
+router.post('/:workspaceNumber/ai-tracker/monitors', aiTrackerController.createMonitor);
+
+// Single monitor CRUD
+router.get('/:workspaceNumber/ai-tracker/monitors/:monitorId', aiTrackerController.getMonitor);
+router.put('/:workspaceNumber/ai-tracker/monitors/:monitorId', aiTrackerController.updateMonitor);
+router.delete('/:workspaceNumber/ai-tracker/monitors/:monitorId', aiTrackerController.deleteMonitor);
+
+// Monitor-scoped scan
+router.get('/:workspaceNumber/ai-tracker/monitors/:monitorId/scan', aiTrackerController.getMonitorScanStatus);
+router.post('/:workspaceNumber/ai-tracker/monitors/:monitorId/scan', aiTrackerController.triggerMonitorScan);
+
+// Monitor-scoped prompts
+router.post('/:workspaceNumber/ai-tracker/monitors/:monitorId/prompts', aiTrackerController.addMonitorPrompt);
+router.post('/:workspaceNumber/ai-tracker/monitors/:monitorId/prompts/bulk-delete', aiTrackerController.bulkDeleteMonitorPrompts);
+router.put('/:workspaceNumber/ai-tracker/monitors/:monitorId/prompts/:promptId', aiTrackerController.updateMonitorPrompt);
+router.delete('/:workspaceNumber/ai-tracker/monitors/:monitorId/prompts/:promptId', aiTrackerController.removeMonitorPrompt);
+
+// Monitor-scoped competitors
+router.post('/:workspaceNumber/ai-tracker/monitors/:monitorId/competitors', aiTrackerController.addMonitorCompetitor);
+router.delete('/:workspaceNumber/ai-tracker/monitors/:monitorId/competitors/:competitorId', aiTrackerController.removeMonitorCompetitor);
 
 module.exports = router;

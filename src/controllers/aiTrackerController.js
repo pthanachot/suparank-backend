@@ -44,12 +44,28 @@ async function resolveWorkspace(req, res) {
   return workspace;
 }
 
-// ─── Helper: resolve tracker from workspace ───────────────────────────────
+// ─── Helper: resolve tracker from workspace (legacy single-monitor) ──────
 
 async function resolveTracker(workspace, res) {
   const tracker = await AiTracker.findOne({ workspaceId: workspace._id });
   if (!tracker) {
     res.status(404).json({ error: 'AI Tracker not found' });
+    return null;
+  }
+  return tracker;
+}
+
+// ─── Helper: resolve monitor by ID (multi-monitor) ──────────────────────
+
+async function resolveMonitor(req, workspace, res) {
+  const { monitorId } = req.params;
+  if (!monitorId || !monitorId.match(/^[0-9a-fA-F]{24}$/)) {
+    res.status(400).json({ error: 'Invalid monitor ID' });
+    return null;
+  }
+  const tracker = await AiTracker.findOne({ _id: monitorId, workspaceId: workspace._id });
+  if (!tracker) {
+    res.status(404).json({ error: 'Monitor not found' });
     return null;
   }
   return tracker;
@@ -512,7 +528,46 @@ async function executeScan(trackerId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ENDPOINT HANDLERS
+// SHARED: Build full dashboard response for a tracker
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function buildDashboardResponse(tracker) {
+  const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id });
+  const competitors = await AiTrackerCompetitor.find({ trackerId: tracker._id });
+
+  const recentScans = await AiTrackerScan.find({
+    trackerId: tracker._id,
+    status: 'ready',
+  })
+    .sort({ completedAt: -1 })
+    .limit(12)
+    .lean();
+
+  const latestScan = recentScans[0] || null;
+  const previousScan = recentScans[1] || null;
+
+  const metrics = computeMetrics(latestScan, prompts.length, competitors);
+  const trackedPrompts = formatTrackedPrompts(prompts, latestScan, previousScan, recentScans);
+  const formattedCompetitors = formatCompetitors(competitors, latestScan, previousScan);
+  const changes = computeChanges(latestScan, previousScan);
+  const trendData = computeTrendData(recentScans);
+  const actionItems = generateActionItems(latestScan);
+  const platformStats = computePlatformStats(latestScan);
+
+  return {
+    tracker: tracker.toTrackerState(),
+    metrics,
+    trackedPrompts,
+    competitors: formattedCompetitors,
+    changes,
+    trendData,
+    actionItems,
+    platformStats,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ENDPOINT HANDLERS (legacy single-monitor)
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ─── GET /:workspaceNumber/ai-tracker ─────────────────────────────────────
@@ -527,41 +582,7 @@ const getTracker = async (req, res) => {
       return res.status(404).json({ error: 'AI Tracker not set up' });
     }
 
-    // Fetch prompts and competitors
-    const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id });
-    const competitors = await AiTrackerCompetitor.find({ trackerId: tracker._id });
-
-    // Fetch latest 2 scans for change detection, and up to 12 for trends
-    const recentScans = await AiTrackerScan.find({
-      trackerId: tracker._id,
-      status: 'ready',
-    })
-      .sort({ completedAt: -1 })
-      .limit(12)
-      .lean();
-
-    const latestScan = recentScans[0] || null;
-    const previousScan = recentScans[1] || null;
-
-    // Compute all derived data
-    const metrics = computeMetrics(latestScan, prompts.length, competitors);
-    const trackedPrompts = formatTrackedPrompts(prompts, latestScan, previousScan, recentScans);
-    const formattedCompetitors = formatCompetitors(competitors, latestScan, previousScan);
-    const changes = computeChanges(latestScan, previousScan);
-    const trendData = computeTrendData(recentScans);
-    const actionItems = generateActionItems(latestScan);
-    const platformStats = computePlatformStats(latestScan);
-
-    res.json({
-      tracker: tracker.toTrackerState(),
-      metrics,
-      trackedPrompts,
-      competitors: formattedCompetitors,
-      changes,
-      trendData,
-      actionItems,
-      platformStats,
-    });
+    res.json(await buildDashboardResponse(tracker));
   } catch (err) {
     console.error('getTracker error:', err.message);
     res.status(500).json({ error: 'Failed to fetch AI tracker data' });
@@ -708,7 +729,7 @@ const setup = async (req, res) => {
     const workspace = await resolveWorkspace(req, res);
     if (!workspace) return;
 
-    const { domain, prompts, competitors } = req.body;
+    const { domain, name, prompts, competitors } = req.body;
 
     if (!domain || typeof domain !== 'string' || !domain.trim()) {
       return res.status(400).json({ error: 'Domain is required' });
@@ -717,18 +738,29 @@ const setup = async (req, res) => {
       return res.status(400).json({ error: 'At least one prompt is required' });
     }
 
-    // Check if tracker already exists
-    const existing = await AiTracker.findOne({ workspaceId: workspace._id });
+    const monitorName = (name && typeof name === 'string' && name.trim()) ? name.trim() : domain.trim();
+
+    // Check if monitor with same name already exists
+    const existing = await AiTracker.findOne({ workspaceId: workspace._id, name: monitorName });
     if (existing) {
-      return res.status(409).json({ error: 'AI Tracker already set up for this workspace' });
+      return res.status(409).json({ error: 'A monitor with this name already exists' });
     }
 
     // Create tracker
-    const tracker = await AiTracker.create({
-      workspaceId: workspace._id,
-      domain: domain.trim(),
-      scanStatus: 'pending',
-    });
+    let tracker;
+    try {
+      tracker = await AiTracker.create({
+        workspaceId: workspace._id,
+        name: monitorName,
+        domain: domain.trim(),
+        scanStatus: 'pending',
+      });
+    } catch (createErr) {
+      if (createErr.code === 11000) {
+        return res.status(409).json({ error: 'A monitor with this name already exists' });
+      }
+      throw createErr;
+    }
 
     // Create prompts
     const promptDocs = prompts
@@ -1028,7 +1060,403 @@ const removeCompetitor = async (req, res) => {
   }
 };
 
+// ═══════════════════════════════════════════════════════════════════════════
+// MULTI-MONITOR ENDPOINT HANDLERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── GET /:wn/ai-tracker/monitors ────────────────────────────────────────
+
+const listMonitors = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+
+    const trackers = await AiTracker.find({ workspaceId: workspace._id })
+      .sort({ createdAt: 1 })
+      .lean();
+
+    const monitors = await Promise.all(trackers.map(async (t) => {
+      const promptCount = await AiTrackerPrompt.countDocuments({ trackerId: t._id });
+      return {
+        id: t._id.toString(),
+        name: t.name || t.domain,
+        domain: t.domain,
+        scanStatus: t.scanStatus,
+        lastScanAt: t.lastScanAt ? t.lastScanAt.toISOString() : null,
+        createdAt: t.createdAt.toISOString(),
+        promptCount,
+      };
+    }));
+
+    res.json({ monitors });
+  } catch (err) {
+    console.error('listMonitors error:', err.message);
+    res.status(500).json({ error: 'Failed to list monitors' });
+  }
+};
+
+// ─── POST /:wn/ai-tracker/monitors ──────────────────────────────────────
+
+const createMonitor = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+
+    const { domain, name, prompts, competitors } = req.body;
+
+    if (!domain || typeof domain !== 'string' || !domain.trim()) {
+      return res.status(400).json({ error: 'Domain is required' });
+    }
+    if (!Array.isArray(prompts) || prompts.length === 0) {
+      return res.status(400).json({ error: 'At least one prompt is required' });
+    }
+
+    const monitorName = (name && typeof name === 'string' && name.trim()) ? name.trim() : domain.trim();
+
+    // Check duplicate name
+    const existing = await AiTracker.findOne({ workspaceId: workspace._id, name: monitorName });
+    if (existing) {
+      return res.status(409).json({ error: 'A monitor with this name already exists' });
+    }
+
+    // Create tracker
+    let tracker;
+    try {
+      tracker = await AiTracker.create({
+        workspaceId: workspace._id,
+        name: monitorName,
+        domain: domain.trim(),
+        scanStatus: 'pending',
+      });
+    } catch (createErr) {
+      if (createErr.code === 11000) {
+        return res.status(409).json({ error: 'A monitor with this name already exists' });
+      }
+      throw createErr;
+    }
+
+    // Create prompts
+    const promptDocs = prompts
+      .filter((p) => typeof p === 'string' && p.trim())
+      .map((p) => ({ trackerId: tracker._id, prompt: p.trim() }));
+    if (promptDocs.length > 0) {
+      await AiTrackerPrompt.insertMany(promptDocs, { ordered: false }).catch((err) => {
+        if (err.code !== 11000) throw err;
+      });
+    }
+
+    // Create own-brand competitor
+    const brandName = domain.trim().replace(/^(https?:\/\/)?(www\.)?/, '').split('.')[0];
+    const capitalizedBrand = brandName.charAt(0).toUpperCase() + brandName.slice(1);
+    await AiTrackerCompetitor.create({
+      trackerId: tracker._id,
+      name: capitalizedBrand,
+      isOwn: true,
+    });
+
+    // Create additional competitors
+    if (Array.isArray(competitors)) {
+      const compDocs = competitors
+        .filter((c) => typeof c === 'string' && c.trim())
+        .map((c) => ({ trackerId: tracker._id, name: c.trim(), isOwn: false }));
+      if (compDocs.length > 0) {
+        await AiTrackerCompetitor.insertMany(compDocs);
+      }
+    }
+
+    // Fire-and-forget: start first scan
+    executeScan(tracker._id).catch((err) => {
+      console.error('[ai-tracker-monitor] scan failed:', err.message);
+    });
+
+    res.status(201).json({
+      monitorId: tracker._id.toString(),
+      name: monitorName,
+      scanStatus: 'pending',
+    });
+  } catch (err) {
+    console.error('createMonitor error:', err.message);
+    res.status(500).json({ error: 'Failed to create monitor' });
+  }
+};
+
+// ─── DELETE /:wn/ai-tracker/monitors/:monitorId ─────────────────────────
+
+const deleteMonitor = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+
+    const tracker = await resolveMonitor(req, workspace, res);
+    if (!tracker) return;
+
+    // Cascade delete all associated data
+    await AiTrackerScan.deleteMany({ trackerId: tracker._id });
+    await AiTrackerPrompt.deleteMany({ trackerId: tracker._id });
+    await AiTrackerCompetitor.deleteMany({ trackerId: tracker._id });
+    await AiTracker.findByIdAndDelete(tracker._id);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('deleteMonitor error:', err.message);
+    res.status(500).json({ error: 'Failed to delete monitor' });
+  }
+};
+
+// ─── GET /:wn/ai-tracker/monitors/:monitorId ────────────────────────────
+
+const getMonitor = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+
+    const tracker = await resolveMonitor(req, workspace, res);
+    if (!tracker) return;
+
+    res.json(await buildDashboardResponse(tracker));
+  } catch (err) {
+    console.error('getMonitor error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch monitor data' });
+  }
+};
+
+// ─── PUT /:wn/ai-tracker/monitors/:monitorId ────────────────────────────
+
+const updateMonitor = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+
+    const tracker = await resolveMonitor(req, workspace, res);
+    if (!tracker) return;
+
+    const { defaultModels, name } = req.body;
+
+    const update = {};
+    if (Array.isArray(defaultModels)) update.defaultModels = defaultModels;
+    if (name && typeof name === 'string' && name.trim()) update.name = name.trim();
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    let doc;
+    try {
+      doc = await AiTracker.findByIdAndUpdate(tracker._id, { $set: update }, { new: true });
+    } catch (updateErr) {
+      if (updateErr.code === 11000) {
+        return res.status(409).json({ error: 'A monitor with this name already exists' });
+      }
+      throw updateErr;
+    }
+    res.json({ tracker: doc.toTrackerState() });
+  } catch (err) {
+    console.error('updateMonitor error:', err.message);
+    res.status(500).json({ error: 'Failed to update monitor' });
+  }
+};
+
+// ─── Monitor-scoped scan, prompt, competitor handlers ────────────────────
+
+const getMonitorScanStatus = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+    const tracker = await resolveMonitor(req, workspace, res);
+    if (!tracker) return;
+
+    res.json({
+      status: tracker.scanStatus,
+      progress: tracker.scanProgress,
+      platformStatuses: tracker.platformStatuses || [],
+      ...(tracker.scanError ? { error: tracker.scanError } : {}),
+    });
+  } catch (err) {
+    console.error('getMonitorScanStatus error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch scan status' });
+  }
+};
+
+const triggerMonitorScan = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+    const tracker = await resolveMonitor(req, workspace, res);
+    if (!tracker) return;
+
+    if (tracker.scanStatus === 'pending' || tracker.scanStatus === 'scanning') {
+      return res.status(409).json({ error: 'A scan is already in progress' });
+    }
+    if (tracker.lastScanAt) {
+      const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
+      if (tracker.lastScanAt > hourAgo) {
+        return res.status(429).json({ error: 'Please wait at least 1 hour between scans' });
+      }
+    }
+
+    await AiTracker.findByIdAndUpdate(tracker._id, {
+      $set: { scanStatus: 'pending', scanProgress: 0, scanError: null },
+    });
+    executeScan(tracker._id).catch((err) => {
+      console.error('[ai-tracker-scan] manual scan failed:', err.message);
+    });
+
+    res.json({ scanStatus: 'pending' });
+  } catch (err) {
+    console.error('triggerMonitorScan error:', err.message);
+    res.status(500).json({ error: 'Failed to trigger scan' });
+  }
+};
+
+const addMonitorPrompt = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+    const tracker = await resolveMonitor(req, workspace, res);
+    if (!tracker) return;
+
+    const { prompt, models, frequency } = req.body;
+    if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
+      return res.status(400).json({ error: 'Prompt is required' });
+    }
+
+    const existing = await AiTrackerPrompt.findOne({ trackerId: tracker._id, prompt: prompt.trim() });
+    if (existing) {
+      return res.status(409).json({ error: 'This prompt is already being tracked' });
+    }
+
+    const doc = await AiTrackerPrompt.create({
+      trackerId: tracker._id,
+      prompt: prompt.trim(),
+      ...(Array.isArray(models) && models.length > 0 ? { models } : {}),
+      ...(frequency ? { frequency } : {}),
+    });
+
+    res.status(201).json({ id: doc._id.toString(), prompt: doc.prompt });
+  } catch (err) {
+    console.error('addMonitorPrompt error:', err.message);
+    res.status(500).json({ error: 'Failed to add prompt' });
+  }
+};
+
+const updateMonitorPrompt = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+    const tracker = await resolveMonitor(req, workspace, res);
+    if (!tracker) return;
+
+    const { promptId } = req.params;
+    const { models, frequency, active } = req.body;
+
+    const update = {};
+    if (Array.isArray(models)) update.models = models;
+    if (frequency !== undefined) update.frequency = frequency;
+    if (active !== undefined) update.active = active;
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    const doc = await AiTrackerPrompt.findOneAndUpdate(
+      { _id: promptId, trackerId: tracker._id },
+      { $set: update },
+      { new: true }
+    );
+
+    if (!doc) {
+      return res.status(404).json({ error: 'Prompt not found' });
+    }
+
+    res.json({ id: doc._id.toString(), prompt: doc.prompt, models: doc.models, frequency: doc.frequency, active: doc.active });
+  } catch (err) {
+    console.error('updateMonitorPrompt error:', err.message);
+    res.status(500).json({ error: 'Failed to update prompt' });
+  }
+};
+
+const removeMonitorPrompt = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+    const tracker = await resolveMonitor(req, workspace, res);
+    if (!tracker) return;
+
+    const { promptId } = req.params;
+    const deleted = await AiTrackerPrompt.findOneAndDelete({ _id: promptId, trackerId: tracker._id });
+    if (!deleted) {
+      return res.status(404).json({ error: 'Prompt not found' });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('removeMonitorPrompt error:', err.message);
+    res.status(500).json({ error: 'Failed to remove prompt' });
+  }
+};
+
+const bulkDeleteMonitorPrompts = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+    const tracker = await resolveMonitor(req, workspace, res);
+    if (!tracker) return;
+
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: 'ids array is required' });
+    }
+
+    const result = await AiTrackerPrompt.deleteMany({ _id: { $in: ids }, trackerId: tracker._id });
+    res.json({ deleted: result.deletedCount });
+  } catch (err) {
+    console.error('bulkDeleteMonitorPrompts error:', err.message);
+    res.status(500).json({ error: 'Failed to delete prompts' });
+  }
+};
+
+const addMonitorCompetitor = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+    const tracker = await resolveMonitor(req, workspace, res);
+    if (!tracker) return;
+
+    const { name } = req.body;
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ error: 'Competitor name is required' });
+    }
+
+    const doc = await AiTrackerCompetitor.create({ trackerId: tracker._id, name: name.trim(), isOwn: false });
+    res.status(201).json({ id: doc._id.toString(), name: doc.name });
+  } catch (err) {
+    console.error('addMonitorCompetitor error:', err.message);
+    res.status(500).json({ error: 'Failed to add competitor' });
+  }
+};
+
+const removeMonitorCompetitor = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+    const tracker = await resolveMonitor(req, workspace, res);
+    if (!tracker) return;
+
+    const { competitorId } = req.params;
+    const deleted = await AiTrackerCompetitor.findOneAndDelete({ _id: competitorId, trackerId: tracker._id });
+    if (!deleted) {
+      return res.status(404).json({ error: 'Competitor not found' });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('removeMonitorCompetitor error:', err.message);
+    res.status(500).json({ error: 'Failed to remove competitor' });
+  }
+};
+
 module.exports = {
+  // Legacy single-monitor
   getTracker,
   updateTracker,
   suggestPrompts,
@@ -1042,4 +1470,18 @@ module.exports = {
   addCompetitor,
   removeCompetitor,
   executeScan,
+  // Multi-monitor
+  listMonitors,
+  createMonitor,
+  deleteMonitor,
+  getMonitor,
+  updateMonitor,
+  getMonitorScanStatus,
+  triggerMonitorScan,
+  addMonitorPrompt,
+  updateMonitorPrompt,
+  removeMonitorPrompt,
+  bulkDeleteMonitorPrompts,
+  addMonitorCompetitor,
+  removeMonitorCompetitor,
 };

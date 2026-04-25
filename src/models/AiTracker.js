@@ -11,6 +11,7 @@ const aiTrackerSchema = new mongoose.Schema({
     ref: 'Workspace',
     required: true,
   },
+  name: { type: String, trim: true, default: null },
   domain: { type: String, required: true, trim: true },
   defaultModels: { type: [String], default: ['chatgpt', 'gemini', 'claude', 'perplexity'] },
   scanCadence: { type: String, default: 'weekly' },
@@ -27,12 +28,21 @@ const aiTrackerSchema = new mongoose.Schema({
   currentScanId: { type: mongoose.Schema.Types.ObjectId, ref: 'AiTrackerScan', default: null },
 }, { timestamps: true });
 
-aiTrackerSchema.index({ workspaceId: 1 }, { unique: true });
+// Default name to domain if not set
+aiTrackerSchema.pre('save', function (next) {
+  if (!this.name) this.name = this.domain;
+  next();
+});
+
+// Multi-monitor: allow multiple trackers per workspace, unique by name
+aiTrackerSchema.index({ workspaceId: 1 });
+aiTrackerSchema.index({ workspaceId: 1, name: 1 }, { unique: true });
 aiTrackerSchema.index({ nextScanAt: 1, scanStatus: 1 });
 
 aiTrackerSchema.methods.toTrackerState = function () {
   return {
     id: this._id.toString(),
+    name: this.name || this.domain,
     domain: this.domain,
     createdAt: this.createdAt.toISOString(),
     scanCadence: this.scanCadence,

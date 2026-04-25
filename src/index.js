@@ -61,12 +61,14 @@ const billingRoutes = require('./routes/billingRoutes');
 const workspaceRoutes = require('./routes/workspaceRoutes');
 const workspaceCrudRoutes = require('./routes/workspaceCrudRoutes');
 const aiTrackerRoutes = require('./routes/aiTrackerRoutes');
+const keywordRoutes = require('./routes/keywordRoutes');
 const imageRoutes = require('./routes/imageRoutes');
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/billing', billingRoutes);
 app.use('/api/b2-image', imageRoutes);
 app.use('/api/workspace', aiTrackerRoutes);
+app.use('/api/workspace', keywordRoutes);
 app.use('/api/workspace', workspaceRoutes);
 app.use('/api/workspaces', workspaceCrudRoutes);
 

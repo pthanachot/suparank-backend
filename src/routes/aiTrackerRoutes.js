@@ -10,6 +10,9 @@ router.use(authenticateToken);
 router.get('/:workspaceNumber/ai-tracker', aiTrackerController.getTracker);
 router.put('/:workspaceNumber/ai-tracker', aiTrackerController.updateTracker);
 
+// Prompt suggestions (LLM-generated)
+router.post('/:workspaceNumber/ai-tracker/suggest-prompts', aiTrackerController.suggestPrompts);
+
 // Setup (onboarding)
 router.post('/:workspaceNumber/ai-tracker/setup', aiTrackerController.setup);
 

@@ -134,7 +134,7 @@ function generatePromptSuggestions(scanResult) {
   return suggestions.slice(0, 6);
 }
 
-function formatTrackedPrompts(prompts, latestScan, previousScan) {
+function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
   if (!latestScan) {
     return prompts.map((p) => ({
       id: p._id.toString(),
@@ -147,6 +147,7 @@ function formatTrackedPrompts(prompts, latestScan, previousScan) {
       frequency: p.frequency,
       active: p.active,
       suggestions: generatePromptSuggestions(null),
+      trendHistory: [],
     }));
   }
 
@@ -193,6 +194,13 @@ function formatTrackedPrompts(prompts, latestScan, previousScan) {
       frequency: p.frequency,
       active: p.active,
       suggestions: generatePromptSuggestions(scanResult),
+      trendHistory: (recentScans || []).map((scan) => {
+        const result = scan.results.find((r) => r.promptId.equals(p._id));
+        if (!result) return 0;
+        const mentionedCount = result.platforms.filter((pl) => pl.mentioned).length;
+        const totalCount = result.platforms.length || PLATFORMS.length;
+        return Math.round((mentionedCount / totalCount) * 100);
+      }).reverse(),
     };
   });
 }
@@ -537,7 +545,7 @@ const getTracker = async (req, res) => {
 
     // Compute all derived data
     const metrics = computeMetrics(latestScan, prompts.length, competitors);
-    const trackedPrompts = formatTrackedPrompts(prompts, latestScan, previousScan);
+    const trackedPrompts = formatTrackedPrompts(prompts, latestScan, previousScan, recentScans);
     const formattedCompetitors = formatCompetitors(competitors, latestScan, previousScan);
     const changes = computeChanges(latestScan, previousScan);
     const trendData = computeTrendData(recentScans);
@@ -585,6 +593,103 @@ const updateTracker = async (req, res) => {
   } catch (err) {
     console.error('updateTracker error:', err.message);
     res.status(500).json({ error: 'Failed to update tracker' });
+  }
+};
+
+// ─── POST /:workspaceNumber/ai-tracker/suggest-prompts ────────────────────
+
+const DEFAULT_SUGGESTIONS = [
+  { prompt: 'best tools in your industry', category: 'brand', reason: 'High-volume query where your brand could be recommended' },
+  { prompt: 'how to solve problems your product addresses', category: 'feature', reason: 'Directly related to your core value proposition' },
+  { prompt: 'your brand vs competitors comparison', category: 'comparison', reason: 'Users actively compare products in your space' },
+  { prompt: 'best free alternatives in your category', category: 'brand', reason: 'Captures price-sensitive users searching for options' },
+  { prompt: 'how to get started with your type of product', category: 'feature', reason: 'High intent query matching onboarding use cases' },
+  { prompt: 'industry trends and tools for your market', category: 'industry', reason: 'Broad industry query where your brand could appear' },
+  { prompt: 'reviews and recommendations for your product type', category: 'brand', reason: 'Users seeking social proof before purchasing' },
+  { prompt: 'tips and best practices in your domain', category: 'industry', reason: 'Educational content where your brand adds authority' },
+];
+
+const suggestPrompts = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+
+    const { domain } = req.body;
+    if (!domain || typeof domain !== 'string' || !domain.trim()) {
+      return res.status(400).json({ error: 'Domain is required' });
+    }
+
+    const apiKey = process.env.CHATGPT_SEARCH_KEY;
+    if (!apiKey) {
+      return res.json({ suggestions: DEFAULT_SUGGESTIONS });
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+
+    try {
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          messages: [
+            {
+              role: 'system',
+              content: `You are an AI visibility analyst. Given a website domain, suggest 8 search prompts that users would type into AI assistants (ChatGPT, Gemini, Claude, Perplexity) where this brand could potentially be mentioned or recommended.
+
+Return a JSON object with a "suggestions" key containing an array of exactly 8 items:
+{"suggestions": [{"prompt": "the search prompt", "category": "brand", "reason": "why this prompt matters"}]}
+
+Categories: brand, feature, comparison, industry.
+- brand: queries where the brand should be directly mentioned
+- feature: queries about features/capabilities the brand offers
+- comparison: queries comparing the brand to competitors
+- industry: broader industry queries where the brand could appear
+
+Make prompts realistic — what real users would ask AI assistants.`,
+            },
+            { role: 'user', content: `Domain: ${domain.trim()}` },
+          ],
+          response_format: { type: 'json_object' },
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        console.error('[suggest-prompts] OpenAI error:', response.status);
+        return res.json({ suggestions: DEFAULT_SUGGESTIONS });
+      }
+
+      const data = await response.json();
+      const content = data.choices?.[0]?.message?.content;
+      if (!content) {
+        return res.json({ suggestions: DEFAULT_SUGGESTIONS });
+      }
+
+      const parsed = JSON.parse(content);
+      const suggestions = Array.isArray(parsed.suggestions) ? parsed.suggestions : Array.isArray(parsed) ? parsed : DEFAULT_SUGGESTIONS;
+
+      // Validate shape
+      const valid = suggestions
+        .filter((s) => s && typeof s.prompt === 'string' && s.prompt.trim())
+        .slice(0, 8)
+        .map((s) => ({
+          prompt: s.prompt.trim(),
+          category: ['brand', 'feature', 'comparison', 'industry'].includes(s.category) ? s.category : 'industry',
+          reason: typeof s.reason === 'string' ? s.reason : 'Relevant to your brand visibility',
+        }));
+
+      res.json({ suggestions: valid.length > 0 ? valid : DEFAULT_SUGGESTIONS });
+    } finally {
+      clearTimeout(timeout);
+    }
+  } catch (err) {
+    console.error('suggestPrompts error:', err.message);
+    res.json({ suggestions: DEFAULT_SUGGESTIONS });
   }
 };
 
@@ -918,6 +1023,7 @@ const removeCompetitor = async (req, res) => {
 module.exports = {
   getTracker,
   updateTracker,
+  suggestPrompts,
   setup,
   getScanStatus,
   triggerScan,

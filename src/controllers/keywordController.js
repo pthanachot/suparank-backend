@@ -1,6 +1,7 @@
 const Workspace = require('../models/Workspace');
 const KeywordSearch = require('../models/KeywordSearch');
 const KeywordDetail = require('../models/KeywordDetail');
+const KeywordResearchHistory = require('../models/KeywordResearchHistory');
 const { resolveCountry, fetchRelatedKeywords, fetchSerpResults, SUPPORTED_COUNTRIES } = require('../services/keywordService');
 
 // ─── Workspace Resolution (same pattern as aiTrackerController.js) ──────────
@@ -52,6 +53,13 @@ async function searchKeywords(req, res) {
     });
 
     if (cached) {
+      // Record in workspace history (fire-and-forget)
+      KeywordResearchHistory.findOneAndUpdate(
+        { workspaceId: workspace._id, seedKeyword, country: countryCode },
+        { searchedAt: new Date() },
+        { upsert: true },
+      ).catch(() => {});
+
       return res.json({
         seedMetrics: cached.seedMetrics,
         relatedKeywords: cached.relatedKeywords,
@@ -79,6 +87,13 @@ async function searchKeywords(req, res) {
       },
       { upsert: true, new: true },
     );
+
+    // Record in workspace history (fire-and-forget)
+    KeywordResearchHistory.findOneAndUpdate(
+      { workspaceId: workspace._id, seedKeyword, country: countryCode },
+      { searchedAt: new Date() },
+      { upsert: true },
+    ).catch(() => {});
 
     return res.json({
       seedMetrics: seed,
@@ -158,16 +173,62 @@ async function getSearchHistory(req, res) {
     const workspace = await resolveWorkspace(req, res);
     if (!workspace) return;
 
-    const searches = await KeywordSearch.find()
-      .sort({ fetchedAt: -1 })
-      .limit(20)
-      .select('seedKeyword country totalCount fetchedAt')
+    const historyEntries = await KeywordResearchHistory.find({ workspaceId: workspace._id })
+      .sort({ searchedAt: -1 })
+      .limit(50)
       .lean();
+
+    // Enrich with totalCount from cache where available
+    const searches = await Promise.all(
+      historyEntries.map(async (entry) => {
+        const cached = await KeywordSearch.findOne({
+          seedKeyword: entry.seedKeyword,
+          country: entry.country,
+        })
+          .select('totalCount')
+          .lean();
+
+        return {
+          _id: entry._id,
+          seedKeyword: entry.seedKeyword,
+          country: entry.country,
+          searchedAt: entry.searchedAt,
+          totalCount: cached?.totalCount ?? 0,
+        };
+      }),
+    );
 
     return res.json({ searches });
   } catch (err) {
     console.error('[keywordController] getSearchHistory error:', err.message);
     return res.status(500).json({ error: err.message || 'Failed to get search history' });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DELETE /:workspaceNumber/keywords/history/:historyId
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function deleteSearchHistory(req, res) {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+
+    const { historyId } = req.params;
+
+    const deleted = await KeywordResearchHistory.findOneAndDelete({
+      _id: historyId,
+      workspaceId: workspace._id,
+    });
+
+    if (!deleted) {
+      return res.status(404).json({ error: 'History entry not found' });
+    }
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('[keywordController] deleteSearchHistory error:', err.message);
+    return res.status(500).json({ error: err.message || 'Failed to delete history entry' });
   }
 }
 
@@ -183,5 +244,6 @@ module.exports = {
   searchKeywords,
   getKeywordDetail,
   getSearchHistory,
+  deleteSearchHistory,
   getCountries,
 };

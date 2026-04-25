@@ -12,8 +12,9 @@ router.post('/:workspaceNumber/keywords/search', keywordController.searchKeyword
 // Get SERP detail for a single keyword (Serper)
 router.get('/:workspaceNumber/keywords/detail', keywordController.getKeywordDetail);
 
-// List previous searches for this workspace
+// Research history
 router.get('/:workspaceNumber/keywords/history', keywordController.getSearchHistory);
+router.delete('/:workspaceNumber/keywords/history/:historyId', keywordController.deleteSearchHistory);
 
 // Get supported countries list
 router.get('/:workspaceNumber/keywords/countries', keywordController.getCountries);

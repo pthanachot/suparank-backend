@@ -1,0 +1,63 @@
+const express = require('express');
+const multer = require('multer');
+const router = express.Router();
+const brandVoiceController = require('../controllers/brandVoiceController');
+const { authenticateToken } = require('../middleware/auth');
+
+// Multer config: memory storage, 10MB limit, PDF/DOCX/TXT only
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = [
+      'application/pdf',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'text/plain',
+    ];
+    if (allowed.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only PDF, DOCX, and TXT files are allowed'));
+    }
+  },
+});
+
+// All routes require authentication
+router.use(authenticateToken);
+
+// Brand voice
+router.get('/:workspaceNumber/brand-voice', brandVoiceController.getBrandVoice);
+router.put('/:workspaceNumber/brand-voice', brandVoiceController.saveBrandVoice);
+router.post('/:workspaceNumber/brand-voice/test', brandVoiceController.testBrandVoice);
+router.get('/:workspaceNumber/brand-voice/rate-limit', brandVoiceController.getTestRateLimit);
+
+// Avatars
+router.get('/:workspaceNumber/brand-voice/avatars', brandVoiceController.listAvatars);
+router.post('/:workspaceNumber/brand-voice/avatars', brandVoiceController.createAvatar);
+router.put('/:workspaceNumber/brand-voice/avatars/:avatarId', brandVoiceController.updateAvatar);
+router.delete('/:workspaceNumber/brand-voice/avatars/:avatarId', brandVoiceController.deleteAvatar);
+router.patch('/:workspaceNumber/brand-voice/avatars/:avatarId/toggle', brandVoiceController.toggleAvatar);
+router.post('/:workspaceNumber/brand-voice/avatars/:avatarId/test', brandVoiceController.testAvatar);
+
+// Avatar file uploads (with multer error handling)
+router.post(
+  '/:workspaceNumber/brand-voice/avatars/:avatarId/upload',
+  (req, res, next) => {
+    upload.single('file')(req, res, (err) => {
+      if (err) {
+        if (err.code === 'LIMIT_FILE_SIZE') {
+          return res.status(400).json({ error: 'File too large. Maximum size is 10 MB.' });
+        }
+        return res.status(400).json({ error: err.message || 'File upload failed' });
+      }
+      next();
+    });
+  },
+  brandVoiceController.uploadAvatarFile
+);
+router.delete(
+  '/:workspaceNumber/brand-voice/avatars/:avatarId/upload/:uploadId',
+  brandVoiceController.deleteAvatarUpload
+);
+
+module.exports = router;

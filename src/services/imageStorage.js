@@ -3,7 +3,7 @@
  * Falls back gracefully when B2 is not configured — returns original data as-is.
  */
 
-const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const crypto = require('crypto');
 
@@ -176,11 +176,50 @@ async function uploadFromUrl(url, workspaceId, contentNumber) {
   return uploadImage(buffer, contentType, workspaceId, contentNumber);
 }
 
+/**
+ * Upload a buffer to B2 with a custom key.
+ * Generic version of uploadImage for non-image files (e.g. brand voice uploads).
+ * @param {Buffer} buffer - File data
+ * @param {string} contentType - MIME type
+ * @param {string} key - Full B2 object key
+ * @returns {Promise<string>} The B2 key
+ */
+async function uploadBuffer(buffer, contentType, key) {
+  const client = getClient();
+  if (!client) throw new Error('B2 storage not configured');
+
+  await client.send(new PutObjectCommand({
+    Bucket: B2_BUCKET,
+    Key: key,
+    Body: buffer,
+    ContentType: contentType,
+    CacheControl: 'private, max-age=86400',
+  }));
+
+  return key;
+}
+
+/**
+ * Delete an object from B2 by key.
+ * @param {string} key - B2 object key
+ */
+async function deleteObject(key) {
+  const client = getClient();
+  if (!client) return;
+
+  await client.send(new DeleteObjectCommand({
+    Bucket: B2_BUCKET,
+    Key: key,
+  }));
+}
+
 module.exports = {
   isEnabled,
   uploadImage,
   uploadFromDataUri,
   uploadFromUrl,
+  uploadBuffer,
+  deleteObject,
   getPresignedUrl,
   isB2Path,
   extractKey,

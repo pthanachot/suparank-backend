@@ -56,6 +56,6 @@ const avatarSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-avatarSchema.index({ workspace: 1, name: 1 }, { unique: true });
+avatarSchema.index({ workspace: 1, name: 1 });
 
 module.exports = mongoose.model('Avatar', avatarSchema);

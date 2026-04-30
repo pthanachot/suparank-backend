@@ -241,9 +241,6 @@ const createAvatar = async (req, res) => {
 
     res.status(201).json({ avatar });
   } catch (err) {
-    if (err.code === 11000) {
-      return res.status(409).json({ error: 'An avatar with this name already exists' });
-    }
     console.error('createAvatar error:', err.message);
     res.status(500).json({ error: 'Failed to create avatar' });
   }
@@ -281,9 +278,6 @@ const updateAvatar = async (req, res) => {
     await avatar.save();
     res.json({ avatar });
   } catch (err) {
-    if (err.code === 11000) {
-      return res.status(409).json({ error: 'An avatar with this name already exists' });
-    }
     console.error('updateAvatar error:', err.message);
     res.status(500).json({ error: 'Failed to update avatar' });
   }

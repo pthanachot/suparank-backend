@@ -54,6 +54,9 @@ router.delete('/:workspaceNumber/brand-voice/avatars/:avatarId', brandVoiceContr
 router.patch('/:workspaceNumber/brand-voice/avatars/:avatarId/toggle', brandVoiceController.toggleAvatar);
 router.post('/:workspaceNumber/brand-voice/avatars/:avatarId/test', brandVoiceController.testAvatar);
 
+// Google Doc URL import
+router.post('/:workspaceNumber/brand-voice/avatars/:avatarId/import-url', brandVoiceController.importGoogleDoc);
+
 // Avatar file uploads (with multer error handling)
 router.post(
   '/:workspaceNumber/brand-voice/avatars/:avatarId/upload',

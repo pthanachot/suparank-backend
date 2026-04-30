@@ -928,6 +928,159 @@ const deleteAvatarImage = async (req, res) => {
   }
 };
 
+/* ── 14. POST Import Google Doc URL ────────────────────────────────── */
+
+const GOOGLE_DOC_REGEX = /docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]+)/;
+
+const importGoogleDoc = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+
+    const { avatarId } = req.params;
+    const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
+    if (!avatar) {
+      return res.status(404).json({ error: 'Avatar not found' });
+    }
+
+    if (avatar.uploads.length >= 5) {
+      return res.status(400).json({ error: 'Maximum 5 uploads per avatar' });
+    }
+
+    const { url } = req.body;
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({ error: 'URL is required' });
+    }
+
+    const match = url.match(GOOGLE_DOC_REGEX);
+    if (!match) {
+      return res.status(400).json({ error: 'Invalid Google Docs URL. Expected format: https://docs.google.com/document/d/...' });
+    }
+
+    const docId = match[1];
+    const exportUrl = `https://docs.google.com/document/d/${docId}/export?format=txt`;
+
+    let text;
+    try {
+      const fetchRes = await fetch(exportUrl);
+      if (!fetchRes.ok) {
+        if (fetchRes.status === 404) {
+          return res.status(400).json({ error: 'Google Doc not found. Make sure the document exists.' });
+        }
+        if (fetchRes.status === 401 || fetchRes.status === 403) {
+          return res.status(400).json({ error: 'Cannot access this Google Doc. Make sure sharing is set to "Anyone with the link".' });
+        }
+        return res.status(400).json({ error: `Failed to fetch Google Doc (HTTP ${fetchRes.status})` });
+      }
+      text = await fetchRes.text();
+    } catch (err) {
+      return res.status(400).json({ error: 'Failed to fetch Google Doc. Check your URL and try again.' });
+    }
+
+    // Clean up whitespace
+    text = text.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    const wordCount = text.split(/\s+/).filter(Boolean).length;
+
+    if (wordCount < 50) {
+      return res.status(400).json({ error: `Document only has ${wordCount} words. Minimum 50 words required.` });
+    }
+
+    // Upload text to B2
+    const buffer = Buffer.from(text, 'utf-8');
+    const hash = crypto.createHash('md5').update(buffer).digest('hex').slice(0, 8);
+    const b2Key = `brand-voice/${workspace._id}/${avatarId}/${Date.now()}-${hash}.txt`;
+    await uploadBuffer(buffer, 'text/plain', b2Key);
+
+    // Add upload record
+    const uploadDoc = {
+      originalName: `Google Doc (${docId.slice(0, 8)}…)`,
+      b2Key,
+      size: buffer.length,
+      words: wordCount,
+      status: 'learning',
+    };
+    avatar.uploads.push(uploadDoc);
+    await avatar.save();
+
+    const savedUpload = avatar.uploads[avatar.uploads.length - 1];
+
+    // Fire-and-forget: summarize writing style via Writing Engine
+    (async () => {
+      try {
+        const sessionId = await writingEngine.createSession();
+        await writingEngine.pushDocument(sessionId, text);
+
+        const summarizePrompt = `Analyze this writing sample and extract the author's writing style. Focus on:
+1. Sentence structure patterns (short/long, simple/complex)
+2. Vocabulary preferences and register
+3. Tone and voice characteristics
+4. Opening/closing patterns
+5. Use of examples, analogies, or data
+6. Paragraph length tendencies
+7. Distinctive quirks or habits
+
+Provide a concise style summary (max 200 words) that can be used to replicate this writing style. Only output the summary, nothing else.`;
+
+        const chatRes = await writingEngine.sendChatMessageStream(sessionId, summarizePrompt);
+
+        const reader = chatRes.body.getReader();
+        const decoder = new TextDecoder();
+        let fullText = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          const lines = chunk.split('\n');
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6));
+                if (data.type === 'text_delta' && typeof data.textDelta === 'string') {
+                  fullText += data.textDelta;
+                } else if (data.type === 'complete' && typeof data.fullText === 'string') {
+                  fullText = data.fullText;
+                }
+              } catch { /* skip unparseable */ }
+            }
+          }
+        }
+
+        await Avatar.findOneAndUpdate(
+          { _id: avatarId, 'uploads._id': savedUpload._id },
+          {
+            $set: {
+              'uploads.$.summary': fullText.trim(),
+              'uploads.$.status': 'learned',
+            },
+          }
+        );
+
+        const updatedAvatar = await Avatar.findById(avatarId);
+        if (updatedAvatar) {
+          updatedAvatar.content = generateAvatarMarkdown(updatedAvatar.toObject());
+          const mdKey = `brand-voice/${workspace._id}/avatars/${avatarId}/avatar.md`;
+          await uploadBuffer(Buffer.from(updatedAvatar.content, 'utf-8'), 'text/markdown', mdKey);
+          updatedAvatar.b2Key = mdKey;
+          await updatedAvatar.save();
+        }
+
+        console.log(`[brand-voice] Google Doc summarization complete for upload ${savedUpload._id}`);
+      } catch (err) {
+        console.error(`[brand-voice] Google Doc summarization failed for upload ${savedUpload._id}:`, err.message);
+        await Avatar.findOneAndUpdate(
+          { _id: avatarId, 'uploads._id': savedUpload._id },
+          { $set: { 'uploads.$.status': 'failed' } }
+        ).catch(() => {});
+      }
+    })();
+
+    res.status(201).json({ avatar });
+  } catch (err) {
+    console.error('importGoogleDoc error:', err.message);
+    res.status(500).json({ error: 'Failed to import Google Doc' });
+  }
+};
+
 module.exports = {
   getBrandVoice,
   saveBrandVoice,
@@ -944,4 +1097,5 @@ module.exports = {
   uploadAvatarImage,
   deleteAvatarImage,
   getTestRateLimit,
+  importGoogleDoc,
 };

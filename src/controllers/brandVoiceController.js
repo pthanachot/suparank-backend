@@ -4,7 +4,7 @@ const Avatar = require('../models/Avatar');
 const BrandVoiceTestLog = require('../models/BrandVoiceTestLog');
 const { generateBrandVoiceMarkdown, generateAvatarMarkdown } = require('../services/brandVoiceMarkdown');
 const { parseFile } = require('../services/fileParser');
-const { uploadBuffer, deleteObject } = require('../services/imageStorage');
+const { uploadBuffer, uploadImage, deleteObject } = require('../services/imageStorage');
 const writingEngine = require('../services/writingEngine');
 const crypto = require('crypto');
 
@@ -12,6 +12,10 @@ const crypto = require('crypto');
 
 async function resolveWorkspace(req, res) {
   const { workspaceNumber } = req.params;
+  if (!workspaceNumber || isNaN(Number(workspaceNumber))) {
+    res.status(400).json({ error: 'Invalid workspace number' });
+    return null;
+  }
   const workspace = await Workspace.findOne({
     workspaceNumber: Number(workspaceNumber),
     $or: [
@@ -100,6 +104,240 @@ ${userInput}`;
     if (!clientDisconnected && !abortCtrl.signal.aborted) throw streamErr;
   }
   res.end();
+}
+
+/** Like streamWritingEngineResponse but accepts a pre-created sessionId (for parallelisation). */
+async function streamWritingEngineResponseWithSession(req, res, sessionId, markdownContent, userInput) {
+  const abortCtrl = new AbortController();
+  let clientDisconnected = false;
+  req.on('close', () => {
+    clientDisconnected = true;
+    abortCtrl.abort();
+  });
+
+  // 120s timeout to prevent indefinite hangs
+  const timeout = setTimeout(() => abortCtrl.abort(), 120_000);
+
+  await writingEngine.pushDocument(sessionId, markdownContent);
+
+  const prompt = `You are a writing assistant. The document above defines a brand voice with specific tone, vocabulary rules, and style preferences.
+
+CRITICAL RULES:
+- Follow every instruction in the document exactly.
+- If the document lists "Never Use" words, you MUST NOT use any of those words or phrases — no exceptions.
+- If the document lists "Always Use" words, incorporate them naturally.
+- Match the specified tone (formality, warmth, humor) precisely.
+- Follow the perspective and sentence style instructions.
+- Keep your response under ${MAX_TEST_WORDS} words.
+- Only output the rewritten text, nothing else.
+
+Text to rewrite:
+${userInput}`;
+
+  const chatRes = await writingEngine.sendChatMessageStream(sessionId, prompt, abortCtrl.signal);
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+
+  const reader = chatRes.body.getReader();
+  abortCtrl.signal.addEventListener('abort', () => {
+    reader.cancel().catch(() => {});
+  });
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(Buffer.from(value));
+    }
+  } catch (streamErr) {
+    if (!clientDisconnected && !abortCtrl.signal.aborted) throw streamErr;
+  }
+  clearTimeout(timeout);
+  res.end();
+}
+
+/* ── Preview generation (comparison + sample) ────────────────────────── */
+
+const PREVIEW_REGEN_LIMIT = 10;
+const PREVIEW_REGEN_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+
+const GENERIC_TEXT = 'Project management tools help teams organize their work and improve productivity across the organization. These solutions enable better collaboration and workflow optimization for modern teams.';
+
+function buildPreviewPrompt(instruction) {
+  return `You are a writing assistant. The document above defines a brand voice with specific tone, vocabulary rules, and style preferences.
+
+CRITICAL RULES:
+- Follow every instruction in the document exactly.
+- If the document lists "Never Use" words, you MUST NOT use any of those words or phrases — no exceptions.
+- If the document lists "Always Use" words, incorporate them naturally.
+- Match the specified tone (formality, warmth, humor) precisely.
+- Follow the perspective and sentence style instructions.
+- Keep your response under 150 words.
+- Only output the text, nothing else.
+
+${instruction}`;
+}
+
+/** Read an SSE stream from the Writing Engine and collect the full text. */
+async function collectStreamText(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let text = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const payload = line.slice(6).trim();
+      if (payload === '[DONE]') continue;
+      try {
+        const parsed = JSON.parse(payload);
+        if (parsed.type === 'text_delta' && typeof parsed.textDelta === 'string') {
+          text += parsed.textDelta;
+        }
+      } catch {
+        if (payload) text += payload;
+      }
+    }
+  }
+  return text.trim();
+}
+
+/**
+ * Run a single generation: create session → push doc → stream chat → collect text.
+ * Returns the generated text or '' on failure.
+ */
+async function generateOnePreview(markdownContent, prompt, signal) {
+  const t0 = Date.now();
+  const sessionId = await writingEngine.createSession(signal);
+  console.log(`[brand-voice]   createSession: ${Date.now() - t0}ms`);
+  await writingEngine.pushDocument(sessionId, markdownContent, signal);
+  console.log(`[brand-voice]   pushDocument: ${Date.now() - t0}ms`);
+  const response = await writingEngine.sendChatMessageStream(sessionId, prompt, signal);
+  console.log(`[brand-voice]   sendChatMessageStream returned: ${Date.now() - t0}ms`);
+  const text = await collectStreamText(response);
+  console.log(`[brand-voice]   collectStreamText: ${Date.now() - t0}ms (${text.length} chars)`);
+  return text;
+}
+
+/**
+ * Generate comparison + sample preview texts for an avatar.
+ * Mutates the avatar document in-place. Call avatar.save() after.
+ *
+ * Shared rate limit: 10 per hour. Only counts when BOTH succeed.
+ * If one section fails, retries it once before giving up.
+ * On total failure, keeps old texts and marks previewsStale = true.
+ *
+ * @returns {'success'|'failed'|'rate_limited'} generation status
+ */
+async function generateAvatarPreviews(avatar, brandVoice) {
+  // ── Rate limit check ──
+  const now = new Date();
+  const windowStart = avatar.previewRegenWindowStart;
+  const windowExpired = !windowStart || (now - windowStart) >= PREVIEW_REGEN_WINDOW_MS;
+
+  if (windowExpired) {
+    avatar.previewRegenCount = 0;
+    avatar.previewRegenWindowStart = now;
+  }
+
+  if (avatar.previewRegenCount >= PREVIEW_REGEN_LIMIT) {
+    avatar.previewsStale = true;
+    console.log(`[brand-voice] Preview regen rate-limited for avatar ${avatar._id} (${avatar.previewRegenCount}/${PREVIEW_REGEN_LIMIT})`);
+    return 'rate_limited';
+  }
+
+  // ── Build context ──
+  const markdownContent = brandVoice?.content
+    ? brandVoice.content + '\n\n---\n\n' + avatar.content
+    : avatar.content;
+
+  console.log(`[brand-voice] Generating previews for avatar ${avatar._id} (context: ${markdownContent.length} chars)`);
+
+  const compPrompt = buildPreviewPrompt(
+    `Rewrite the following generic text in your voice and style. Keep the same core message.\n\n"${GENERIC_TEXT}"`
+  );
+  const sampPrompt = buildPreviewPrompt(
+    'Write a short opening paragraph (2-3 sentences) for an article about why most teams fail at project management. Use your voice, style, and opening approach.'
+  );
+
+  const abortCtrl = new AbortController();
+  const startTime = Date.now();
+  const timeout = setTimeout(() => {
+    console.error(`[brand-voice] Preview generation timed out after 180s`);
+    abortCtrl.abort();
+  }, 180_000);
+
+  try {
+    // ── Run sequentially to avoid competing for Writing Engine resources ──
+    let compText = '';
+    let sampText = '';
+
+    try {
+      compText = await generateOnePreview(markdownContent, compPrompt, abortCtrl.signal);
+    } catch (err) {
+      console.error('[brand-voice] Comparison generation failed:', err.message);
+    }
+
+    try {
+      sampText = await generateOnePreview(markdownContent, sampPrompt, abortCtrl.signal);
+    } catch (err) {
+      console.error('[brand-voice] Sample generation failed:', err.message);
+    }
+
+    console.log(`[brand-voice] Both generations done in ${Date.now() - startTime}ms (comp: ${compText.length}, samp: ${sampText.length})`);
+
+    // ── Retry: if one succeeded but the other failed, retry the failed one once ──
+    if (compText && !sampText) {
+      console.log('[brand-voice] Retrying sample generation...');
+      try {
+        sampText = await generateOnePreview(markdownContent, sampPrompt, abortCtrl.signal);
+      } catch (err) {
+        console.error('[brand-voice] Sample retry failed:', err.message);
+      }
+    } else if (sampText && !compText) {
+      console.log('[brand-voice] Retrying comparison generation...');
+      try {
+        compText = await generateOnePreview(markdownContent, compPrompt, abortCtrl.signal);
+      } catch (err) {
+        console.error('[brand-voice] Comparison retry failed:', err.message);
+      }
+    }
+
+    // ── Only count and update when BOTH succeed ──
+    if (compText && sampText) {
+      avatar.generatedComparison = compText;
+      avatar.generatedSample = sampText;
+      avatar.previewRegenCount += 1;
+      avatar.previewsStale = false;
+      avatar.previewsGenerating = false;
+      console.log(`[brand-voice] Preview generation succeeded (comp: ${compText.length} chars, samp: ${sampText.length} chars)`);
+      return 'success';
+    } else {
+      // Keep old texts, mark stale
+      avatar.previewsStale = true;
+      avatar.previewsGenerating = false;
+      console.error(`[brand-voice] Preview generation incomplete — comp: ${compText.length} chars, samp: ${sampText.length} chars`);
+      return 'failed';
+    }
+  } catch (err) {
+    console.error('[brand-voice] Preview generation failed:', err.message);
+    avatar.previewsStale = true;
+    avatar.previewsGenerating = false;
+    return 'failed';
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 /* ── 1. GET Brand Voice ────────────────────────────────────────────────── */
@@ -246,6 +484,26 @@ const createAvatar = async (req, res) => {
   }
 };
 
+/* ── 5b. GET Single Avatar (for polling preview generation status) ───── */
+
+const getAvatar = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+
+    const { avatarId } = req.params;
+    const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
+    if (!avatar) {
+      return res.status(404).json({ error: 'Avatar not found' });
+    }
+
+    res.json({ avatar });
+  } catch (err) {
+    console.error('getAvatar error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch avatar' });
+  }
+};
+
 /* ── 6. PUT Update Avatar ──────────────────────────────────────────────── */
 
 const updateAvatar = async (req, res) => {
@@ -260,7 +518,7 @@ const updateAvatar = async (req, res) => {
     }
 
     const allowed = ['name', 'emoji', 'role', 'experience', 'tagline', 'traits',
-                     'writingQuirks', 'toneOverrides', 'vocabulary', 'openingStyle', 'sample'];
+                     'writingQuirks', 'toneOverrides', 'vocabulary', 'openingStyle', 'sample', 'background'];
     for (const key of allowed) {
       if (req.body[key] !== undefined) {
         avatar[key] = req.body[key];
@@ -275,8 +533,32 @@ const updateAvatar = async (req, res) => {
     await uploadBuffer(Buffer.from(avatar.content, 'utf-8'), 'text/markdown', b2Key);
     avatar.b2Key = b2Key;
 
+    // Check rate limit before save so we can tell the frontend immediately
+    const now = new Date();
+    const windowStart = avatar.previewRegenWindowStart;
+    const windowExpired = !windowStart || (now - windowStart) >= PREVIEW_REGEN_WINDOW_MS;
+    const currentCount = windowExpired ? 0 : avatar.previewRegenCount;
+    const rateLimited = currentCount >= PREVIEW_REGEN_LIMIT;
+
+    // Mark as generating (unless rate-limited)
+    if (!rateLimited) {
+      avatar.previewsGenerating = true;
+    }
+
+    // Save field changes first so user edits are never lost
     await avatar.save();
-    res.json({ avatar });
+
+    // Respond immediately — don't make the user wait for AI generation
+    const previewStatus = rateLimited ? 'rate_limited' : 'generating';
+    res.json({ avatar, previewStatus });
+
+    // Fire-and-forget: generate preview texts in the background
+    if (!rateLimited) {
+      const brandVoice = await BrandVoice.findOne({ workspace: workspace._id }).lean();
+      const result = await generateAvatarPreviews(avatar, brandVoice);
+      await avatar.save();
+      console.log(`[brand-voice] Background generation finished: ${result}`);
+    }
   } catch (err) {
     console.error('updateAvatar error:', err.message);
     res.status(500).json({ error: 'Failed to update avatar' });
@@ -296,10 +578,15 @@ const deleteAvatar = async (req, res) => {
       return res.status(404).json({ error: 'Avatar not found' });
     }
 
-    // Clean up B2 files (fire-and-forget): avatar.md + upload files
+    // Clean up B2 files (fire-and-forget): avatar.md + avatar image + upload files
     if (avatar.b2Key) {
       deleteObject(avatar.b2Key).catch(err =>
         console.error(`[brand-voice] B2 delete failed for avatar.md ${avatar.b2Key}:`, err.message)
+      );
+    }
+    if (avatar.avatarImage) {
+      deleteObject(avatar.avatarImage).catch(err =>
+        console.error(`[brand-voice] B2 delete failed for avatar image ${avatar.avatarImage}:`, err.message)
       );
     }
     for (const upload of avatar.uploads || []) {
@@ -363,19 +650,23 @@ const testAvatar = async (req, res) => {
       });
     }
 
-    const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
+    // Parallelize DB lookups with Writing Engine session creation
+    const [avatar, brandVoice, sessionId] = await Promise.all([
+      Avatar.findOne({ _id: avatarId, workspace: workspace._id }).lean(),
+      BrandVoice.findOne({ workspace: workspace._id }).lean(),
+      writingEngine.createSession(),
+    ]);
     if (!avatar || !avatar.content) {
       return res.status(400).json({ error: 'Save your avatar settings first' });
     }
 
     // Combine brand voice + avatar markdown at test time
-    const brandVoice = await BrandVoice.findOne({ workspace: workspace._id }).lean();
     const combinedContent = brandVoice?.content
       ? brandVoice.content + '\n\n---\n\n' + avatar.content
       : avatar.content;
 
     await recordTestUsage(req.user.userId);
-    await streamWritingEngineResponse(req, res, combinedContent, input);
+    await streamWritingEngineResponseWithSession(req, res, sessionId, combinedContent, input);
   } catch (err) {
     if (!res.headersSent) {
       console.error('testAvatar error:', err.message);
@@ -565,11 +856,84 @@ const getTestRateLimit = async (req, res) => {
   }
 };
 
+/* ── 12. POST Upload Avatar Image ─────────────────────────────────── */
+
+const uploadAvatarImage = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+
+    const { avatarId } = req.params;
+    const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
+    if (!avatar) {
+      return res.status(404).json({ error: 'Avatar not found' });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'Image file is required' });
+    }
+
+    // Delete old image from B2 if exists
+    if (avatar.avatarImage) {
+      deleteObject(avatar.avatarImage).catch(err =>
+        console.error(`[brand-voice] B2 delete old avatar image failed:`, err.message)
+      );
+    }
+
+    // Upload to B2
+    const imagePath = await uploadImage(
+      req.file.buffer,
+      req.file.mimetype,
+      workspace._id.toString(),
+      `avatar-${avatarId}`
+    );
+
+    // Store the B2 key (strip the /api/b2-image/ prefix)
+    const b2Key = imagePath.replace('/api/b2-image/', '');
+    avatar.avatarImage = b2Key;
+    await avatar.save();
+
+    res.json({ avatar });
+  } catch (err) {
+    console.error('uploadAvatarImage error:', err.message);
+    res.status(500).json({ error: 'Failed to upload avatar image' });
+  }
+};
+
+/* ── 13. DELETE Avatar Image ─────────────────────────────────────── */
+
+const deleteAvatarImage = async (req, res) => {
+  try {
+    const workspace = await resolveWorkspace(req, res);
+    if (!workspace) return;
+
+    const { avatarId } = req.params;
+    const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
+    if (!avatar) {
+      return res.status(404).json({ error: 'Avatar not found' });
+    }
+
+    if (avatar.avatarImage) {
+      deleteObject(avatar.avatarImage).catch(err =>
+        console.error(`[brand-voice] B2 delete avatar image failed:`, err.message)
+      );
+      avatar.avatarImage = '';
+      await avatar.save();
+    }
+
+    res.json({ avatar });
+  } catch (err) {
+    console.error('deleteAvatarImage error:', err.message);
+    res.status(500).json({ error: 'Failed to delete avatar image' });
+  }
+};
+
 module.exports = {
   getBrandVoice,
   saveBrandVoice,
   testBrandVoice,
   listAvatars,
+  getAvatar,
   createAvatar,
   updateAvatar,
   deleteAvatar,
@@ -577,5 +941,7 @@ module.exports = {
   testAvatar,
   uploadAvatarFile,
   deleteAvatarUpload,
+  uploadAvatarImage,
+  deleteAvatarImage,
   getTestRateLimit,
 };

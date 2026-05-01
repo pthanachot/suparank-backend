@@ -32,13 +32,16 @@ async function resolveWorkspace(req, res) {
 
 /* ── Rate limit helpers ───────────────────────────────────────────────── */
 
+const TEST_RATE_LIMIT = 10;
+const TEST_RATE_WINDOW_MS = 4 * 60 * 60 * 1000; // 4 hours
+
 async function checkTestRateLimit(userId) {
-  const fourHoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000);
+  const windowStart = new Date(Date.now() - TEST_RATE_WINDOW_MS);
   const count = await BrandVoiceTestLog.countDocuments({
     userId,
-    createdAt: { $gte: fourHoursAgo },
+    createdAt: { $gte: windowStart },
   });
-  return { allowed: count < 10, remaining: Math.max(0, 10 - count) };
+  return { allowed: count < TEST_RATE_LIMIT, remaining: Math.max(0, TEST_RATE_LIMIT - count) };
 }
 
 async function recordTestUsage(userId) {
@@ -53,9 +56,9 @@ function countWords(text) {
   return text.trim().split(/\s+/).filter(Boolean).length;
 }
 
-/* ── SSE streaming helper ─────────────────────────────────────────────── */
+/* ── SSE streaming helper — lightweight rewrite via Writing Engine ────── */
 
-async function streamWritingEngineResponse(req, res, markdownContent, userInput) {
+async function streamRewriteResponse(req, res, markdownContent, userInput) {
   const abortCtrl = new AbortController();
   let clientDisconnected = false;
   req.on('close', () => {
@@ -63,24 +66,33 @@ async function streamWritingEngineResponse(req, res, markdownContent, userInput)
     abortCtrl.abort();
   });
 
-  const sessionId = await writingEngine.createSession();
-  await writingEngine.pushDocument(sessionId, markdownContent);
+  const systemPrompt = `You are a text rewriter. Your ONLY job is to rewrite the user's text using the brand voice below. Output ONLY the rewritten text — no explanations, no preamble, no commentary, no quotes around it.
 
-  const prompt = `You are a writing assistant. The document above defines a brand voice with specific tone, vocabulary rules, and style preferences.
+${markdownContent}
 
-CRITICAL RULES:
-- Follow every instruction in the document exactly.
-- If the document lists "Never Use" words, you MUST NOT use any of those words or phrases — no exceptions.
-- If the document lists "Always Use" words, incorporate them naturally.
-- Match the specified tone (formality, warmth, humor) precisely.
-- Follow the perspective and sentence style instructions.
+RULES:
+- REWRITE the user's text in the brand voice above. Do NOT answer it, do NOT respond to it, do NOT explain it.
+- If "Never Use" words are listed, do NOT use them — no exceptions.
+- If "Always Use" words are listed, incorporate them naturally.
+- Match the specified tone precisely.
 - Keep your response under ${MAX_TEST_WORDS} words.
-- Only output the rewritten text, nothing else.
+- Output ONLY the rewritten version. Nothing else.`;
 
-Text to rewrite:
-${userInput}`;
+  const apiRes = await fetch(`${writingEngine.WRITING_ENGINE_URL}/api/rewrite`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      systemPrompt,
+      userMessage: userInput,
+      maxTokens: 1000,
+    }),
+    signal: abortCtrl.signal,
+  });
 
-  const chatRes = await writingEngine.sendChatMessageStream(sessionId, prompt, abortCtrl.signal);
+  if (!apiRes.ok) {
+    const errText = await apiRes.text().catch(() => '');
+    throw new Error(`Writing Engine rewrite error (${apiRes.status}): ${errText}`);
+  }
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -89,10 +101,8 @@ ${userInput}`;
     'X-Accel-Buffering': 'no',
   });
 
-  const reader = chatRes.body.getReader();
-  abortCtrl.signal.addEventListener('abort', () => {
-    reader.cancel().catch(() => {});
-  });
+  // Pipe SSE stream from Writing Engine directly to client
+  const reader = apiRes.body.getReader();
 
   try {
     while (true) {
@@ -103,61 +113,6 @@ ${userInput}`;
   } catch (streamErr) {
     if (!clientDisconnected && !abortCtrl.signal.aborted) throw streamErr;
   }
-  res.end();
-}
-
-/** Like streamWritingEngineResponse but accepts a pre-created sessionId (for parallelisation). */
-async function streamWritingEngineResponseWithSession(req, res, sessionId, markdownContent, userInput) {
-  const abortCtrl = new AbortController();
-  let clientDisconnected = false;
-  req.on('close', () => {
-    clientDisconnected = true;
-    abortCtrl.abort();
-  });
-
-  // 120s timeout to prevent indefinite hangs
-  const timeout = setTimeout(() => abortCtrl.abort(), 120_000);
-
-  await writingEngine.pushDocument(sessionId, markdownContent);
-
-  const prompt = `You are a writing assistant. The document above defines a brand voice with specific tone, vocabulary rules, and style preferences.
-
-CRITICAL RULES:
-- Follow every instruction in the document exactly.
-- If the document lists "Never Use" words, you MUST NOT use any of those words or phrases — no exceptions.
-- If the document lists "Always Use" words, incorporate them naturally.
-- Match the specified tone (formality, warmth, humor) precisely.
-- Follow the perspective and sentence style instructions.
-- Keep your response under ${MAX_TEST_WORDS} words.
-- Only output the rewritten text, nothing else.
-
-Text to rewrite:
-${userInput}`;
-
-  const chatRes = await writingEngine.sendChatMessageStream(sessionId, prompt, abortCtrl.signal);
-
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    'X-Accel-Buffering': 'no',
-  });
-
-  const reader = chatRes.body.getReader();
-  abortCtrl.signal.addEventListener('abort', () => {
-    reader.cancel().catch(() => {});
-  });
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      res.write(Buffer.from(value));
-    }
-  } catch (streamErr) {
-    if (!clientDisconnected && !abortCtrl.signal.aborted) throw streamErr;
-  }
-  clearTimeout(timeout);
   res.end();
 }
 
@@ -168,22 +123,21 @@ const PREVIEW_REGEN_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 
 const GENERIC_TEXT = 'Project management tools help teams organize their work and improve productivity across the organization. These solutions enable better collaboration and workflow optimization for modern teams.';
 
-function buildPreviewPrompt(instruction) {
-  return `You are a writing assistant. The document above defines a brand voice with specific tone, vocabulary rules, and style preferences.
+function buildPreviewSystemPrompt(markdownContent) {
+  return `You are a text rewriter. Your ONLY job is to write text using the brand voice below. Output ONLY the written text — no explanations, no preamble, no commentary, no quotes around it.
 
-CRITICAL RULES:
-- Follow every instruction in the document exactly.
-- If the document lists "Never Use" words, you MUST NOT use any of those words or phrases — no exceptions.
-- If the document lists "Always Use" words, incorporate them naturally.
-- Match the specified tone (formality, warmth, humor) precisely.
-- Follow the perspective and sentence style instructions.
+${markdownContent}
+
+RULES:
+- Write using the brand voice above. Do NOT explain or comment on the task.
+- If "Never Use" words are listed, do NOT use them — no exceptions.
+- If "Always Use" words are listed, incorporate them naturally.
+- Match the specified tone precisely.
 - Keep your response under 150 words.
-- Only output the text, nothing else.
-
-${instruction}`;
+- Output ONLY the text. Nothing else.`;
 }
 
-/** Read an SSE stream from the Writing Engine and collect the full text. */
+/** Read an SSE stream and collect the full text. */
 async function collectStreamText(response) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -205,28 +159,35 @@ async function collectStreamText(response) {
         if (parsed.type === 'text_delta' && typeof parsed.textDelta === 'string') {
           text += parsed.textDelta;
         }
-      } catch {
-        if (payload) text += payload;
-      }
+      } catch { /* skip */ }
     }
   }
   return text.trim();
 }
 
 /**
- * Run a single generation: create session → push doc → stream chat → collect text.
+ * Run a single generation via Writing Engine /api/rewrite (no session, no tools).
  * Returns the generated text or '' on failure.
  */
-async function generateOnePreview(markdownContent, prompt, signal) {
+async function generateOnePreview(markdownContent, userMessage, signal) {
   const t0 = Date.now();
-  const sessionId = await writingEngine.createSession(signal);
-  console.log(`[brand-voice]   createSession: ${Date.now() - t0}ms`);
-  await writingEngine.pushDocument(sessionId, markdownContent, signal);
-  console.log(`[brand-voice]   pushDocument: ${Date.now() - t0}ms`);
-  const response = await writingEngine.sendChatMessageStream(sessionId, prompt, signal);
-  console.log(`[brand-voice]   sendChatMessageStream returned: ${Date.now() - t0}ms`);
+  const response = await fetch(`${writingEngine.WRITING_ENGINE_URL}/api/rewrite`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      systemPrompt: buildPreviewSystemPrompt(markdownContent),
+      userMessage,
+      maxTokens: 1000,
+    }),
+    signal,
+  });
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    throw new Error(`Rewrite API error (${response.status}): ${errText}`);
+  }
+  console.log(`[brand-voice]   rewrite API responded: ${Date.now() - t0}ms`);
   const text = await collectStreamText(response);
-  console.log(`[brand-voice]   collectStreamText: ${Date.now() - t0}ms (${text.length} chars)`);
+  console.log(`[brand-voice]   collected: ${Date.now() - t0}ms (${text.length} chars)`);
   return text;
 }
 
@@ -264,12 +225,8 @@ async function generateAvatarPreviews(avatar, brandVoice) {
 
   console.log(`[brand-voice] Generating previews for avatar ${avatar._id} (context: ${markdownContent.length} chars)`);
 
-  const compPrompt = buildPreviewPrompt(
-    `Rewrite the following generic text in your voice and style. Keep the same core message.\n\n"${GENERIC_TEXT}"`
-  );
-  const sampPrompt = buildPreviewPrompt(
-    'Write a short opening paragraph (2-3 sentences) for an article about why most teams fail at project management. Use your voice, style, and opening approach.'
-  );
+  const compMessage = `Rewrite the following generic text in your voice and style. Keep the same core message.\n\n"${GENERIC_TEXT}"`;
+  const sampMessage = 'Write a short opening paragraph (2-3 sentences) for an article about why most teams fail at project management. Use your voice, style, and opening approach.';
 
   const abortCtrl = new AbortController();
   const startTime = Date.now();
@@ -284,13 +241,13 @@ async function generateAvatarPreviews(avatar, brandVoice) {
     let sampText = '';
 
     try {
-      compText = await generateOnePreview(markdownContent, compPrompt, abortCtrl.signal);
+      compText = await generateOnePreview(markdownContent, compMessage, abortCtrl.signal);
     } catch (err) {
       console.error('[brand-voice] Comparison generation failed:', err.message);
     }
 
     try {
-      sampText = await generateOnePreview(markdownContent, sampPrompt, abortCtrl.signal);
+      sampText = await generateOnePreview(markdownContent, sampMessage, abortCtrl.signal);
     } catch (err) {
       console.error('[brand-voice] Sample generation failed:', err.message);
     }
@@ -301,14 +258,14 @@ async function generateAvatarPreviews(avatar, brandVoice) {
     if (compText && !sampText) {
       console.log('[brand-voice] Retrying sample generation...');
       try {
-        sampText = await generateOnePreview(markdownContent, sampPrompt, abortCtrl.signal);
+        sampText = await generateOnePreview(markdownContent, sampMessage, abortCtrl.signal);
       } catch (err) {
         console.error('[brand-voice] Sample retry failed:', err.message);
       }
     } else if (sampText && !compText) {
       console.log('[brand-voice] Retrying comparison generation...');
       try {
-        compText = await generateOnePreview(markdownContent, compPrompt, abortCtrl.signal);
+        compText = await generateOnePreview(markdownContent, compMessage, abortCtrl.signal);
       } catch (err) {
         console.error('[brand-voice] Comparison retry failed:', err.message);
       }
@@ -340,6 +297,20 @@ async function generateAvatarPreviews(avatar, brandVoice) {
   }
 }
 
+/* ── Default settings (matches frontend BRAND_VOICE_DEFAULT) ─────────── */
+
+const DEFAULT_SETTINGS = {
+  formality: 35,
+  warmth: 70,
+  humor: 25,
+  technicality: 40,
+  perspective: 'you',
+  sentenceStyle: 'mixed',
+  formattingHabits: ['questions-as-headings', 'short-paragraphs', 'no-intro-filler'],
+  useWords: [],
+  avoidWords: [],
+};
+
 /* ── 1. GET Brand Voice ────────────────────────────────────────────────── */
 
 const getBrandVoice = async (req, res) => {
@@ -347,8 +318,26 @@ const getBrandVoice = async (req, res) => {
     const workspace = await resolveWorkspace(req, res);
     if (!workspace) return;
 
-    const brandVoice = await BrandVoice.findOne({ workspace: workspace._id }).lean();
-    res.json({ brandVoice: brandVoice || null });
+    let brandVoice = await BrandVoice.findOne({ workspace: workspace._id }).lean();
+
+    // Auto-create default brand voice on first visit
+    if (!brandVoice) {
+      const settings = DEFAULT_SETTINGS;
+      const content = generateBrandVoiceMarkdown(settings);
+      const b2Key = `brand-voice/${workspace._id}/brand_voice.md`;
+      uploadBuffer(Buffer.from(content, 'utf-8'), 'text/markdown', b2Key).catch(() => {});
+      brandVoice = await BrandVoice.create({
+        workspace: workspace._id,
+        createdBy: req.user.userId,
+        settings,
+        content,
+        b2Key,
+        filename: 'brand_voice.md',
+      });
+      brandVoice = brandVoice.toObject();
+    }
+
+    res.json({ brandVoice });
   } catch (err) {
     console.error('getBrandVoice error:', err.message);
     res.status(500).json({ error: 'Failed to fetch brand voice' });
@@ -371,8 +360,11 @@ const saveBrandVoice = async (req, res) => {
 
     // Upload brand_voice.md to B2
     const b2Key = `brand-voice/${workspace._id}/brand_voice.md`;
+    const t0 = Date.now();
     await uploadBuffer(Buffer.from(content, 'utf-8'), 'text/markdown', b2Key);
+    console.log(`[saveBrandVoice] B2 upload took ${Date.now() - t0}ms`);
 
+    const t1 = Date.now();
     const brandVoice = await BrandVoice.findOneAndUpdate(
       { workspace: workspace._id },
       {
@@ -382,6 +374,7 @@ const saveBrandVoice = async (req, res) => {
       { upsert: true, new: true, runValidators: true }
     );
 
+    console.log(`[saveBrandVoice] DB save took ${Date.now() - t1}ms, total=${Date.now() - t0}ms`);
     res.json({ brandVoice });
   } catch (err) {
     console.error('saveBrandVoice error:', err.message);
@@ -404,21 +397,25 @@ const testBrandVoice = async (req, res) => {
       return res.status(400).json({ error: `Input must be ${MAX_TEST_WORDS} words or less` });
     }
 
-    const rateCheck = await checkTestRateLimit(req.user.userId);
+    // Parallelize rate limit check + brand voice fetch
+    const [rateCheck, brandVoice] = await Promise.all([
+      checkTestRateLimit(req.user.userId),
+      BrandVoice.findOne({ workspace: workspace._id }),
+    ]);
+
     if (!rateCheck.allowed) {
       return res.status(429).json({
-        error: 'Rate limit exceeded. 10 tests per 4 hours.',
+        error: `Rate limit exceeded. ${TEST_RATE_LIMIT} tests per 4 hours.`,
         remaining: 0,
       });
     }
 
-    const brandVoice = await BrandVoice.findOne({ workspace: workspace._id });
     if (!brandVoice || !brandVoice.content) {
       return res.status(400).json({ error: 'Save your brand voice settings first' });
     }
 
     await recordTestUsage(req.user.userId);
-    await streamWritingEngineResponse(req, res, brandVoice.content, input);
+    await streamRewriteResponse(req, res, brandVoice.content, input);
   } catch (err) {
     if (!res.headersSent) {
       console.error('testBrandVoice error:', err.message);
@@ -530,7 +527,9 @@ const updateAvatar = async (req, res) => {
 
     // Upload avatar.md to B2
     const b2Key = `brand-voice/${workspace._id}/avatars/${avatar._id}/avatar.md`;
+    const t0 = Date.now();
     await uploadBuffer(Buffer.from(avatar.content, 'utf-8'), 'text/markdown', b2Key);
+    console.log(`[updateAvatar] B2 upload took ${Date.now() - t0}ms`);
     avatar.b2Key = b2Key;
 
     // Check rate limit before save so we can tell the frontend immediately
@@ -645,16 +644,15 @@ const testAvatar = async (req, res) => {
     const rateCheck = await checkTestRateLimit(req.user.userId);
     if (!rateCheck.allowed) {
       return res.status(429).json({
-        error: 'Rate limit exceeded. 10 tests per 4 hours.',
+        error: `Rate limit exceeded. ${TEST_RATE_LIMIT} tests per 4 hours.`,
         remaining: 0,
       });
     }
 
-    // Parallelize DB lookups with Writing Engine session creation
-    const [avatar, brandVoice, sessionId] = await Promise.all([
+    // Parallelize DB lookups
+    const [avatar, brandVoice] = await Promise.all([
       Avatar.findOne({ _id: avatarId, workspace: workspace._id }).lean(),
       BrandVoice.findOne({ workspace: workspace._id }).lean(),
-      writingEngine.createSession(),
     ]);
     if (!avatar || !avatar.content) {
       return res.status(400).json({ error: 'Save your avatar settings first' });
@@ -666,7 +664,7 @@ const testAvatar = async (req, res) => {
       : avatar.content;
 
     await recordTestUsage(req.user.userId);
-    await streamWritingEngineResponseWithSession(req, res, sessionId, combinedContent, input);
+    await streamRewriteResponse(req, res, combinedContent, input);
   } catch (err) {
     if (!res.headersSent) {
       console.error('testAvatar error:', err.message);
@@ -705,7 +703,7 @@ const uploadAvatarFile = async (req, res) => {
     // Upload original file to B2
     const hash = crypto.createHash('md5').update(req.file.buffer).digest('hex').slice(0, 8);
     const ext = req.file.originalname.split('.').pop() || 'bin';
-    const b2Key = `brand-voice/${workspace._id}/${avatarId}/${Date.now()}-${hash}.${ext}`;
+    const b2Key = `brand-voice/${workspace._id}/avatars/${avatarId}/documents/${Date.now()}-${hash}.${ext}`;
     await uploadBuffer(req.file.buffer, req.file.mimetype, b2Key);
 
     // Add upload record
@@ -880,16 +878,11 @@ const uploadAvatarImage = async (req, res) => {
       );
     }
 
-    // Upload to B2
-    const imagePath = await uploadImage(
-      req.file.buffer,
-      req.file.mimetype,
-      workspace._id.toString(),
-      `avatar-${avatarId}`
-    );
-
-    // Store the B2 key (strip the /api/b2-image/ prefix)
-    const b2Key = imagePath.replace('/api/b2-image/', '');
+    // Upload to B2 under the avatar folder
+    const imgExt = req.file.mimetype.split('/')[1] === 'jpeg' ? 'jpg' : req.file.mimetype.split('/')[1] || 'png';
+    const imgHash = crypto.createHash('md5').update(req.file.buffer).digest('hex').slice(0, 8);
+    const b2Key = `brand-voice/${workspace._id}/avatars/${avatarId}/image-${imgHash}.${imgExt}`;
+    await uploadBuffer(req.file.buffer, req.file.mimetype, b2Key);
     avatar.avatarImage = b2Key;
     await avatar.save();
 
@@ -988,7 +981,7 @@ const importGoogleDoc = async (req, res) => {
     // Upload text to B2
     const buffer = Buffer.from(text, 'utf-8');
     const hash = crypto.createHash('md5').update(buffer).digest('hex').slice(0, 8);
-    const b2Key = `brand-voice/${workspace._id}/${avatarId}/${Date.now()}-${hash}.txt`;
+    const b2Key = `brand-voice/${workspace._id}/avatars/${avatarId}/documents/${Date.now()}-${hash}.txt`;
     await uploadBuffer(buffer, 'text/plain', b2Key);
 
     // Add upload record

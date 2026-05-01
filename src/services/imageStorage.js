@@ -3,8 +3,10 @@
  * Falls back gracefully when B2 is not configured — returns original data as-is.
  */
 
-const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, ListObjectsV2Command, ListObjectVersionsCommand } = require('@aws-sdk/client-s3');
+const { NodeHttpHandler } = require('@smithy/node-http-handler');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const https = require('https');
 const crypto = require('crypto');
 
 const B2_ENDPOINT = process.env.B2_ENDPOINT;
@@ -24,6 +26,9 @@ function getClient() {
     region: B2_REGION,
     credentials: { accessKeyId: B2_KEY_ID, secretAccessKey: B2_APP_KEY },
     forcePathStyle: true,
+    requestHandler: new NodeHttpHandler({
+      httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 10 }),
+    }),
   });
   return s3;
 }
@@ -31,6 +36,16 @@ function getClient() {
 function isEnabled() {
   return !!(B2_ENDPOINT && B2_BUCKET && B2_KEY_ID && B2_APP_KEY);
 }
+
+// Keep B2 connection warm — initial handshake + periodic ping every 30s
+// so uploads always hit the fast path (~3s) instead of cold start (~11s).
+(function keepWarm() {
+  const client = getClient();
+  if (!client) return;
+  const ping = () => client.send(new ListObjectsV2Command({ Bucket: B2_BUCKET, MaxKeys: 1 })).catch(() => {});
+  ping().then(() => console.log('[B2] connection warmed up'));
+  setInterval(ping, 60_000).unref();
+})();
 
 /**
  * Build a backend-relative path for an uploaded file.
@@ -188,6 +203,7 @@ async function uploadBuffer(buffer, contentType, key) {
   const client = getClient();
   if (!client) throw new Error('B2 storage not configured');
 
+  const t0 = Date.now();
   await client.send(new PutObjectCommand({
     Bucket: B2_BUCKET,
     Key: key,
@@ -195,8 +211,40 @@ async function uploadBuffer(buffer, contentType, key) {
     ContentType: contentType,
     CacheControl: 'private, max-age=86400',
   }));
+  console.log(`[B2] uploadBuffer key=${key} took=${Date.now() - t0}ms`);
+
+  // Upload succeeded — now clean up old versions (B2 versioning stacks on each PUT)
+  await cleanOldVersions(key).catch(() => {});
 
   return key;
+}
+
+/**
+ * Delete all old versions of a key, keeping only the latest.
+ * B2 versioning creates a new version on every PUT — this prevents stacking.
+ */
+async function cleanOldVersions(key) {
+  const client = getClient();
+  if (!client) return;
+
+  const res = await client.send(new ListObjectVersionsCommand({
+    Bucket: B2_BUCKET,
+    Prefix: key,
+    MaxKeys: 50,
+  }));
+
+  // Filter to exact key match (prefix could match other keys)
+  const versions = (res.Versions || []).filter(v => v.Key === key);
+  const markers = (res.DeleteMarkers || []).filter(dm => dm.Key === key);
+
+  // Keep the first (latest) version, delete the rest
+  for (const v of versions.slice(1)) {
+    await client.send(new DeleteObjectCommand({ Bucket: B2_BUCKET, Key: key, VersionId: v.VersionId }));
+  }
+  // Delete all hide markers
+  for (const dm of markers) {
+    await client.send(new DeleteObjectCommand({ Bucket: B2_BUCKET, Key: dm.Key, VersionId: dm.VersionId }));
+  }
 }
 
 /**
@@ -213,6 +261,48 @@ async function deleteObject(key) {
   }));
 }
 
+/**
+ * Delete ALL versions of all B2 objects under a given prefix.
+ * Uses ListObjectVersions to find every version (including hide markers)
+ * and deletes each by VersionId so they're truly removed.
+ * @param {string} prefix - e.g. 'brand-voice/' or 'images/'
+ * @returns {Promise<number>} Number of versions deleted
+ */
+async function deleteAllWithPrefix(prefix) {
+  const client = getClient();
+  if (!client) return 0;
+
+  let deleted = 0;
+  let keyMarker;
+  let versionIdMarker;
+
+  do {
+    const res = await client.send(new ListObjectVersionsCommand({
+      Bucket: B2_BUCKET,
+      Prefix: prefix,
+      KeyMarker: keyMarker,
+      VersionIdMarker: versionIdMarker,
+    }));
+
+    // Delete all versions (actual files)
+    for (const v of res.Versions || []) {
+      await client.send(new DeleteObjectCommand({ Bucket: B2_BUCKET, Key: v.Key, VersionId: v.VersionId }));
+      deleted++;
+    }
+
+    // Delete all delete markers (hide markers)
+    for (const dm of res.DeleteMarkers || []) {
+      await client.send(new DeleteObjectCommand({ Bucket: B2_BUCKET, Key: dm.Key, VersionId: dm.VersionId }));
+      deleted++;
+    }
+
+    keyMarker = res.IsTruncated ? res.NextKeyMarker : undefined;
+    versionIdMarker = res.IsTruncated ? res.NextVersionIdMarker : undefined;
+  } while (keyMarker);
+
+  return deleted;
+}
+
 module.exports = {
   isEnabled,
   uploadImage,
@@ -224,4 +314,5 @@ module.exports = {
   isB2Path,
   extractKey,
   migratePublicUrl,
+  deleteAllWithPrefix,
 };

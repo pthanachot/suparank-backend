@@ -74,6 +74,11 @@ app.use('/api/workspace', brandVoiceRoutes);
 app.use('/api/workspace', workspaceRoutes);
 app.use('/api/workspaces', workspaceCrudRoutes);
 
+// Dev-only routes (never in production, file may not exist)
+if (process.env.NODE_ENV !== 'production') {
+  try { app.use(require('./routes/devRoutes')); } catch {}
+}
+
 // Scheduled scan: check daily at 3:00 AM for trackers due for weekly scan
 const cron = require('node-cron');
 const AiTracker = require('./models/AiTracker');

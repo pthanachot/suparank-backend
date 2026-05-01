@@ -5,3 +5,7 @@ node_modules/
 npm-debug.log
 yarn-error.log
 .DS_Store
+
+# dev-only (local tools, not deployed)
+src/routes/devRoutes.js
+scripts/

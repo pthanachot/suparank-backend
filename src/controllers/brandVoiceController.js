@@ -80,7 +80,10 @@ RULES:
 
   const apiRes = await fetch(`${writingEngine.WRITING_ENGINE_URL}/api/rewrite`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(process.env.REWRITE_SECRET && { 'X-Rewrite-Secret': process.env.REWRITE_SECRET }),
+    },
     body: JSON.stringify({
       systemPrompt,
       userMessage: userInput,
@@ -173,7 +176,10 @@ async function generateOnePreview(markdownContent, userMessage, signal) {
   const t0 = Date.now();
   const response = await fetch(`${writingEngine.WRITING_ENGINE_URL}/api/rewrite`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(process.env.REWRITE_SECRET && { 'X-Rewrite-Secret': process.env.REWRITE_SECRET }),
+    },
     body: JSON.stringify({
       systemPrompt: buildPreviewSystemPrompt(markdownContent),
       userMessage,
@@ -318,23 +324,20 @@ const getBrandVoice = async (req, res) => {
     const workspace = await resolveWorkspace(req, res);
     if (!workspace) return;
 
-    let brandVoice = await BrandVoice.findOne({ workspace: workspace._id }).lean();
+    const settings = DEFAULT_SETTINGS;
+    const content = generateBrandVoiceMarkdown(settings);
+    const b2Key = `brand-voice/${workspace._id}/brand_voice.md`;
 
-    // Auto-create default brand voice on first visit
-    if (!brandVoice) {
-      const settings = DEFAULT_SETTINGS;
-      const content = generateBrandVoiceMarkdown(settings);
-      const b2Key = `brand-voice/${workspace._id}/brand_voice.md`;
+    // Atomic upsert — auto-creates on first visit, no race condition
+    const brandVoice = await BrandVoice.findOneAndUpdate(
+      { workspace: workspace._id },
+      { $setOnInsert: { createdBy: req.user.userId, settings, content, b2Key, filename: 'brand_voice.md' } },
+      { upsert: true, new: true, lean: true }
+    );
+
+    // Fire-and-forget B2 upload (idempotent PUT to same key)
+    if (!brandVoice.content || brandVoice.content === content) {
       uploadBuffer(Buffer.from(content, 'utf-8'), 'text/markdown', b2Key).catch(() => {});
-      brandVoice = await BrandVoice.create({
-        workspace: workspace._id,
-        createdBy: req.user.userId,
-        settings,
-        content,
-        b2Key,
-        filename: 'brand_voice.md',
-      });
-      brandVoice = brandVoice.toObject();
     }
 
     res.json({ brandVoice });
@@ -389,8 +392,8 @@ const testBrandVoice = async (req, res) => {
     const workspace = await resolveWorkspace(req, res);
     if (!workspace) return;
 
-    const { input } = req.body;
-    if (!input || typeof input !== 'string') {
+    const input = (req.body.input || '').trim();
+    if (!input) {
       return res.status(400).json({ error: 'input is required' });
     }
     if (countWords(input) > MAX_TEST_WORDS) {
@@ -633,8 +636,8 @@ const testAvatar = async (req, res) => {
     if (!workspace) return;
 
     const { avatarId } = req.params;
-    const { input } = req.body;
-    if (!input || typeof input !== 'string') {
+    const input = (req.body.input || '').trim();
+    if (!input) {
       return res.status(400).json({ error: 'input is required' });
     }
     if (countWords(input) > MAX_TEST_WORDS) {
@@ -702,7 +705,8 @@ const uploadAvatarFile = async (req, res) => {
 
     // Upload original file to B2
     const hash = crypto.createHash('md5').update(req.file.buffer).digest('hex').slice(0, 8);
-    const ext = req.file.originalname.split('.').pop() || 'bin';
+    const rawExt = (req.file.originalname.split('.').pop() || 'bin').toLowerCase();
+    const ext = rawExt.replace(/[^a-z0-9]/g, '') || 'bin';
     const b2Key = `brand-voice/${workspace._id}/avatars/${avatarId}/documents/${Date.now()}-${hash}.${ext}`;
     await uploadBuffer(req.file.buffer, req.file.mimetype, b2Key);
 

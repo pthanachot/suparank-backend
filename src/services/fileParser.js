@@ -2,7 +2,7 @@
  * Parse uploaded files (PDF, DOCX, TXT) into plain text.
  */
 
-const { PDFParse } = require('pdf-parse');
+const pdfParse = require('pdf-parse');
 const mammoth = require('mammoth');
 
 const SUPPORTED_MIMES = [
@@ -22,8 +22,7 @@ async function parseFile(buffer, mimetype) {
 
   switch (mimetype) {
     case 'application/pdf': {
-      const parser = new PDFParse({ verbosity: 0, data: buffer });
-      const result = await parser.getText();
+      const result = await pdfParse(buffer);
       text = result.text;
       break;
     }

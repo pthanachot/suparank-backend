@@ -4,7 +4,7 @@ const Avatar = require('../models/Avatar');
 const BrandVoiceTestLog = require('../models/BrandVoiceTestLog');
 const { generateBrandVoiceMarkdown, generateAvatarMarkdown } = require('../services/brandVoiceMarkdown');
 const { parseFile } = require('../services/fileParser');
-const { uploadBuffer, uploadImage, deleteObject } = require('../services/imageStorage');
+const { uploadBuffer, uploadImage, deleteObject, deleteAllWithPrefix } = require('../services/imageStorage');
 const writingEngine = require('../services/writingEngine');
 const crypto = require('crypto');
 
@@ -587,24 +587,14 @@ const deleteAvatar = async (req, res) => {
       return res.status(404).json({ error: 'Avatar not found' });
     }
 
-    // Clean up B2 files (fire-and-forget): avatar.md + avatar image + upload files
-    if (avatar.b2Key) {
-      deleteObject(avatar.b2Key).catch(err =>
-        console.error(`[brand-voice] B2 delete failed for avatar.md ${avatar.b2Key}:`, err.message)
-      );
-    }
-    if (avatar.avatarImage) {
-      deleteObject(avatar.avatarImage).catch(err =>
-        console.error(`[brand-voice] B2 delete failed for avatar image ${avatar.avatarImage}:`, err.message)
-      );
-    }
-    for (const upload of avatar.uploads || []) {
-      if (upload.b2Key) {
-        deleteObject(upload.b2Key).catch(err =>
-          console.error(`[brand-voice] B2 delete failed for ${upload.b2Key}:`, err.message)
-        );
-      }
-    }
+    // Clean up ALL B2 files under avatar prefix (fire-and-forget)
+    // Covers avatar.md, avatar image, and all upload files + their versioned copies
+    const avatarPrefix = `brand-voice/${workspace._id}/avatars/${avatarId}/`;
+    deleteAllWithPrefix(avatarPrefix).then(n =>
+      console.log(`[brand-voice] B2 cleanup: deleted ${n} versions under ${avatarPrefix}`)
+    ).catch(err =>
+      console.error(`[brand-voice] B2 cleanup failed for ${avatarPrefix}:`, err.message)
+    );
 
     res.json({ message: 'Avatar deleted' });
   } catch (err) {
@@ -822,9 +812,9 @@ const deleteAvatarUpload = async (req, res) => {
       return res.status(404).json({ error: 'Upload not found' });
     }
 
-    // Delete from B2 (fire-and-forget)
+    // Delete all versions from B2 (fire-and-forget)
     if (upload.b2Key) {
-      deleteObject(upload.b2Key).catch(err =>
+      deleteAllWithPrefix(upload.b2Key).catch(err =>
         console.error(`[brand-voice] B2 delete failed for ${upload.b2Key}:`, err.message)
       );
     }
@@ -874,9 +864,9 @@ const uploadAvatarImage = async (req, res) => {
       return res.status(400).json({ error: 'Image file is required' });
     }
 
-    // Delete old image from B2 if exists
+    // Delete all versions of old image from B2 if exists
     if (avatar.avatarImage) {
-      deleteObject(avatar.avatarImage).catch(err =>
+      deleteAllWithPrefix(avatar.avatarImage).catch(err =>
         console.error(`[brand-voice] B2 delete old avatar image failed:`, err.message)
       );
     }
@@ -910,7 +900,7 @@ const deleteAvatarImage = async (req, res) => {
     }
 
     if (avatar.avatarImage) {
-      deleteObject(avatar.avatarImage).catch(err =>
+      deleteAllWithPrefix(avatar.avatarImage).catch(err =>
         console.error(`[brand-voice] B2 delete avatar image failed:`, err.message)
       );
       avatar.avatarImage = '';

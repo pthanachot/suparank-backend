@@ -30,7 +30,7 @@ app.use(cookieParser());
 // CORS
 const corsOptions = {
   origin: [process.env.FRONTEND_URL || 'http://localhost:3000'],
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
   maxAge: 600,
@@ -48,7 +48,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Rate limiting
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
+  max: process.env.NODE_ENV === 'production' ? 100 : 1000,
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -63,14 +63,21 @@ const workspaceCrudRoutes = require('./routes/workspaceCrudRoutes');
 const aiTrackerRoutes = require('./routes/aiTrackerRoutes');
 const keywordRoutes = require('./routes/keywordRoutes');
 const imageRoutes = require('./routes/imageRoutes');
+const brandVoiceRoutes = require('./routes/brandVoiceRoutes');
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/billing', billingRoutes);
 app.use('/api/b2-image', imageRoutes);
 app.use('/api/workspace', aiTrackerRoutes);
 app.use('/api/workspace', keywordRoutes);
+app.use('/api/workspace', brandVoiceRoutes);
 app.use('/api/workspace', workspaceRoutes);
 app.use('/api/workspaces', workspaceCrudRoutes);
+
+// Dev-only routes (never in production, file may not exist)
+if (process.env.NODE_ENV !== 'production') {
+  try { app.use(require('./routes/devRoutes')); } catch {}
+}
 
 // Scheduled scan: check daily at 3:00 AM for trackers due for weekly scan
 const cron = require('node-cron');

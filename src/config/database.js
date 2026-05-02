@@ -19,6 +19,11 @@ const connectDB = async () => {
     console.log(`Connecting to MongoDB (${options.dbName})...`);
     const conn = await mongoose.connect(process.env.MONGODB_URI, options);
     console.log(`MongoDB connected: ${conn.connection.host}/${conn.connection.name}`);
+
+    // Sync indexes to drop stale unique constraints
+    const Avatar = require('../models/Avatar');
+    await Avatar.syncIndexes();
+
     return conn;
   } catch (error) {
     console.error('MongoDB connection failed:', error.message);

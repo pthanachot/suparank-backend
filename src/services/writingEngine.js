@@ -16,10 +16,11 @@ const WRITING_ENGINE_URL = process.env.WRITING_ENGINE_URL || 'http://localhost:8
  * Create a new Writing Engine session.
  * @returns {Promise<string>} sessionId
  */
-async function createSession() {
+async function createSession(signal) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    signal,
   });
   if (!res.ok) {
     throw new Error(`Writing Engine: create session failed (${res.status})`);
@@ -33,11 +34,12 @@ async function createSession() {
  * @param {string} sessionId
  * @param {string} markdownContent
  */
-async function pushDocument(sessionId, markdownContent) {
+async function pushDocument(sessionId, markdownContent, signal) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/document`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ content: markdownContent }),
+    signal,
   });
   if (!res.ok) {
     throw new Error(`Writing Engine: push document failed (${res.status})`);

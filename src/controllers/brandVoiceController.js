@@ -146,6 +146,7 @@ async function collectStreamText(response) {
   const decoder = new TextDecoder();
   let buffer = '';
   let text = '';
+  let streamError = null;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -161,9 +162,15 @@ async function collectStreamText(response) {
         const parsed = JSON.parse(payload);
         if (parsed.type === 'text_delta' && typeof parsed.textDelta === 'string') {
           text += parsed.textDelta;
+        } else if (parsed.type === 'error') {
+          streamError = parsed.message || 'Unknown stream error';
+          console.error('[brand-voice] SSE stream error:', streamError);
         }
       } catch { /* skip */ }
     }
+  }
+  if (!text && streamError) {
+    throw new Error(`Writing Engine stream error: ${streamError}`);
   }
   return text.trim();
 }
@@ -723,13 +730,11 @@ const uploadAvatarFile = async (req, res) => {
 
     const savedUpload = avatar.uploads[avatar.uploads.length - 1];
 
-    // Fire-and-forget: summarize writing style via Writing Engine
+    // Fire-and-forget: summarize writing style via lightweight /api/rewrite
     (async () => {
+      const t0 = Date.now();
       try {
-        const sessionId = await writingEngine.createSession();
-        await writingEngine.pushDocument(sessionId, text);
-
-        const summarizePrompt = `Analyze this writing sample and extract the author's writing style. Focus on:
+        const systemPrompt = `You are a writing style analyst. Analyze the writing sample provided by the user and extract the author's writing style. Focus on:
 1. Sentence structure patterns (short/long, simple/complex)
 2. Vocabulary preferences and register
 3. Tone and voice characteristics
@@ -740,31 +745,25 @@ const uploadAvatarFile = async (req, res) => {
 
 Provide a concise style summary (max 200 words) that can be used to replicate this writing style. Only output the summary, nothing else.`;
 
-        const chatRes = await writingEngine.sendChatMessageStream(sessionId, summarizePrompt);
+        const response = await fetch(`${writingEngine.WRITING_ENGINE_URL}/api/rewrite`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(process.env.REWRITE_SECRET && { 'X-Rewrite-Secret': process.env.REWRITE_SECRET }),
+          },
+          body: JSON.stringify({
+            systemPrompt,
+            userMessage: text,
+            maxTokens: 1000,
+          }),
+        });
 
-        // Consume SSE stream to get full response
-        const reader = chatRes.body.getReader();
-        const decoder = new TextDecoder();
-        let fullText = '';
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const chunk = decoder.decode(value, { stream: true });
-          // Parse SSE events — extract text_delta data
-          const lines = chunk.split('\n');
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              try {
-                const data = JSON.parse(line.slice(6));
-                if (data.type === 'text_delta' && typeof data.textDelta === 'string') {
-                  fullText += data.textDelta;
-                } else if (data.type === 'complete' && typeof data.fullText === 'string') {
-                  fullText = data.fullText;
-                }
-              } catch { /* skip unparseable */ }
-            }
-          }
+        if (!response.ok) {
+          throw new Error(`Rewrite API error (${response.status})`);
         }
+
+        const fullText = await collectStreamText(response);
+        console.log(`[brand-voice] summarization via /api/rewrite: ${Date.now() - t0}ms (${fullText.length} chars)`);
 
         // Update upload record
         await Avatar.findOneAndUpdate(
@@ -787,7 +786,7 @@ Provide a concise style summary (max 200 words) that can be used to replicate th
           await updatedAvatar.save();
         }
 
-        console.log(`[brand-voice] summarization complete for upload ${savedUpload._id}`);
+        console.log(`[brand-voice] summarization complete for upload ${savedUpload._id} (${Date.now() - t0}ms total)`);
       } catch (err) {
         console.error(`[brand-voice] summarization failed for upload ${savedUpload._id}:`, err.message);
         // Mark upload as failed so UI doesn't show "Learning..." forever
@@ -1001,13 +1000,11 @@ const importGoogleDoc = async (req, res) => {
 
     const savedUpload = avatar.uploads[avatar.uploads.length - 1];
 
-    // Fire-and-forget: summarize writing style via Writing Engine
+    // Fire-and-forget: summarize writing style via lightweight /api/rewrite
     (async () => {
+      const t0 = Date.now();
       try {
-        const sessionId = await writingEngine.createSession();
-        await writingEngine.pushDocument(sessionId, text);
-
-        const summarizePrompt = `Analyze this writing sample and extract the author's writing style. Focus on:
+        const systemPrompt = `You are a writing style analyst. Analyze the writing sample provided by the user and extract the author's writing style. Focus on:
 1. Sentence structure patterns (short/long, simple/complex)
 2. Vocabulary preferences and register
 3. Tone and voice characteristics
@@ -1018,29 +1015,25 @@ const importGoogleDoc = async (req, res) => {
 
 Provide a concise style summary (max 200 words) that can be used to replicate this writing style. Only output the summary, nothing else.`;
 
-        const chatRes = await writingEngine.sendChatMessageStream(sessionId, summarizePrompt);
+        const response = await fetch(`${writingEngine.WRITING_ENGINE_URL}/api/rewrite`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(process.env.REWRITE_SECRET && { 'X-Rewrite-Secret': process.env.REWRITE_SECRET }),
+          },
+          body: JSON.stringify({
+            systemPrompt,
+            userMessage: text,
+            maxTokens: 1000,
+          }),
+        });
 
-        const reader = chatRes.body.getReader();
-        const decoder = new TextDecoder();
-        let fullText = '';
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split('\n');
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              try {
-                const data = JSON.parse(line.slice(6));
-                if (data.type === 'text_delta' && typeof data.textDelta === 'string') {
-                  fullText += data.textDelta;
-                } else if (data.type === 'complete' && typeof data.fullText === 'string') {
-                  fullText = data.fullText;
-                }
-              } catch { /* skip unparseable */ }
-            }
-          }
+        if (!response.ok) {
+          throw new Error(`Rewrite API error (${response.status})`);
         }
+
+        const fullText = await collectStreamText(response);
+        console.log(`[brand-voice] Google Doc summarization via /api/rewrite: ${Date.now() - t0}ms (${fullText.length} chars)`);
 
         await Avatar.findOneAndUpdate(
           { _id: avatarId, 'uploads._id': savedUpload._id },
@@ -1061,7 +1054,7 @@ Provide a concise style summary (max 200 words) that can be used to replicate th
           await updatedAvatar.save();
         }
 
-        console.log(`[brand-voice] Google Doc summarization complete for upload ${savedUpload._id}`);
+        console.log(`[brand-voice] Google Doc summarization complete for upload ${savedUpload._id} (${Date.now() - t0}ms total)`);
       } catch (err) {
         console.error(`[brand-voice] Google Doc summarization failed for upload ${savedUpload._id}:`, err.message);
         await Avatar.findOneAndUpdate(

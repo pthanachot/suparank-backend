@@ -64,6 +64,23 @@ async function pushBrief(sessionId, brief) {
 }
 
 /**
+ * Push brand voice markdown to a Writing Engine session.
+ * @param {string} sessionId
+ * @param {string} markdownContent - Combined brand voice + avatar markdown
+ */
+async function pushBrandVoice(sessionId, markdownContent) {
+  if (!markdownContent) return;
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/brand-voice`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content: markdownContent }),
+  });
+  if (!res.ok) {
+    throw new Error(`Writing Engine: push brand voice failed (${res.status})`);
+  }
+}
+
+/**
  * Send a chat message to the Writing Engine via SSE streaming.
  * The engine's /chat endpoint streams every event (thinking_delta,
  * text_delta, tool_start, document_diff, complete, error) so the UI
@@ -169,6 +186,7 @@ module.exports = {
   createSession,
   pushDocument,
   pushBrief,
+  pushBrandVoice,
   sendChatMessageStream,
   startAgent,
   generateImage,

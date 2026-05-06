@@ -1,5 +1,7 @@
 const Content = require('../models/Content');
 const Workspace = require('../models/Workspace');
+const BrandVoice = require('../models/BrandVoice');
+const Avatar = require('../models/Avatar');
 const { blocksToMarkdown, stripHtml } = require('../services/blocksToMarkdown');
 const { markdownToBlocks } = require('../services/markdownToBlocks');
 const { benchmarkToContentBrief } = require('../services/benchmarkToContentBrief');
@@ -30,10 +32,14 @@ async function resolveContent(req, res) {
 }
 
 /**
- * Set up a Writing Engine session with document + brief.
+ * Set up a Writing Engine session with document + brief + brand voice.
  * Returns { sessionId, markdown } or throws.
+ *
+ * @param {Object} content - Content document from MongoDB
+ * @param {Object} [opts]
+ * @param {string} [opts.avatarId] - Selected avatar ID (optional)
  */
-async function setupSession(content) {
+async function setupSession(content, { avatarId } = {}) {
   // 1. Create session
   const sessionId = await writingEngine.createSession();
 
@@ -74,6 +80,30 @@ async function setupSession(content) {
 
   await writingEngine.pushBrief(sessionId, brief);
 
+  // 4. Push brand voice + selected avatar to the engine (non-fatal)
+  try {
+    const workspaceId = content.workspaceId || content.workspace;
+    const brandVoice = await BrandVoice.findOne({ workspace: workspaceId }).lean();
+    let combinedMarkdown = '';
+
+    if (brandVoice && brandVoice.content) {
+      combinedMarkdown += brandVoice.content;
+    }
+
+    if (avatarId) {
+      const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspaceId, active: true }).lean();
+      if (avatar && avatar.content) {
+        combinedMarkdown += (combinedMarkdown ? '\n\n---\n\n' : '') + avatar.content;
+      }
+    }
+
+    if (combinedMarkdown.trim()) {
+      await writingEngine.pushBrandVoice(sessionId, combinedMarkdown);
+    }
+  } catch (err) {
+    console.error('Brand voice push failed (non-fatal):', err.message);
+  }
+
   return { sessionId, markdown };
 }
 
@@ -87,13 +117,13 @@ const chat = async (req, res) => {
     const content = await resolveContent(req, res);
     if (!content) return;
 
-    const { prompt } = req.body;
+    const { prompt, avatarId } = req.body;
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'prompt is required' });
     }
 
     // Set up Writing Engine session
-    const { sessionId } = await setupSession(content);
+    const { sessionId } = await setupSession(content, { avatarId });
 
     // AbortController tied to the client request so that if the browser
     // disconnects (user pressed Stop / Esc), we abort the fetch to the Go
@@ -170,13 +200,13 @@ const agent = async (req, res) => {
     const content = await resolveContent(req, res);
     if (!content) return;
 
-    const { goal, targetScore, maxIterations, allowedTools } = req.body;
+    const { goal, targetScore, maxIterations, allowedTools, avatarId } = req.body;
     if (!goal || typeof goal !== 'string') {
       return res.status(400).json({ error: 'goal is required' });
     }
 
     // Set up Writing Engine session
-    const { sessionId } = await setupSession(content);
+    const { sessionId } = await setupSession(content, { avatarId });
 
     // AbortController tied to the client request so that if the browser
     // disconnects (user pressed Stop / Esc), we abort the fetch to the Go

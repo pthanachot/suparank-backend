@@ -1,4 +1,3 @@
-const Workspace = require('../models/Workspace');
 const AiTracker = require('../models/AiTracker');
 const AiTrackerPrompt = require('../models/AiTrackerPrompt');
 const AiTrackerCompetitor = require('../models/AiTrackerCompetitor');
@@ -26,23 +25,7 @@ const PLATFORM_DISPLAY = [
   },
 ];
 
-// ─── Workspace Resolution (same pattern as contentController.js) ──────────
-
-async function resolveWorkspace(req, res) {
-  const { workspaceNumber } = req.params;
-  const workspace = await Workspace.findOne({
-    workspaceNumber: Number(workspaceNumber),
-    $or: [
-      { userId: req.user.userId },
-      { 'members.userId': req.user.userId },
-    ],
-  });
-  if (!workspace) {
-    res.status(404).json({ error: 'Workspace not found' });
-    return null;
-  }
-  return workspace;
-}
+// Workspace resolved by permissions middleware (req.workspace).
 
 // ─── Helper: resolve tracker from workspace (legacy single-monitor) ──────
 
@@ -574,8 +557,7 @@ async function buildDashboardResponse(tracker) {
 
 const getTracker = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await AiTracker.findOne({ workspaceId: workspace._id });
     if (!tracker) {
@@ -593,8 +575,7 @@ const getTracker = async (req, res) => {
 
 const updateTracker = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
@@ -633,11 +614,7 @@ const DEFAULT_SUGGESTIONS = [
 const suggestPrompts = async (req, res) => {
   console.log('[suggest-prompts] route hit, body:', JSON.stringify(req.body));
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) {
-      console.log('[suggest-prompts] workspace not found');
-      return;
-    }
+    const workspace = req.workspace;
     console.log('[suggest-prompts] workspace resolved:', workspace.workspaceNumber);
 
     const { domain } = req.body;
@@ -726,8 +703,7 @@ Make prompts realistic — what real users would ask AI assistants.`,
 
 const setup = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { domain, name, prompts, competitors } = req.body;
 
@@ -811,8 +787,7 @@ const setup = async (req, res) => {
 
 const getScanStatus = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
@@ -833,8 +808,7 @@ const getScanStatus = async (req, res) => {
 
 const triggerScan = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
@@ -872,8 +846,7 @@ const triggerScan = async (req, res) => {
 
 const addPrompt = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
@@ -910,8 +883,7 @@ const addPrompt = async (req, res) => {
 
 const removePrompt = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
@@ -937,8 +909,7 @@ const removePrompt = async (req, res) => {
 
 const updatePrompt = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
@@ -982,8 +953,7 @@ const updatePrompt = async (req, res) => {
 
 const bulkDeletePrompts = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
@@ -1009,8 +979,7 @@ const bulkDeletePrompts = async (req, res) => {
 
 const addCompetitor = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
@@ -1037,8 +1006,7 @@ const addCompetitor = async (req, res) => {
 
 const removeCompetitor = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
@@ -1068,8 +1036,7 @@ const removeCompetitor = async (req, res) => {
 
 const listMonitors = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const trackers = await AiTracker.find({ workspaceId: workspace._id })
       .sort({ createdAt: 1 })
@@ -1099,8 +1066,7 @@ const listMonitors = async (req, res) => {
 
 const createMonitor = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { domain, name, prompts, competitors } = req.body;
 
@@ -1184,8 +1150,7 @@ const createMonitor = async (req, res) => {
 
 const deleteMonitor = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
@@ -1207,8 +1172,7 @@ const deleteMonitor = async (req, res) => {
 
 const getMonitor = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
@@ -1224,8 +1188,7 @@ const getMonitor = async (req, res) => {
 
 const updateMonitor = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
@@ -1260,8 +1223,7 @@ const updateMonitor = async (req, res) => {
 
 const getMonitorScanStatus = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 
@@ -1279,8 +1241,7 @@ const getMonitorScanStatus = async (req, res) => {
 
 const triggerMonitorScan = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 
@@ -1310,8 +1271,7 @@ const triggerMonitorScan = async (req, res) => {
 
 const addMonitorPrompt = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 
@@ -1341,8 +1301,7 @@ const addMonitorPrompt = async (req, res) => {
 
 const updateMonitorPrompt = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 
@@ -1377,8 +1336,7 @@ const updateMonitorPrompt = async (req, res) => {
 
 const removeMonitorPrompt = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 
@@ -1397,8 +1355,7 @@ const removeMonitorPrompt = async (req, res) => {
 
 const bulkDeleteMonitorPrompts = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 
@@ -1417,8 +1374,7 @@ const bulkDeleteMonitorPrompts = async (req, res) => {
 
 const addMonitorCompetitor = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 
@@ -1437,8 +1393,7 @@ const addMonitorCompetitor = async (req, res) => {
 
 const removeMonitorCompetitor = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 

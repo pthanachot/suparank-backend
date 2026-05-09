@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const Workspace = require('../models/Workspace');
 const User = require('../models/User');
+const OrgMember = require('../models/OrgMember');
 
 // ─── GET WORKSPACE (find or create for user) ────────────────────
 const getWorkspace = async (req, res) => {
@@ -39,18 +40,45 @@ async function ensureDefaultWorkspace(userId) {
 const listWorkspaces = async (req, res) => {
   try {
     await ensureDefaultWorkspace(req.user.userId);
+
+    // Get org memberships (new RBAC system)
+    const memberships = await OrgMember.find({
+      userId: req.user.userId,
+      status: 'active',
+    }).lean();
+    const memberOwnerIds = memberships.map((m) => m.ownerId);
+
+    // Build role lookup: ownerId → role
+    const roleByOwner = {};
+    for (const m of memberships) {
+      roleByOwner[m.ownerId.toString()] = m.role;
+    }
+
+    // Query own workspaces + org member workspaces + legacy member workspaces
     const workspaces = await Workspace.find({
       $or: [
         { userId: req.user.userId },
-        { 'members.userId': req.user.userId },
+        { userId: { $in: memberOwnerIds } },
+        { 'members.userId': req.user.userId }, // legacy fallback
       ],
     })
       .sort({ isDefault: -1, createdAt: 1 })
       .lean();
-    const enriched = workspaces.map((ws) => ({
-      ...ws,
-      role: ws.userId.equals(req.user.userId) ? 'owner' : 'member',
-    }));
+
+    // Enrich with role
+    const enriched = workspaces.map((ws) => {
+      if (ws.userId.equals(req.user.userId)) {
+        return { ...ws, role: 'owner' };
+      }
+      // Check OrgMember role
+      const orgRole = roleByOwner[ws.userId.toString()];
+      if (orgRole) {
+        return { ...ws, role: orgRole };
+      }
+      // Legacy fallback
+      return { ...ws, role: 'editor' };
+    });
+
     res.json({ workspaces: enriched });
   } catch (error) {
     console.error('List workspaces error:', error);
@@ -143,16 +171,22 @@ const deleteWorkspace = async (req, res) => {
 const setActiveWorkspace = async (req, res) => {
   try {
     const { workspaceId } = req.params;
-    const workspace = await Workspace.findOne({
-      _id: workspaceId,
-      $or: [
-        { userId: req.user.userId },
-        { 'members.userId': req.user.userId },
-      ],
-    });
+    const workspace = await Workspace.findById(workspaceId);
     if (!workspace) {
       return res.status(404).json({ error: 'Workspace not found' });
     }
+
+    // Check access: owner, org member, or legacy member
+    const isOwner = workspace.userId.equals(req.user.userId);
+    const isOrgMember = !isOwner && await OrgMember.findMembership(workspace.userId, req.user.userId);
+    const isLegacyMember = !isOwner && !isOrgMember && workspace.members?.some(
+      (m) => m.userId.equals(req.user.userId)
+    );
+
+    if (!isOwner && !isOrgMember && !isLegacyMember) {
+      return res.status(403).json({ error: 'You do not have access to this workspace' });
+    }
+
     await User.updateOne(
       { _id: req.user.userId },
       { $set: { activeWorkspaceId: workspaceId } }

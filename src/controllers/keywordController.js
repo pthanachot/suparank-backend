@@ -1,26 +1,9 @@
-const Workspace = require('../models/Workspace');
 const KeywordSearch = require('../models/KeywordSearch');
 const KeywordDetail = require('../models/KeywordDetail');
 const KeywordResearchHistory = require('../models/KeywordResearchHistory');
 const { resolveCountry, fetchRelatedKeywords, fetchSerpResults, SUPPORTED_COUNTRIES } = require('../services/keywordService');
 
-// ─── Workspace Resolution (same pattern as aiTrackerController.js) ──────────
-
-async function resolveWorkspace(req, res) {
-  const { workspaceNumber } = req.params;
-  const workspace = await Workspace.findOne({
-    workspaceNumber: Number(workspaceNumber),
-    $or: [
-      { userId: req.user.userId },
-      { 'members.userId': req.user.userId },
-    ],
-  });
-  if (!workspace) {
-    res.status(404).json({ error: 'Workspace not found' });
-    return null;
-  }
-  return workspace;
-}
+// Workspace resolved by permissions middleware (req.workspace).
 
 // ─── Cache TTL (24 hours) ───────────────────────────────────────────────────
 
@@ -33,8 +16,7 @@ const CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 
 async function searchKeywords(req, res) {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { keyword, country } = req.body;
     if (!keyword || typeof keyword !== 'string' || !keyword.trim()) {
@@ -112,8 +94,7 @@ async function searchKeywords(req, res) {
 
 async function getKeywordDetail(req, res) {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { kw, country } = req.query;
     if (!kw || typeof kw !== 'string' || !kw.trim()) {
@@ -170,8 +151,7 @@ async function getKeywordDetail(req, res) {
 
 async function getSearchHistory(req, res) {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const historyEntries = await KeywordResearchHistory.find({ workspaceId: workspace._id })
       .sort({ searchedAt: -1 })
@@ -211,8 +191,7 @@ async function getSearchHistory(req, res) {
 
 async function deleteSearchHistory(req, res) {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { historyId } = req.params;
 

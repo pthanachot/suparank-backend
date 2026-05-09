@@ -64,6 +64,7 @@ const aiTrackerRoutes = require('./routes/aiTrackerRoutes');
 const keywordRoutes = require('./routes/keywordRoutes');
 const imageRoutes = require('./routes/imageRoutes');
 const brandVoiceRoutes = require('./routes/brandVoiceRoutes');
+const orgRoutes = require('./routes/orgRoutes');
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/billing', billingRoutes);
@@ -73,6 +74,7 @@ app.use('/api/workspace', keywordRoutes);
 app.use('/api/workspace', brandVoiceRoutes);
 app.use('/api/workspace', workspaceRoutes);
 app.use('/api/workspaces', workspaceCrudRoutes);
+app.use('/api/org', orgRoutes);
 
 // Dev-only routes (never in production, file may not exist)
 if (process.env.NODE_ENV !== 'production') {

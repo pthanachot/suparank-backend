@@ -1,5 +1,4 @@
 const Content = require('../models/Content');
-const Workspace = require('../models/Workspace');
 const BrandVoice = require('../models/BrandVoice');
 const Avatar = require('../models/Avatar');
 const { blocksToMarkdown, stripHtml } = require('../services/blocksToMarkdown');
@@ -27,21 +26,11 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
-/**
- * Shared helper: resolve workspace + content from route params.
- * Same pattern as analysisController.
- */
+// Workspace resolved by permissions middleware (req.workspace).
+// This helper finds the content within that workspace.
 async function resolveContent(req, res) {
-  const { workspaceNumber, contentNumber } = req.params;
-  const workspace = await Workspace.findOne({
-    workspaceNumber: Number(workspaceNumber),
-    userId: req.user.userId,
-  });
-  if (!workspace) {
-    res.status(404).json({ error: 'Workspace not found' });
-    return null;
-  }
-  const content = await Content.findByNumber(workspace._id, contentNumber);
+  const { contentNumber } = req.params;
+  const content = await Content.findByNumber(req.workspace._id, contentNumber);
   if (!content) {
     res.status(404).json({ error: 'Content not found' });
     return null;

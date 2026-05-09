@@ -1,4 +1,3 @@
-const Workspace = require('../models/Workspace');
 const BrandVoice = require('../models/BrandVoice');
 const Avatar = require('../models/Avatar');
 const BrandVoiceTestLog = require('../models/BrandVoiceTestLog');
@@ -8,27 +7,7 @@ const { uploadBuffer, uploadImage, deleteObject, deleteAllWithPrefix } = require
 const writingEngine = require('../services/writingEngine');
 const crypto = require('crypto');
 
-/* ── Shared: resolve workspace ─────────────────────────────────────────── */
-
-async function resolveWorkspace(req, res) {
-  const { workspaceNumber } = req.params;
-  if (!workspaceNumber || isNaN(Number(workspaceNumber))) {
-    res.status(400).json({ error: 'Invalid workspace number' });
-    return null;
-  }
-  const workspace = await Workspace.findOne({
-    workspaceNumber: Number(workspaceNumber),
-    $or: [
-      { userId: req.user.userId },
-      { 'members.userId': req.user.userId },
-    ],
-  });
-  if (!workspace) {
-    res.status(404).json({ error: 'Workspace not found' });
-    return null;
-  }
-  return workspace;
-}
+// Workspace resolved by permissions middleware (req.workspace).
 
 /* ── Rate limit helpers ───────────────────────────────────────────────── */
 
@@ -328,8 +307,7 @@ const DEFAULT_SETTINGS = {
 
 const getBrandVoice = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const settings = DEFAULT_SETTINGS;
     const content = generateBrandVoiceMarkdown(settings);
@@ -358,8 +336,7 @@ const getBrandVoice = async (req, res) => {
 
 const saveBrandVoice = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { settings } = req.body;
     if (!settings) {
@@ -396,8 +373,7 @@ const saveBrandVoice = async (req, res) => {
 
 const testBrandVoice = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const input = (req.body.input || '').trim();
     if (!input) {
@@ -438,8 +414,7 @@ const testBrandVoice = async (req, res) => {
 
 const listAvatars = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const avatars = await Avatar.find({ workspace: workspace._id })
       .sort({ createdAt: -1 })
@@ -455,8 +430,7 @@ const listAvatars = async (req, res) => {
 
 const createAvatar = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { name, emoji, role, experience, tagline, traits, writingQuirks,
             toneOverrides, vocabulary, openingStyle, sample } = req.body;
@@ -495,8 +469,7 @@ const createAvatar = async (req, res) => {
 
 const getAvatar = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId } = req.params;
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
@@ -515,8 +488,7 @@ const getAvatar = async (req, res) => {
 
 const updateAvatar = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId } = req.params;
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
@@ -578,8 +550,7 @@ const updateAvatar = async (req, res) => {
 
 const deleteAvatar = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId } = req.params;
     const avatar = await Avatar.findOneAndDelete({ _id: avatarId, workspace: workspace._id });
@@ -607,8 +578,7 @@ const deleteAvatar = async (req, res) => {
 
 const toggleAvatar = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId } = req.params;
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
@@ -629,8 +599,7 @@ const toggleAvatar = async (req, res) => {
 
 const testAvatar = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId } = req.params;
     const input = (req.body.input || '').trim();
@@ -677,8 +646,7 @@ const testAvatar = async (req, res) => {
 
 const uploadAvatarFile = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId } = req.params;
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
@@ -798,8 +766,7 @@ Provide a concise style summary (max 200 words) that can be used to replicate th
 
 const deleteAvatarUpload = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId, uploadId } = req.params;
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
@@ -851,8 +818,7 @@ const getTestRateLimit = async (req, res) => {
 
 const uploadAvatarImage = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId } = req.params;
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
@@ -890,8 +856,7 @@ const uploadAvatarImage = async (req, res) => {
 
 const deleteAvatarImage = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId } = req.params;
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
@@ -920,8 +885,7 @@ const GOOGLE_DOC_REGEX = /docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]+)/;
 
 const importGoogleDoc = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId } = req.params;
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });

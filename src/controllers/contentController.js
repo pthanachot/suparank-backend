@@ -1,31 +1,15 @@
-const Workspace = require('../models/Workspace');
 const Content = require('../models/Content');
 const { runAnalysis } = require('./analysisController');
 const imageStorage = require('../services/imageStorage');
 
-// Middleware-style: resolve workspace from :workspaceNumber param
-async function resolveWorkspace(req, res) {
-  const { workspaceNumber } = req.params;
-  const workspace = await Workspace.findOne({
-    workspaceNumber: Number(workspaceNumber),
-    $or: [
-      { userId: req.user.userId },
-      { 'members.userId': req.user.userId },
-    ],
-  });
-  if (!workspace) {
-    res.status(404).json({ error: 'Workspace not found' });
-    return null;
-  }
-  return workspace;
-}
+// Workspace is resolved by the permissions middleware (resolveWorkspaceWithRole)
+// and available as req.workspace.
 
 // ─── LIST CONTENTS (summaries) ─────────────────────────────────
 
 const listContents = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { status, folder } = req.query;
     const contents = await Content.findSummariesByWorkspace(workspace._id, { status, folder });
@@ -40,8 +24,7 @@ const listContents = async (req, res) => {
 
 const getContent = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const content = await Content.findByNumber(workspace._id, req.params.contentNumber);
     if (!content) {
@@ -69,8 +52,7 @@ const getContent = async (req, res) => {
 
 const createContent = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const contentNumber = await Content.getNextContentNumber();
     const { title, slug, description, blocks, targetKeywords, country, device, score, wordCount, status, folder, platform, versions } = req.body;
@@ -111,8 +93,7 @@ const createContent = async (req, res) => {
 
 const updateContent = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const allowedFields = [
       'title', 'slug', 'description', 'blocks', 'targetKeywords',
@@ -170,8 +151,7 @@ const updateContent = async (req, res) => {
 
 const deleteContent = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const content = await Content.findOneAndDelete({
       workspaceId: workspace._id,
@@ -193,8 +173,7 @@ const User = require('../models/User');
 
 const addComment = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { blockId, selectedText, text } = req.body;
     if (!blockId || !text) return res.status(400).json({ error: 'blockId and text are required' });
@@ -228,8 +207,7 @@ const addComment = async (req, res) => {
 
 const updateComment = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { commentId } = req.params;
     const update = {};
@@ -257,8 +235,7 @@ const updateComment = async (req, res) => {
 
 const deleteComment = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const content = await Content.findOneAndUpdate(
       { workspaceId: workspace._id, contentNumber: Number(req.params.contentNumber) },
@@ -596,8 +573,7 @@ async function streamAudit(req, res, { prompt, contentHash, contentId, dbField, 
 
 const runAudit = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const content = await Content.findOne({
       workspaceId: workspace._id,
@@ -688,8 +664,7 @@ Return ONLY valid JSON (no markdown fences, no extra text) in this exact format:
 
 const runWritingQualityAudit = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const content = await Content.findOne({
       workspaceId: workspace._id,

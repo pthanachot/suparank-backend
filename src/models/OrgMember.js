@@ -2,13 +2,18 @@ const mongoose = require('mongoose');
 
 const orgMemberSchema = new mongoose.Schema(
   {
+    organizationId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Organization',
+      required: true,
+      index: true,
+    },
     ownerId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
       required: true,
       index: true,
-      // The "organization" = the owner's account.
-      // All workspaces under this owner are accessible to the member.
+      // Denormalized from Organization.ownerId for fast permission checks.
     },
     userId: {
       type: mongoose.Schema.Types.ObjectId,
@@ -41,17 +46,25 @@ const orgMemberSchema = new mongoose.Schema(
 );
 
 // One membership per user per organization
-orgMemberSchema.index({ ownerId: 1, userId: 1 }, { unique: true });
+orgMemberSchema.index({ organizationId: 1, userId: 1 }, { unique: true });
+orgMemberSchema.index({ ownerId: 1, userId: 1 });
 // Fast lookup: "which orgs am I a member of?"
 orgMemberSchema.index({ userId: 1, status: 1 });
 
 // ─── Static methods ─────────────────────────────────────────
 
 /**
- * Find a single membership (or null).
+ * Find a single membership by owner (or null).
  */
 orgMemberSchema.statics.findMembership = function (ownerId, userId) {
   return this.findOne({ ownerId, userId, status: 'active' });
+};
+
+/**
+ * Find a single membership by organization (or null).
+ */
+orgMemberSchema.statics.findMembershipByOrg = function (organizationId, userId) {
+  return this.findOne({ organizationId, userId, status: 'active' });
 };
 
 /**

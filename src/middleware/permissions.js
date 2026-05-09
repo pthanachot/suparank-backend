@@ -10,6 +10,7 @@
  */
 
 const Workspace = require('../models/Workspace');
+const Organization = require('../models/Organization');
 const OrgMember = require('../models/OrgMember');
 const Permission = require('../models/Permission');
 const FeatureFlag = require('../models/FeatureFlag');
@@ -61,9 +62,10 @@ function _meetsMinimumPlan(userPlanId, minimumPlan) {
 //
 // 1. Finds workspace by req.params.workspaceNumber
 // 2. workspace.userId === req.user.userId → role = 'owner'
-// 3. OrgMember.findMembership(workspace.userId, req.user.userId) → membership.role
-// 4. Fallback: legacy Workspace.members[] array → 'editor'
-// 5. Sets req.workspace + req.workspaceRole, or 403
+// 3. If workspace.organizationId → check OrgMember by org
+// 4. Fallback: OrgMember.findMembership(workspace.userId, req.user.userId)
+// 5. Legacy fallback: Workspace.members[] array → 'editor'
+// 6. Sets req.workspace + req.workspaceRole, or 403
 //
 
 const resolveWorkspaceWithRole = async (req, res, next) => {
@@ -88,7 +90,29 @@ const resolveWorkspaceWithRole = async (req, res, next) => {
       return next();
     }
 
-    // Org member — role from OrgMember document
+    // Org-based access: check membership by organizationId
+    if (workspace.organizationId) {
+      const org = await Organization.findById(workspace.organizationId).lean();
+      if (org) {
+        // Org owner = workspace owner
+        if (org.ownerId.equals(req.user.userId)) {
+          req.workspace = workspace;
+          req.workspaceRole = 'owner';
+          return next();
+        }
+        const membership = await OrgMember.findMembershipByOrg(
+          workspace.organizationId,
+          req.user.userId
+        );
+        if (membership) {
+          req.workspace = workspace;
+          req.workspaceRole = membership.role;
+          return next();
+        }
+      }
+    }
+
+    // Fallback: OrgMember by ownerId (pre-multi-org records)
     const membership = await OrgMember.findMembership(
       workspace.userId, // ownerId
       req.user.userId // userId

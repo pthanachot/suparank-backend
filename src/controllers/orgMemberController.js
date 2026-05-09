@@ -1,16 +1,52 @@
 const User = require('../models/User');
+const Organization = require('../models/Organization');
 const OrgMember = require('../models/OrgMember');
 const Role = require('../models/Role');
 const FeatureFlag = require('../models/FeatureFlag');
 
+// ─── Helper: resolve org + check caller is owner/admin ──────
+
+async function resolveOrgWithAccess(req, res, requireOwnerOrAdmin = false) {
+  const { orgId } = req.params;
+  if (!orgId) {
+    res.status(400).json({ error: 'Organization ID is required' });
+    return null;
+  }
+
+  const org = await Organization.findById(orgId).lean();
+  if (!org) {
+    res.status(404).json({ error: 'Organization not found' });
+    return null;
+  }
+
+  const isOwner = org.ownerId.equals(req.user.userId);
+  if (isOwner) return { org, callerRole: 'owner' };
+
+  const membership = await OrgMember.findMembershipByOrg(org._id, req.user.userId);
+  if (!membership) {
+    res.status(403).json({ error: 'You do not have access to this organization' });
+    return null;
+  }
+
+  if (requireOwnerOrAdmin && !['admin'].includes(membership.role)) {
+    res.status(403).json({ error: 'Only organization owners or admins can perform this action' });
+    return null;
+  }
+
+  return { org, callerRole: membership.role };
+}
+
 // ─── LIST MEMBERS ────────────────────────────────────────────────
+// GET /api/organizations/:orgId/members
 // Returns the org owner + all org members with roles.
 
 const listMembers = async (req, res) => {
   try {
-    const members = await OrgMember.find({
-      ownerId: req.user.userId,
-    })
+    const result = await resolveOrgWithAccess(req, res);
+    if (!result) return;
+    const { org } = result;
+
+    const members = await OrgMember.find({ organizationId: org._id })
       .sort({ createdAt: 1 })
       .lean();
 
@@ -39,13 +75,14 @@ const listMembers = async (req, res) => {
     });
 
     // Get owner info
-    const owner = await User.findById(req.user.userId)
+    const owner = await User.findById(org.ownerId)
       .select('email profile.name profile.picture')
       .lean();
 
     res.json({
+      organization: { _id: org._id, name: org.name, slug: org.slug },
       owner: {
-        userId: req.user.userId,
+        userId: org.ownerId,
         email: owner?.email || '',
         name: owner?.profile?.name || '',
         picture: owner?.profile?.picture || '',
@@ -60,10 +97,15 @@ const listMembers = async (req, res) => {
 };
 
 // ─── INVITE MEMBER ───────────────────────────────────────────────
+// POST /api/organizations/:orgId/members
 // Body: { email, role }
 
 const inviteMember = async (req, res) => {
   try {
+    const result = await resolveOrgWithAccess(req, res, true);
+    if (!result) return;
+    const { org } = result;
+
     const { email, role } = req.body;
     if (!email || !email.trim()) {
       return res.status(400).json({ error: 'Email is required' });
@@ -77,7 +119,7 @@ const inviteMember = async (req, res) => {
     // Check member limit from feature flag
     const flag = await FeatureFlag.findOne({ key: 'members' }).lean();
     if (flag?.conditions?.custom?.maxMembers) {
-      const currentCount = await OrgMember.countDocuments({ ownerId: req.user.userId });
+      const currentCount = await OrgMember.countDocuments({ organizationId: org._id });
       if (currentCount >= flag.conditions.custom.maxMembers) {
         return res.status(400).json({
           error: `Maximum ${flag.conditions.custom.maxMembers} members allowed`,
@@ -89,13 +131,13 @@ const inviteMember = async (req, res) => {
     if (!targetUser) {
       return res.status(404).json({ error: 'No user found with that email' });
     }
-    if (targetUser._id.equals(req.user.userId)) {
-      return res.status(400).json({ error: 'You cannot invite yourself' });
+    if (targetUser._id.equals(org.ownerId)) {
+      return res.status(400).json({ error: 'Cannot invite the organization owner' });
     }
 
-    // Check if already a member
+    // Check if already a member of this org
     const existing = await OrgMember.findOne({
-      ownerId: req.user.userId,
+      organizationId: org._id,
       userId: targetUser._id,
     });
     if (existing) {
@@ -103,7 +145,8 @@ const inviteMember = async (req, res) => {
     }
 
     const member = await OrgMember.create({
-      ownerId: req.user.userId,
+      organizationId: org._id,
+      ownerId: org.ownerId,
       userId: targetUser._id,
       email: targetUser.email,
       role,
@@ -133,11 +176,15 @@ const inviteMember = async (req, res) => {
 };
 
 // ─── CHANGE ROLE ─────────────────────────────────────────────────
-// PUT /api/org/members/:memberId/role
+// PUT /api/organizations/:orgId/members/:memberId/role
 // Body: { role }
 
 const changeRole = async (req, res) => {
   try {
+    const result = await resolveOrgWithAccess(req, res, true);
+    if (!result) return;
+    const { org } = result;
+
     const { memberId } = req.params;
     const { role } = req.body;
 
@@ -148,7 +195,7 @@ const changeRole = async (req, res) => {
 
     const member = await OrgMember.findOne({
       _id: memberId,
-      ownerId: req.user.userId,
+      organizationId: org._id,
     });
     if (!member) {
       return res.status(404).json({ error: 'Member not found' });
@@ -165,15 +212,19 @@ const changeRole = async (req, res) => {
 };
 
 // ─── REMOVE MEMBER ───────────────────────────────────────────────
-// DELETE /api/org/members/:memberId
+// DELETE /api/organizations/:orgId/members/:memberId
 
 const removeMember = async (req, res) => {
   try {
+    const result = await resolveOrgWithAccess(req, res, true);
+    if (!result) return;
+    const { org } = result;
+
     const { memberId } = req.params;
 
     const member = await OrgMember.findOneAndDelete({
       _id: memberId,
-      ownerId: req.user.userId,
+      organizationId: org._id,
     });
     if (!member) {
       return res.status(404).json({ error: 'Member not found' });
@@ -204,7 +255,7 @@ const listRoles = async (req, res) => {
 };
 
 // ─── LIST FEATURE FLAGS ─────────────────────────────────────────
-// GET /api/feature-flags — returns enabled flags for frontend
+// GET /api/org/feature-flags — returns enabled flags for frontend
 
 const listFeatureFlags = async (req, res) => {
   try {

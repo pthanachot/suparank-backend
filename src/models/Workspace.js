@@ -10,6 +10,13 @@ const workspaceSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    organizationId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Organization',
+      default: null,
+      index: true,
+      // Links workspace to an organization. null = personal (legacy, pre-migration).
+    },
     name: { type: String, trim: true, maxlength: 50, default: 'My Workspace' },
     color: { type: String, default: '#6366F1' },
     isDefault: { type: Boolean, default: false },

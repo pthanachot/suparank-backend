@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const Workspace = require('../models/Workspace');
+const Organization = require('../models/Organization');
 const User = require('../models/User');
 const OrgMember = require('../models/OrgMember');
 
@@ -46,18 +47,31 @@ const listWorkspaces = async (req, res) => {
       userId: req.user.userId,
       status: 'active',
     }).lean();
-    const memberOwnerIds = memberships.map((m) => m.ownerId);
 
-    // Build role lookup: ownerId → role
+    // Build role lookup: organizationId → role, ownerId → role
+    const roleByOrg = {};
     const roleByOwner = {};
+    const memberOrgIds = [];
+    const memberOwnerIds = [];
     for (const m of memberships) {
+      if (m.organizationId) {
+        roleByOrg[m.organizationId.toString()] = m.role;
+        memberOrgIds.push(m.organizationId);
+      }
       roleByOwner[m.ownerId.toString()] = m.role;
+      memberOwnerIds.push(m.ownerId);
     }
 
-    // Query own workspaces + org member workspaces + legacy member workspaces
+    // Orgs the user owns (for workspaces belonging to those orgs)
+    const ownedOrgs = await Organization.find({ ownerId: req.user.userId }).select('_id').lean();
+    const ownedOrgIds = ownedOrgs.map((o) => o._id);
+
+    // Query workspaces: own + org-owned + org-member + owner-member + legacy
     const workspaces = await Workspace.find({
       $or: [
         { userId: req.user.userId },
+        { organizationId: { $in: ownedOrgIds } },
+        { organizationId: { $in: memberOrgIds } },
         { userId: { $in: memberOwnerIds } },
         { 'members.userId': req.user.userId }, // legacy fallback
       ],
@@ -65,16 +79,33 @@ const listWorkspaces = async (req, res) => {
       .sort({ isDefault: -1, createdAt: 1 })
       .lean();
 
+    // Deduplicate (a workspace might match multiple $or conditions)
+    const seen = new Set();
+    const deduped = workspaces.filter((ws) => {
+      const key = ws._id.toString();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
     // Enrich with role
-    const enriched = workspaces.map((ws) => {
+    const enriched = deduped.map((ws) => {
+      // Direct owner
       if (ws.userId.equals(req.user.userId)) {
         return { ...ws, role: 'owner' };
       }
-      // Check OrgMember role
-      const orgRole = roleByOwner[ws.userId.toString()];
-      if (orgRole) {
-        return { ...ws, role: orgRole };
+      // Org owner
+      if (ws.organizationId && ownedOrgIds.some((id) => id.equals(ws.organizationId))) {
+        return { ...ws, role: 'owner' };
       }
+      // Org member
+      if (ws.organizationId) {
+        const orgRole = roleByOrg[ws.organizationId.toString()];
+        if (orgRole) return { ...ws, role: orgRole };
+      }
+      // Owner-based member (pre-multi-org)
+      const ownerRole = roleByOwner[ws.userId.toString()];
+      if (ownerRole) return { ...ws, role: ownerRole };
       // Legacy fallback
       return { ...ws, role: 'editor' };
     });
@@ -89,10 +120,26 @@ const listWorkspaces = async (req, res) => {
 // ─── CREATE WORKSPACE ────────────────────────────────────────────
 const createWorkspace = async (req, res) => {
   try {
-    const { name, color } = req.body;
+    const { name, color, organizationId } = req.body;
     if (!name || !name.trim()) {
       return res.status(400).json({ error: 'Workspace name is required' });
     }
+
+    // If org specified, verify user is owner or admin
+    let orgId = null;
+    if (organizationId) {
+      const org = await Organization.findById(organizationId).lean();
+      if (!org) return res.status(404).json({ error: 'Organization not found' });
+      const isOrgOwner = org.ownerId.equals(req.user.userId);
+      if (!isOrgOwner) {
+        const mem = await OrgMember.findMembershipByOrg(org._id, req.user.userId);
+        if (!mem || !['admin'].includes(mem.role)) {
+          return res.status(403).json({ error: 'Only org owners or admins can create workspaces' });
+        }
+      }
+      orgId = org._id;
+    }
+
     const count = await Workspace.countDocuments({ userId: req.user.userId });
     if (count >= 10) {
       return res.status(400).json({ error: 'Maximum 10 workspaces allowed' });
@@ -102,6 +149,7 @@ const createWorkspace = async (req, res) => {
       workspaceNumber,
       name: name.trim(),
       userId: req.user.userId,
+      organizationId: orgId,
       color: color || '#6366F1',
     });
     res.status(201).json({ workspace });

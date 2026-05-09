@@ -5,9 +5,27 @@ const Avatar = require('../models/Avatar');
 const { blocksToMarkdown, stripHtml } = require('../services/blocksToMarkdown');
 const { markdownToBlocks } = require('../services/markdownToBlocks');
 const { benchmarkToContentBrief } = require('../services/benchmarkToContentBrief');
+const { buildResearchOutlineMd, buildSeoTargetsMd, buildContentAuditMd } = require('../services/contextFileGenerators');
 const { mapEditsToPatches } = require('../services/mapEditsToPatches');
 const writingEngine = require('../services/writingEngine');
 const imageStorage = require('../services/imageStorage');
+
+// ─── Session reuse map ───────────────────────────────────────
+// Maps contentId → { sessionId, lastUsed } for conversation memory.
+// When reuseSession is true, we reuse the engine session so the AI
+// keeps its conversation history (like Claude Code).
+const contentSessionMap = new Map();
+const SESSION_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+// Clean up stale sessions every 10 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of contentSessionMap) {
+    if (now - entry.lastUsed > SESSION_TTL_MS) {
+      contentSessionMap.delete(key);
+    }
+  }
+}, 10 * 60 * 1000);
 
 /**
  * Shared helper: resolve workspace + content from route params.
@@ -38,10 +56,26 @@ async function resolveContent(req, res) {
  * @param {Object} content - Content document from MongoDB
  * @param {Object} [opts]
  * @param {string} [opts.avatarId] - Selected avatar ID (optional)
+ * @param {boolean} [opts.reuseSession] - Reuse existing session for conversation memory
  */
-async function setupSession(content, { avatarId } = {}) {
-  // 1. Create session
-  const sessionId = await writingEngine.createSession();
+async function setupSession(content, { avatarId, reuseSession } = {}) {
+  const contentId = content._id.toString();
+  let sessionId;
+
+  // Reuse existing session if available (conversation memory)
+  if (reuseSession) {
+    const existing = contentSessionMap.get(contentId);
+    if (existing) {
+      existing.lastUsed = Date.now();
+      sessionId = existing.sessionId;
+    }
+  }
+
+  // Create new session if needed
+  if (!sessionId) {
+    sessionId = await writingEngine.createSession();
+    contentSessionMap.set(contentId, { sessionId, lastUsed: Date.now() });
+  }
 
   // 2. Convert blocks → markdown and push document
   const markdown = blocksToMarkdown(content.blocks || []);
@@ -80,7 +114,35 @@ async function setupSession(content, { avatarId } = {}) {
 
   await writingEngine.pushBrief(sessionId, brief);
 
-  // 4. Push brand voice + selected avatar to the engine (non-fatal)
+  // 4. Generate and push context files for ReadFile tool (non-fatal)
+  try {
+    const contextFiles = {};
+
+    // research-outline.md — from benchmark + competitor data
+    if (content.recommendedOutline || content.competitorPages?.length || content.peopleAlsoAsk?.length) {
+      contextFiles['research-outline.md'] = buildResearchOutlineMd(content);
+    }
+
+    // seo-targets.md — from SEO brief
+    if (brief && (brief.nlpTerms?.length || brief.secondaryKeywords?.length || brief.targetKeyword)) {
+      contextFiles['seo-targets.md'] = buildSeoTargetsMd(brief);
+    }
+
+    // content-audit.md — from latest audit results (if available)
+    const latestAudit = content.audits?.[content.audits.length - 1];
+    if (latestAudit) {
+      const auditMd = buildContentAuditMd(latestAudit);
+      if (auditMd) contextFiles['content-audit.md'] = auditMd;
+    }
+
+    if (Object.keys(contextFiles).length > 0) {
+      await writingEngine.pushContextFiles(sessionId, contextFiles);
+    }
+  } catch (err) {
+    console.error('Context files push failed (non-fatal):', err.message);
+  }
+
+  // 5. Push brand voice + selected avatar to the engine (non-fatal)
   try {
     const workspaceId = content.workspaceId || content.workspace;
     const brandVoice = await BrandVoice.findOne({ workspace: workspaceId }).lean();
@@ -200,13 +262,23 @@ const agent = async (req, res) => {
     const content = await resolveContent(req, res);
     if (!content) return;
 
-    const { goal, targetScore, maxIterations, allowedTools, avatarId } = req.body;
+    const { goal, targetScore, maxIterations, allowedTools, avatarId, mode, executionMode } = req.body;
     if (!goal || typeof goal !== 'string') {
       return res.status(400).json({ error: 'goal is required' });
     }
 
-    // Set up Writing Engine session
-    const { sessionId } = await setupSession(content, { avatarId });
+    // Set up Writing Engine session (reuse for conversation memory in freeform mode)
+    const isFreeform = !mode || mode === 'freeform';
+    const { sessionId } = await setupSession(content, { avatarId, reuseSession: isFreeform });
+
+    // Push execution mode to engine if specified
+    if (executionMode) {
+      try {
+        await writingEngine.setExecutionMode(sessionId, executionMode);
+      } catch (err) {
+        console.error('Set execution mode failed (non-fatal):', err.message);
+      }
+    }
 
     // AbortController tied to the client request so that if the browser
     // disconnects (user pressed Stop / Esc), we abort the fetch to the Go
@@ -220,8 +292,9 @@ const agent = async (req, res) => {
     });
 
     // Start agent — returns a raw SSE response from the Writing Engine
+    // mode: "freeform" (default, Claude Code-style) or "sequential" (legacy phases)
     const agentRes = await writingEngine.startAgent(
-      sessionId, goal, targetScore || 75, maxIterations || 5, abortCtrl.signal, allowedTools
+      sessionId, goal, targetScore || 75, maxIterations || 5, abortCtrl.signal, allowedTools, mode || 'freeform'
     );
 
     // Set up SSE headers for the client
@@ -231,6 +304,9 @@ const agent = async (req, res) => {
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
     });
+
+    // Emit session_init event so frontend knows the sessionId for mid-run actions
+    res.write(`data: ${JSON.stringify({ type: 'session_init', sessionId })}\n\n`);
 
     // Raw byte pipe — forward Go engine SSE stream directly to the client.
     // All event transformation (document_diff → patch/draft) is now handled
@@ -731,4 +807,74 @@ const clarifyAnswer = async (req, res) => {
   }
 };
 
-module.exports = { chat, agent, generateImage, uploadImage, clarifyAnswer };
+// ─────────────────────────────────────────────────────────────
+// POST /:workspaceNumber/content/:contentNumber/ai/plan-confirm
+// Proxies the user's plan confirmation to the Writing Engine.
+// ─────────────────────────────────────────────────────────────
+const planConfirm = async (req, res) => {
+  try {
+    const { sessionId, action, selectedSteps, mode } = req.body;
+    if (!sessionId || !action) {
+      return res.status(400).json({ error: 'sessionId and action are required' });
+    }
+    const result = await writingEngine.submitPlanConfirm(sessionId, {
+      action,
+      selectedSteps: selectedSteps || [],
+      mode: mode || 'auto',
+    });
+    return res.json(result);
+  } catch (err) {
+    console.error('Plan confirm error:', err);
+    return res.status(500).json({ error: err.message || 'Failed to submit plan confirm' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// POST /:workspaceNumber/content/:contentNumber/ai/tool-confirm
+// Proxies the user's tool confirm response (step-by-step mode).
+// ─────────────────────────────────────────────────────────────
+const toolConfirm = async (req, res) => {
+  try {
+    const { sessionId, action } = req.body;
+    if (!sessionId || !action) {
+      return res.status(400).json({ error: 'sessionId and action are required' });
+    }
+    const result = await writingEngine.submitToolConfirm(sessionId, action);
+    return res.json(result);
+  } catch (err) {
+    console.error('Tool confirm error:', err);
+    return res.status(500).json({ error: err.message || 'Failed to submit tool confirm' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// POST /:workspaceNumber/content/:contentNumber/ai/execution-mode
+// Sets the execution mode (auto / step-by-step) on a running session.
+// Called when user toggles the mode mid-run.
+// ─────────────────────────────────────────────────────────────
+const setExecutionMode = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+
+    const { mode } = req.body;
+    if (!mode || !['auto', 'step-by-step'].includes(mode)) {
+      return res.status(400).json({ error: 'mode must be "auto" or "step-by-step"' });
+    }
+
+    // Find active session for this content
+    const contentId = content._id.toString();
+    const existing = contentSessionMap.get(contentId);
+    if (!existing) {
+      return res.status(404).json({ error: 'No active session for this content' });
+    }
+
+    const result = await writingEngine.setExecutionMode(existing.sessionId, mode);
+    return res.json(result);
+  } catch (err) {
+    console.error('Set execution mode error:', err);
+    return res.status(500).json({ error: err.message || 'Failed to set execution mode' });
+  }
+};
+
+module.exports = { chat, agent, generateImage, uploadImage, clarifyAnswer, planConfirm, toolConfirm, setExecutionMode };

@@ -41,7 +41,14 @@ function clearPermissionCache() {
 
 // ─── Plan tier helpers ──────────────────────────────────────────
 
-const PLAN_LEVELS = { standard: 1, pro: 2, enterprise: 3 };
+const PLAN_LEVELS = {
+  free: 0,
+  standard: 1,
+  pro: 2,            // Legacy alias for professional
+  professional: 2,
+  agency: 3,
+  enterprise: 3,     // Legacy alias for agency
+};
 
 function _getPlanTier(planId) {
   if (!planId) return null;

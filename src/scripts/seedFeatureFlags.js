@@ -1,14 +1,20 @@
 const FeatureFlag = require('../models/FeatureFlag');
 
 const FLAGS = [
-  // ── Implemented features (different conditions per feature) ──
+  // ════════════════════════════════════════════════════════════════
+  // IMPLEMENTED FEATURES
+  // Each flag has conditions with tierLimitKey referencing TierConfig fields.
+  // ════════════════════════════════════════════════════════════════
+
   {
     key: 'workspace',
     displayName: 'Workspaces',
     description: 'Create and manage workspaces.',
     enabled: true,
     implemented: true,
-    conditions: {},
+    conditions: {
+      // Role-gated via Permission model. No tier-specific limit on workspace count.
+    },
   },
   {
     key: 'content',
@@ -16,7 +22,10 @@ const FLAGS = [
     description: 'Create, edit, and manage content articles.',
     enabled: true,
     implemented: true,
-    conditions: {},
+    conditions: {
+      // Tier limit: free=3 lifetime, standard=20/mo, pro=50/mo, agency=unlimited.
+      custom: { tierLimitKey: 'maxArticlesPerMonth' },
+    },
   },
   {
     key: 'analysis',
@@ -24,7 +33,11 @@ const FLAGS = [
     description: 'Run SEO analysis, audits, and view benchmark results.',
     enabled: true,
     implemented: true,
-    conditions: { minimumPlan: null },
+    conditions: {
+      minimumPlan: null,
+      // Tier limit: free=5 lifetime, standard=50/mo, pro=200/mo, agency=1000/mo.
+      custom: { tierLimitKey: 'maxAuditsPerMonth' },
+    },
   },
   {
     key: 'aiChat',
@@ -32,7 +45,16 @@ const FLAGS = [
     description: 'AI-powered chat, agent writing, and image generation.',
     enabled: true,
     implemented: true,
-    conditions: { minimumPlan: null, maxUsagePerDay: null },
+    conditions: {
+      minimumPlan: null,
+      maxUsagePerDay: null,
+      // Consumes credits. 1 credit per 50 words generated.
+      custom: {
+        tierLimitKey: 'creditsPerMonth',
+        creditsPerUnit: 1,
+        unitDescription: '50 words',
+      },
+    },
   },
   {
     key: 'brandVoice',
@@ -40,7 +62,11 @@ const FLAGS = [
     description: 'Configure brand voice settings and avatars.',
     enabled: true,
     implemented: true,
-    conditions: {},
+    conditions: {
+      // Tier limit: free=1, standard=1, pro=5, agency=unlimited.
+      // Limit counts across ALL workspaces in the organization.
+      custom: { tierLimitKey: 'maxBrandVoices' },
+    },
   },
   {
     key: 'billing',
@@ -48,7 +74,10 @@ const FLAGS = [
     description: 'Subscription management, checkout, and invoice history.',
     enabled: true,
     implemented: true,
-    conditions: { allowedRoles: ['owner'] },
+    conditions: {
+      allowedRoles: ['owner'],
+      // No tier gating — all plans can access billing page.
+    },
   },
   {
     key: 'aiTracker',
@@ -56,7 +85,16 @@ const FLAGS = [
     description: 'Monitor AI search engine visibility and competitor mentions.',
     enabled: true,
     implemented: true,
-    conditions: { minimumPlan: null, custom: { maxMonitors: 1 } },
+    conditions: {
+      minimumPlan: null,
+      // Tier limits: prompts, platforms, refresh interval.
+      custom: {
+        tierLimitKey: 'maxAiTrackerPromptsPerMonth',
+        // Additional limits checked from TierConfig:
+        //   maxAiTrackerPlatforms — number of LLM platforms per monitor
+        //   aiTrackerRefreshInterval — 'weekly' or 'daily'
+      },
+    },
   },
   {
     key: 'keywords',
@@ -64,7 +102,11 @@ const FLAGS = [
     description: 'Search keywords, view SERP details, and manage research history.',
     enabled: true,
     implemented: true,
-    conditions: { minimumPlan: null, custom: { maxSearchesPerDay: 10 } },
+    conditions: {
+      minimumPlan: null,
+      // Tier limit: free=50 lifetime, standard=1000/mo, pro=5000/mo, agency=25000/mo.
+      custom: { tierLimitKey: 'maxKeywordLookupsPerMonth' },
+    },
   },
   {
     key: 'members',
@@ -72,52 +114,118 @@ const FLAGS = [
     description: 'Invite and manage organization members with role-based access.',
     enabled: true,
     implemented: true,
-    conditions: { custom: { maxMembers: 3 } },
+    conditions: {
+      // Tier limit: free=1 seat, standard=2, pro=5 (+$10/seat), agency=15 (+$15/seat).
+      custom: { tierLimitKey: 'maxSeats' },
+    },
   },
 
-  // ── Not implemented yet — placeholder flags ──
-  // Uncomment when feature is ready to develop.
+  // ════════════════════════════════════════════════════════════════
+  // NOT YET IMPLEMENTED — placeholder flags
   //
-  // {
-  //   key: 'auditLog',
-  //   displayName: 'Audit Log',
-  //   description: 'Track member actions and changes.',
-  //   enabled: false,
-  //   implemented: false,
-  //   conditions: {},
-  // },
-  // {
-  //   key: 'teamPages',
-  //   displayName: 'Team Pages',
-  //   description: 'Create and manage team groupings within the organization.',
-  //   enabled: false,
-  //   implemented: false,
-  //   conditions: {},
-  // },
-  // {
-  //   key: 'apiAccess',
-  //   displayName: 'API Access',
-  //   description: 'Programmatic access to SupaRank features.',
-  //   enabled: false,
-  //   implemented: false,
-  //   conditions: { minimumPlan: 'enterprise' },
-  // },
-  // {
-  //   key: 'whiteLabel',
-  //   displayName: 'White Label',
-  //   description: 'Custom branding for the platform.',
-  //   enabled: false,
-  //   implemented: false,
-  //   conditions: { minimumPlan: 'enterprise' },
-  // },
-  // {
-  //   key: 'bulkExport',
-  //   displayName: 'Bulk Export',
-  //   description: 'Export multiple articles at once.',
-  //   enabled: false,
-  //   implemented: false,
-  //   conditions: { minimumPlan: 'pro' },
-  // },
+  // enabled: true so the flag is returned to the frontend.
+  // implemented: false so middleware returns "Feature coming soon"
+  // and frontend can show "Coming Soon" badge.
+  // ════════════════════════════════════════════════════════════════
+
+  {
+    key: 'sites',
+    displayName: 'Sites / GSC',
+    description: 'Connect sites to Google Search Console for performance data.',
+    enabled: true,
+    implemented: false,
+    conditions: {
+      // Tier limit: free=1, standard=3, pro=10, agency=unlimited.
+      custom: { tierLimitKey: 'maxSites' },
+    },
+  },
+  {
+    key: 'performanceCards',
+    displayName: 'Performance Cards',
+    description: 'View and export content performance reports.',
+    enabled: true,
+    implemented: false,
+    conditions: {
+      custom: {},
+    },
+  },
+  {
+    key: 'credits',
+    displayName: 'Credits',
+    description: 'Credit system for AI generation. 1 credit = 50 words.',
+    enabled: true,
+    implemented: false,
+    conditions: {
+      // Tier limit: free=300 lifetime, standard=3000/mo, pro=8000/mo, agency=25000/mo.
+      custom: { tierLimitKey: 'creditsPerMonth' },
+    },
+  },
+  {
+    key: 'auditLog',
+    displayName: 'Audit Log',
+    description: 'Track member actions and changes within the organization.',
+    enabled: true,
+    implemented: false,
+    conditions: {
+      minimumPlan: 'professional',
+      custom: {},
+    },
+  },
+  {
+    key: 'teamPages',
+    displayName: 'Team Pages',
+    description: 'Create and manage team groupings within the organization.',
+    enabled: true,
+    implemented: false,
+    conditions: {
+      minimumPlan: 'professional',
+      custom: {},
+    },
+  },
+  {
+    key: 'apiAccess',
+    displayName: 'API Access',
+    description: 'Programmatic access to SupaRank features via REST API.',
+    enabled: true,
+    implemented: false,
+    conditions: {
+      minimumPlan: 'agency',
+      custom: {},
+    },
+  },
+  {
+    key: 'whiteLabel',
+    displayName: 'White Label',
+    description: 'Custom branding for reports and the platform.',
+    enabled: true,
+    implemented: false,
+    conditions: {
+      minimumPlan: 'agency',
+      custom: {},
+    },
+  },
+  {
+    key: 'bulkExport',
+    displayName: 'Bulk Export',
+    description: 'Export multiple articles at once in various formats.',
+    enabled: true,
+    implemented: false,
+    conditions: {
+      minimumPlan: 'professional',
+      custom: {},
+    },
+  },
+  {
+    key: 'advancedAnalytics',
+    displayName: 'Advanced Analytics',
+    description: 'Advanced analytics dashboard with custom reporting.',
+    enabled: true,
+    implemented: false,
+    conditions: {
+      minimumPlan: 'professional',
+      custom: {},
+    },
+  },
 ];
 
 async function seedFeatureFlags() {

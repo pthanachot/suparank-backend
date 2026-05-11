@@ -14,15 +14,17 @@ const mongoose = require('mongoose');
 const { seedRoles } = require('./seedRoles');
 const { seedPermissions } = require('./seedPermissions');
 const { seedFeatureFlags } = require('./seedFeatureFlags');
+const { seedTierConfig } = require('./seedTierConfig');
 
 async function main() {
   try {
     await connectDB();
-    console.log('\n─── Seeding RBAC data ───\n');
+    console.log('\n─── Seeding RBAC & config data ───\n');
 
     await seedRoles();
     await seedPermissions();
     await seedFeatureFlags();
+    await seedTierConfig();
 
     console.log('\n─── Done ───\n');
   } catch (err) {

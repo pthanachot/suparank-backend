@@ -8,11 +8,18 @@ const subscriptionSchema = new mongoose.Schema(
       required: true,
       unique: true,
     },
-    stripeCustomerId: { type: String, required: true },
-    stripeSubscriptionId: { type: String, required: true, unique: true },
+    stripeCustomerId: { type: String, default: null },
+    stripeSubscriptionId: { type: String, default: null },
     planId: {
       type: String,
-      enum: ['standard-monthly', 'standard-yearly', 'pro-monthly', 'pro-yearly'],
+      enum: [
+        'free',
+        'standard-monthly', 'standard-yearly',
+        'professional-monthly', 'professional-yearly',
+        'agency-monthly', 'agency-yearly',
+        // Legacy aliases — keep for existing subscribers
+        'pro-monthly', 'pro-yearly',
+      ],
       required: true,
     },
     status: {
@@ -48,5 +55,6 @@ const subscriptionSchema = new mongoose.Schema(
 );
 
 subscriptionSchema.index({ stripeCustomerId: 1 });
+subscriptionSchema.index({ stripeSubscriptionId: 1 }, { unique: true, sparse: true });
 
 module.exports = mongoose.model('Subscription', subscriptionSchema);

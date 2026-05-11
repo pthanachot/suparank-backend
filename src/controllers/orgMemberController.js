@@ -259,8 +259,8 @@ const listRoles = async (req, res) => {
 
 const listFeatureFlags = async (req, res) => {
   try {
-    const flags = await FeatureFlag.find({ enabled: true, implemented: true })
-      .select('key displayName conditions')
+    const flags = await FeatureFlag.find({ enabled: true })
+      .select('key displayName description implemented conditions')
       .lean();
     res.json({ flags });
   } catch (error) {

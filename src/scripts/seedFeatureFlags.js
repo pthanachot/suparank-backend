@@ -226,6 +226,17 @@ const FLAGS = [
       custom: {},
     },
   },
+  {
+    key: 'contentVersionHistory',
+    displayName: 'Content Version History',
+    description: 'View and restore previous versions of content articles.',
+    enabled: true,
+    implemented: false,
+    conditions: {
+      // Tier limit: free=7 days, standard=30 days, pro=90 days, agency=180 days.
+      custom: { tierLimitKey: 'contentVersionHistoryDays' },
+    },
+  },
 ];
 
 async function seedFeatureFlags() {

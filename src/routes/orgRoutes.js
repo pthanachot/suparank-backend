@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const orgMemberController = require('../controllers/orgMemberController');
+const tierController = require('../controllers/tierController');
 const { authenticateToken } = require('../middleware/auth');
 
 // All org routes require authentication
@@ -11,6 +12,9 @@ router.get('/roles', orgMemberController.listRoles);
 
 // Feature flags (global, not org-scoped)
 router.get('/feature-flags', orgMemberController.listFeatureFlags);
+
+// Tier info (org's plan, limits, and current usage)
+router.get('/tier-info', tierController.getTierInfo);
 
 // Org-scoped member management
 router.get('/organizations/:orgId/members', orgMemberController.listMembers);

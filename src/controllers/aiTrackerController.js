@@ -2,7 +2,10 @@ const AiTracker = require('../models/AiTracker');
 const AiTrackerPrompt = require('../models/AiTrackerPrompt');
 const AiTrackerCompetitor = require('../models/AiTrackerCompetitor');
 const AiTrackerScan = require('../models/AiTrackerScan');
+const Workspace = require('../models/Workspace');
 const { runScan, PLATFORMS } = require('../services/aiTrackerScanEngine');
+const UsageTracker = require('../models/UsageTracker');
+const tierService = require('../services/tierService');
 
 // ─── Platform display config (returned in platformStats) ──────────────────
 
@@ -872,6 +875,11 @@ const addPrompt = async (req, res) => {
       ...(frequency ? { frequency } : {}),
     });
 
+    // Track prompt creation against tier quota
+    if (req.tierQuota) {
+      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+    }
+
     res.status(201).json({ id: doc._id.toString(), prompt: doc.prompt });
   } catch (err) {
     console.error('addPrompt error:', err.message);
@@ -1075,6 +1083,23 @@ const createMonitor = async (req, res) => {
     }
     if (!Array.isArray(prompts) || prompts.length === 0) {
       return res.status(400).json({ error: 'At least one prompt is required' });
+    }
+
+    // Check monitor count against tier limit (maxAiTrackerPlatforms)
+    const orgId = workspace.organizationId;
+    if (orgId) {
+      const { config, tier } = await tierService.getOrgTierConfig(orgId);
+      if (config?.maxAiTrackerPlatforms != null) {
+        const wsIds = await Workspace.find({ organizationId: orgId }).distinct('_id');
+        const monitorCount = await AiTracker.countDocuments({ workspaceId: { $in: wsIds } });
+        if (monitorCount >= config.maxAiTrackerPlatforms) {
+          return res.status(429).json({
+            error: `Your ${tier} plan allows ${config.maxAiTrackerPlatforms} monitors`,
+            code: 'QUOTA_EXCEEDED',
+            quota: { limit: config.maxAiTrackerPlatforms, used: monitorCount, tier, limitKey: 'maxAiTrackerPlatforms' },
+          });
+        }
+      }
     }
 
     const monitorName = (name && typeof name === 'string' && name.trim()) ? name.trim() : domain.trim();
@@ -1291,6 +1316,11 @@ const addMonitorPrompt = async (req, res) => {
       ...(Array.isArray(models) && models.length > 0 ? { models } : {}),
       ...(frequency ? { frequency } : {}),
     });
+
+    // Track prompt creation against tier quota
+    if (req.tierQuota) {
+      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+    }
 
     res.status(201).json({ id: doc._id.toString(), prompt: doc.prompt });
   } catch (err) {

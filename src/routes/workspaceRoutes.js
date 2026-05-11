@@ -6,6 +6,7 @@ const analysisController = require('../controllers/analysisController');
 const aiController = require('../controllers/aiController');
 const { authenticateToken } = require('../middleware/auth');
 const { resolveWorkspaceWithRole: rwr, requirePermission: rp, requireFeature: rf } = require('../middleware/permissions');
+const { requireQuota: rq } = require('../middleware/tierEnforcement');
 
 // All workspace routes are protected
 router.use(authenticateToken);
@@ -15,7 +16,7 @@ router.get('/', workspaceController.getWorkspace);
 
 // Content under workspace: /api/workspace/:workspaceNumber/content
 router.get('/:workspaceNumber/content', rwr, rp('content', 'read'), contentController.listContents);
-router.post('/:workspaceNumber/content', rwr, rp('content', 'create'), contentController.createContent);
+router.post('/:workspaceNumber/content', rwr, rp('content', 'create'), rq('articlesCreated', 'maxArticlesPerMonth', 'articleLimitType'), contentController.createContent);
 router.get('/:workspaceNumber/content/:contentNumber', rwr, rp('content', 'read'), contentController.getContent);
 router.put('/:workspaceNumber/content/:contentNumber', rwr, rp('content', 'update'), contentController.updateContent);
 router.delete('/:workspaceNumber/content/:contentNumber', rwr, rp('content', 'delete'), contentController.deleteContent);
@@ -26,11 +27,11 @@ router.put('/:workspaceNumber/content/:contentNumber/comments/:commentId', rwr, 
 router.delete('/:workspaceNumber/content/:contentNumber/comments/:commentId', rwr, rp('content', 'comment'), contentController.deleteComment);
 
 // Content audit
-router.post('/:workspaceNumber/content/:contentNumber/audit', rwr, rf('analysis'), rp('analysis', 'use'), contentController.runAudit);
-router.post('/:workspaceNumber/content/:contentNumber/writing-quality', rwr, rf('analysis'), rp('analysis', 'use'), contentController.runWritingQualityAudit);
+router.post('/:workspaceNumber/content/:contentNumber/audit', rwr, rf('analysis'), rp('analysis', 'use'), rq('auditsRun', 'maxAuditsPerMonth', 'auditLimitType'), contentController.runAudit);
+router.post('/:workspaceNumber/content/:contentNumber/writing-quality', rwr, rf('analysis'), rp('analysis', 'use'), rq('auditsRun', 'maxAuditsPerMonth', 'auditLimitType'), contentController.runWritingQualityAudit);
 
 // Analysis under content: /api/workspace/:workspaceNumber/content/:contentNumber/...
-router.post('/:workspaceNumber/content/:contentNumber/analyze', rwr, rf('analysis'), rp('analysis', 'use'), analysisController.triggerAnalysis);
+router.post('/:workspaceNumber/content/:contentNumber/analyze', rwr, rf('analysis'), rp('analysis', 'use'), rq('auditsRun', 'maxAuditsPerMonth', 'auditLimitType'), analysisController.triggerAnalysis);
 router.get('/:workspaceNumber/content/:contentNumber/benchmark', rwr, rf('analysis'), rp('analysis', 'read'), analysisController.getBenchmark);
 router.post('/:workspaceNumber/content/:contentNumber/reanalyze', rwr, rf('analysis'), rp('analysis', 'use'), analysisController.reanalyze);
 router.post('/:workspaceNumber/content/:contentNumber/score', rwr, rf('analysis'), rp('analysis', 'use'), analysisController.computeScore);

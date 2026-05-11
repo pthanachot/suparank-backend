@@ -2,6 +2,7 @@ const KeywordSearch = require('../models/KeywordSearch');
 const KeywordDetail = require('../models/KeywordDetail');
 const KeywordResearchHistory = require('../models/KeywordResearchHistory');
 const { resolveCountry, fetchRelatedKeywords, fetchSerpResults, SUPPORTED_COUNTRIES } = require('../services/keywordService');
+const UsageTracker = require('../models/UsageTracker');
 
 // Workspace resolved by permissions middleware (req.workspace).
 
@@ -26,6 +27,11 @@ async function searchKeywords(req, res) {
     const seedKeyword = keyword.trim().toLowerCase();
     const countryConfig = resolveCountry(country || 'United States');
     const countryCode = countryConfig.gl.toUpperCase();
+
+    // Track keyword search against tier quota
+    if (req.tierQuota) {
+      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+    }
 
     // Check cache (global — not workspace-scoped)
     const cached = await KeywordSearch.findOne({
@@ -104,6 +110,11 @@ async function getKeywordDetail(req, res) {
     const keyword = kw.trim().toLowerCase();
     const countryConfig = resolveCountry(country || 'United States');
     const countryCode = countryConfig.gl.toUpperCase();
+
+    // Track keyword detail lookup against tier quota
+    if (req.tierQuota) {
+      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+    }
 
     // Check cache (global)
     const cached = await KeywordDetail.findOne({

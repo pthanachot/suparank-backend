@@ -3,6 +3,7 @@ const Organization = require('../models/Organization');
 const OrgMember = require('../models/OrgMember');
 const Role = require('../models/Role');
 const FeatureFlag = require('../models/FeatureFlag');
+const tierService = require('../services/tierService');
 
 // ─── Helper: resolve org + check caller is owner/admin ──────
 
@@ -116,13 +117,17 @@ const inviteMember = async (req, res) => {
       return res.status(400).json({ error: `Role must be one of: ${validRoles.join(', ')}` });
     }
 
-    // Check member limit from feature flag
-    const flag = await FeatureFlag.findOne({ key: 'members' }).lean();
-    if (flag?.conditions?.custom?.maxMembers) {
-      const currentCount = await OrgMember.countDocuments({ organizationId: org._id });
-      if (currentCount >= flag.conditions.custom.maxMembers) {
-        return res.status(400).json({
-          error: `Maximum ${flag.conditions.custom.maxMembers} members allowed`,
+    // Check seat limit from TierConfig
+    const { config, tier } = await tierService.getOrgTierConfig(org._id);
+    if (config?.maxSeats != null) {
+      const memberCount = await OrgMember.countDocuments({ organizationId: org._id });
+      // +1 because the org owner is not in OrgMember but counts as a seat
+      const totalSeats = memberCount + 1;
+      if (totalSeats >= config.maxSeats) {
+        return res.status(429).json({
+          error: `Your ${config.displayName || tier} plan allows ${config.maxSeats} seat(s). Upgrade for more.`,
+          code: 'QUOTA_EXCEEDED',
+          quota: { limit: config.maxSeats, used: totalSeats, tier, limitKey: 'maxSeats' },
         });
       }
     }

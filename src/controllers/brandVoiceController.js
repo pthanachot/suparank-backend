@@ -1,11 +1,13 @@
 const BrandVoice = require('../models/BrandVoice');
 const Avatar = require('../models/Avatar');
 const BrandVoiceTestLog = require('../models/BrandVoiceTestLog');
+const Workspace = require('../models/Workspace');
 const { generateBrandVoiceMarkdown, generateAvatarMarkdown } = require('../services/brandVoiceMarkdown');
 const { parseFile } = require('../services/fileParser');
 const { uploadBuffer, uploadImage, deleteObject, deleteAllWithPrefix } = require('../services/imageStorage');
 const writingEngine = require('../services/writingEngine');
 const crypto = require('crypto');
+const tierService = require('../services/tierService');
 
 // Workspace resolved by permissions middleware (req.workspace).
 
@@ -437,6 +439,23 @@ const createAvatar = async (req, res) => {
 
     if (!name || typeof name !== 'string') {
       return res.status(400).json({ error: 'name is required' });
+    }
+
+    // Check brand voice (avatar) count against tier limit
+    const orgId = workspace.organizationId;
+    if (orgId) {
+      const { config, tier } = await tierService.getOrgTierConfig(orgId);
+      if (config?.maxBrandVoices != null) {
+        const wsIds = await Workspace.find({ organizationId: orgId }).distinct('_id');
+        const avatarCount = await Avatar.countDocuments({ workspace: { $in: wsIds } });
+        if (avatarCount >= config.maxBrandVoices) {
+          return res.status(429).json({
+            error: `Your ${tier} plan allows ${config.maxBrandVoices} brand voice(s)`,
+            code: 'QUOTA_EXCEEDED',
+            quota: { limit: config.maxBrandVoices, used: avatarCount, tier, limitKey: 'maxBrandVoices' },
+          });
+        }
+      }
     }
 
     const avatarData = {

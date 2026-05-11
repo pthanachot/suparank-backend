@@ -80,6 +80,9 @@ const tierConfigSchema = new mongoose.Schema(
       default: 'monthly',
     },
 
+    // ── Content Version History ──
+    contentVersionHistoryDays: { type: Number, default: 7 }, // how many days of revision history to keep
+
     // ── Future extensibility ──
     custom: {
       type: mongoose.Schema.Types.Mixed,

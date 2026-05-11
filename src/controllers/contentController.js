@@ -1,6 +1,7 @@
 const Content = require('../models/Content');
 const { runAnalysis } = require('./analysisController');
 const imageStorage = require('../services/imageStorage');
+const UsageTracker = require('../models/UsageTracker');
 
 // Workspace is resolved by the permissions middleware (resolveWorkspaceWithRole)
 // and available as req.workspace.
@@ -80,6 +81,11 @@ const createContent = async (req, res) => {
     if (content.targetKeywords && content.targetKeywords.length > 0) {
       await Content.findByIdAndUpdate(content._id, { $set: { analysisStatus: 'pending' } });
       runAnalysis(content._id);
+    }
+
+    // Track article creation against tier quota
+    if (req.tierQuota) {
+      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
     }
 
     res.status(201).json({ content });
@@ -594,6 +600,11 @@ const runAudit = async (req, res) => {
     const blocksText = (content.blocks || []).map((b) => stripTags(b.text)).join(' ');
     const wordCount = blocksText.trim().split(/\s+/).filter(Boolean).length;
 
+    // Track audit usage (only for non-cached audits)
+    if (req.tierQuota) {
+      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+    }
+
     await streamAudit(req, res, {
       prompt: buildAuditPrompt(markdown, keyword, wordCount),
       contentHash,
@@ -683,6 +694,11 @@ const runWritingQualityAudit = async (req, res) => {
     const markdown = blocksToText(content.blocks);
     const blocksText = (content.blocks || []).map((b) => stripTags(b.text)).join(' ');
     const wordCount = blocksText.trim().split(/\s+/).filter(Boolean).length;
+
+    // Track audit usage (only for non-cached audits)
+    if (req.tierQuota) {
+      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+    }
 
     await streamAudit(req, res, {
       prompt: buildWritingQualityPrompt(markdown, wordCount),

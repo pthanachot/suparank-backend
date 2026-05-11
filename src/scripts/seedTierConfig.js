@@ -33,6 +33,7 @@ const TIERS = [
     extraSeatPrice: 0,
     creditsPerMonth: 300,
     creditLimitType: 'lifetime',
+    contentVersionHistoryDays: 7,
   },
   {
     tier: 'standard',
@@ -55,6 +56,7 @@ const TIERS = [
     extraSeatPrice: 0,
     creditsPerMonth: 3000,
     creditLimitType: 'monthly',
+    contentVersionHistoryDays: 30,
   },
   {
     tier: 'professional',
@@ -77,6 +79,7 @@ const TIERS = [
     extraSeatPrice: 10,
     creditsPerMonth: 8000,
     creditLimitType: 'monthly',
+    contentVersionHistoryDays: 90,
   },
   {
     tier: 'agency',
@@ -99,6 +102,7 @@ const TIERS = [
     extraSeatPrice: 15,
     creditsPerMonth: 25000,
     creditLimitType: 'monthly',
+    contentVersionHistoryDays: 180,
   },
 ];
 

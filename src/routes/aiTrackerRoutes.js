@@ -3,6 +3,7 @@ const router = express.Router();
 const aiTrackerController = require('../controllers/aiTrackerController');
 const { authenticateToken } = require('../middleware/auth');
 const { resolveWorkspaceWithRole: rwr, requirePermission: rp, requireFeature: rf } = require('../middleware/permissions');
+const { requireQuota: rq } = require('../middleware/tierEnforcement');
 
 // All AI tracker routes require authentication
 router.use(authenticateToken);
@@ -29,7 +30,7 @@ router.get('/:workspaceNumber/ai-tracker/scan', ...rwrAiTracker, rp('aiTracker',
 router.post('/:workspaceNumber/ai-tracker/scan', ...rwrAiTracker, rp('aiTracker', 'use'), aiTrackerController.triggerScan);
 
 // Prompt CRUD
-router.post('/:workspaceNumber/ai-tracker/prompts', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.addPrompt);
+router.post('/:workspaceNumber/ai-tracker/prompts', ...rwrAiTracker, rp('aiTracker', 'manage'), rq('aiTrackerPromptsCreated', 'maxAiTrackerPromptsPerMonth', 'aiTrackerPromptLimitType'), aiTrackerController.addPrompt);
 router.post('/:workspaceNumber/ai-tracker/prompts/bulk-delete', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.bulkDeletePrompts);
 router.put('/:workspaceNumber/ai-tracker/prompts/:promptId', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.updatePrompt);
 router.delete('/:workspaceNumber/ai-tracker/prompts/:promptId', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.removePrompt);
@@ -56,7 +57,7 @@ router.get('/:workspaceNumber/ai-tracker/monitors/:monitorId/scan', ...rwrAiTrac
 router.post('/:workspaceNumber/ai-tracker/monitors/:monitorId/scan', ...rwrAiTracker, rp('aiTracker', 'use'), aiTrackerController.triggerMonitorScan);
 
 // Monitor-scoped prompts
-router.post('/:workspaceNumber/ai-tracker/monitors/:monitorId/prompts', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.addMonitorPrompt);
+router.post('/:workspaceNumber/ai-tracker/monitors/:monitorId/prompts', ...rwrAiTracker, rp('aiTracker', 'manage'), rq('aiTrackerPromptsCreated', 'maxAiTrackerPromptsPerMonth', 'aiTrackerPromptLimitType'), aiTrackerController.addMonitorPrompt);
 router.post('/:workspaceNumber/ai-tracker/monitors/:monitorId/prompts/bulk-delete', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.bulkDeleteMonitorPrompts);
 router.put('/:workspaceNumber/ai-tracker/monitors/:monitorId/prompts/:promptId', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.updateMonitorPrompt);
 router.delete('/:workspaceNumber/ai-tracker/monitors/:monitorId/prompts/:promptId', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.removeMonitorPrompt);

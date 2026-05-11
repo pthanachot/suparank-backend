@@ -245,12 +245,31 @@ function requireFeature(featureKey) {
         }
       }
 
-      // allowedRoles — only check if workspace context exists
-      if (conditions?.allowedRoles?.length > 0 && req.workspaceRole) {
-        if (!conditions.allowedRoles.includes(req.workspaceRole)) {
-          return res
-            .status(403)
-            .json({ error: 'Feature not available for your role' });
+      // allowedRoles — check against workspace role or org ownership
+      if (conditions?.allowedRoles?.length > 0) {
+        if (req.workspaceRole) {
+          // Workspace context exists — check workspace role
+          if (!conditions.allowedRoles.includes(req.workspaceRole)) {
+            return res
+              .status(403)
+              .json({ error: 'Feature not available for your role' });
+          }
+        } else {
+          // No workspace context (e.g. billing routes).
+          // If 'owner' is in allowedRoles, verify the user owns at least one org.
+          if (conditions.allowedRoles.includes('owner')) {
+            const ownsOrg = await Organization.exists({ ownerId: req.user.userId });
+            if (!ownsOrg) {
+              return res
+                .status(403)
+                .json({ error: 'Feature not available for your role' });
+            }
+          } else {
+            // Non-owner role required but no workspace context — deny
+            return res
+              .status(403)
+              .json({ error: 'Feature not available for your role' });
+          }
         }
       }
 

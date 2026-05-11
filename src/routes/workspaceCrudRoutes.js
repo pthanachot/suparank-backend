@@ -10,6 +10,7 @@ router.post('/', workspaceController.createWorkspace);
 router.put('/:workspaceId', workspaceController.updateWorkspace);
 router.delete('/:workspaceId', workspaceController.deleteWorkspace);
 router.put('/:workspaceId/activate', workspaceController.setActiveWorkspace);
+router.put('/:workspaceId/move', workspaceController.moveWorkspace);
 router.get('/:workspaceId/members', workspaceController.getMembers);
 router.post('/:workspaceId/members', workspaceController.addMember);
 router.delete('/:workspaceId/members/:memberId', workspaceController.removeMember);

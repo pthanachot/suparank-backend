@@ -59,7 +59,17 @@ const createOrganization = async (req, res) => {
       isPersonal: false,
     });
 
-    res.status(201).json({ organization: { ...org.toObject(), role: 'owner' } });
+    // Auto-adopt orphan workspaces (created before org system)
+    const adoptResult = await Workspace.updateMany(
+      { userId: req.user.userId, organizationId: null },
+      { $set: { organizationId: org._id } }
+    );
+    const adoptedWorkspaces = adoptResult.modifiedCount || 0;
+
+    res.status(201).json({
+      organization: { ...org.toObject(), role: 'owner' },
+      adoptedWorkspaces,
+    });
   } catch (error) {
     if (error.code === 11000) {
       return res.status(409).json({ error: 'You already have an organization with that name' });
@@ -142,10 +152,6 @@ const deleteOrganization = async (req, res) => {
     if (!org.ownerId.equals(req.user.userId)) {
       return res.status(403).json({ error: 'Only the organization owner can delete it' });
     }
-    if (org.isPersonal) {
-      return res.status(400).json({ error: 'Cannot delete your personal organization' });
-    }
-
     // Check for workspaces
     const wsCount = await Workspace.countDocuments({ organizationId: org._id });
     if (wsCount > 0) {

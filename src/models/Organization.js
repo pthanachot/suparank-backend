@@ -61,20 +61,5 @@ organizationSchema.statics.generateSlug = async function (name, ownerId) {
   }
 };
 
-// Find or create the personal org for a user
-organizationSchema.statics.findOrCreatePersonal = async function (userId, userName, userEmail) {
-  let org = await this.findOne({ ownerId: userId, isPersonal: true });
-  if (!org) {
-    const displayName = userName || userEmail?.split('@')[0] || 'My Organization';
-    const slug = await this.generateSlug(displayName, userId);
-    org = await this.create({
-      name: displayName,
-      slug,
-      ownerId: userId,
-      isPersonal: true,
-    });
-  }
-  return org;
-};
 
 module.exports = mongoose.model('Organization', organizationSchema);

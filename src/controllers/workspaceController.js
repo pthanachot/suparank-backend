@@ -351,4 +351,36 @@ const removeMember = async (req, res) => {
   }
 };
 
-module.exports = { getWorkspace, listWorkspaces, createWorkspace, updateWorkspace, deleteWorkspace, setActiveWorkspace, getMembers, addMember, removeMember };
+// ─── MOVE WORKSPACE TO ANOTHER ORG ──────────────────────────
+const moveWorkspace = async (req, res) => {
+  try {
+    const { workspaceId } = req.params;
+    const { targetOrgId } = req.body;
+    if (!targetOrgId) {
+      return res.status(400).json({ error: 'targetOrgId is required' });
+    }
+
+    const workspace = await Workspace.findOne({ _id: workspaceId, userId: req.user.userId });
+    if (!workspace) {
+      return res.status(404).json({ error: 'Workspace not found or you are not the owner' });
+    }
+
+    const targetOrg = await Organization.findById(targetOrgId).lean();
+    if (!targetOrg) {
+      return res.status(404).json({ error: 'Target organization not found' });
+    }
+    if (!targetOrg.ownerId.equals(req.user.userId)) {
+      return res.status(403).json({ error: 'You must own the target organization' });
+    }
+
+    workspace.organizationId = targetOrg._id;
+    await workspace.save();
+
+    res.json({ workspace });
+  } catch (error) {
+    console.error('Move workspace error:', error);
+    res.status(500).json({ error: 'Failed to move workspace' });
+  }
+};
+
+module.exports = { getWorkspace, listWorkspaces, createWorkspace, updateWorkspace, deleteWorkspace, setActiveWorkspace, getMembers, addMember, removeMember, moveWorkspace };

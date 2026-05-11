@@ -17,5 +17,7 @@ router.get('/organizations/:orgId/members', orgMemberController.listMembers);
 router.post('/organizations/:orgId/members', orgMemberController.inviteMember);
 router.put('/organizations/:orgId/members/:memberId/role', orgMemberController.changeRole);
 router.delete('/organizations/:orgId/members/:memberId', orgMemberController.removeMember);
+router.post('/organizations/:orgId/transfer-ownership', orgMemberController.transferOwnership);
+router.post('/organizations/:orgId/leave', orgMemberController.leaveOrganization);
 
 module.exports = router;

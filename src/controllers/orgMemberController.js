@@ -269,4 +269,92 @@ const listFeatureFlags = async (req, res) => {
   }
 };
 
-module.exports = { listMembers, inviteMember, changeRole, removeMember, listRoles, listFeatureFlags };
+// ─── TRANSFER OWNERSHIP ─────────────────────────────────────────
+// POST /api/organizations/:orgId/transfer-ownership
+// Body: { newOwnerMemberId, selfRole }
+// Only the current owner can transfer ownership.
+
+const transferOwnership = async (req, res) => {
+  try {
+    const { orgId } = req.params;
+    const { newOwnerMemberId, selfRole } = req.body;
+
+    const org = await Organization.findById(orgId);
+    if (!org) return res.status(404).json({ error: 'Organization not found' });
+
+    // Only current owner can transfer
+    if (!org.ownerId.equals(req.user.userId)) {
+      return res.status(403).json({ error: 'Only the owner can transfer ownership' });
+    }
+
+    const validRoles = ['admin', 'editor', 'viewer'];
+    if (!validRoles.includes(selfRole)) {
+      return res.status(400).json({ error: `selfRole must be one of: ${validRoles.join(', ')}` });
+    }
+
+    // Find the successor member
+    const successor = await OrgMember.findOne({ _id: newOwnerMemberId, organizationId: org._id });
+    if (!successor) return res.status(404).json({ error: 'Successor member not found' });
+
+    const successorUserId = successor.userId;
+    const oldOwnerId = org.ownerId;
+
+    // 1. Update org owner to successor
+    org.ownerId = successorUserId;
+    await org.save();
+
+    // 2. Remove successor's OrgMember record (owner is implicit, not in OrgMember)
+    await OrgMember.findByIdAndDelete(successor._id);
+
+    // 3. Create OrgMember record for the old owner with their chosen role
+    const oldOwnerUser = await User.findById(oldOwnerId).select('email').lean();
+    await OrgMember.create({
+      organizationId: org._id,
+      ownerId: successorUserId,
+      userId: oldOwnerId,
+      email: oldOwnerUser?.email || '',
+      role: selfRole,
+      status: 'active',
+      invitedAt: new Date(),
+    });
+
+    res.json({ message: 'Ownership transferred successfully' });
+  } catch (error) {
+    console.error('Transfer ownership error:', error);
+    res.status(500).json({ error: 'Failed to transfer ownership' });
+  }
+};
+
+// ─── LEAVE ORGANIZATION ─────────────────────────────────────
+const leaveOrganization = async (req, res) => {
+  try {
+    const { orgId } = req.params;
+    const org = await Organization.findById(orgId).lean();
+    if (!org) {
+      return res.status(404).json({ error: 'Organization not found' });
+    }
+
+    // Owner cannot leave — must transfer ownership first
+    if (org.ownerId.equals(req.user.userId)) {
+      return res.status(400).json({
+        error: 'As the owner, you must transfer ownership before leaving the organization.',
+      });
+    }
+
+    const membership = await OrgMember.findOne({
+      organizationId: org._id,
+      userId: req.user.userId,
+    });
+    if (!membership) {
+      return res.status(404).json({ error: 'You are not a member of this organization' });
+    }
+
+    await OrgMember.findByIdAndDelete(membership._id);
+    res.json({ message: 'You have left the organization' });
+  } catch (error) {
+    console.error('Leave organization error:', error);
+    res.status(500).json({ error: 'Failed to leave organization' });
+  }
+};
+
+module.exports = { listMembers, inviteMember, changeRole, removeMember, listRoles, listFeatureFlags, transferOwnership, leaveOrganization };

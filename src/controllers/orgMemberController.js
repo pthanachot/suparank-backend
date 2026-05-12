@@ -4,6 +4,7 @@ const OrgMember = require('../models/OrgMember');
 const Role = require('../models/Role');
 const FeatureFlag = require('../models/FeatureFlag');
 const tierService = require('../services/tierService');
+const { ORG_CONFIG } = require('../scripts/configOrganization');
 
 // ─── Helper: resolve org + check caller is owner/admin ──────
 
@@ -303,6 +304,19 @@ const transferOwnership = async (req, res) => {
 
     const successorUserId = successor.userId;
     const oldOwnerId = org.ownerId;
+
+    // ── Check if successor can own another org (global limit from configOrganization.js) ──
+    const maxOrgs = ORG_CONFIG.maxOrganizationsPerUser;
+    if (maxOrgs != null) {
+      const successorOwnedCount = await Organization.countDocuments({ ownerId: successorUserId });
+      if (successorOwnedCount >= maxOrgs) {
+        return res.status(429).json({
+          error: `The new owner already owns ${successorOwnedCount} organization(s). The limit is ${maxOrgs}.`,
+          code: 'QUOTA_EXCEEDED',
+          quota: { limit: maxOrgs, used: successorOwnedCount, limitKey: 'maxOrganizationsPerUser' },
+        });
+      }
+    }
 
     // 1. Update org owner to successor
     org.ownerId = successorUserId;

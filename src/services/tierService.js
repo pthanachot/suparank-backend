@@ -9,7 +9,6 @@
  * Uses a 5-minute in-memory cache (same strategy as permissions.js).
  */
 
-const Organization = require('../models/Organization');
 const Subscription = require('../models/Subscription');
 const TierConfig = require('../models/TierConfig');
 
@@ -41,7 +40,7 @@ function clearTierCache() {
 /**
  * Resolve the tier name for an organisation.
  *
- * org → org.ownerId → Subscription → planId → tier name
+ * org → Subscription (by organizationId) → planId → tier name
  * No subscription → 'free'
  */
 async function getOrgTier(orgId) {
@@ -49,14 +48,8 @@ async function getOrgTier(orgId) {
   let cached = _get(cacheKey);
   if (cached !== undefined) return cached;
 
-  const org = await Organization.findById(orgId).select('ownerId').lean();
-  if (!org) {
-    _set(cacheKey, 'free');
-    return 'free';
-  }
-
   const sub = await Subscription.findOne({
-    userId: org.ownerId,
+    organizationId: orgId,
     status: { $in: ['active', 'trialing'] },
   })
     .select('planId')

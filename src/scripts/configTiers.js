@@ -3,8 +3,8 @@ const TierConfig = require('../models/TierConfig');
 /**
  * Tier configuration — the source of truth for per-tier limits.
  *
- * Values can be edited directly in MongoDB without code changes.
- * This seed uses $setOnInsert so re-running will NOT overwrite manual edits.
+ * THIS FILE IS THE SOURCE OF TRUTH. Changes here are synced to the
+ * database on every server startup. Do not edit values in MongoDB directly.
  *
  * null = unlimited for numeric limits.
  * limitType 'lifetime' = one-time allotment (free tier).
@@ -28,6 +28,7 @@ const TIERS = [
     maxAuditsPerMonth: 5,
     auditLimitType: 'lifetime',
     maxBrandVoices: 1,
+    maxWorkspaces: 1,
     maxSites: 1,
     maxSeats: 1,
     extraSeatPrice: 0,
@@ -51,6 +52,7 @@ const TIERS = [
     maxAuditsPerMonth: 50,
     auditLimitType: 'monthly',
     maxBrandVoices: 1,
+    maxWorkspaces: 2,
     maxSites: 3,
     maxSeats: 2,
     extraSeatPrice: 0,
@@ -74,6 +76,7 @@ const TIERS = [
     maxAuditsPerMonth: 200,
     auditLimitType: 'monthly',
     maxBrandVoices: 5,
+    maxWorkspaces: 5,
     maxSites: 10,
     maxSeats: 5,
     extraSeatPrice: 10,
@@ -97,6 +100,7 @@ const TIERS = [
     maxAuditsPerMonth: 1000,
     auditLimitType: 'monthly',
     maxBrandVoices: null,   // unlimited
+    maxWorkspaces: 10,
     maxSites: null,          // unlimited
     maxSeats: 15,
     extraSeatPrice: 15,
@@ -106,21 +110,26 @@ const TIERS = [
   },
 ];
 
-async function seedTierConfig() {
-  let created = 0;
-  let skipped = 0;
+async function syncTiers() {
+  let upserted = 0;
+  let updated = 0;
+
+  const configTiers = TIERS.map((t) => t.tier);
 
   for (const config of TIERS) {
     const result = await TierConfig.updateOne(
       { tier: config.tier },
-      { $setOnInsert: config },
+      { $set: config },
       { upsert: true }
     );
-    if (result.upsertedCount > 0) created++;
-    else skipped++;
+    if (result.upsertedCount > 0) upserted++;
+    else if (result.modifiedCount > 0) updated++;
   }
 
-  console.log(`[seedTierConfig] ${created} created, ${skipped} already existed`);
+  // Remove tiers no longer in config
+  const removed = await TierConfig.deleteMany({ tier: { $nin: configTiers } });
+
+  console.log(`[syncTiers] ${upserted} created, ${updated} updated, ${removed.deletedCount} removed`);
 }
 
-module.exports = { seedTierConfig, TIERS };
+module.exports = { syncTiers, TIERS };

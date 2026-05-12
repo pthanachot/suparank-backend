@@ -2,11 +2,18 @@ const mongoose = require('mongoose');
 
 const subscriptionSchema = new mongoose.Schema(
   {
+    organizationId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Organization',
+      required: false, // Will become required after migration
+      index: true,
+      unique: true,
+      sparse: true, // Allow null during migration
+    },
     userId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
-      required: true,
-      unique: true,
+      required: false, // Kept as billing contact / creator — no longer the lookup key
     },
     stripeCustomerId: { type: String, default: null },
     stripeSubscriptionId: { type: String, default: null },
@@ -56,5 +63,6 @@ const subscriptionSchema = new mongoose.Schema(
 
 subscriptionSchema.index({ stripeCustomerId: 1 });
 subscriptionSchema.index({ stripeSubscriptionId: 1 }, { unique: true, sparse: true });
+subscriptionSchema.index({ organizationId: 1, status: 1 });
 
 module.exports = mongoose.model('Subscription', subscriptionSchema);

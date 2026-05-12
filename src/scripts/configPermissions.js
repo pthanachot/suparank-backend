@@ -1,6 +1,7 @@
 const Permission = require('../models/Permission');
 
-// ─── Permission matrix (matches user's exact specification) ─────────
+// ─── Permission matrix — SOURCE OF TRUTH ────────────────────────────
+// Synced to database on every server startup.
 // Format: [resource, action, owner, admin, editor, viewer]
 // true = allowed, false = denied
 
@@ -47,26 +48,41 @@ const MATRIX = [
 
 const ROLE_NAMES = ['owner', 'admin', 'editor', 'viewer'];
 
-async function seedPermissions() {
-  let created = 0;
-  let skipped = 0;
+async function syncPermissions() {
+  let upserted = 0;
+  let updated = 0;
+
+  // Build set of valid keys for cleanup
+  const validKeys = new Set();
 
   for (const [resource, action, ...roleFlags] of MATRIX) {
     for (let i = 0; i < ROLE_NAMES.length; i++) {
       const role = ROLE_NAMES[i];
       const allowed = roleFlags[i];
+      validKeys.add(`${role}:${resource}:${action}`);
 
       const result = await Permission.updateOne(
         { role, resource, action },
-        { $setOnInsert: { role, resource, action, allowed } },
+        { $set: { role, resource, action, allowed } },
         { upsert: true }
       );
-      if (result.upsertedCount > 0) created++;
-      else skipped++;
+      if (result.upsertedCount > 0) upserted++;
+      else if (result.modifiedCount > 0) updated++;
     }
   }
 
-  console.log(`[seedPermissions] ${created} created, ${skipped} already existed`);
+  // Remove permissions no longer in config
+  const allPerms = await Permission.find({}).select('role resource action').lean();
+  const staleIds = allPerms
+    .filter((p) => !validKeys.has(`${p.role}:${p.resource}:${p.action}`))
+    .map((p) => p._id);
+  let removedCount = 0;
+  if (staleIds.length > 0) {
+    const removed = await Permission.deleteMany({ _id: { $in: staleIds } });
+    removedCount = removed.deletedCount;
+  }
+
+  console.log(`[syncPermissions] ${upserted} created, ${updated} updated, ${removedCount} removed`);
 }
 
-module.exports = { seedPermissions, MATRIX, ROLE_NAMES };
+module.exports = { syncPermissions, MATRIX, ROLE_NAMES };

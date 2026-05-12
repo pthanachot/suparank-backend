@@ -1,5 +1,6 @@
 const FeatureFlag = require('../models/FeatureFlag');
 
+// SOURCE OF TRUTH — synced to database on every server startup.
 const FLAGS = [
   // ════════════════════════════════════════════════════════════════
   // IMPLEMENTED FEATURES
@@ -13,7 +14,8 @@ const FLAGS = [
     enabled: true,
     implemented: true,
     conditions: {
-      // Role-gated via Permission model. No tier-specific limit on workspace count.
+      // Tier limit: free=1, standard=2, pro=5, agency=10.
+      custom: { tierLimitKey: 'maxWorkspaces' },
     },
   },
   {
@@ -239,21 +241,26 @@ const FLAGS = [
   },
 ];
 
-async function seedFeatureFlags() {
-  let created = 0;
-  let skipped = 0;
+async function syncFeatureFlags() {
+  let upserted = 0;
+  let updated = 0;
+
+  const configKeys = FLAGS.map((f) => f.key);
 
   for (const flag of FLAGS) {
     const result = await FeatureFlag.updateOne(
       { key: flag.key },
-      { $setOnInsert: flag },
+      { $set: flag },
       { upsert: true }
     );
-    if (result.upsertedCount > 0) created++;
-    else skipped++;
+    if (result.upsertedCount > 0) upserted++;
+    else if (result.modifiedCount > 0) updated++;
   }
 
-  console.log(`[seedFeatureFlags] ${created} created, ${skipped} already existed`);
+  // Remove flags no longer in config
+  const removed = await FeatureFlag.deleteMany({ key: { $nin: configKeys } });
+
+  console.log(`[syncFeatureFlags] ${upserted} created, ${updated} updated, ${removed.deletedCount} removed`);
 }
 
-module.exports = { seedFeatureFlags, FLAGS };
+module.exports = { syncFeatureFlags, FLAGS };

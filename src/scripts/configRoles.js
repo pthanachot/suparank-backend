@@ -1,5 +1,6 @@
 const Role = require('../models/Role');
 
+// SOURCE OF TRUTH — synced to database on every server startup.
 const ROLES = [
   {
     name: 'owner',
@@ -31,21 +32,26 @@ const ROLES = [
   },
 ];
 
-async function seedRoles() {
-  let created = 0;
-  let skipped = 0;
+async function syncRoles() {
+  let upserted = 0;
+  let updated = 0;
+
+  const configNames = ROLES.map((r) => r.name);
 
   for (const role of ROLES) {
     const result = await Role.updateOne(
       { name: role.name },
-      { $setOnInsert: role },
+      { $set: role },
       { upsert: true }
     );
-    if (result.upsertedCount > 0) created++;
-    else skipped++;
+    if (result.upsertedCount > 0) upserted++;
+    else if (result.modifiedCount > 0) updated++;
   }
 
-  console.log(`[seedRoles] ${created} created, ${skipped} already existed`);
+  // Remove roles no longer in config
+  const removed = await Role.deleteMany({ name: { $nin: configNames }, isSystem: true });
+
+  console.log(`[syncRoles] ${upserted} created, ${updated} updated, ${removed.deletedCount} removed`);
 }
 
-module.exports = { seedRoles, ROLES };
+module.exports = { syncRoles, ROLES };

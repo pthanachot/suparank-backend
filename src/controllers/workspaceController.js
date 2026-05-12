@@ -3,6 +3,7 @@ const Workspace = require('../models/Workspace');
 const Organization = require('../models/Organization');
 const User = require('../models/User');
 const OrgMember = require('../models/OrgMember');
+const tierService = require('../services/tierService');
 
 // ─── GET WORKSPACE (find or create for user) ────────────────────
 const getWorkspace = async (req, res) => {
@@ -140,9 +141,20 @@ const createWorkspace = async (req, res) => {
       orgId = org._id;
     }
 
-    const count = await Workspace.countDocuments({ userId: req.user.userId });
-    if (count >= 10) {
-      return res.status(400).json({ error: 'Maximum 10 workspaces allowed' });
+    // Enforce per-org workspace limit from tier config
+    if (orgId) {
+      const { config, tier } = await tierService.getOrgTierConfig(orgId);
+      const maxWs = config?.maxWorkspaces;
+      if (maxWs != null) {
+        const wsCount = await Workspace.countDocuments({ organizationId: orgId });
+        if (wsCount >= maxWs) {
+          return res.status(429).json({
+            error: `Your ${config.displayName || tier} plan allows ${maxWs} workspace(s). Upgrade for more.`,
+            code: 'QUOTA_EXCEEDED',
+            quota: { limit: maxWs, used: wsCount, tier, limitKey: 'maxWorkspaces' },
+          });
+        }
+      }
     }
     const workspaceNumber = await Workspace.getNextNumber();
     const workspace = await Workspace.create({

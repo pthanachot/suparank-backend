@@ -1,6 +1,8 @@
 const Stripe = require('stripe');
 const User = require('../models/User');
+const Organization = require('../models/Organization');
 const Subscription = require('../models/Subscription');
+const { clearTierCache } = require('../services/tierService');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -74,17 +76,54 @@ const handleWebhook = async (req, res) => {
   }
 };
 
+// ─── HELPERS ─────────────────────────────────────────────────
+
+/**
+ * Resolve organizationId from session/subscription metadata.
+ * Handles both new (organizationId in metadata) and legacy (userId only) checkouts.
+ */
+async function resolveOrgId(metadata) {
+  // New flow: organizationId directly in metadata
+  if (metadata?.organizationId) {
+    return metadata.organizationId;
+  }
+
+  // Legacy fallback: find user's personal org
+  if (metadata?.userId) {
+    const personalOrg = await Organization.findOne({
+      ownerId: metadata.userId,
+      isPersonal: true,
+    }).lean();
+
+    if (personalOrg) {
+      console.warn(`Legacy checkout: resolved org from user's personal org. userId=${metadata.userId} orgId=${personalOrg._id}`);
+      return personalOrg._id.toString();
+    }
+  }
+
+  return null;
+}
+
 // ─── EVENT HANDLERS ───────────────────────────────────────────
 
 async function handleCheckoutCompleted(session) {
+  if (session.mode !== 'subscription') return;
+
+  const organizationId = await resolveOrgId(session.metadata);
   const userId = session.metadata?.userId;
-  if (!userId || session.mode !== 'subscription') return;
+
+  if (!organizationId) {
+    console.error('Checkout completed but could not resolve organizationId. metadata:', session.metadata);
+    return;
+  }
 
   const subscriptionId = session.subscription;
   const customerId = session.customer;
 
-  // Store stripeCustomerId on user
-  await User.findByIdAndUpdate(userId, { stripeCustomerId: customerId });
+  // Store stripeCustomerId on user (backward compat)
+  if (userId) {
+    await User.findByIdAndUpdate(userId, { stripeCustomerId: customerId });
+  }
 
   // Fetch full subscription from Stripe
   const stripeSub = await stripe.subscriptions.retrieve(subscriptionId, {
@@ -103,9 +142,10 @@ async function handleCheckoutCompleted(session) {
   const paymentMethod = stripeSub.default_payment_method;
 
   await Subscription.findOneAndUpdate(
-    { userId },
+    { organizationId },
     {
-      userId,
+      organizationId,
+      userId: userId || undefined,
       stripeCustomerId: customerId,
       stripeSubscriptionId: subscriptionId,
       planId,
@@ -125,7 +165,8 @@ async function handleCheckoutCompleted(session) {
     { upsert: true, new: true }
   );
 
-  console.log(`Checkout completed: user=${userId} plan=${planId}`);
+  clearTierCache();
+  console.log(`Checkout completed: org=${organizationId} plan=${planId}`);
 }
 
 async function handleSubscriptionUpdated(stripeSub) {
@@ -136,20 +177,26 @@ async function handleSubscriptionUpdated(stripeSub) {
   const priceId = stripeSub.items.data[0]?.price?.id;
   const planId = getPlanFromPriceId(priceId);
 
-  // If no local record, try to create one by looking up user via stripeCustomerId
+  // If no local record, try to create one by resolving org from subscription metadata
   if (!sub) {
-    const customerId = typeof stripeSub.customer === 'string' ? stripeSub.customer : stripeSub.customer?.id;
-    const user = await User.findOne({ stripeCustomerId: customerId });
-    if (!user || !planId) return;
-
-    sub = new Subscription({
-      userId: user._id,
-      stripeCustomerId: customerId,
-      stripeSubscriptionId: stripeSub.id,
-      planId,
-      status: stripeSub.status,
-    });
-    console.log(`Creating missing subscription record: user=${user._id} sub=${stripeSub.id}`);
+    const organizationId = await resolveOrgId(stripeSub.metadata);
+    if (organizationId && planId) {
+      sub = new Subscription({
+        organizationId,
+        stripeCustomerId: typeof stripeSub.customer === 'string' ? stripeSub.customer : stripeSub.customer?.id,
+        stripeSubscriptionId: stripeSub.id,
+        planId,
+        status: stripeSub.status,
+      });
+      console.log(`Creating missing subscription record: org=${organizationId} sub=${stripeSub.id}`);
+    } else {
+      // Fallback: try finding via stripeCustomerId on existing subscription records
+      const customerId = typeof stripeSub.customer === 'string' ? stripeSub.customer : stripeSub.customer?.id;
+      const existingSub = await Subscription.findOne({ stripeCustomerId: customerId });
+      if (!existingSub || !planId) return;
+      sub = existingSub;
+      console.log(`Matched subscription via stripeCustomerId: org=${sub.organizationId} sub=${stripeSub.id}`);
+    }
   }
 
   if (planId) sub.planId = planId;
@@ -188,6 +235,7 @@ async function handleSubscriptionUpdated(stripeSub) {
   }
 
   await sub.save();
+  clearTierCache();
   console.log(`Subscription updated: sub=${stripeSub.id} status=${stripeSub.status}`);
 }
 
@@ -201,6 +249,7 @@ async function handleSubscriptionDeleted(stripeSub) {
   sub.canceledAt = sub.canceledAt || new Date();
   await sub.save();
 
+  clearTierCache();
   console.log(`Subscription deleted: sub=${stripeSub.id}`);
 }
 
@@ -259,6 +308,7 @@ async function handlePaymentFailed(invoice) {
   }
 
   await sub.save();
+  clearTierCache();
 
   console.log(`Payment failed: sub=${invoice.subscription}`);
 }

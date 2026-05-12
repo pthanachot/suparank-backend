@@ -4,8 +4,8 @@ const mongoose = require('mongoose');
  * TierConfig — stores pricing tier limits in MongoDB.
  *
  * One document per tier (free, standard, professional, agency).
- * Values can be edited directly in the database without code changes.
- * Seeded by src/scripts/seedTierConfig.js (idempotent, won't overwrite manual edits).
+ * Synced from src/scripts/configTiers.js on every server startup.
+ * To change values, edit configTiers.js and restart the server.
  *
  * null = unlimited for numeric limits.
  * limitType = 'lifetime' means the allotment is one-time (free tier);
@@ -64,6 +64,9 @@ const tierConfigSchema = new mongoose.Schema(
 
     // ── Brand Voice ──
     maxBrandVoices: { type: Number, default: null }, // null = unlimited
+
+    // ── Workspaces ──
+    maxWorkspaces: { type: Number, default: 1 },
 
     // ── Sites / GSC ──
     maxSites: { type: Number, default: null }, // null = unlimited

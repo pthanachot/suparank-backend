@@ -2,6 +2,8 @@ const Organization = require('../models/Organization');
 const OrgMember = require('../models/OrgMember');
 const Workspace = require('../models/Workspace');
 const User = require('../models/User');
+const tierService = require('../services/tierService');
+const { ORG_CONFIG } = require('../scripts/configOrganization');
 
 // ─── LIST ORGANIZATIONS ──────────────────────────────────────
 // Returns orgs the user owns + orgs the user is a member of.
@@ -34,7 +36,7 @@ const listOrganizations = async (req, res) => {
         .map((o) => ({ ...o, role: roleMap[o._id.toString()] || 'viewer' })),
     ];
 
-    res.json({ organizations: orgs });
+    res.json({ organizations: orgs, maxOrganizationsPerUser: ORG_CONFIG.maxOrganizationsPerUser });
   } catch (error) {
     console.error('List organizations error:', error);
     res.status(500).json({ error: 'Failed to list organizations' });
@@ -48,6 +50,19 @@ const createOrganization = async (req, res) => {
     const { name } = req.body;
     if (!name || !name.trim()) {
       return res.status(400).json({ error: 'Organization name is required' });
+    }
+
+    // ── Enforce maxOrganizationsPerUser (global limit from configOrganization.js) ──
+    const maxOrgs = ORG_CONFIG.maxOrganizationsPerUser;
+    if (maxOrgs != null) {
+      const ownedCount = await Organization.countDocuments({ ownerId: req.user.userId });
+      if (ownedCount >= maxOrgs) {
+        return res.status(429).json({
+          error: `You can own up to ${maxOrgs} organization(s).`,
+          code: 'QUOTA_EXCEEDED',
+          quota: { limit: maxOrgs, used: ownedCount, limitKey: 'maxOrganizationsPerUser' },
+        });
+      }
     }
 
     const slug = await Organization.generateSlug(name.trim(), req.user.userId);

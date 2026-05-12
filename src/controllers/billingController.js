@@ -1,6 +1,8 @@
 const Stripe = require('stripe');
 const User = require('../models/User');
+const Organization = require('../models/Organization');
 const Subscription = require('../models/Subscription');
+const { clearTierCache } = require('../services/tierService');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -34,13 +36,43 @@ const PLAN_INFO = {
   'pro-yearly': { name: 'Pro', optimizations: -1, aiModel: 'Custom' },
 };
 
+// ─── HELPERS ─────────────────────────────────────────────────
+
+/**
+ * Validate that the authenticated user is the owner of the given org.
+ * Returns the org document on success, or sends a 400/403 and returns null.
+ */
+async function validateOrgOwner(req, res, orgId) {
+  if (!orgId) {
+    res.status(400).json({ error: 'orgId is required' });
+    return null;
+  }
+
+  const org = await Organization.findById(orgId).lean();
+  if (!org) {
+    res.status(404).json({ error: 'Organization not found' });
+    return null;
+  }
+
+  if (!org.ownerId.equals(req.user.userId)) {
+    res.status(403).json({ error: 'Only the organization owner can manage billing' });
+    return null;
+  }
+
+  return org;
+}
+
 // ─── GET SUBSCRIPTION ─────────────────────────────────────────
 
 const getSubscription = async (req, res) => {
   try {
+    const orgId = req.query.orgId;
+    const org = await validateOrgOwner(req, res, orgId);
+    if (!org) return;
+
     // Only return real, active subscriptions (must have a Stripe subscription ID and plan)
     let sub = await Subscription.findOne({
-      userId: req.user.userId,
+      organizationId: orgId,
       status: { $in: ['active', 'trialing'] },
       stripeSubscriptionId: { $exists: true, $ne: null },
       planId: { $exists: true, $ne: null },
@@ -54,7 +86,7 @@ const getSubscription = async (req, res) => {
         sub.currentPeriodStart = parseStripeDate(subItem?.current_period_start || stripeSub.current_period_start);
         sub.currentPeriodEnd = parseStripeDate(subItem?.current_period_end || stripeSub.current_period_end);
         await sub.save();
-        console.log(`Refreshed missing dates from Stripe for user=${req.user.userId}`);
+        console.log(`Refreshed missing dates from Stripe for org=${orgId}`);
       } catch (err) {
         console.error('Failed to refresh dates from Stripe:', err.message);
       }
@@ -62,10 +94,11 @@ const getSubscription = async (req, res) => {
 
     // Fallback: if no local record, check Stripe directly and sync
     if (!sub) {
-      const user = await User.findById(req.user.userId);
-      if (user?.stripeCustomerId) {
+      // Check if there's an existing subscription for this org with a Stripe customer
+      const existingSub = await Subscription.findOne({ organizationId: orgId });
+      if (existingSub?.stripeCustomerId) {
         const stripeSubs = await stripe.subscriptions.list({
-          customer: user.stripeCustomerId,
+          customer: existingSub.stripeCustomerId,
           status: 'active',
           limit: 1,
           expand: ['data.default_payment_method'],
@@ -80,10 +113,11 @@ const getSubscription = async (req, res) => {
             const paymentMethod = stripeSub.default_payment_method;
             const subItem = stripeSub.items.data[0];
             sub = await Subscription.findOneAndUpdate(
-              { userId: req.user.userId },
+              { organizationId: orgId },
               {
+                organizationId: orgId,
                 userId: req.user.userId,
-                stripeCustomerId: user.stripeCustomerId,
+                stripeCustomerId: existingSub.stripeCustomerId,
                 stripeSubscriptionId: stripeSub.id,
                 planId,
                 status: stripeSub.status,
@@ -102,7 +136,7 @@ const getSubscription = async (req, res) => {
               },
               { upsert: true, new: true }
             );
-            console.log(`Synced subscription from Stripe: user=${req.user.userId} plan=${planId}`);
+            console.log(`Synced subscription from Stripe: org=${orgId} plan=${planId}`);
           }
         }
       }
@@ -180,44 +214,49 @@ const getSubscription = async (req, res) => {
 
 const createCheckoutSession = async (req, res) => {
   try {
-    const { priceId } = req.body;
+    const { priceId, orgId } = req.body;
 
     if (!priceId) {
       return res.status(400).json({ error: 'Price ID is required' });
     }
+
+    const org = await validateOrgOwner(req, res, orgId);
+    if (!org) return;
 
     const user = await User.findById(req.user.userId);
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Create or retrieve Stripe customer
-    let customerId = user.stripeCustomerId;
+    // Create or retrieve Stripe customer per organization
+    let existingSub = await Subscription.findOne({ organizationId: orgId });
+    let customerId = existingSub?.stripeCustomerId;
 
     if (!customerId) {
       const customer = await stripe.customers.create({
         email: user.email,
-        name: user.profile?.name || undefined,
-        metadata: { userId: user._id.toString() },
+        name: `${org.name} (${user.profile?.name || user.email})`,
+        metadata: {
+          organizationId: orgId.toString(),
+          userId: user._id.toString(),
+        },
       });
       customerId = customer.id;
-      user.stripeCustomerId = customerId;
-      await user.save();
     }
 
-    // Block checkout if user already has an active subscription
-    const existingSub = await Subscription.findOne({
-      userId: user._id,
+    // Block checkout if org already has an active subscription
+    const activeSub = await Subscription.findOne({
+      organizationId: orgId,
       status: { $in: ['active', 'trialing'] },
       stripeSubscriptionId: { $exists: true, $ne: null },
     });
 
-    if (existingSub) {
+    if (activeSub) {
       return res.status(400).json({
-        error: 'You already have an active subscription. Please cancel your current plan first to switch plans.',
+        error: 'This organization already has an active subscription. Please cancel the current plan first to switch plans.',
         existingSubscription: {
-          planId: existingSub.planId,
-          status: existingSub.status,
+          planId: activeSub.planId,
+          status: activeSub.status,
         },
       });
     }
@@ -231,7 +270,7 @@ const createCheckoutSession = async (req, res) => {
 
     if (stripeSubscriptions.data.length > 0) {
       return res.status(400).json({
-        error: 'You already have an active subscription. Please cancel your current plan first to switch plans.',
+        error: 'This organization already has an active subscription. Please cancel the current plan first to switch plans.',
       });
     }
 
@@ -244,10 +283,12 @@ const createCheckoutSession = async (req, res) => {
       success_url: `${APP_URL}/settings/billing?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${APP_URL}/settings/billing/plans`,
       metadata: {
+        organizationId: orgId.toString(),
         userId: user._id.toString(),
       },
       subscription_data: {
         metadata: {
+          organizationId: orgId.toString(),
           userId: user._id.toString(),
         },
       },
@@ -264,30 +305,37 @@ const createCheckoutSession = async (req, res) => {
 
 const createCustomerPortal = async (req, res) => {
   try {
-    const { flow } = req.body || {};
+    const { flow, orgId } = req.body || {};
 
-    const user = await User.findById(req.user.userId);
-    if (!user?.stripeCustomerId) {
-      return res.status(400).json({ error: 'No billing account found' });
+    const org = await validateOrgOwner(req, res, orgId);
+    if (!org) return;
+
+    const sub = await Subscription.findOne({
+      organizationId: orgId,
+      stripeCustomerId: { $exists: true, $ne: null },
+    });
+
+    if (!sub?.stripeCustomerId) {
+      return res.status(400).json({ error: 'No billing account found for this organization' });
     }
 
     const portalParams = {
-      customer: user.stripeCustomerId,
+      customer: sub.stripeCustomerId,
       return_url: `${APP_URL}/settings/billing`,
     };
 
     // If flow is 'subscription_update', go directly to plan switching
     if (flow === 'subscription_update') {
-      const sub = await Subscription.findOne({
-        userId: user._id,
+      const activeSub = await Subscription.findOne({
+        organizationId: orgId,
         status: { $in: ['active', 'trialing'] },
         stripeSubscriptionId: { $exists: true, $ne: null },
       });
 
-      if (sub) {
+      if (activeSub) {
         // Release any pending schedule first — Stripe blocks flow_data when a schedule exists
         try {
-          const stripeSub = await stripe.subscriptions.retrieve(sub.stripeSubscriptionId);
+          const stripeSub = await stripe.subscriptions.retrieve(activeSub.stripeSubscriptionId);
           if (stripeSub.schedule) {
             await stripe.subscriptionSchedules.release(stripeSub.schedule);
             console.log(`Released schedule ${stripeSub.schedule} before portal update flow`);
@@ -299,7 +347,7 @@ const createCustomerPortal = async (req, res) => {
         portalParams.flow_data = {
           type: 'subscription_update',
           subscription_update: {
-            subscription: sub.stripeSubscriptionId,
+            subscription: activeSub.stripeSubscriptionId,
           },
         };
       }
@@ -318,8 +366,12 @@ const createCustomerPortal = async (req, res) => {
 
 const revokeScheduledChange = async (req, res) => {
   try {
+    const { orgId } = req.body || {};
+    const org = await validateOrgOwner(req, res, orgId);
+    if (!org) return;
+
     const sub = await Subscription.findOne({
-      userId: req.user.userId,
+      organizationId: orgId,
       status: { $in: ['active', 'trialing'] },
       stripeSubscriptionId: { $exists: true, $ne: null },
     });
@@ -347,8 +399,12 @@ const revokeScheduledChange = async (req, res) => {
 
 const cancelSubscription = async (req, res) => {
   try {
+    const { orgId } = req.body || {};
+    const org = await validateOrgOwner(req, res, orgId);
+    if (!org) return;
+
     const sub = await Subscription.findOne({
-      userId: req.user.userId,
+      organizationId: orgId,
       status: { $in: ['active', 'trialing'] },
     });
 
@@ -374,6 +430,9 @@ const cancelSubscription = async (req, res) => {
     sub.cancelAtPeriodEnd = true;
     sub.canceledAt = new Date();
     await sub.save();
+
+    clearTierCache();
+
     res.json({ message: 'Subscription will cancel at end of billing period' });
   } catch (error) {
     console.error('Cancel subscription error:', error);
@@ -385,8 +444,12 @@ const cancelSubscription = async (req, res) => {
 
 const reactivateSubscription = async (req, res) => {
   try {
+    const { orgId } = req.body || {};
+    const org = await validateOrgOwner(req, res, orgId);
+    if (!org) return;
+
     const sub = await Subscription.findOne({
-      userId: req.user.userId,
+      organizationId: orgId,
       status: { $in: ['active', 'trialing'] },
       cancelAtPeriodEnd: true,
     });
@@ -413,6 +476,8 @@ const reactivateSubscription = async (req, res) => {
     sub.canceledAt = undefined;
     await sub.save();
 
+    clearTierCache();
+
     res.json({ message: 'Subscription reactivated' });
   } catch (error) {
     console.error('Reactivate subscription error:', error);
@@ -424,14 +489,18 @@ const reactivateSubscription = async (req, res) => {
 
 const getInvoices = async (req, res) => {
   try {
-    const sub = await Subscription.findOne({ userId: req.user.userId });
+    const orgId = req.query.orgId;
+    const org = await validateOrgOwner(req, res, orgId);
+    if (!org) return;
+
+    const sub = await Subscription.findOne({ organizationId: orgId });
 
     // No subscription at all
     if (!sub) {
       return res.json({ invoices: [] });
     }
 
-    // If paymentHistory is empty but user has a Stripe customer, backfill once from Stripe
+    // If paymentHistory is empty but org has a Stripe customer, backfill once from Stripe
     if (sub.paymentHistory.length === 0 && sub.stripeCustomerId) {
       try {
         const stripeInvoices = await stripe.invoices.list({
@@ -455,7 +524,7 @@ const getInvoices = async (req, res) => {
 
         if (sub.paymentHistory.length > 0) {
           await sub.save();
-          console.log(`Backfilled ${sub.paymentHistory.length} invoices from Stripe for user=${req.user.userId}`);
+          console.log(`Backfilled ${sub.paymentHistory.length} invoices from Stripe for org=${orgId}`);
         }
       } catch (err) {
         console.error('Failed to backfill invoices from Stripe:', err.message);

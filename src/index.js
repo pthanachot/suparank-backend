@@ -9,14 +9,16 @@ const cookieParser = require('cookie-parser');
 dotenv.config();
 
 const { connectDB, checkConnectionHealth } = require('./config/database');
+const { syncConfig } = require('./scripts/configSync');
 
 const app = express();
 
 // Trust proxy for production
 app.set('trust proxy', 1);
 
-// Connect to MongoDB
+// Connect to MongoDB, then sync config from seed files
 connectDB()
+  .then(() => syncConfig())
   .then(() => console.log('Database ready'))
   .catch((error) => {
     console.error('Failed to connect to database:', error.message);

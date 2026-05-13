@@ -60,21 +60,21 @@ orgMemberSchema.index({ userId: 1, status: 1 });
  * Find a single membership by owner (or null).
  */
 orgMemberSchema.statics.findMembership = function (ownerId, userId) {
-  return this.findOne({ ownerId, userId, status: 'active' });
+  return this.findOne({ ownerId, userId, status: 'active', locked: { $ne: true } });
 };
 
 /**
  * Find a single membership by organization (or null).
  */
 orgMemberSchema.statics.findMembershipByOrg = function (organizationId, userId) {
-  return this.findOne({ organizationId, userId, status: 'active' });
+  return this.findOne({ organizationId, userId, status: 'active', locked: { $ne: true } });
 };
 
 /**
  * Find all orgs this user belongs to (active memberships).
  */
 orgMemberSchema.statics.findMembershipsForUser = function (userId) {
-  return this.find({ userId, status: 'active' });
+  return this.find({ userId, status: 'active', locked: { $ne: true } });
 };
 
 module.exports = mongoose.model('OrgMember', orgMemberSchema);

@@ -72,6 +72,7 @@ const listMembers = async (req, res) => {
         picture: u?.profile?.picture || '',
         role: m.role,
         status: m.status,
+        locked: m.locked || false,
         invitedAt: m.invitedAt,
       };
     });
@@ -121,7 +122,7 @@ const inviteMember = async (req, res) => {
     // Check seat limit from TierConfig
     const { config, tier } = await tierService.getOrgTierConfig(org._id);
     if (config?.maxSeats != null) {
-      const memberCount = await OrgMember.countDocuments({ organizationId: org._id });
+      const memberCount = await OrgMember.countDocuments({ organizationId: org._id, locked: { $ne: true } });
       // +1 because the org owner is not in OrgMember but counts as a seat
       const totalSeats = memberCount + 1;
       if (totalSeats >= config.maxSeats) {

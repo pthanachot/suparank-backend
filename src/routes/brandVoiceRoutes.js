@@ -40,6 +40,8 @@ const imageUpload = multer({
 router.use(authenticateToken);
 
 const { resolveWorkspaceWithRole: rwr, requirePermission: rp } = require('../middleware/permissions');
+const Avatar = require('../models/Avatar');
+const { rejectIfLocked } = require('../middleware/lockGuard');
 
 // Brand voice
 router.get('/:workspaceNumber/brand-voice', rwr, rp('brandVoice', 'read'), brandVoiceController.getBrandVoice);
@@ -51,9 +53,9 @@ router.get('/:workspaceNumber/brand-voice/rate-limit', rwr, rp('brandVoice', 're
 router.get('/:workspaceNumber/brand-voice/avatars', rwr, rp('brandVoice', 'read'), brandVoiceController.listAvatars);
 router.get('/:workspaceNumber/brand-voice/avatars/:avatarId', rwr, rp('brandVoice', 'read'), brandVoiceController.getAvatar);
 router.post('/:workspaceNumber/brand-voice/avatars', rwr, rp('brandVoice', 'manage'), brandVoiceController.createAvatar);
-router.put('/:workspaceNumber/brand-voice/avatars/:avatarId', rwr, rp('brandVoice', 'manage'), brandVoiceController.updateAvatar);
+router.put('/:workspaceNumber/brand-voice/avatars/:avatarId', rwr, rp('brandVoice', 'manage'), rejectIfLocked(Avatar, 'avatarId'), brandVoiceController.updateAvatar);
 router.delete('/:workspaceNumber/brand-voice/avatars/:avatarId', rwr, rp('brandVoice', 'manage'), brandVoiceController.deleteAvatar);
-router.patch('/:workspaceNumber/brand-voice/avatars/:avatarId/toggle', rwr, rp('brandVoice', 'manage'), brandVoiceController.toggleAvatar);
+router.patch('/:workspaceNumber/brand-voice/avatars/:avatarId/toggle', rwr, rp('brandVoice', 'manage'), rejectIfLocked(Avatar, 'avatarId'), brandVoiceController.toggleAvatar);
 router.post('/:workspaceNumber/brand-voice/avatars/:avatarId/test', rwr, rp('brandVoice', 'manage'), brandVoiceController.testAvatar);
 
 // Google Doc URL import

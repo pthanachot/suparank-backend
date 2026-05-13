@@ -14,6 +14,8 @@
  */
 
 const Organization = require('../models/Organization');
+const Workspace = require('../models/Workspace');
+const Content = require('../models/Content');
 const UsageTracker = require('../models/UsageTracker');
 const tierService = require('../services/tierService');
 
@@ -66,6 +68,34 @@ function requireQuota(counterKey, tierLimitKey, tierLimitTypeKey) {
       }
 
       const limitType = config[tierLimitTypeKey] || 'monthly';
+
+      // For lifetime limits (free tier): count unlocked resources directly instead of
+      // UsageTracker. This ensures deleting an unlocked resource frees a creation slot
+      // even when the UsageTracker counter reflects historical (higher) creation counts.
+      if (limitType === 'lifetime' && counterKey === 'articlesCreated') {
+        const wsIds = await Workspace.find({ organizationId: orgId }).distinct('_id');
+        const unlockedCount = await Content.countDocuments({
+          workspaceId: { $in: wsIds },
+          locked: { $ne: true },
+        });
+        if (unlockedCount >= limit) {
+          return res.status(429).json({
+            error: `${config.displayName || tier} plan limit reached for this feature`,
+            code: 'QUOTA_EXCEEDED',
+            quota: {
+              limit,
+              used: unlockedCount,
+              tier,
+              limitKey: tierLimitKey,
+              limitType,
+              upgradeHint: tierService._upgradeHint(tier, tierLimitKey),
+            },
+          });
+        }
+        req.tierQuota = { orgId, counterKey, period: 'lifetime', limit, used: unlockedCount };
+        return next();
+      }
+
       const period = tierService.getPeriod(limitType);
       const used = await UsageTracker.getCount(orgId, counterKey, period);
 

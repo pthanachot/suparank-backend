@@ -31,6 +31,9 @@ const workspaceSchema = new mongoose.Schema(
       default: [],
       validate: [arr => arr.length <= 3, 'Maximum 3 members allowed per workspace'],
     },
+
+    // Downgrade locking — locked workspaces are inaccessible until the org upgrades
+    locked: { type: Boolean, default: false },
   },
   { timestamps: true }
 );

@@ -60,6 +60,9 @@ const avatarSchema = new mongoose.Schema(
       default: [],
       validate: [arr => arr.length <= 5, 'Maximum 5 uploads per avatar'],
     },
+
+    // Downgrade locking — locked avatars are read-only until the org upgrades
+    locked: { type: Boolean, default: false },
   },
   { timestamps: true }
 );

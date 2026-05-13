@@ -230,10 +230,43 @@ function getCountries(req, res) {
   return res.json({ countries: SUPPORTED_COUNTRIES });
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// GET /:workspaceNumber/keywords/cached?kw=...&country=US
+// Returns cached results only (no DataForSEO call). For viewers loading history.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function getCachedResults(req, res) {
+  try {
+    const { kw, country } = req.query;
+    if (!kw || typeof kw !== 'string' || !kw.trim()) {
+      return res.status(400).json({ error: 'kw query parameter is required' });
+    }
+
+    const seedKeyword = kw.trim().toLowerCase();
+    const countryCode = (country || 'US').toUpperCase();
+
+    const cached = await KeywordSearch.findOne({ seedKeyword, country: countryCode });
+
+    if (!cached) {
+      return res.status(404).json({ error: 'No cached results found' });
+    }
+
+    return res.json({
+      seedMetrics: cached.seedMetrics,
+      relatedKeywords: cached.relatedKeywords,
+      totalCount: cached.totalCount,
+    });
+  } catch (err) {
+    console.error('[keywordController] getCachedResults error:', err.message);
+    return res.status(500).json({ error: err.message || 'Failed to get cached results' });
+  }
+}
+
 module.exports = {
   searchKeywords,
   getKeywordDetail,
   getSearchHistory,
   deleteSearchHistory,
   getCountries,
+  getCachedResults,
 };

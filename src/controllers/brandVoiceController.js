@@ -447,7 +447,7 @@ const createAvatar = async (req, res) => {
       const { config, tier } = await tierService.getOrgTierConfig(orgId);
       if (config?.maxBrandVoices != null) {
         const wsIds = await Workspace.find({ organizationId: orgId }).distinct('_id');
-        const avatarCount = await Avatar.countDocuments({ workspace: { $in: wsIds } });
+        const avatarCount = await Avatar.countDocuments({ workspace: { $in: wsIds }, locked: { $ne: true } });
         if (avatarCount >= config.maxBrandVoices) {
           return res.status(429).json({
             error: `Your ${tier} plan allows ${config.maxBrandVoices} brand voice(s)`,

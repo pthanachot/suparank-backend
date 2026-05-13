@@ -21,6 +21,9 @@ router.get('/:workspaceNumber/keywords/detail', ...rwrKw, rp('keywords', 'use'),
 router.get('/:workspaceNumber/keywords/history', ...rwrKw, rp('keywords', 'read'), keywordController.getSearchHistory);
 router.delete('/:workspaceNumber/keywords/history/:historyId', ...rwrKw, rp('keywords', 'delete'), keywordController.deleteSearchHistory);
 
+// Get cached results (read-only, no DataForSEO call — for viewers loading history)
+router.get('/:workspaceNumber/keywords/cached', ...rwrKw, rp('keywords', 'read'), keywordController.getCachedResults);
+
 // Get supported countries list
 router.get('/:workspaceNumber/keywords/countries', ...rwrKw, rp('keywords', 'read'), keywordController.getCountries);
 

@@ -3,6 +3,7 @@ const User = require('../models/User');
 const Organization = require('../models/Organization');
 const Subscription = require('../models/Subscription');
 const { clearTierCache } = require('../services/tierService');
+const { applyLocksForOrg } = require('../services/downgradeService');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -166,6 +167,10 @@ async function handleCheckoutCompleted(session) {
   );
 
   clearTierCache();
+  // Re-evaluate resource locks for the new tier (unlocks on upgrade)
+  applyLocksForOrg(organizationId).catch((err) =>
+    console.error(`[downgradeService] checkout lock error for org=${organizationId}:`, err.message)
+  );
   console.log(`Checkout completed: org=${organizationId} plan=${planId}`);
 }
 
@@ -236,6 +241,12 @@ async function handleSubscriptionUpdated(stripeSub) {
 
   await sub.save();
   clearTierCache();
+  // Re-evaluate resource locks for the new tier (locks on downgrade, unlocks on upgrade)
+  if (sub.organizationId) {
+    applyLocksForOrg(sub.organizationId).catch((err) =>
+      console.error(`[downgradeService] subscription update lock error for org=${sub.organizationId}:`, err.message)
+    );
+  }
   console.log(`Subscription updated: sub=${stripeSub.id} status=${stripeSub.status}`);
 }
 
@@ -250,6 +261,10 @@ async function handleSubscriptionDeleted(stripeSub) {
   await sub.save();
 
   clearTierCache();
+  // Lock excess resources — org falls back to free tier
+  applyLocksForOrg(sub.organizationId).catch((err) =>
+    console.error(`[downgradeService] subscription delete lock error for org=${sub.organizationId}:`, err.message)
+  );
   console.log(`Subscription deleted: sub=${stripeSub.id}`);
 }
 

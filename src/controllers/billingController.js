@@ -3,6 +3,7 @@ const User = require('../models/User');
 const Organization = require('../models/Organization');
 const Subscription = require('../models/Subscription');
 const { clearTierCache } = require('../services/tierService');
+const { applyLocksForOrg } = require('../services/downgradeService');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -477,6 +478,10 @@ const reactivateSubscription = async (req, res) => {
     await sub.save();
 
     clearTierCache();
+    // Re-evaluate resource locks — reactivation restores the paid tier
+    applyLocksForOrg(orgId).catch((err) =>
+      console.error(`[downgradeService] reactivation lock error for org=${orgId}:`, err.message)
+    );
 
     res.json({ message: 'Subscription reactivated' });
   } catch (error) {

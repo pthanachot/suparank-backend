@@ -81,6 +81,18 @@ const createOrganization = async (req, res) => {
     );
     const adoptedWorkspaces = adoptResult.modifiedCount || 0;
 
+    // If no workspaces were adopted, create a default one
+    if (adoptedWorkspaces === 0) {
+      const workspaceNumber = await Workspace.getNextNumber();
+      await Workspace.create({
+        workspaceNumber,
+        name: 'My Workspace',
+        userId: req.user.userId,
+        organizationId: org._id,
+        isDefault: true,
+      });
+    }
+
     res.status(201).json({
       organization: { ...org.toObject(), role: 'owner' },
       adoptedWorkspaces,

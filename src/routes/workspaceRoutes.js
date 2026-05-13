@@ -7,6 +7,7 @@ const aiController = require('../controllers/aiController');
 const { authenticateToken } = require('../middleware/auth');
 const { resolveWorkspaceWithRole: rwr, requirePermission: rp, requireFeature: rf } = require('../middleware/permissions');
 const { requireQuota: rq } = require('../middleware/tierEnforcement');
+const { rejectIfLocked, contentLockResolver } = require('../middleware/lockGuard');
 
 // All workspace routes are protected
 router.use(authenticateToken);
@@ -18,7 +19,7 @@ router.get('/', workspaceController.getWorkspace);
 router.get('/:workspaceNumber/content', rwr, rp('content', 'read'), contentController.listContents);
 router.post('/:workspaceNumber/content', rwr, rp('content', 'create'), rq('articlesCreated', 'maxArticlesPerMonth', 'articleLimitType'), contentController.createContent);
 router.get('/:workspaceNumber/content/:contentNumber', rwr, rp('content', 'read'), contentController.getContent);
-router.put('/:workspaceNumber/content/:contentNumber', rwr, rp('content', 'update'), contentController.updateContent);
+router.put('/:workspaceNumber/content/:contentNumber', rwr, rp('content', 'update'), rejectIfLocked(null, contentLockResolver), contentController.updateContent);
 router.delete('/:workspaceNumber/content/:contentNumber', rwr, rp('content', 'delete'), contentController.deleteContent);
 
 // Comments under content

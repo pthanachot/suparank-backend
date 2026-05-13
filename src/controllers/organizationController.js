@@ -3,6 +3,7 @@ const OrgMember = require('../models/OrgMember');
 const Workspace = require('../models/Workspace');
 const User = require('../models/User');
 const tierService = require('../services/tierService');
+const creditService = require('../services/creditService');
 const { ORG_CONFIG } = require('../scripts/configOrganization');
 
 // ─── LIST ORGANIZATIONS ──────────────────────────────────────
@@ -91,6 +92,16 @@ const createOrganization = async (req, res) => {
         organizationId: org._id,
         isDefault: true,
       });
+    }
+
+    // Grant free-tier credits (lifetime, no expiry)
+    try {
+      const { config } = await tierService.getOrgTierConfig(org._id);
+      if (config?.creditsPerMonth) {
+        await creditService.grantSubscriptionCredits(org._id, config.creditsPerMonth, null);
+      }
+    } catch (err) {
+      console.error(`[credits] Failed to grant free-tier credits for org=${org._id}:`, err.message);
     }
 
     res.status(201).json({

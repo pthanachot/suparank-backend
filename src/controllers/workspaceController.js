@@ -4,6 +4,7 @@ const Organization = require('../models/Organization');
 const User = require('../models/User');
 const OrgMember = require('../models/OrgMember');
 const tierService = require('../services/tierService');
+const creditService = require('../services/creditService');
 
 // ─── GET WORKSPACE (resolve through active org — no ghost creation) ──
 const getWorkspace = async (req, res) => {
@@ -23,6 +24,15 @@ const getWorkspace = async (req, res) => {
     if (!orgId) {
       // No org at all — create one with a default workspace
       const org = await Organization.create({ name: 'My Organization', ownerId: userId });
+      // Grant free-tier credits (lifetime, no expiry)
+      try {
+        const { config } = await tierService.getOrgTierConfig(org._id);
+        if (config?.creditsPerMonth) {
+          await creditService.grantSubscriptionCredits(org._id, config.creditsPerMonth, null);
+        }
+      } catch (err) {
+        console.error(`[credits] Failed to grant free-tier credits for org=${org._id}:`, err.message);
+      }
       const workspaceNumber = await Workspace.getNextNumber();
       const workspace = await Workspace.create({
         workspaceNumber,

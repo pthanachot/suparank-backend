@@ -6,6 +6,7 @@ const Workspace = require('../models/Workspace');
 const { runScan, PLATFORMS } = require('../services/aiTrackerScanEngine');
 const UsageTracker = require('../models/UsageTracker');
 const tierService = require('../services/tierService');
+const creditService = require('../services/creditService');
 
 // ─── Platform display config (returned in platformStats) ──────────────────
 
@@ -919,6 +920,21 @@ const triggerScan = async (req, res) => {
       }
     }
 
+    // Deduct credits (fixed cost: 5 credits per scan)
+    if (req.creditContext?.deductionEnabled) {
+      try {
+        await creditService.preDeduct(
+          req.creditContext.orgId, req.user.userId, 5,
+          req.creditContext.featureKey, { feature: 'aiTrackerScan', trackerId: tracker._id.toString() }
+        );
+      } catch (creditErr) {
+        return res.status(402).json({
+          error: creditErr.message,
+          code: 'INSUFFICIENT_CREDITS',
+        });
+      }
+    }
+
     // Set to pending and fire scan
     await AiTracker.findByIdAndUpdate(tracker._id, {
       $set: { scanStatus: 'pending', scanProgress: 0, scanError: null },
@@ -1428,6 +1444,21 @@ const triggerMonitorScan = async (req, res) => {
       const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
       if (tracker.lastScanAt > hourAgo) {
         return res.status(429).json({ error: 'Please wait at least 1 hour between scans' });
+      }
+    }
+
+    // Deduct credits (fixed cost: 5 credits per scan)
+    if (req.creditContext?.deductionEnabled) {
+      try {
+        await creditService.preDeduct(
+          req.creditContext.orgId, req.user.userId, 5,
+          req.creditContext.featureKey, { feature: 'aiTrackerScan', trackerId: tracker._id.toString() }
+        );
+      } catch (creditErr) {
+        return res.status(402).json({
+          error: creditErr.message,
+          code: 'INSUFFICIENT_CREDITS',
+        });
       }
     }
 

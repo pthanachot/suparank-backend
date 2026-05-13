@@ -4,6 +4,7 @@ const Workspace = require('../models/Workspace');
 const Avatar = require('../models/Avatar');
 const BrandVoice = require('../models/BrandVoice');
 const UsageTracker = require('../models/UsageTracker');
+const Credit = require('../models/Credit');
 const tierService = require('../services/tierService');
 
 /**
@@ -108,7 +109,16 @@ const getTierInfo = async (req, res) => {
       workspaces: { used: wsCount, limit: config.maxWorkspaces },
     };
 
-    res.json({ tier, config, usage });
+    // ── Credit balance ──
+    const creditDoc = await Credit.findOne({ organizationId: orgId }).lean();
+    const creditBalance = {
+      subscription: creditDoc?.subscriptionCredits || 0,
+      purchased: creditDoc?.purchasedCredits || 0,
+      total: (creditDoc?.subscriptionCredits || 0) + (creditDoc?.purchasedCredits || 0),
+      expiresAt: creditDoc?.subscriptionCreditsExpireAt || null,
+    };
+
+    res.json({ tier, config, usage, creditBalance });
   } catch (err) {
     console.error('getTierInfo error:', err.message);
     res.status(500).json({ error: 'Failed to get tier info' });

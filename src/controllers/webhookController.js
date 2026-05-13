@@ -2,8 +2,9 @@ const Stripe = require('stripe');
 const User = require('../models/User');
 const Organization = require('../models/Organization');
 const Subscription = require('../models/Subscription');
-const { clearTierCache } = require('../services/tierService');
+const { clearTierCache, getOrgTierConfig, getTierConfig } = require('../services/tierService');
 const { applyLocksForOrg } = require('../services/downgradeService');
+const creditService = require('../services/creditService');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -171,6 +172,19 @@ async function handleCheckoutCompleted(session) {
   applyLocksForOrg(organizationId).catch((err) =>
     console.error(`[downgradeService] checkout lock error for org=${organizationId}:`, err.message)
   );
+
+  // Grant subscription credits for new plan
+  try {
+    const { config } = await getOrgTierConfig(organizationId);
+    if (config?.creditsPerMonth) {
+      const periodEnd = parseStripeDate(subItem?.current_period_end || stripeSub.current_period_end);
+      await creditService.grantSubscriptionCredits(organizationId, config.creditsPerMonth, periodEnd || null);
+      console.log(`[credits] Granted ${config.creditsPerMonth} credits for org=${organizationId}`);
+    }
+  } catch (err) {
+    console.error(`[credits] Failed to grant on checkout for org=${organizationId}:`, err.message);
+  }
+
   console.log(`Checkout completed: org=${organizationId} plan=${planId}`);
 }
 
@@ -203,6 +217,10 @@ async function handleSubscriptionUpdated(stripeSub) {
       console.log(`Matched subscription via stripeCustomerId: org=${sub.organizationId} sub=${stripeSub.id}`);
     }
   }
+
+  // Detect plan change for credit pro-rating
+  const oldPlanId = sub.planId;
+  const isPlanChange = planId && oldPlanId && planId !== oldPlanId;
 
   if (planId) sub.planId = planId;
 
@@ -247,6 +265,35 @@ async function handleSubscriptionUpdated(stripeSub) {
       console.error(`[downgradeService] subscription update lock error for org=${sub.organizationId}:`, err.message)
     );
   }
+
+  // Handle credit pro-rating on plan change
+  if (isPlanChange && sub.organizationId) {
+    try {
+      await creditService.expireSubscriptionCredits(sub.organizationId);
+
+      const newTier = planId.split('-')[0] === 'pro' ? 'professional' : planId.split('-')[0];
+      const newConfig = await getTierConfig(newTier);
+
+      if (newConfig?.creditsPerMonth) {
+        const periodEnd = parseStripeDate(subItem?.current_period_end || stripeSub.current_period_end);
+        const periodStart = parseStripeDate(subItem?.current_period_start || stripeSub.current_period_start);
+
+        if (periodEnd && periodStart) {
+          const totalDays = Math.max(1, (periodEnd - periodStart) / (1000 * 60 * 60 * 24));
+          const daysRemaining = Math.max(0, (periodEnd - Date.now()) / (1000 * 60 * 60 * 24));
+          const proRatedCredits = Math.ceil(newConfig.creditsPerMonth * (daysRemaining / totalDays));
+          await creditService.grantSubscriptionCredits(sub.organizationId, proRatedCredits, periodEnd);
+          console.log(`[credits] Plan change: granted ${proRatedCredits} pro-rated credits for org=${sub.organizationId}`);
+        } else {
+          await creditService.grantSubscriptionCredits(sub.organizationId, newConfig.creditsPerMonth, periodEnd || null);
+          console.log(`[credits] Plan change: granted ${newConfig.creditsPerMonth} full credits for org=${sub.organizationId}`);
+        }
+      }
+    } catch (err) {
+      console.error(`[credits] Plan change credit error for org=${sub.organizationId}:`, err.message);
+    }
+  }
+
   console.log(`Subscription updated: sub=${stripeSub.id} status=${stripeSub.status}`);
 }
 
@@ -265,6 +312,15 @@ async function handleSubscriptionDeleted(stripeSub) {
   applyLocksForOrg(sub.organizationId).catch((err) =>
     console.error(`[downgradeService] subscription delete lock error for org=${sub.organizationId}:`, err.message)
   );
+
+  // Expire remaining subscription credits
+  try {
+    await creditService.expireSubscriptionCredits(sub.organizationId);
+    console.log(`[credits] Expired credits for canceled org=${sub.organizationId}`);
+  } catch (err) {
+    console.error(`[credits] Failed to expire on cancel for org=${sub.organizationId}:`, err.message);
+  }
+
   console.log(`Subscription deleted: sub=${stripeSub.id}`);
 }
 
@@ -292,6 +348,21 @@ async function handlePaymentSucceeded(invoice) {
     date: parseStripeDate(invoice.created),
   });
   await sub.save();
+
+  // Grant credits on subscription renewal (not initial checkout)
+  if (invoice.billing_reason === 'subscription_cycle') {
+    try {
+      const { config } = await getOrgTierConfig(sub.organizationId);
+      if (config?.creditsPerMonth) {
+        await creditService.expireSubscriptionCredits(sub.organizationId);
+        const newPeriodEnd = parseStripeDate(invoice.lines?.data?.[0]?.period?.end);
+        await creditService.grantSubscriptionCredits(sub.organizationId, config.creditsPerMonth, newPeriodEnd || null);
+        console.log(`[credits] Renewed ${config.creditsPerMonth} credits for org=${sub.organizationId}`);
+      }
+    } catch (err) {
+      console.error(`[credits] Failed to renew credits for org=${sub.organizationId}:`, err.message);
+    }
+  }
 
   console.log(`Invoice saved: ${invoice.id} for sub=${invoice.subscription}`);
 }

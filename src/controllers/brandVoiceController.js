@@ -8,6 +8,7 @@ const { uploadBuffer, uploadImage, deleteObject, deleteAllWithPrefix } = require
 const writingEngine = require('../services/writingEngine');
 const crypto = require('crypto');
 const tierService = require('../services/tierService');
+const creditService = require('../services/creditService');
 
 // Workspace resolved by permissions middleware (req.workspace).
 
@@ -424,6 +425,21 @@ const testBrandVoice = async (req, res) => {
       return res.status(400).json({ error: 'Save your brand voice settings first' });
     }
 
+    // Deduct credits (fixed cost: 3 credits for ~150 words)
+    if (req.creditContext?.deductionEnabled) {
+      try {
+        await creditService.preDeduct(
+          req.creditContext.orgId, req.user.userId, 3,
+          req.creditContext.featureKey, { feature: 'brandVoiceTest' }
+        );
+      } catch (creditErr) {
+        return res.status(402).json({
+          error: creditErr.message,
+          code: 'INSUFFICIENT_CREDITS',
+        });
+      }
+    }
+
     await recordTestUsage(req.user.userId);
     await streamRewriteResponse(req, res, brandVoice.content, input);
   } catch (err) {
@@ -671,6 +687,21 @@ const testAvatar = async (req, res) => {
     const combinedContent = brandVoice?.content
       ? brandVoice.content + '\n\n---\n\n' + avatar.content
       : avatar.content;
+
+    // Deduct credits (fixed cost: 3 credits for ~150 words)
+    if (req.creditContext?.deductionEnabled) {
+      try {
+        await creditService.preDeduct(
+          req.creditContext.orgId, req.user.userId, 3,
+          req.creditContext.featureKey, { feature: 'avatarTest', avatarId }
+        );
+      } catch (creditErr) {
+        return res.status(402).json({
+          error: creditErr.message,
+          code: 'INSUFFICIENT_CREDITS',
+        });
+      }
+    }
 
     await recordTestUsage(req.user.userId);
     await streamRewriteResponse(req, res, combinedContent, input);

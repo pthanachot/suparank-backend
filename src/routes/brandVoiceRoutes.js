@@ -40,6 +40,7 @@ const imageUpload = multer({
 router.use(authenticateToken);
 
 const { resolveWorkspaceWithRole: rwr, requirePermission: rp } = require('../middleware/permissions');
+const { requireCredits: rc } = require('../middleware/creditGate');
 const Avatar = require('../models/Avatar');
 const { rejectIfLocked } = require('../middleware/lockGuard');
 
@@ -48,7 +49,7 @@ const BrandVoice = require('../models/BrandVoice');
 // Brand voice (single active)
 router.get('/:workspaceNumber/brand-voice', rwr, rp('brandVoice', 'read'), brandVoiceController.getBrandVoice);
 router.put('/:workspaceNumber/brand-voice', rwr, rp('brandVoice', 'manage'), brandVoiceController.saveBrandVoice);
-router.post('/:workspaceNumber/brand-voice/test', rwr, rp('brandVoice', 'manage'), brandVoiceController.testBrandVoice);
+router.post('/:workspaceNumber/brand-voice/test', rwr, rp('brandVoice', 'manage'), rc('brandVoiceTest', 3), brandVoiceController.testBrandVoice);
 router.get('/:workspaceNumber/brand-voice/rate-limit', rwr, rp('brandVoice', 'read'), brandVoiceController.getTestRateLimit);
 
 // Brand voice CRUD (multiple voices per workspace)
@@ -65,7 +66,7 @@ router.post('/:workspaceNumber/brand-voice/avatars', rwr, rp('brandVoice', 'mana
 router.put('/:workspaceNumber/brand-voice/avatars/:avatarId', rwr, rp('brandVoice', 'manage'), rejectIfLocked(Avatar, 'avatarId'), brandVoiceController.updateAvatar);
 router.delete('/:workspaceNumber/brand-voice/avatars/:avatarId', rwr, rp('brandVoice', 'manage'), brandVoiceController.deleteAvatar);
 router.patch('/:workspaceNumber/brand-voice/avatars/:avatarId/toggle', rwr, rp('brandVoice', 'manage'), rejectIfLocked(Avatar, 'avatarId'), brandVoiceController.toggleAvatar);
-router.post('/:workspaceNumber/brand-voice/avatars/:avatarId/test', rwr, rp('brandVoice', 'manage'), brandVoiceController.testAvatar);
+router.post('/:workspaceNumber/brand-voice/avatars/:avatarId/test', rwr, rp('brandVoice', 'manage'), rc('avatarTest', 3), brandVoiceController.testAvatar);
 
 // Google Doc URL import
 router.post('/:workspaceNumber/brand-voice/avatars/:avatarId/import-url', rwr, rp('brandVoice', 'manage'), brandVoiceController.importGoogleDoc);

@@ -7,6 +7,7 @@ const aiController = require('../controllers/aiController');
 const { authenticateToken } = require('../middleware/auth');
 const { resolveWorkspaceWithRole: rwr, requirePermission: rp, requireFeature: rf } = require('../middleware/permissions');
 const { requireQuota: rq } = require('../middleware/tierEnforcement');
+const { requireCredits: rc } = require('../middleware/creditGate');
 const { rejectIfLocked, contentLockResolver } = require('../middleware/lockGuard');
 
 // All workspace routes are protected
@@ -28,8 +29,8 @@ router.put('/:workspaceNumber/content/:contentNumber/comments/:commentId', rwr, 
 router.delete('/:workspaceNumber/content/:contentNumber/comments/:commentId', rwr, rp('content', 'comment'), contentController.deleteComment);
 
 // Content audit
-router.post('/:workspaceNumber/content/:contentNumber/audit', rwr, rf('analysis'), rp('analysis', 'use'), rq('auditsRun', 'maxAuditsPerMonth', 'auditLimitType'), contentController.runAudit);
-router.post('/:workspaceNumber/content/:contentNumber/writing-quality', rwr, rf('analysis'), rp('analysis', 'use'), rq('auditsRun', 'maxAuditsPerMonth', 'auditLimitType'), contentController.runWritingQualityAudit);
+router.post('/:workspaceNumber/content/:contentNumber/audit', rwr, rf('analysis'), rp('analysis', 'use'), rq('auditsRun', 'maxAuditsPerMonth', 'auditLimitType'), rc('contentAudit', 10), contentController.runAudit);
+router.post('/:workspaceNumber/content/:contentNumber/writing-quality', rwr, rf('analysis'), rp('analysis', 'use'), rq('auditsRun', 'maxAuditsPerMonth', 'auditLimitType'), rc('writingQualityAudit', 10), contentController.runWritingQualityAudit);
 
 // Analysis under content: /api/workspace/:workspaceNumber/content/:contentNumber/...
 router.post('/:workspaceNumber/content/:contentNumber/analyze', rwr, rf('analysis'), rp('analysis', 'use'), rq('auditsRun', 'maxAuditsPerMonth', 'auditLimitType'), analysisController.triggerAnalysis);
@@ -40,8 +41,8 @@ router.post('/:workspaceNumber/content/:contentNumber/readability-check', rwr, r
 router.post('/:workspaceNumber/content/:contentNumber/regenerate-outline', rwr, rf('analysis'), rp('analysis', 'use'), analysisController.regenerateOutline);
 
 // AI writing under content: /api/workspace/:workspaceNumber/content/:contentNumber/ai/...
-router.post('/:workspaceNumber/content/:contentNumber/ai/chat', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.chat);
-router.post('/:workspaceNumber/content/:contentNumber/ai/agent', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.agent);
+router.post('/:workspaceNumber/content/:contentNumber/ai/chat', rwr, rf('aiChat'), rp('aiChat', 'use'), rc('aiChat', 10), aiController.chat);
+router.post('/:workspaceNumber/content/:contentNumber/ai/agent', rwr, rf('aiChat'), rp('aiChat', 'use'), rc('aiAgent', 10), aiController.agent);
 router.post('/:workspaceNumber/content/:contentNumber/ai/generate-image', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.generateImage);
 router.post('/:workspaceNumber/content/:contentNumber/ai/upload-image', rwr, rp('content', 'update'), aiController.uploadImage);
 router.post('/:workspaceNumber/content/:contentNumber/ai/clarify-answer', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.clarifyAnswer);

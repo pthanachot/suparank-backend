@@ -2,6 +2,7 @@ const Content = require('../models/Content');
 const { runAnalysis } = require('./analysisController');
 const imageStorage = require('../services/imageStorage');
 const UsageTracker = require('../models/UsageTracker');
+const creditService = require('../services/creditService');
 
 // Workspace is resolved by the permissions middleware (resolveWorkspaceWithRole)
 // and available as req.workspace.
@@ -568,6 +569,22 @@ async function streamAudit(req, res, { prompt, contentHash, contentId, dbField, 
     );
   } catch (e) {
     console.error(`[${dbField}] DB save error:`, e.message);
+  }
+
+  // Deduct credits based on actual output word count
+  if (req.creditContext?.deductionEnabled) {
+    try {
+      const wordCount = fullContent.trim().split(/\s+/).filter(Boolean).length;
+      const credits = creditService.wordsToCredits(wordCount);
+      if (credits > 0) {
+        await creditService.preDeduct(
+          req.creditContext.orgId, req.user.userId, credits,
+          req.creditContext.featureKey, { contentId: contentId.toString(), wordCount, feature: req.creditContext.featureKey }
+        );
+      }
+    } catch (creditErr) {
+      console.error(`[${dbField}] credit deduction failed (non-fatal):`, creditErr.message);
+    }
   }
 
   // Emit final complete event

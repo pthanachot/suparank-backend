@@ -4,6 +4,7 @@ const aiTrackerController = require('../controllers/aiTrackerController');
 const { authenticateToken } = require('../middleware/auth');
 const { resolveWorkspaceWithRole: rwr, requirePermission: rp, requireFeature: rf } = require('../middleware/permissions');
 const { requireQuota: rq } = require('../middleware/tierEnforcement');
+const { requireCredits: rc } = require('../middleware/creditGate');
 
 // All AI tracker routes require authentication
 router.use(authenticateToken);
@@ -27,7 +28,7 @@ router.post('/:workspaceNumber/ai-tracker/setup', ...rwrAiTracker, rp('aiTracker
 
 // Scan status & trigger
 router.get('/:workspaceNumber/ai-tracker/scan', ...rwrAiTracker, rp('aiTracker', 'read'), aiTrackerController.getScanStatus);
-router.post('/:workspaceNumber/ai-tracker/scan', ...rwrAiTracker, rp('aiTracker', 'use'), aiTrackerController.triggerScan);
+router.post('/:workspaceNumber/ai-tracker/scan', ...rwrAiTracker, rp('aiTracker', 'use'), rc('aiTrackerScan', 5), aiTrackerController.triggerScan);
 
 // Prompt CRUD
 router.post('/:workspaceNumber/ai-tracker/prompts', ...rwrAiTracker, rp('aiTracker', 'manage'), rq('aiTrackerPromptsCreated', 'maxAiTrackerPromptsPerMonth', 'aiTrackerPromptLimitType'), aiTrackerController.addPrompt);
@@ -54,7 +55,7 @@ router.delete('/:workspaceNumber/ai-tracker/monitors/:monitorId', ...rwrAiTracke
 
 // Monitor-scoped scan
 router.get('/:workspaceNumber/ai-tracker/monitors/:monitorId/scan', ...rwrAiTracker, rp('aiTracker', 'read'), aiTrackerController.getMonitorScanStatus);
-router.post('/:workspaceNumber/ai-tracker/monitors/:monitorId/scan', ...rwrAiTracker, rp('aiTracker', 'use'), aiTrackerController.triggerMonitorScan);
+router.post('/:workspaceNumber/ai-tracker/monitors/:monitorId/scan', ...rwrAiTracker, rp('aiTracker', 'use'), rc('aiTrackerScan', 5), aiTrackerController.triggerMonitorScan);
 
 // Monitor-scoped prompts
 router.post('/:workspaceNumber/ai-tracker/monitors/:monitorId/prompts', ...rwrAiTracker, rp('aiTracker', 'manage'), rq('aiTrackerPromptsCreated', 'maxAiTrackerPromptsPerMonth', 'aiTrackerPromptLimitType'), aiTrackerController.addMonitorPrompt);

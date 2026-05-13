@@ -37,6 +37,17 @@ const TIERS = [
     creditsPerMonth: 300,
     creditLimitType: 'lifetime',
     contentVersionHistoryDays: 7,
+    custom: {
+      creditDeductionFlags: {
+        aiChat: true,
+        aiAgent: true,
+        brandVoiceTest: true,
+        avatarTest: true,
+        contentAudit: true,
+        writingQualityAudit: true,
+        aiTrackerScan: true,
+      },
+    },
   },
   {
     tier: 'standard',
@@ -63,6 +74,17 @@ const TIERS = [
     creditsPerMonth: 3000,
     creditLimitType: 'monthly',
     contentVersionHistoryDays: 30,
+    custom: {
+      creditDeductionFlags: {
+        aiChat: true,
+        aiAgent: true,
+        brandVoiceTest: true,
+        avatarTest: true,
+        contentAudit: true,
+        writingQualityAudit: true,
+        aiTrackerScan: true,
+      },
+    },
   },
   {
     tier: 'professional',
@@ -89,6 +111,17 @@ const TIERS = [
     creditsPerMonth: 8000,
     creditLimitType: 'monthly',
     contentVersionHistoryDays: 90,
+    custom: {
+      creditDeductionFlags: {
+        aiChat: true,
+        aiAgent: true,
+        brandVoiceTest: true,
+        avatarTest: true,
+        contentAudit: true,
+        writingQualityAudit: true,
+        aiTrackerScan: true,
+      },
+    },
   },
   {
     tier: 'agency',
@@ -115,6 +148,17 @@ const TIERS = [
     creditsPerMonth: 25000,
     creditLimitType: 'monthly',
     contentVersionHistoryDays: 180,
+    custom: {
+      creditDeductionFlags: {
+        aiChat: true,
+        aiAgent: true,
+        brandVoiceTest: true,
+        avatarTest: true,
+        contentAudit: true,
+        writingQualityAudit: true,
+        aiTrackerScan: true,
+      },
+    },
   },
 ];
 

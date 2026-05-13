@@ -1,6 +1,7 @@
 const Content = require('../models/Content');
 const BrandVoice = require('../models/BrandVoice');
 const Avatar = require('../models/Avatar');
+const CreditTransaction = require('../models/CreditTransaction');
 const { blocksToMarkdown, stripHtml } = require('../services/blocksToMarkdown');
 const { markdownToBlocks } = require('../services/markdownToBlocks');
 const { benchmarkToContentBrief } = require('../services/benchmarkToContentBrief');
@@ -8,6 +9,7 @@ const { buildResearchOutlineMd, buildSeoTargetsMd, buildContentAuditMd } = requi
 const { mapEditsToPatches } = require('../services/mapEditsToPatches');
 const writingEngine = require('../services/writingEngine');
 const imageStorage = require('../services/imageStorage');
+const creditService = require('../services/creditService');
 
 // ─── Session reuse map ───────────────────────────────────────
 // Maps contentId → { sessionId, lastUsed } for conversation memory.
@@ -164,6 +166,7 @@ async function setupSession(content, { avatarId, reuseSession } = {}) {
 // and final draft/patch events so the UI can show live progress.
 // ─────────────────────────────────────────────────────────────
 const chat = async (req, res) => {
+  let creditTxId = null;
   try {
     const content = await resolveContent(req, res);
     if (!content) return;
@@ -175,6 +178,24 @@ const chat = async (req, res) => {
 
     // Set up Writing Engine session
     const { sessionId } = await setupSession(content, { avatarId });
+
+    // Pre-deduct credits before starting the stream
+    if (req.creditContext?.deductionEnabled) {
+      try {
+        const result = await creditService.preDeduct(
+          req.creditContext.orgId, req.user.userId,
+          req.creditContext.estimatedCredits,
+          req.creditContext.featureKey,
+          { contentId: content._id.toString(), feature: 'aiChat' }
+        );
+        creditTxId = result.transactionId;
+      } catch (creditErr) {
+        return res.status(402).json({
+          error: creditErr.message,
+          code: 'INSUFFICIENT_CREDITS',
+        });
+      }
+    }
 
     // AbortController tied to the client request so that if the browser
     // disconnects (user pressed Stop / Esc), we abort the fetch to the Go
@@ -222,12 +243,32 @@ const chat = async (req, res) => {
     } catch (streamErr) {
       if (clientDisconnected || abortCtrl.signal.aborted) {
         console.log('[chat-sse] stream aborted by client disconnect');
+        // Refund credits on client abort
+        if (creditTxId) {
+          creditService.refund(creditTxId).catch((e) =>
+            console.error('[credit] chat abort refund failed:', e.message)
+          );
+          creditTxId = null;
+        }
       } else {
         throw streamErr;
       }
     }
+
+    // Stream completed — mark credits as settled
+    if (creditTxId) {
+      CreditTransaction.findByIdAndUpdate(creditTxId, { status: 'settled' }).catch(() => {});
+    }
+
     if (!clientDisconnected) res.end();
   } catch (err) {
+    // Refund credits on error
+    if (creditTxId) {
+      creditService.refund(creditTxId).catch((e) =>
+        console.error('[credit] chat error refund failed:', e.message)
+      );
+    }
+
     // AbortError from fetch when client disconnected — silent.
     if (err.name === 'AbortError') {
       console.log('[chat-sse] upstream fetch aborted');
@@ -247,6 +288,7 @@ const chat = async (req, res) => {
 // SSE streaming — agent writes/edits, streams progress
 // ─────────────────────────────────────────────────────────────
 const agent = async (req, res) => {
+  let creditTxId = null;
   try {
     const content = await resolveContent(req, res);
     if (!content) return;
@@ -266,6 +308,24 @@ const agent = async (req, res) => {
         await writingEngine.setExecutionMode(sessionId, executionMode);
       } catch (err) {
         console.error('Set execution mode failed (non-fatal):', err.message);
+      }
+    }
+
+    // Pre-deduct credits before starting the stream
+    if (req.creditContext?.deductionEnabled) {
+      try {
+        const result = await creditService.preDeduct(
+          req.creditContext.orgId, req.user.userId,
+          req.creditContext.estimatedCredits,
+          req.creditContext.featureKey,
+          { contentId: content._id.toString(), feature: 'aiAgent' }
+        );
+        creditTxId = result.transactionId;
+      } catch (creditErr) {
+        return res.status(402).json({
+          error: creditErr.message,
+          code: 'INSUFFICIENT_CREDITS',
+        });
       }
     }
 
@@ -322,12 +382,32 @@ const agent = async (req, res) => {
     } catch (streamErr) {
       if (clientDisconnected || abortCtrl.signal.aborted) {
         console.log('[agent-sse] stream aborted by client disconnect');
+        // Refund credits on client abort
+        if (creditTxId) {
+          creditService.refund(creditTxId).catch((e) =>
+            console.error('[credit] agent abort refund failed:', e.message)
+          );
+          creditTxId = null;
+        }
       } else {
         throw streamErr;
       }
     }
+
+    // Stream completed — mark credits as settled
+    if (creditTxId) {
+      CreditTransaction.findByIdAndUpdate(creditTxId, { status: 'settled' }).catch(() => {});
+    }
+
     if (!clientDisconnected) res.end();
   } catch (err) {
+    // Refund credits on error
+    if (creditTxId) {
+      creditService.refund(creditTxId).catch((e) =>
+        console.error('[credit] agent error refund failed:', e.message)
+      );
+    }
+
     // AbortError from fetch when client disconnected — silent.
     if (err.name === 'AbortError') {
       console.log('[agent-sse] upstream fetch aborted');

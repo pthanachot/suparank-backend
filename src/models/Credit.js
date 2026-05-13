@@ -3,15 +3,12 @@ const mongoose = require('mongoose');
 /**
  * Credit — tracks current credit balance per organization.
  *
- * TODO: Not yet implemented. This is a placeholder model.
- *
  * Credits: 1 credit = 50 words of AI-generated content.
  * Two pools:
  *   - subscriptionCredits: granted each billing cycle, expire at cycle end.
  *   - purchasedCredits: bought via credit packs, never expire.
  *
  * See TierConfig for per-tier credit allotments.
- * See acequiz-backend/src/models/Credit.js for the reference implementation.
  */
 
 const creditSchema = new mongoose.Schema(
@@ -48,14 +45,28 @@ const creditSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// TODO: Add instance methods:
-//   deductCredits(amount)  — subscription first, then purchased
-//   canAfford(amount)      — check if total balance >= amount
-//   resetSubscriptionCredits(amount, expiresAt) — grant new cycle credits
-//
-// TODO: Add static methods:
-//   getOrCreateForOrg(orgId)
-//   expireAllExpiredCredits()  — batch job
+// ─── Instance methods ────────────────────────────────────────
+
+/**
+ * Total balance across both pools.
+ */
+creditSchema.methods.totalBalance = function () {
+  return this.subscriptionCredits + this.purchasedCredits;
+};
+
+// ─── Static methods ──────────────────────────────────────────
+
+/**
+ * Get or create credit document for an organization.
+ * Uses upsert so it's safe to call concurrently.
+ */
+creditSchema.statics.getOrCreateForOrg = function (orgId) {
+  return this.findOneAndUpdate(
+    { organizationId: orgId },
+    { $setOnInsert: { organizationId: orgId, subscriptionCredits: 0, purchasedCredits: 0 } },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+};
 
 creditSchema.index({ subscriptionCreditsExpireAt: 1 });
 

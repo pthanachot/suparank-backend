@@ -5,10 +5,58 @@ const User = require('../models/User');
 const OrgMember = require('../models/OrgMember');
 const tierService = require('../services/tierService');
 
-// ─── GET WORKSPACE (find or create for user) ────────────────────
+// ─── GET WORKSPACE (resolve through active org — no ghost creation) ──
 const getWorkspace = async (req, res) => {
   try {
-    const workspace = await Workspace.findOrCreateForUser(req.user.userId);
+    const userId = req.user.userId;
+
+    // 1. Find user's organization (owned first, then membership)
+    let orgId;
+    const ownedOrg = await Organization.findOne({ ownerId: userId }).lean();
+    if (ownedOrg) {
+      orgId = ownedOrg._id;
+    } else {
+      const membership = await OrgMember.findOne({ userId }).lean();
+      if (membership) orgId = membership.organizationId;
+    }
+
+    if (!orgId) {
+      // No org at all — create one with a default workspace
+      const org = await Organization.create({ name: 'My Organization', ownerId: userId });
+      const workspaceNumber = await Workspace.getNextNumber();
+      const workspace = await Workspace.create({
+        workspaceNumber,
+        userId,
+        organizationId: org._id,
+        isDefault: true,
+      });
+      return res.json({ workspace });
+    }
+
+    // 2. Find active workspace in that org, or default, or first
+    const user = await User.findById(userId, 'activeWorkspaceId').lean();
+    let workspace;
+    if (user?.activeWorkspaceId) {
+      workspace = await Workspace.findOne({ _id: user.activeWorkspaceId, organizationId: orgId }).lean();
+    }
+    if (!workspace) {
+      workspace = await Workspace.findOne({ organizationId: orgId, isDefault: true }).lean();
+    }
+    if (!workspace) {
+      workspace = await Workspace.findOne({ organizationId: orgId }).lean();
+    }
+
+    if (!workspace) {
+      // Org exists but has no workspaces — create a default one
+      const workspaceNumber = await Workspace.getNextNumber();
+      workspace = await Workspace.create({
+        workspaceNumber,
+        userId,
+        organizationId: orgId,
+        isDefault: true,
+      });
+    }
+
     res.json({ workspace });
   } catch (err) {
     console.error('getWorkspace error:', err.message);
@@ -91,18 +139,20 @@ const listWorkspaces = async (req, res) => {
 
     // Enrich with role
     const enriched = deduped.map((ws) => {
-      // Direct owner
-      if (ws.userId.equals(req.user.userId)) {
-        return { ...ws, role: 'owner' };
-      }
-      // Org owner
-      if (ws.organizationId && ownedOrgIds.some((id) => id.equals(ws.organizationId))) {
-        return { ...ws, role: 'owner' };
-      }
-      // Org member
+      // Org-based workspaces: org role takes priority over ws.userId (creator)
+      // because ownership can be transferred, making the creator a non-owner.
       if (ws.organizationId) {
+        // Org owner
+        if (ownedOrgIds.some((id) => id.equals(ws.organizationId))) {
+          return { ...ws, role: 'owner' };
+        }
+        // Org member
         const orgRole = roleByOrg[ws.organizationId.toString()];
         if (orgRole) return { ...ws, role: orgRole };
+      }
+      // Personal workspace (no org): creator is always owner
+      if (ws.userId.equals(req.user.userId)) {
+        return { ...ws, role: 'owner' };
       }
       // Owner-based member (pre-multi-org)
       const ownerRole = roleByOwner[ws.userId.toString()];
@@ -146,7 +196,7 @@ const createWorkspace = async (req, res) => {
       const { config, tier } = await tierService.getOrgTierConfig(orgId);
       const maxWs = config?.maxWorkspaces;
       if (maxWs != null) {
-        const wsCount = await Workspace.countDocuments({ organizationId: orgId });
+        const wsCount = await Workspace.countDocuments({ organizationId: orgId, locked: { $ne: true } });
         if (wsCount >= maxWs) {
           return res.status(429).json({
             error: `Your ${config.displayName || tier} plan allows ${maxWs} workspace(s). Upgrade for more.`,
@@ -200,12 +250,18 @@ const updateWorkspace = async (req, res) => {
 const deleteWorkspace = async (req, res) => {
   try {
     const { workspaceId } = req.params;
-    const workspace = await Workspace.findOne({ _id: workspaceId, userId: req.user.userId });
+    const workspace = await Workspace.findById(workspaceId);
     if (!workspace) {
       return res.status(404).json({ error: 'Workspace not found' });
     }
-    if (workspace.isDefault) {
-      return res.status(400).json({ error: 'Cannot delete the default workspace' });
+    // Permission: org owner for org workspaces, creator for personal
+    if (workspace.organizationId) {
+      const org = await Organization.findById(workspace.organizationId).select('ownerId').lean();
+      if (!org?.ownerId.equals(req.user.userId)) {
+        return res.status(403).json({ error: 'Only the organization owner can delete workspaces' });
+      }
+    } else if (!workspace.userId.equals(req.user.userId)) {
+      return res.status(404).json({ error: 'Workspace not found' });
     }
     // Block deletion if workspace has content (articles)
     const Article = mongoose.models.Article;
@@ -214,6 +270,13 @@ const deleteWorkspace = async (req, res) => {
       if (articleCount > 0) {
         return res.status(400).json({ error: 'Cannot delete a workspace that has content. Move or delete its articles first.' });
       }
+    }
+    // If deleting the default workspace, promote the next oldest in the same org
+    if (workspace.isDefault) {
+      const filter = workspace.organizationId
+        ? { organizationId: workspace.organizationId, _id: { $ne: workspace._id } }
+        : { userId: workspace.userId, _id: { $ne: workspace._id } };
+      await Workspace.findOneAndUpdate(filter, { $set: { isDefault: true } }, { sort: { createdAt: 1 } });
     }
     await workspace.deleteOne();
     await User.updateOne(
@@ -236,14 +299,30 @@ const setActiveWorkspace = async (req, res) => {
       return res.status(404).json({ error: 'Workspace not found' });
     }
 
-    // Check access: owner, org member, or legacy member
-    const isOwner = workspace.userId.equals(req.user.userId);
-    const isOrgMember = !isOwner && await OrgMember.findMembership(workspace.userId, req.user.userId);
-    const isLegacyMember = !isOwner && !isOrgMember && workspace.members?.some(
-      (m) => m.userId.equals(req.user.userId)
-    );
+    // Check access: org owner/member, personal workspace creator, or legacy member
+    let hasAccess = false;
+    if (workspace.organizationId) {
+      const org = await Organization.findById(workspace.organizationId).select('ownerId').lean();
+      if (org?.ownerId.equals(req.user.userId)) {
+        hasAccess = true;
+      } else {
+        const membership = await OrgMember.findMembershipByOrg(workspace.organizationId, req.user.userId);
+        if (membership) hasAccess = true;
+      }
+    }
+    if (!hasAccess && !workspace.organizationId && workspace.userId.equals(req.user.userId)) {
+      hasAccess = true; // personal workspace creator
+    }
+    if (!hasAccess && !workspace.organizationId) {
+      // Legacy fallback (non-org workspaces only)
+      const legacyMember = await OrgMember.findMembership(workspace.userId, req.user.userId);
+      if (legacyMember) hasAccess = true;
+      if (!hasAccess && workspace.members?.some((m) => m.userId.equals(req.user.userId))) {
+        hasAccess = true;
+      }
+    }
 
-    if (!isOwner && !isOrgMember && !isLegacyMember) {
+    if (!hasAccess) {
       return res.status(403).json({ error: 'You do not have access to this workspace' });
     }
 
@@ -272,10 +351,16 @@ const getMembers = async (req, res) => {
     if (!workspace) {
       return res.status(404).json({ error: 'Workspace not found' });
     }
-    const owner = await User.findById(workspace.userId).select('email profile.name profile.picture').lean();
+    // For org workspaces, the real owner is Organization.ownerId (not workspace.userId which is the creator)
+    let ownerId = workspace.userId;
+    if (workspace.organizationId) {
+      const org = await Organization.findById(workspace.organizationId).select('ownerId').lean();
+      if (org) ownerId = org.ownerId;
+    }
+    const owner = await User.findById(ownerId).select('email profile.name profile.picture').lean();
     res.json({
       owner: {
-        userId: workspace.userId,
+        userId: ownerId,
         email: owner?.email || '',
         name: owner?.profile?.name || '',
         picture: owner?.profile?.picture || '',
@@ -285,7 +370,7 @@ const getMembers = async (req, res) => {
         email: m.email,
         addedAt: m.addedAt,
       })),
-      isOwner: workspace.userId.equals(req.user.userId),
+      isOwner: ownerId.equals(req.user.userId),
     });
   } catch (error) {
     console.error('Get members error:', error);

@@ -33,7 +33,7 @@ const orgMemberSchema = new mongoose.Schema(
       required: true,
       default: 'viewer',
       // References Role.name: 'admin' | 'editor' | 'viewer'
-      // 'owner' is NEVER stored — it's implicit when workspace.userId === req.user.userId
+      // 'owner' is NEVER stored — it's implicit via Organization.ownerId
     },
     status: {
       type: String,
@@ -41,6 +41,9 @@ const orgMemberSchema = new mongoose.Schema(
       default: 'active',
     },
     invitedAt: { type: Date, default: Date.now },
+
+    // Downgrade locking — locked members are suspended until the org upgrades
+    locked: { type: Boolean, default: false },
   },
   { timestamps: true }
 );

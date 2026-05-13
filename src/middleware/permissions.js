@@ -90,14 +90,8 @@ const resolveWorkspaceWithRole = async (req, res, next) => {
       return res.status(404).json({ error: 'Workspace not found' });
     }
 
-    // Owner — implicit role, never stored in OrgMember
-    if (workspace.userId.equals(req.user.userId)) {
-      req.workspace = workspace;
-      req.workspaceRole = 'owner';
-      return next();
-    }
-
-    // Org-based access: check membership by organizationId
+    // Org-based workspaces: org role takes priority over ws.userId (creator)
+    // because ownership can be transferred, making the creator a non-owner.
     if (workspace.organizationId) {
       const org = await Organization.findById(workspace.organizationId).lean();
       if (org) {
@@ -119,16 +113,25 @@ const resolveWorkspaceWithRole = async (req, res, next) => {
       }
     }
 
-    // Fallback: OrgMember by ownerId (pre-multi-org records)
-    const membership = await OrgMember.findMembership(
-      workspace.userId, // ownerId
-      req.user.userId // userId
-    );
-
-    if (membership) {
+    // Personal workspace (no org): creator is always owner
+    if (!workspace.organizationId && workspace.userId.equals(req.user.userId)) {
       req.workspace = workspace;
-      req.workspaceRole = membership.role;
+      req.workspaceRole = 'owner';
       return next();
+    }
+
+    // Fallback: OrgMember by ownerId (pre-multi-org records, non-org workspaces only)
+    if (!workspace.organizationId) {
+      const membership = await OrgMember.findMembership(
+        workspace.userId, // ownerId
+        req.user.userId // userId
+      );
+
+      if (membership) {
+        req.workspace = workspace;
+        req.workspaceRole = membership.role;
+        return next();
+      }
     }
 
     // Legacy fallback: Workspace.members[] (pre-migration).
@@ -220,21 +223,36 @@ function requireFeature(featureKey) {
 
       const { conditions } = flag;
 
-      // minimumPlan — check the org owner's subscription
+      // minimumPlan — check the org's subscription
       if (conditions?.minimumPlan) {
-        // Use workspace owner if available, otherwise the authenticated user
-        const ownerId = req.workspace
-          ? req.workspace.userId
-          : req.user.userId;
-
-        const subCacheKey = `sub:${ownerId}`;
-        let subscription = _getCached(subCacheKey);
-        if (subscription === undefined) {
-          subscription = await Subscription.findOne({
-            userId: ownerId,
-            status: { $in: ['active', 'trialing'] },
-          }).lean();
-          _setCache(subCacheKey, subscription);
+        let subscription;
+        const orgId = req.workspace?.organizationId;
+        if (orgId) {
+          // Org workspace: look up subscription by organizationId
+          const subCacheKey = `sub:org:${orgId}`;
+          subscription = _getCached(subCacheKey);
+          if (subscription === undefined) {
+            subscription = await Subscription.findOne({
+              organizationId: orgId,
+              status: { $in: ['active', 'trialing'] },
+            }).lean();
+            _setCache(subCacheKey, subscription);
+          }
+        } else {
+          // Non-org workspace: resolve owner's personal org, then look up by organizationId
+          const ownerId = req.workspace ? req.workspace.userId : req.user.userId;
+          const subCacheKey = `sub:personal:${ownerId}`;
+          subscription = _getCached(subCacheKey);
+          if (subscription === undefined) {
+            const personalOrg = await Organization.findOne({ ownerId, isPersonal: true }).select('_id').lean();
+            subscription = personalOrg
+              ? await Subscription.findOne({
+                  organizationId: personalOrg._id,
+                  status: { $in: ['active', 'trialing'] },
+                }).lean()
+              : null;
+            _setCache(subCacheKey, subscription);
+          }
         }
 
         if (!_meetsMinimumPlan(subscription?.planId, conditions.minimumPlan)) {

@@ -134,7 +134,7 @@ async function setupSession(content, { avatarId, reuseSession } = {}) {
   // 5. Push brand voice + selected avatar to the engine (non-fatal)
   try {
     const workspaceId = content.workspaceId || content.workspace;
-    const brandVoice = await BrandVoice.findOne({ workspace: workspaceId }).lean();
+    const brandVoice = await BrandVoice.findOne({ workspace: workspaceId, active: true }).lean();
     let combinedMarkdown = '';
 
     if (brandVoice && brandVoice.content) {

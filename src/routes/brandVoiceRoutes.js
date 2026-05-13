@@ -43,11 +43,20 @@ const { resolveWorkspaceWithRole: rwr, requirePermission: rp } = require('../mid
 const Avatar = require('../models/Avatar');
 const { rejectIfLocked } = require('../middleware/lockGuard');
 
-// Brand voice
+const BrandVoice = require('../models/BrandVoice');
+
+// Brand voice (single active)
 router.get('/:workspaceNumber/brand-voice', rwr, rp('brandVoice', 'read'), brandVoiceController.getBrandVoice);
 router.put('/:workspaceNumber/brand-voice', rwr, rp('brandVoice', 'manage'), brandVoiceController.saveBrandVoice);
 router.post('/:workspaceNumber/brand-voice/test', rwr, rp('brandVoice', 'manage'), brandVoiceController.testBrandVoice);
 router.get('/:workspaceNumber/brand-voice/rate-limit', rwr, rp('brandVoice', 'read'), brandVoiceController.getTestRateLimit);
+
+// Brand voice CRUD (multiple voices per workspace)
+router.get('/:workspaceNumber/brand-voice/voices', rwr, rp('brandVoice', 'read'), brandVoiceController.listBrandVoices);
+router.post('/:workspaceNumber/brand-voice/voices', rwr, rp('brandVoice', 'manage'), brandVoiceController.createBrandVoice);
+router.put('/:workspaceNumber/brand-voice/voices/:brandVoiceId', rwr, rp('brandVoice', 'manage'), rejectIfLocked(BrandVoice, 'brandVoiceId'), brandVoiceController.saveBrandVoice);
+router.delete('/:workspaceNumber/brand-voice/voices/:brandVoiceId', rwr, rp('brandVoice', 'manage'), brandVoiceController.deleteBrandVoice);
+router.patch('/:workspaceNumber/brand-voice/voices/:brandVoiceId/toggle', rwr, rp('brandVoice', 'manage'), rejectIfLocked(BrandVoice, 'brandVoiceId'), brandVoiceController.toggleBrandVoice);
 
 // Avatars
 router.get('/:workspaceNumber/brand-voice/avatars', rwr, rp('brandVoice', 'read'), brandVoiceController.listAvatars);

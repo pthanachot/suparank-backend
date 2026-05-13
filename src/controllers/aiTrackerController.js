@@ -491,16 +491,27 @@ async function executeScan(trackerId) {
       $set: { status: 'ready', completedAt: now, results, competitorResults },
     });
 
+    // Determine refresh interval from tier config (daily or weekly)
+    let intervalDays = 7; // default weekly
+    const ws = await Workspace.findById(tracker.workspaceId);
+    if (ws?.organizationId) {
+      const { config } = await tierService.getOrgTierConfig(ws.organizationId);
+      intervalDays = config?.aiTrackerRefreshInterval === 'daily' ? 1 : 7;
+    }
+
     // Update tracker to ready
+    const scannedPlatforms = tracker.defaultModels && tracker.defaultModels.length > 0
+      ? tracker.defaultModels
+      : PLATFORM_DISPLAY.map((p) => p.platformId);
     await AiTracker.findByIdAndUpdate(trackerId, {
       $set: {
         scanStatus: 'ready',
         scanProgress: 100,
         lastScanAt: now,
-        nextScanAt: new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000),
+        nextScanAt: new Date(now.getTime() + intervalDays * 24 * 60 * 60 * 1000),
         currentScanId: null,
-        platformStatuses: PLATFORM_DISPLAY.map((p) => ({
-          platformId: p.platformId,
+        platformStatuses: scannedPlatforms.map((pid) => ({
+          platformId: pid,
           status: 'completed',
         })),
       },
@@ -586,7 +597,24 @@ const updateTracker = async (req, res) => {
     const { defaultModels } = req.body;
 
     const update = {};
-    if (Array.isArray(defaultModels)) update.defaultModels = defaultModels;
+    if (Array.isArray(defaultModels)) {
+      // Validate against tier limit
+      const validPlatformIds = PLATFORM_DISPLAY.map((p) => p.platformId);
+      const filtered = defaultModels.filter((p) => validPlatformIds.includes(p));
+      const orgId = workspace.organizationId;
+      if (orgId) {
+        const { config, tier } = await tierService.getOrgTierConfig(orgId);
+        const maxPlatforms = config?.maxAiTrackerPlatforms ?? validPlatformIds.length;
+        if (filtered.length > maxPlatforms) {
+          return res.status(400).json({
+            error: `Your ${tier} plan allows up to ${maxPlatforms} AI platform${maxPlatforms !== 1 ? 's' : ''}`,
+            code: 'PLATFORM_LIMIT',
+            quota: { limit: maxPlatforms, requested: filtered.length, tier },
+          });
+        }
+      }
+      update.defaultModels = filtered;
+    }
 
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ error: 'No fields to update' });
@@ -708,13 +736,67 @@ const setup = async (req, res) => {
   try {
     const workspace = req.workspace;
 
-    const { domain, name, prompts, competitors } = req.body;
+    const { domain, name, prompts, competitors, platforms } = req.body;
 
     if (!domain || typeof domain !== 'string' || !domain.trim()) {
       return res.status(400).json({ error: 'Domain is required' });
     }
     if (!Array.isArray(prompts) || prompts.length === 0) {
       return res.status(400).json({ error: 'At least one prompt is required' });
+    }
+
+    // Validate platforms and monitor count against tier limits
+    const validPlatformIds = PLATFORM_DISPLAY.map((p) => p.platformId);
+    let selectedPlatforms = validPlatformIds; // default: all
+    const orgId = workspace.organizationId;
+    let tierConfig = null;
+    let tierName = 'free';
+    if (orgId) {
+      const { config, tier } = await tierService.getOrgTierConfig(orgId);
+      tierConfig = config;
+      tierName = tier;
+
+      // Check monitor count limit (per workspace, tier from org)
+      if (config?.maxAiTrackerMonitors != null) {
+        const monitorCount = await AiTracker.countDocuments({ workspaceId: workspace._id });
+        if (monitorCount >= config.maxAiTrackerMonitors) {
+          return res.status(429).json({
+            error: `Your ${tier} plan allows up to ${config.maxAiTrackerMonitors} AI Tracker monitor${config.maxAiTrackerMonitors !== 1 ? 's' : ''} per workspace`,
+            code: 'QUOTA_EXCEEDED',
+            quota: { limit: config.maxAiTrackerMonitors, used: monitorCount, tier, limitKey: 'maxAiTrackerMonitors' },
+          });
+        }
+      }
+
+      // Check prompt quota
+      const promptCount = prompts.filter((p) => typeof p === 'string' && p.trim()).length;
+      if (config?.maxAiTrackerPromptsPerMonth != null && promptCount > 0) {
+        const limitType = config.aiTrackerPromptLimitType || 'monthly';
+        const period = tierService.getPeriod(limitType);
+        const used = await UsageTracker.getCount(orgId, 'aiTrackerPromptsCreated', period);
+        if (used + promptCount > config.maxAiTrackerPromptsPerMonth) {
+          return res.status(429).json({
+            error: `Your ${tier} plan allows ${config.maxAiTrackerPromptsPerMonth} AI Tracker prompts (${used} used, ${promptCount} requested)`,
+            code: 'QUOTA_EXCEEDED',
+            quota: { limit: config.maxAiTrackerPromptsPerMonth, used, tier, limitKey: 'maxAiTrackerPromptsPerMonth' },
+          });
+        }
+      }
+
+      // Validate platform count
+      const maxPlatforms = config?.maxAiTrackerPlatforms ?? validPlatformIds.length;
+      if (Array.isArray(platforms) && platforms.length > 0) {
+        selectedPlatforms = platforms.filter((p) => validPlatformIds.includes(p));
+        if (selectedPlatforms.length > maxPlatforms) {
+          return res.status(400).json({
+            error: `Your ${tier} plan allows up to ${maxPlatforms} AI platform${maxPlatforms !== 1 ? 's' : ''}`,
+            code: 'PLATFORM_LIMIT',
+            quota: { limit: maxPlatforms, requested: selectedPlatforms.length, tier },
+          });
+        }
+      } else {
+        selectedPlatforms = validPlatformIds.slice(0, maxPlatforms);
+      }
     }
 
     const monitorName = (name && typeof name === 'string' && name.trim()) ? name.trim() : domain.trim();
@@ -732,6 +814,7 @@ const setup = async (req, res) => {
         workspaceId: workspace._id,
         name: monitorName,
         domain: domain.trim(),
+        defaultModels: selectedPlatforms,
         scanStatus: 'pending',
       });
     } catch (createErr) {
@@ -750,6 +833,13 @@ const setup = async (req, res) => {
         // Ignore duplicate key errors from compound unique index
         if (err.code !== 11000) throw err;
       });
+    }
+
+    // Increment prompt usage counter for the bulk insert
+    if (orgId && promptDocs.length > 0) {
+      const limitType = tierConfig?.aiTrackerPromptLimitType || 'monthly';
+      const period = tierService.getPeriod(limitType);
+      await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, promptDocs.length);
     }
 
     // Create own-brand competitor
@@ -1076,7 +1166,7 @@ const createMonitor = async (req, res) => {
   try {
     const workspace = req.workspace;
 
-    const { domain, name, prompts, competitors } = req.body;
+    const { domain, name, prompts, competitors, platforms } = req.body;
 
     if (!domain || typeof domain !== 'string' || !domain.trim()) {
       return res.status(400).json({ error: 'Domain is required' });
@@ -1085,20 +1175,57 @@ const createMonitor = async (req, res) => {
       return res.status(400).json({ error: 'At least one prompt is required' });
     }
 
-    // Check monitor count against tier limit (maxAiTrackerPlatforms)
+    // Validate platforms, monitor count, and prompt quota against tier limits
+    const validPlatformIds = PLATFORM_DISPLAY.map((p) => p.platformId);
+    let selectedPlatforms = validPlatformIds; // default: all
     const orgId = workspace.organizationId;
+    let tierConfig = null;
+    let tierName = 'free';
     if (orgId) {
       const { config, tier } = await tierService.getOrgTierConfig(orgId);
-      if (config?.maxAiTrackerPlatforms != null) {
-        const wsIds = await Workspace.find({ organizationId: orgId }).distinct('_id');
-        const monitorCount = await AiTracker.countDocuments({ workspaceId: { $in: wsIds } });
-        if (monitorCount >= config.maxAiTrackerPlatforms) {
+      tierConfig = config;
+      tierName = tier;
+
+      // Check monitor count limit (per workspace, tier from org)
+      if (config?.maxAiTrackerMonitors != null) {
+        const monitorCount = await AiTracker.countDocuments({ workspaceId: workspace._id });
+        if (monitorCount >= config.maxAiTrackerMonitors) {
           return res.status(429).json({
-            error: `Your ${tier} plan allows ${config.maxAiTrackerPlatforms} monitors`,
+            error: `Your ${tier} plan allows up to ${config.maxAiTrackerMonitors} AI Tracker monitor${config.maxAiTrackerMonitors !== 1 ? 's' : ''} per workspace`,
             code: 'QUOTA_EXCEEDED',
-            quota: { limit: config.maxAiTrackerPlatforms, used: monitorCount, tier, limitKey: 'maxAiTrackerPlatforms' },
+            quota: { limit: config.maxAiTrackerMonitors, used: monitorCount, tier, limitKey: 'maxAiTrackerMonitors' },
           });
         }
+      }
+
+      // Check prompt quota
+      const promptCount = prompts.filter((p) => typeof p === 'string' && p.trim()).length;
+      if (config?.maxAiTrackerPromptsPerMonth != null && promptCount > 0) {
+        const limitType = config.aiTrackerPromptLimitType || 'monthly';
+        const period = tierService.getPeriod(limitType);
+        const used = await UsageTracker.getCount(orgId, 'aiTrackerPromptsCreated', period);
+        if (used + promptCount > config.maxAiTrackerPromptsPerMonth) {
+          return res.status(429).json({
+            error: `Your ${tier} plan allows ${config.maxAiTrackerPromptsPerMonth} AI Tracker prompts (${used} used, ${promptCount} requested)`,
+            code: 'QUOTA_EXCEEDED',
+            quota: { limit: config.maxAiTrackerPromptsPerMonth, used, tier, limitKey: 'maxAiTrackerPromptsPerMonth' },
+          });
+        }
+      }
+
+      // Validate platform count
+      const maxPlatforms = config?.maxAiTrackerPlatforms ?? validPlatformIds.length;
+      if (Array.isArray(platforms) && platforms.length > 0) {
+        selectedPlatforms = platforms.filter((p) => validPlatformIds.includes(p));
+        if (selectedPlatforms.length > maxPlatforms) {
+          return res.status(400).json({
+            error: `Your ${tier} plan allows up to ${maxPlatforms} AI platform${maxPlatforms !== 1 ? 's' : ''}`,
+            code: 'PLATFORM_LIMIT',
+            quota: { limit: maxPlatforms, requested: selectedPlatforms.length, tier },
+          });
+        }
+      } else {
+        selectedPlatforms = validPlatformIds.slice(0, maxPlatforms);
       }
     }
 
@@ -1117,6 +1244,7 @@ const createMonitor = async (req, res) => {
         workspaceId: workspace._id,
         name: monitorName,
         domain: domain.trim(),
+        defaultModels: selectedPlatforms,
         scanStatus: 'pending',
       });
     } catch (createErr) {
@@ -1134,6 +1262,13 @@ const createMonitor = async (req, res) => {
       await AiTrackerPrompt.insertMany(promptDocs, { ordered: false }).catch((err) => {
         if (err.code !== 11000) throw err;
       });
+    }
+
+    // Increment prompt usage counter for the bulk insert
+    if (orgId && promptDocs.length > 0) {
+      const limitType = tierConfig?.aiTrackerPromptLimitType || 'monthly';
+      const period = tierService.getPeriod(limitType);
+      await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, promptDocs.length);
     }
 
     // Create own-brand competitor
@@ -1221,7 +1356,23 @@ const updateMonitor = async (req, res) => {
     const { defaultModels, name } = req.body;
 
     const update = {};
-    if (Array.isArray(defaultModels)) update.defaultModels = defaultModels;
+    if (Array.isArray(defaultModels)) {
+      const validPlatformIds = PLATFORM_DISPLAY.map((p) => p.platformId);
+      const filtered = defaultModels.filter((p) => validPlatformIds.includes(p));
+      const orgId = workspace.organizationId;
+      if (orgId) {
+        const { config, tier } = await tierService.getOrgTierConfig(orgId);
+        const maxPlatforms = config?.maxAiTrackerPlatforms ?? validPlatformIds.length;
+        if (filtered.length > maxPlatforms) {
+          return res.status(400).json({
+            error: `Your ${tier} plan allows up to ${maxPlatforms} AI platform${maxPlatforms !== 1 ? 's' : ''}`,
+            code: 'PLATFORM_LIMIT',
+            quota: { limit: maxPlatforms, requested: filtered.length, tier },
+          });
+        }
+      }
+      update.defaultModels = filtered;
+    }
     if (name && typeof name === 'string' && name.trim()) update.name = name.trim();
 
     if (Object.keys(update).length === 0) {

@@ -39,6 +39,7 @@ const tierConfigSchema = new mongoose.Schema(
       enum: ['monthly', 'lifetime'],
       default: 'monthly',
     },
+    maxAiTrackerMonitors: { type: Number, default: 1 },
     maxAiTrackerPlatforms: { type: Number, default: 2 },
     aiTrackerRefreshInterval: {
       type: String,
@@ -64,6 +65,9 @@ const tierConfigSchema = new mongoose.Schema(
 
     // ── Brand Voice ──
     maxBrandVoices: { type: Number, default: null }, // null = unlimited
+
+    // ── Avatars (writer personas) ──
+    maxAvatars: { type: Number, default: null }, // null = unlimited
 
     // ── Workspaces ──
     maxWorkspaces: { type: Number, default: 1 },

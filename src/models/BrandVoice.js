@@ -6,7 +6,6 @@ const brandVoiceSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Workspace',
       required: true,
-      unique: true,
       index: true,
     },
     createdBy: {
@@ -14,6 +13,9 @@ const brandVoiceSchema = new mongoose.Schema(
       ref: 'User',
       required: true,
     },
+    name: { type: String, required: true, default: 'Default' },
+    active: { type: Boolean, default: true },
+    locked: { type: Boolean, default: false },
     filename: { type: String, default: 'brand_voice.md' },
     b2Key: { type: String, default: '' },
     content: { type: String, default: '' },
@@ -31,5 +33,7 @@ const brandVoiceSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+brandVoiceSchema.index({ workspace: 1, active: 1 });
 
 module.exports = mongoose.model('BrandVoice', brandVoiceSchema);

@@ -2,6 +2,7 @@ const Organization = require('../models/Organization');
 const OrgMember = require('../models/OrgMember');
 const Workspace = require('../models/Workspace');
 const Avatar = require('../models/Avatar');
+const BrandVoice = require('../models/BrandVoice');
 const UsageTracker = require('../models/UsageTracker');
 const tierService = require('../services/tierService');
 
@@ -71,11 +72,13 @@ const getTierInfo = async (req, res) => {
       UsageTracker.getUsage(orgId, 'lifetime'),
     ]);
 
-    // Total counts (seats, brand voices — counted from live documents)
+    // Total counts (live from documents, unlocked only for consistency with creation checks)
     const wsIds = await Workspace.find({ organizationId: orgId }).distinct('_id');
-    const [memberCount, avatarCount] = await Promise.all([
-      OrgMember.countDocuments({ organizationId: orgId }),
-      Avatar.countDocuments({ workspace: { $in: wsIds } }),
+    const [memberCount, avatarCount, brandVoiceCount, wsCount] = await Promise.all([
+      OrgMember.countDocuments({ organizationId: orgId, locked: { $ne: true } }),
+      Avatar.countDocuments({ workspace: { $in: wsIds }, locked: { $ne: true } }),
+      BrandVoice.countDocuments({ workspace: { $in: wsIds }, locked: { $ne: true } }),
+      Workspace.countDocuments({ organizationId: orgId, locked: { $ne: true } }),
     ]);
 
     // Build usage response keyed by counter name
@@ -100,7 +103,9 @@ const getTierInfo = async (req, res) => {
       creditsUsed: usageEntry('creditsUsed', 'creditsPerMonth', 'creditLimitType'),
       // Total counts (not periodic)
       seats: { used: memberCount + 1, limit: config.maxSeats }, // +1 for owner
-      brandVoices: { used: avatarCount, limit: config.maxBrandVoices },
+      brandVoices: { used: brandVoiceCount, limit: config.maxBrandVoices },
+      avatars: { used: avatarCount, limit: config.maxAvatars },
+      workspaces: { used: wsCount, limit: config.maxWorkspaces },
     };
 
     res.json({ tier, config, usage });

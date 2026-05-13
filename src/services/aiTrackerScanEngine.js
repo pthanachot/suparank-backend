@@ -445,7 +445,13 @@ async function searchPlatform(platformId, query) {
  * @returns {Promise<{ results: Array, competitorResults: Array }>}
  */
 async function runScan(tracker, prompts, competitors, onProgress) {
-  const availablePlatforms = getAvailablePlatforms();
+  let availablePlatforms = getAvailablePlatforms();
+
+  // Filter to only the platforms configured on this tracker (defaultModels)
+  if (tracker.defaultModels && tracker.defaultModels.length > 0) {
+    availablePlatforms = availablePlatforms.filter((p) => tracker.defaultModels.includes(p.id));
+  }
+
   const totalSteps = availablePlatforms.length * prompts.length;
   let completedSteps = 0;
 
@@ -458,7 +464,7 @@ async function runScan(tracker, prompts, competitors, onProgress) {
       citations: 0,
       visibility: 0,
     }));
-    await onProgress(100, PLATFORMS.map((p) => ({ platformId: p.id, status: 'completed' })));
+    await onProgress(100, availablePlatforms.map((p) => ({ platformId: p.id, status: 'completed' })));
     return { results: [], competitorResults };
   }
 
@@ -480,12 +486,10 @@ async function runScan(tracker, prompts, competitors, onProgress) {
   for (let pi = 0; pi < availablePlatforms.length; pi++) {
     const platform = availablePlatforms[pi];
 
-    // Build platform statuses for progress reporting
-    const platformStatuses = PLATFORMS.map((p) => {
-      const availIdx = availablePlatforms.findIndex((ap) => ap.id === p.id);
-      if (availIdx === -1) return { platformId: p.id, status: 'completed' }; // not available, show as done
-      if (availIdx < pi) return { platformId: p.id, status: 'completed' };
-      if (availIdx === pi) return { platformId: p.id, status: 'scanning' };
+    // Build platform statuses for progress reporting (only selected platforms)
+    const platformStatuses = availablePlatforms.map((p, idx) => {
+      if (idx < pi) return { platformId: p.id, status: 'completed' };
+      if (idx === pi) return { platformId: p.id, status: 'scanning' };
       return { platformId: p.id, status: 'queued' };
     });
 

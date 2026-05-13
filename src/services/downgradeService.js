@@ -4,15 +4,23 @@
  * When an org's tier changes (up or down), this service re-evaluates all
  * lockable resources and locks excess beyond the new tier's limits.
  *
- * STATIC locking: once locked at tier-change time, resources stay locked
- * until the next tier change. Deleting unlocked resources frees creation
- * slots but does NOT unlock any locked resource.
+ * Two kinds of resources:
+ *
+ * 1. QUOTA resources (articles, keywords, etc.): controlled by UsageTracker
+ *    counters. Users keep ALL existing resources — they just can't create
+ *    beyond their plan limit. Articles are NEVER locked.
+ *
+ * 2. CAPACITY resources (workspaces, brand voices, seats): represent active
+ *    slots. Excess beyond the new tier's limit IS locked on tier change.
+ *    Once locked, resources stay locked until the next tier change.
  */
 
 const Content = require('../models/Content');
 const Workspace = require('../models/Workspace');
 const Avatar = require('../models/Avatar');
+const BrandVoice = require('../models/BrandVoice');
 const OrgMember = require('../models/OrgMember');
+const AiTracker = require('../models/AiTracker');
 const tierService = require('./tierService');
 
 // ─── Helpers ────────────────────────────────────────────────────
@@ -59,29 +67,17 @@ async function applyLocks(Model, allIds, limit) {
 
 // ─── Per-resource lock functions ────────────────────────────────
 
-async function lockArticles(orgId, limit) {
-  if (limit === null || limit === undefined) {
-    // Unlimited — unlock all articles for this org
-    const wsIds = await getOrgWorkspaceIds(orgId);
-    if (wsIds.length > 0) {
-      await Content.updateMany(
-        { workspaceId: { $in: wsIds }, locked: true },
-        { $set: { locked: false } }
-      );
-    }
-    return;
-  }
+// Articles are NEVER locked — they are quota-controlled via UsageTracker.
+// Users keep all existing articles; they just can't create beyond their limit.
 
+async function unlockAllArticles(orgId) {
   const wsIds = await getOrgWorkspaceIds(orgId);
-  if (wsIds.length === 0) return;
-
-  // Sort oldest first — oldest N stay unlocked
-  const articles = await Content.find({ workspaceId: { $in: wsIds } })
-    .sort({ createdAt: 1 })
-    .select('_id')
-    .lean();
-
-  await applyLocks(Content, articles.map((a) => a._id), limit);
+  if (wsIds.length > 0) {
+    await Content.updateMany(
+      { workspaceId: { $in: wsIds }, locked: true },
+      { $set: { locked: false } }
+    );
+  }
 }
 
 async function lockWorkspaces(orgId, limit) {
@@ -102,7 +98,32 @@ async function lockWorkspaces(orgId, limit) {
   await applyLocks(Workspace, workspaces.map((w) => w._id), limit);
 }
 
-async function lockBrandVoices(orgId, limit) {
+async function lockBrandVoiceConfigs(orgId, limit) {
+  const wsIds = await getOrgWorkspaceIds(orgId);
+
+  if (limit === null || limit === undefined) {
+    if (wsIds.length > 0) {
+      await BrandVoice.updateMany(
+        { workspace: { $in: wsIds }, locked: true },
+        { $set: { locked: false } }
+      );
+    }
+    return;
+  }
+
+  if (wsIds.length === 0) return;
+
+  // Apply limit PER WORKSPACE (each workspace gets `limit` brand voices)
+  await Promise.all(wsIds.map(async (wsId) => {
+    const voices = await BrandVoice.find({ workspace: wsId })
+      .sort({ createdAt: 1 })
+      .select('_id')
+      .lean();
+    await applyLocks(BrandVoice, voices.map((v) => v._id), limit);
+  }));
+}
+
+async function lockAvatars(orgId, limit) {
   const wsIds = await getOrgWorkspaceIds(orgId);
 
   if (limit === null || limit === undefined) {
@@ -117,12 +138,14 @@ async function lockBrandVoices(orgId, limit) {
 
   if (wsIds.length === 0) return;
 
-  const avatars = await Avatar.find({ workspace: { $in: wsIds } })
-    .sort({ createdAt: 1 })
-    .select('_id')
-    .lean();
-
-  await applyLocks(Avatar, avatars.map((a) => a._id), limit);
+  // Apply limit PER WORKSPACE (each workspace gets `limit` avatars)
+  await Promise.all(wsIds.map(async (wsId) => {
+    const avatars = await Avatar.find({ workspace: wsId })
+      .sort({ createdAt: 1 })
+      .select('_id')
+      .lean();
+    await applyLocks(Avatar, avatars.map((a) => a._id), limit);
+  }));
 }
 
 async function lockMembers(orgId, maxSeats) {
@@ -145,6 +168,35 @@ async function lockMembers(orgId, maxSeats) {
   await applyLocks(OrgMember, members.map((m) => m._id), memberSlots);
 }
 
+/**
+ * Reset AI Tracker platform selections when they exceed the new tier limit.
+ *
+ * Clears `defaultModels` to [] on any monitor that has more platforms than
+ * `maxAiTrackerPlatforms` allows, forcing the user to re-select.
+ */
+async function resetAiTrackerPlatforms(orgId, maxPlatforms) {
+  const wsIds = await getOrgWorkspaceIds(orgId);
+  if (wsIds.length === 0) return;
+
+  // Unlimited — unlock all (no-op, nothing to clear)
+  if (maxPlatforms === null || maxPlatforms === undefined) return;
+
+  // Find monitors that exceed the new platform limit
+  const trackers = await AiTracker.find({
+    workspaceId: { $in: wsIds },
+    $expr: { $gt: [{ $size: '$defaultModels' }, maxPlatforms] },
+  }).select('_id').lean();
+
+  if (trackers.length === 0) return;
+
+  await AiTracker.updateMany(
+    { _id: { $in: trackers.map((t) => t._id) } },
+    { $set: { defaultModels: [] } }
+  );
+
+  console.log(`[downgradeService] Cleared defaultModels on ${trackers.length} AI Tracker monitor(s) for org ${orgId}`);
+}
+
 // ─── Main orchestrator ──────────────────────────────────────────
 
 /**
@@ -163,11 +215,27 @@ async function applyLocksForOrg(orgId) {
   }
 
   await Promise.all([
-    lockArticles(orgId, config.maxArticlesPerMonth),
+    // Quota resources: unlock any previously locked articles (cleanup)
+    unlockAllArticles(orgId),
+    // Capacity resources: lock excess beyond new tier limits
     lockWorkspaces(orgId, config.maxWorkspaces),
-    lockBrandVoices(orgId, config.maxBrandVoices),
+    lockBrandVoiceConfigs(orgId, config.maxBrandVoices),
+    lockAvatars(orgId, config.maxAvatars),
     lockMembers(orgId, config.maxSeats),
+    // AI Tracker: clear platform selections that exceed new tier limit
+    resetAiTrackerPlatforms(orgId, config.maxAiTrackerPlatforms),
   ]);
+
+  // Lifetime UsageTracker counters are NOT reset on tier change.
+  //
+  // The lifetime counter only increments when the user is on a tier that
+  // uses lifetime limits (e.g. Free). When on a paid tier (e.g. Standard),
+  // requireQuota increments the monthly counter instead, leaving lifetime
+  // untouched. This means the lifetime counter naturally preserves the
+  // correct count across upgrade/downgrade cycles:
+  //
+  //   Free (create 2/3) → Standard (create 10) → Free: counter still 2, 1 left
+  //   New free user: counter=0, can create 3
 
   console.log(`[downgradeService] Applied locks for org ${orgId} (tier: ${config.tier || config.displayName})`);
 }

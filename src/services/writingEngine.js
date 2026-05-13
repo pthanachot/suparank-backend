@@ -64,6 +64,23 @@ async function pushBrief(sessionId, brief) {
 }
 
 /**
+ * Push brand voice markdown to a Writing Engine session.
+ * @param {string} sessionId
+ * @param {string} markdownContent - Combined brand voice + avatar markdown
+ */
+async function pushBrandVoice(sessionId, markdownContent) {
+  if (!markdownContent) return;
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/brand-voice`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content: markdownContent }),
+  });
+  if (!res.ok) {
+    throw new Error(`Writing Engine: push brand voice failed (${res.status})`);
+  }
+}
+
+/**
  * Send a chat message to the Writing Engine via SSE streaming.
  * The engine's /chat endpoint streams every event (thinking_delta,
  * text_delta, tool_start, document_diff, complete, error) so the UI
@@ -103,10 +120,13 @@ async function sendChatMessageStream(sessionId, prompt, signal) {
  * @param {string[]} [allowedTools] - restrict agent to only these tools (e.g. ["EditTool"])
  * @returns {Promise<Response>} The raw fetch response (SSE stream)
  */
-async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5, signal, allowedTools) {
+async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5, signal, allowedTools, mode) {
   const payload = { goal, targetScore, maxIterations };
   if (allowedTools?.length > 0) {
     payload.allowedTools = allowedTools;
+  }
+  if (mode) {
+    payload.mode = mode;
   }
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/agent`, {
     method: 'POST',
@@ -165,13 +185,95 @@ async function submitClarifyAnswer(sessionId, answer) {
   return res.json();
 }
 
+/**
+ * Push context files (.md virtual files) to a Writing Engine session.
+ * The AI reads these on demand via ReadFile tool.
+ *
+ * @param {string} sessionId
+ * @param {Object<string, string>} files - Map of filename → markdown content
+ */
+async function pushContextFiles(sessionId, files) {
+  if (!files || Object.keys(files).length === 0) return;
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/context-files`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ files }),
+  });
+  if (!res.ok) {
+    throw new Error(`Writing Engine: push context files failed (${res.status})`);
+  }
+}
+
+/**
+ * Submit the user's plan confirmation response.
+ *
+ * @param {string} sessionId - Go engine session ID
+ * @param {Object} response - { action: "confirm"|"retry"|"reject", selectedSteps: string[], mode: "auto"|"step-by-step" }
+ */
+async function submitPlanConfirm(sessionId, response) {
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/plan-confirm`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(response),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Writing Engine: plan confirm failed (${res.status}): ${body}`);
+  }
+  return res.json();
+}
+
+/**
+ * Submit the user's tool confirm response (step-by-step mode).
+ *
+ * @param {string} sessionId - Go engine session ID
+ * @param {string} action - "apply", "skip", or "retry"
+ */
+async function submitToolConfirm(sessionId, action) {
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/tool-confirm`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Writing Engine: tool confirm failed (${res.status}): ${body}`);
+  }
+  return res.json();
+}
+
+/**
+ * Set execution mode on a running session.
+ * Called when user toggles "auto edit" / "ask first" mid-run.
+ *
+ * @param {string} sessionId - Go engine session ID
+ * @param {string} mode - "auto" or "step-by-step"
+ */
+async function setExecutionMode(sessionId, mode) {
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/execution-mode`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Writing Engine: set execution mode failed (${res.status}): ${body}`);
+  }
+  return res.json();
+}
+
 module.exports = {
   createSession,
   pushDocument,
   pushBrief,
+  pushBrandVoice,
   sendChatMessageStream,
   startAgent,
   generateImage,
   submitClarifyAnswer,
+  pushContextFiles,
+  submitPlanConfirm,
+  submitToolConfirm,
+  setExecutionMode,
   WRITING_ENGINE_URL,
 };

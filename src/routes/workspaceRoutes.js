@@ -42,5 +42,8 @@ router.post('/:workspaceNumber/content/:contentNumber/ai/agent', aiController.ag
 router.post('/:workspaceNumber/content/:contentNumber/ai/generate-image', aiController.generateImage);
 router.post('/:workspaceNumber/content/:contentNumber/ai/upload-image', aiController.uploadImage);
 router.post('/:workspaceNumber/content/:contentNumber/ai/clarify-answer', aiController.clarifyAnswer);
+router.post('/:workspaceNumber/content/:contentNumber/ai/plan-confirm', aiController.planConfirm);
+router.post('/:workspaceNumber/content/:contentNumber/ai/tool-confirm', aiController.toolConfirm);
+router.post('/:workspaceNumber/content/:contentNumber/ai/execution-mode', aiController.setExecutionMode);
 
 module.exports = router;

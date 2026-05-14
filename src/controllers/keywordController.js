@@ -47,9 +47,10 @@ async function searchKeywords(req, res) {
 
     if (cached) {
       // Record in workspace history (fire-and-forget)
+      // Reset locked=false so re-searching an old locked keyword unlocks it
       KeywordResearchHistory.findOneAndUpdate(
         { workspaceId: workspace._id, seedKeyword, country: countryCode },
-        { searchedAt: new Date(), createdOnPlan },
+        { searchedAt: new Date(), createdOnPlan, locked: false },
         { upsert: true },
       ).catch(() => {});
 
@@ -87,9 +88,10 @@ async function searchKeywords(req, res) {
     );
 
     // Record in workspace history (fire-and-forget)
+    // Reset locked=false so re-searching an old locked keyword unlocks it
     KeywordResearchHistory.findOneAndUpdate(
       { workspaceId: workspace._id, seedKeyword, country: countryCode },
-      { searchedAt: new Date(), createdOnPlan },
+      { searchedAt: new Date(), createdOnPlan, locked: false },
       { upsert: true },
     ).catch(() => {});
 

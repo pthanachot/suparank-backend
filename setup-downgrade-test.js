@@ -265,7 +265,7 @@ async function main() {
     workspaceId: wsIds[0],
     name: 'Downgrade Test Monitor',
     domain: 'downgrade-test.com',
-    defaultModels: ['chatgpt', 'gemini', 'claude', 'perplexity'],
+    defaultModels: [],  // Empty = triggers PlatformReselection on free tier (limit=2, had 4)
     scanCadence: 'weekly',
     scanStatus: 'idle',
     scanProgress: 0,

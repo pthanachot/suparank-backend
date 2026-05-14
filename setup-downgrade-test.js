@@ -74,6 +74,7 @@ async function main() {
   const avatars     = db.collection('avatars');
   const subs        = db.collection('subscriptions');
   const kwHistories = db.collection('keywordresearchhistories');
+  const kwSearches  = db.collection('keywordsearches');
   const aiTrackers  = db.collection('aitrackers');
   const aiPrompts   = db.collection('aitrackerprompts');
 
@@ -180,7 +181,7 @@ async function main() {
     console.log(`  Avatar ${i}: locked=${i > 1}`);
   }
 
-  // ── 6. Keyword Research Histories (6 total: 3 free + 3 locked paid) ──
+  // ── 6. Keyword Research Histories + Cached Results ──
   console.log('\n=== 6. Keyword Research Histories ===');
   await kwHistories.deleteMany({ workspaceId: wsIds[0], seedKeyword: /^downgrade test/ });
 
@@ -193,8 +194,29 @@ async function main() {
     { seedKeyword: 'downgrade test ai writing', country: 'US', createdOnPlan: 'paid', locked: true },
   ];
 
+  // Helper to generate fake related keywords for a seed
+  function fakeRelated(seed, count) {
+    const related = [];
+    const prefixes = ['best', 'top', 'free', 'cheap', 'how to use', 'alternatives to'];
+    for (let j = 0; j < count; j++) {
+      related.push({
+        keyword: `${prefixes[j % prefixes.length]} ${seed} ${j + 1}`,
+        searchVolume: Math.floor(Math.random() * 5000) + 100,
+        keywordDifficulty: Math.floor(Math.random() * 80) + 10,
+        cpc: +(Math.random() * 5).toFixed(2),
+        searchIntent: ['informational', 'commercial', 'transactional'][j % 3],
+        monthlySearches: Array.from({ length: 12 }, () => Math.floor(Math.random() * 3000) + 200),
+        serpFeatures: ['featured_snippet', 'people_also_ask', 'knowledge_panel'].slice(0, (j % 3) + 1),
+        isQuestion: j % 4 === 0,
+      });
+    }
+    return related;
+  }
+
   for (let i = 0; i < kwTestData.length; i++) {
     const kw = kwTestData[i];
+
+    // Insert history entry
     await kwHistories.insertOne({
       workspaceId: wsIds[0],
       seedKeyword: kw.seedKeyword,
@@ -205,7 +227,34 @@ async function main() {
       createdAt: new Date(Date.now() - (7 - i) * 86400000),
       updatedAt: new Date(),
     });
-    console.log(`  KW "${kw.seedKeyword}": locked=${kw.locked}, createdOnPlan=${kw.createdOnPlan}`);
+
+    // Upsert cached KeywordSearch result (so clicking history loads data)
+    const related = fakeRelated(kw.seedKeyword, 8);
+    await kwSearches.updateOne(
+      { seedKeyword: kw.seedKeyword, country: kw.country },
+      {
+        $set: {
+          seedMetrics: {
+            keyword: kw.seedKeyword,
+            searchVolume: Math.floor(Math.random() * 10000) + 500,
+            keywordDifficulty: Math.floor(Math.random() * 70) + 15,
+            cpc: +(Math.random() * 4 + 0.5).toFixed(2),
+            searchIntent: 'informational',
+            monthlySearches: Array.from({ length: 12 }, () => Math.floor(Math.random() * 5000) + 300),
+            serpFeatures: ['featured_snippet', 'people_also_ask'],
+            isQuestion: false,
+          },
+          relatedKeywords: related,
+          totalCount: related.length,
+          fetchedAt: new Date(),
+          updatedAt: new Date(),
+        },
+        $setOnInsert: { createdAt: new Date() },
+      },
+      { upsert: true },
+    );
+
+    console.log(`  KW "${kw.seedKeyword}": locked=${kw.locked}, createdOnPlan=${kw.createdOnPlan}, cached=${related.length} related`);
   }
 
   // ── 7. AI Tracker + Prompts (5 prompts: 2 free + 3 locked paid) ──

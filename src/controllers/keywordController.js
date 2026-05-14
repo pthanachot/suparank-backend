@@ -29,11 +29,6 @@ async function searchKeywords(req, res) {
     const countryConfig = resolveCountry(country || 'United States');
     const countryCode = countryConfig.gl.toUpperCase();
 
-    // Track keyword search against tier quota
-    if (req.tierQuota) {
-      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
-    }
-
     // Determine createdOnPlan for history entry
     let createdOnPlan = 'free';
     if (req.body.quotaSource === 'free') {
@@ -57,6 +52,11 @@ async function searchKeywords(req, res) {
         { searchedAt: new Date(), createdOnPlan },
         { upsert: true },
       ).catch(() => {});
+
+      // Track quota only after successful result
+      if (req.tierQuota) {
+        await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+      }
 
       return res.json({
         seedMetrics: cached.seedMetrics,
@@ -93,6 +93,11 @@ async function searchKeywords(req, res) {
       { upsert: true },
     ).catch(() => {});
 
+    // Track quota only after successful result
+    if (req.tierQuota) {
+      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+    }
+
     return res.json({
       seedMetrics: seed,
       relatedKeywords: related,
@@ -121,11 +126,6 @@ async function getKeywordDetail(req, res) {
     const countryConfig = resolveCountry(country || 'United States');
     const countryCode = countryConfig.gl.toUpperCase();
 
-    // Track keyword detail lookup against tier quota
-    if (req.tierQuota) {
-      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
-    }
-
     // Check cache (global)
     const cached = await KeywordDetail.findOne({
       keyword,
@@ -134,6 +134,11 @@ async function getKeywordDetail(req, res) {
     });
 
     if (cached) {
+      // Track quota only after successful result
+      if (req.tierQuota) {
+        await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+      }
+
       return res.json({
         keyword: cached.keyword,
         serpResults: cached.serpResults,
@@ -154,6 +159,11 @@ async function getKeywordDetail(req, res) {
       },
       { upsert: true, new: true },
     );
+
+    // Track quota only after successful result
+    if (req.tierQuota) {
+      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+    }
 
     return res.json({
       keyword,

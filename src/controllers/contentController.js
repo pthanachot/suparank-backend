@@ -462,7 +462,7 @@ function extractCriteria(buffer) {
   return criteria;
 }
 
-async function streamAudit(req, res, { prompt, contentHash, contentId, dbField, errorPrefix }) {
+async function streamAudit(req, res, { prompt, contentHash, contentId, dbField, errorPrefix, tierQuota }) {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) return res.status(500).json({ error: 'OpenRouter API key not configured' });
 
@@ -587,6 +587,11 @@ async function streamAudit(req, res, { prompt, contentHash, contentId, dbField, 
       { _id: contentId },
       { $push: { [dbField]: { $each: [auditResult], $slice: -10 } } }
     );
+
+    // Track quota only after successful audit completion + DB save
+    if (tierQuota) {
+      await UsageTracker.increment(tierQuota.orgId, tierQuota.counterKey, tierQuota.period);
+    }
   } catch (e) {
     console.error(`[${dbField}] DB save error:`, e.message);
   }
@@ -637,17 +642,13 @@ const runAudit = async (req, res) => {
     const blocksText = (content.blocks || []).map((b) => stripTags(b.text)).join(' ');
     const wordCount = blocksText.trim().split(/\s+/).filter(Boolean).length;
 
-    // Track audit usage (only for non-cached audits)
-    if (req.tierQuota) {
-      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
-    }
-
     await streamAudit(req, res, {
       prompt: buildAuditPrompt(markdown, keyword, wordCount),
       contentHash,
       contentId: content._id,
       dbField: 'audits',
       errorPrefix: 'AI audit failed',
+      tierQuota: req.tierQuota || null,
     });
   } catch (err) {
     if (err.name === 'AbortError') return;
@@ -732,17 +733,13 @@ const runWritingQualityAudit = async (req, res) => {
     const blocksText = (content.blocks || []).map((b) => stripTags(b.text)).join(' ');
     const wordCount = blocksText.trim().split(/\s+/).filter(Boolean).length;
 
-    // Track audit usage (only for non-cached audits)
-    if (req.tierQuota) {
-      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
-    }
-
     await streamAudit(req, res, {
       prompt: buildWritingQualityPrompt(markdown, wordCount),
       contentHash,
       contentId: content._id,
       dbField: 'writingQualityAudits',
       errorPrefix: 'AI writing quality check failed',
+      tierQuota: req.tierQuota || null,
     });
   } catch (err) {
     if (err.name === 'AbortError') return;

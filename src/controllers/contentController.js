@@ -3,6 +3,7 @@ const { runAnalysis } = require('./analysisController');
 const imageStorage = require('../services/imageStorage');
 const UsageTracker = require('../models/UsageTracker');
 const creditService = require('../services/creditService');
+const tierService = require('../services/tierService');
 
 // Workspace is resolved by the permissions middleware (resolveWorkspaceWithRole)
 // and available as req.workspace.
@@ -33,6 +34,11 @@ const getContent = async (req, res) => {
       return res.status(404).json({ error: 'Content not found' });
     }
 
+    // Block access to locked content (e.g. paid-created content on free tier)
+    if (content.locked) {
+      return res.status(403).json({ error: 'This content is locked. Upgrade your plan to regain access.', locked: true });
+    }
+
     // Migrate old public B2 URLs to new /api/b2-image/ path format
     if (content.blocks && Array.isArray(content.blocks)) {
       for (const block of content.blocks) {
@@ -59,6 +65,14 @@ const createContent = async (req, res) => {
     const contentNumber = await Content.getNextContentNumber();
     const { title, slug, description, blocks, targetKeywords, country, device, score, wordCount, status, folder, platform, versions } = req.body;
 
+    // Determine plan tier at creation time
+    const orgId = workspace.organizationId;
+    let createdOnPlan = 'free';
+    if (orgId) {
+      const { tier } = await tierService.getOrgTierConfig(orgId);
+      createdOnPlan = tier === 'free' ? 'free' : 'paid';
+    }
+
     const content = await Content.create({
       userId: req.user.userId,
       workspaceId: workspace._id,
@@ -76,6 +90,7 @@ const createContent = async (req, res) => {
       folder,
       platform,
       versions: versions || [],
+      createdOnPlan,
     });
 
     // Auto-trigger analysis if keywords are provided

@@ -255,6 +255,10 @@ const contentSchema = new mongoose.Schema(
     // Downgrade locking — locked resources are read-only until the org upgrades
     locked: { type: Boolean, default: false },
 
+    // Tracks whether this resource was created on a free or paid plan.
+    // On downgrade to free, paid-created resources are locked.
+    createdOnPlan: { type: String, enum: ['free', 'paid'], default: 'free' },
+
     // Plan mode (v4 spec). mode is the persistent source of truth — frontend
     // reads it on load and disables incompatible UI. Per-request mode is NOT
     // threaded through; conflicts are surfaced as 409 at the application layer.
@@ -347,7 +351,7 @@ contentSchema.statics.findSummariesByWorkspace = function (workspaceId, { status
   if (status) query.status = status;
   if (folder) query.folder = folder;
   return this.find(query)
-    .select('contentNumber title slug description targetKeywords country device score wordCount status folder platform contentType analysisStatus analyzedAt publishedAt scheduledAt locked createdAt updatedAt')
+    .select('contentNumber title slug description targetKeywords country device score wordCount status folder platform contentType analysisStatus analyzedAt publishedAt scheduledAt locked createdOnPlan createdAt updatedAt')
     .sort({ updatedAt: -1 });
 };
 

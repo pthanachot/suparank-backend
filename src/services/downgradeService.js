@@ -192,12 +192,21 @@ async function resetAiTrackerPlatforms(orgId, maxPlatforms) {
 
   if (trackers.length === 0) return;
 
-  await AiTracker.updateMany(
-    { _id: { $in: trackers.map((t) => t._id) } },
-    { $set: { defaultModels: [] } }
-  );
+  const trackerIds = trackers.map((t) => t._id);
 
-  console.log(`[downgradeService] Cleared defaultModels on ${trackers.length} AI Tracker monitor(s) for org ${orgId}`);
+  await Promise.all([
+    AiTracker.updateMany(
+      { _id: { $in: trackerIds } },
+      { $set: { defaultModels: [] } }
+    ),
+    // Also clear prompt-level models so they re-inherit from tracker after reselection
+    AiTrackerPrompt.updateMany(
+      { trackerId: { $in: trackerIds } },
+      { $set: { models: [] } }
+    ),
+  ]);
+
+  console.log(`[downgradeService] Cleared defaultModels on ${trackers.length} AI Tracker monitor(s) and their prompt models for org ${orgId}`);
 }
 
 // ─── Free-tier plan-origin locking ──────────────────────────────

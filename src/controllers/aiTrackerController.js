@@ -456,28 +456,57 @@ function formatRelativeDate(date) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function executeScan(trackerId) {
-  try {
-    const tracker = await AiTracker.findById(trackerId);
-    if (!tracker) return;
+  let creditTxId = null;
+  let orgId = null;
 
+  try {
+    // ── 1. Atomic guard: claim the scan (prevents double-execution from race conditions)
+    const claimed = await AiTracker.findOneAndUpdate(
+      { _id: trackerId, scanStatus: { $in: ['ready', 'pending', 'idle', 'failed'] } },
+      { $set: { scanStatus: 'scanning', scanProgress: 0, scanError: null } },
+      { new: true }
+    );
+    if (!claimed) return; // already scanning or doesn't exist
+
+    const tracker = claimed;
+
+    // ── 2. Resolve org for credit operations
+    const ws = await Workspace.findById(tracker.workspaceId);
+    orgId = ws?.organizationId?.toString() || null;
+
+    // ── 3. Load prompts & platforms to estimate credit cost
     const prompts = await AiTrackerPrompt.find({ trackerId });
     const competitors = await AiTrackerCompetitor.find({ trackerId });
 
-    // Create scan document
+    const platformCount = tracker.defaultModels?.length || 0;
+    const promptCount = prompts.length;
+
+    // ── 4. Pre-deduct estimated credits (1 credit per 50 words, ~200 words per answer)
+    //       Estimate = prompts × platforms × 4 credits, minimum 1
+    if (orgId && platformCount > 0 && promptCount > 0) {
+      const estimatedCredits = Math.max(1, promptCount * platformCount * 4);
+      try {
+        const { transactionId } = await creditService.preDeduct(
+          orgId, null, estimatedCredits,
+          'aiTracker', { feature: 'aiTrackerScan', trackerId: trackerId.toString(), estimatedCredits }
+        );
+        creditTxId = transactionId;
+      } catch (creditErr) {
+        // Insufficient credits — abort scan, reset status
+        console.log(`[ai-tracker-scan] skipping scan for tracker ${trackerId}: ${creditErr.message}`);
+        await AiTracker.findByIdAndUpdate(trackerId, {
+          $set: { scanStatus: 'ready', scanProgress: 0, scanError: 'Insufficient credits' },
+        });
+        return;
+      }
+    }
+
+    // ── 5. Create scan document
     const scan = await AiTrackerScan.create({ trackerId, startedAt: new Date() });
+    await AiTracker.findByIdAndUpdate(trackerId, { $set: { currentScanId: scan._id } });
 
-    // Set tracker to scanning
-    await AiTracker.findByIdAndUpdate(trackerId, {
-      $set: {
-        scanStatus: 'scanning',
-        scanProgress: 0,
-        scanError: null,
-        currentScanId: scan._id,
-      },
-    });
-
-    // Run the scan engine
-    const { results, competitorResults } = await runScan(
+    // ── 6. Run the scan engine
+    const { results, competitorResults, totalAnswerWords } = await runScan(
       tracker,
       prompts,
       competitors,
@@ -488,21 +517,27 @@ async function executeScan(trackerId) {
       }
     );
 
-    // Save scan results
+    // ── 7. Settle credits with actual word count
+    if (creditTxId) {
+      const actualCredits = Math.max(1, creditService.wordsToCredits(totalAnswerWords));
+      await creditService.settle(creditTxId, actualCredits);
+      console.log(`[ai-tracker-scan] settled credits for tracker ${trackerId}: estimated ${promptCount * platformCount * 4}, actual ${actualCredits} (${totalAnswerWords} words)`);
+    }
+
+    // ── 8. Save scan results
     const now = new Date();
     await AiTrackerScan.findByIdAndUpdate(scan._id, {
       $set: { status: 'ready', completedAt: now, results, competitorResults },
     });
 
-    // Determine refresh interval from tier config (daily or weekly)
-    let intervalDays = 7; // default weekly
-    const ws = await Workspace.findById(tracker.workspaceId);
-    if (ws?.organizationId) {
-      const { config } = await tierService.getOrgTierConfig(ws.organizationId);
+    // ── 9. Determine refresh interval from tier config
+    let intervalDays = 7;
+    if (orgId) {
+      const { config } = await tierService.getOrgTierConfig(orgId);
       intervalDays = config?.aiTrackerRefreshInterval === 'daily' ? 1 : 7;
     }
 
-    // Update tracker to ready
+    // ── 10. Update tracker to ready
     const scannedPlatforms = tracker.defaultModels && tracker.defaultModels.length > 0
       ? tracker.defaultModels
       : PLATFORM_DISPLAY.map((p) => p.platformId);
@@ -521,6 +556,14 @@ async function executeScan(trackerId) {
     });
   } catch (err) {
     console.error('[ai-tracker-scan] error:', err.message);
+
+    // Refund pre-deducted credits on failure
+    if (creditTxId) {
+      await creditService.refund(creditTxId).catch((refundErr) => {
+        console.error(`[ai-tracker-scan] refund failed for tracker ${trackerId}:`, refundErr.message);
+      });
+    }
+
     await AiTracker.findByIdAndUpdate(trackerId, {
       $set: { scanStatus: 'failed', scanError: err.message, currentScanId: null },
     }).catch(() => {});
@@ -922,22 +965,23 @@ const triggerScan = async (req, res) => {
       }
     }
 
-    // Deduct credits (fixed cost: 5 credits per scan)
+    // Pre-check credit affordability so we can return 402 immediately.
+    // Actual deduction happens inside executeScan (shared with cron path).
     if (req.creditContext?.deductionEnabled) {
-      try {
-        await creditService.preDeduct(
-          req.creditContext.orgId, req.user.userId, 5,
-          req.creditContext.featureKey, { feature: 'aiTrackerScan', trackerId: tracker._id.toString() }
-        );
-      } catch (creditErr) {
+      const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id }).countDocuments();
+      const platforms = tracker.defaultModels?.length || 0;
+      const estimatedCredits = Math.max(1, prompts * platforms * 4);
+      const canPay = await creditService.canAfford(req.creditContext.orgId, estimatedCredits);
+      if (!canPay) {
         return res.status(402).json({
-          error: creditErr.message,
+          error: 'Insufficient credits',
           code: 'INSUFFICIENT_CREDITS',
+          estimatedCredits,
         });
       }
     }
 
-    // Set to pending and fire scan
+    // Set to pending — executeScan atomically claims it to prevent double-execution
     await AiTracker.findByIdAndUpdate(tracker._id, {
       $set: { scanStatus: 'pending', scanProgress: 0, scanError: null },
     });
@@ -1459,21 +1503,23 @@ const triggerMonitorScan = async (req, res) => {
       }
     }
 
-    // Deduct credits (fixed cost: 5 credits per scan)
+    // Pre-check credit affordability so we can return 402 immediately.
+    // Actual deduction happens inside executeScan (shared with cron path).
     if (req.creditContext?.deductionEnabled) {
-      try {
-        await creditService.preDeduct(
-          req.creditContext.orgId, req.user.userId, 5,
-          req.creditContext.featureKey, { feature: 'aiTrackerScan', trackerId: tracker._id.toString() }
-        );
-      } catch (creditErr) {
+      const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id }).countDocuments();
+      const platforms = tracker.defaultModels?.length || 0;
+      const estimatedCredits = Math.max(1, prompts * platforms * 4);
+      const canPay = await creditService.canAfford(req.creditContext.orgId, estimatedCredits);
+      if (!canPay) {
         return res.status(402).json({
-          error: creditErr.message,
+          error: 'Insufficient credits',
           code: 'INSUFFICIENT_CREDITS',
+          estimatedCredits,
         });
       }
     }
 
+    // Set to pending — executeScan atomically claims it to prevent double-execution
     await AiTracker.findByIdAndUpdate(tracker._id, {
       $set: { scanStatus: 'pending', scanProgress: 0, scanError: null },
     });

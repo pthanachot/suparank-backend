@@ -448,9 +448,12 @@ async function runScan(tracker, prompts, competitors, onProgress) {
   let availablePlatforms = getAvailablePlatforms();
 
   // Filter to only the platforms configured on this tracker (defaultModels)
-  if (tracker.defaultModels && tracker.defaultModels.length > 0) {
-    availablePlatforms = availablePlatforms.filter((p) => tracker.defaultModels.includes(p.id));
+  // If defaultModels is empty (e.g. cleared after downgrade), skip scan entirely
+  if (!tracker.defaultModels || tracker.defaultModels.length === 0) {
+    await onProgress(100, []);
+    return { results: [], competitorResults: [] };
   }
+  availablePlatforms = availablePlatforms.filter((p) => tracker.defaultModels.includes(p.id));
 
   const totalSteps = availablePlatforms.length * prompts.length;
   let completedSteps = 0;
@@ -481,6 +484,7 @@ async function runScan(tracker, prompts, competitors, onProgress) {
   // Collect all answers for competitor detection later
   // Key: `${platformId}:${promptId}` → { answer, citations }
   const allAnswers = [];
+  let totalAnswerWords = 0;
 
   // Process each available platform sequentially
   for (let pi = 0; pi < availablePlatforms.length; pi++) {
@@ -513,6 +517,11 @@ async function runScan(tracker, prompts, competitors, onProgress) {
         tier = detection.tier;
         cited = detection.cited;
         citedFrom = detection.citedFrom;
+
+        // Count words from full answer (before truncation)
+        if (answer) {
+          totalAnswerWords += answer.trim().split(/\s+/).filter(Boolean).length;
+        }
 
         // Save for competitor analysis
         allAnswers.push({ platformId: platform.id, answer, citations });
@@ -584,7 +593,7 @@ async function runScan(tracker, prompts, competitors, onProgress) {
     };
   });
 
-  return { results, competitorResults };
+  return { results, competitorResults, totalAnswerWords };
 }
 
 module.exports = { runScan, PLATFORMS };

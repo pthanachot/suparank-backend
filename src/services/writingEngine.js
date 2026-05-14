@@ -164,6 +164,113 @@ async function generateImage(sessionId, { description, format, style }) {
   return res.json();
 }
 
+// ─── M5: plan-mode push methods ─────────────────────────────────────────
+//
+// Express orchestrates plan-mode state by pushing the current view onto
+// the Go session at the start of each chat request. Three independent
+// pushes (mode/plan/cfs) avoid an "everything-or-nothing" call so a
+// future evolution can update one without re-sending the others.
+//
+// All three are best-effort — if Go is unreachable we log and let the
+// chat proceed (Go falls back to chat-mode defaults). The push payloads
+// are tolerant: pushing the same state twice is a no-op.
+
+/**
+ * Push the session mode (chat | plan | execute) and an optional explicit
+ * allowedTools list. When allowedTools is omitted, Go derives the set
+ * from its FilterByMode mapping.
+ */
+async function pushMode(sessionId, mode, allowedTools) {
+  const body = { mode };
+  if (Array.isArray(allowedTools) && allowedTools.length > 0) {
+    body.allowedTools = allowedTools;
+  }
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/mode`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Writing Engine: push mode failed (${res.status}): ${text}`);
+  }
+  return res.json();
+}
+
+/**
+ * Push the current Plan onto the session. Pass `null` (or omit) to
+ * clear the session's plan snapshot — used after /plan/reject so a
+ * subsequent /plan/enter doesn't start from a stale archived plan.
+ *
+ * The plan should already be in the Go-side wire shape (use
+ * planSerializer.toGoPlan to convert from a Mongoose doc).
+ */
+async function pushPlan(sessionId, plan) {
+  const payload = plan == null ? 'null' : JSON.stringify(plan);
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/plan`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: payload,
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Writing Engine: push plan failed (${res.status}): ${text}`);
+  }
+  return res.json();
+}
+
+/**
+ * Push CFS connection info — baseUrl + internal API key + workspace/
+ * content scoping. Go's tool layer (ListContext/ReadContext/...) uses
+ * these to call back into Express's /api/internal/cfs/* routes.
+ */
+async function pushCFSConfig(sessionId, { baseUrl, apiKey, workspaceNumber, contentNumber }) {
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/cfs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ baseUrl, apiKey, workspaceNumber, contentNumber }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Writing Engine: push cfs failed (${res.status}): ${text}`);
+  }
+  return res.json();
+}
+
+/**
+ * Call Go's fast-plan generator to produce a draft plan from the
+ * brief + outline + index summary. Returns the generated skeleton —
+ * caller is responsible for persisting it as a Plan in Mongo.
+ */
+async function generateFastPlan(sessionId, { brief, outline, indexSummary }) {
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/fast-plan`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ brief, outline, indexSummary }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Writing Engine: fast-plan failed (${res.status}): ${text}`);
+  }
+  return res.json();
+}
+
+/**
+ * Fetch the list of available skills from the writing-engine. Used by
+ * Express's GET /api/internal/skills bridge.
+ */
+async function listSkills() {
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/skills`, {
+    method: 'GET',
+    headers: { 'Accept': 'application/json' },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Writing Engine: list skills failed (${res.status}): ${text}`);
+  }
+  return res.json();
+}
+
 /**
  * Submit the user's clarify answer to the Writing Engine.
  * Called when the user responds to an AskUserTool popup.
@@ -267,6 +374,11 @@ module.exports = {
   pushDocument,
   pushBrief,
   pushBrandVoice,
+  pushMode,
+  pushPlan,
+  pushCFSConfig,
+  generateFastPlan,
+  listSkills,
   sendChatMessageStream,
   startAgent,
   generateImage,

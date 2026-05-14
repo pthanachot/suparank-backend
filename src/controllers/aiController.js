@@ -2,12 +2,15 @@ const Content = require('../models/Content');
 const BrandVoice = require('../models/BrandVoice');
 const Avatar = require('../models/Avatar');
 const CreditTransaction = require('../models/CreditTransaction');
+const Plan = require('../models/Plan');
+const AgentUsageLog = require('../models/AgentUsageLog');
 const { blocksToMarkdown, stripHtml } = require('../services/blocksToMarkdown');
 const { markdownToBlocks } = require('../services/markdownToBlocks');
 const { benchmarkToContentBrief } = require('../services/benchmarkToContentBrief');
 const { buildResearchOutlineMd, buildSeoTargetsMd, buildContentAuditMd } = require('../services/contextFileGenerators');
 const { mapEditsToPatches } = require('../services/mapEditsToPatches');
 const writingEngine = require('../services/writingEngine');
+const { toGoPlan } = require('../services/planSerializer');
 const imageStorage = require('../services/imageStorage');
 const creditService = require('../services/creditService');
 
@@ -27,6 +30,72 @@ setInterval(() => {
     }
   }
 }, 10 * 60 * 1000);
+
+/**
+ * Build a lightweight tap that scans SSE bytes for `usage` events and
+ * accumulates input/output token counts across the stream. Go emits one
+ * usage event per agent turn with per-turn counts (see query.go:497-503),
+ * so we sum them. The tap is *read-only* — the raw bytes still go to
+ * `res.write` unchanged; we just observe them in flight.
+ */
+function makeUsageTap() {
+  let buffer = '';
+  let inputTokens = 0;
+  let outputTokens = 0;
+  return {
+    addChunk(buf) {
+      buffer += buf.toString('utf8');
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (!data || data === '[DONE]' || data[0] !== '{') continue;
+        try {
+          const ev = JSON.parse(data);
+          if (ev && ev.type === 'usage' && ev.usage) {
+            inputTokens += Number(ev.usage.inputTokens) || 0;
+            outputTokens += Number(ev.usage.outputTokens) || 0;
+          }
+        } catch { /* malformed event — skip */ }
+      }
+    },
+    snapshot() {
+      return { inputTokens, outputTokens };
+    },
+  };
+}
+
+/**
+ * Persist the accumulated usage at stream end. Best-effort: a failed write
+ * must NOT block the response that already went to the user.
+ */
+function persistUsage(content, tap, source) {
+  const totals = tap.snapshot();
+  if (totals.inputTokens === 0 && totals.outputTokens === 0) return;
+  AgentUsageLog.create({
+    workspaceId: content.workspaceId,
+    contentId: content._id,
+    contentType: content.contentType || '',
+    mode: content.mode || 'chat',
+    inputTokens: totals.inputTokens,
+    outputTokens: totals.outputTokens,
+    source,
+  }).catch((err) => {
+    // Never throw past the SSE response — observability hygiene only.
+    console.warn('[usage-tap] persist failed', err.message);
+  });
+}
+
+// Per-mode default tool allowlist for setupSession's pushMode call. Go's
+// FilterByMode is the authoritative source — these mirror it but let
+// Express tighten further in the future (e.g. trial-tier feature gating).
+// Empty array means "let Go default from the mode."
+const MODE_ALLOWED_TOOLS = {
+  chat: [],
+  plan: [],
+  execute: [],
+};
 
 // Workspace resolved by permissions middleware (req.workspace).
 // This helper finds the content within that workspace.
@@ -157,7 +226,102 @@ async function setupSession(content, { avatarId, reuseSession } = {}) {
     console.error('Brand voice push failed (non-fatal):', err.message);
   }
 
+  // ── M5: plan-mode orchestration ──────────────────────────────────────
+  // Push the session's mode + current plan + CFS connection info BEFORE
+  // returning. Order matters: mode is pushed first so the strategy
+  // router knows which strategy to instantiate; plan and CFS come after.
+  // Failures here are logged but don't block chat — Go falls back to
+  // chat-mode defaults on missing pushes.
+  await pushPlanModeContext(sessionId, content);
+
   return { sessionId, markdown };
+}
+
+/**
+ * Push mode + plan + CFS config to the Go session. M5 orchestration glue.
+ *
+ * Mode comes from Content.mode (persistent — Plan transition statics
+ * update it via reconcile hooks). Plan comes from the proposed > draft >
+ * approved fallback; null when no editable plan exists.
+ *
+ * The CFS push is gated on INTERNAL_API_KEY being set; without it, the
+ * Go tools can't authenticate against /api/internal/cfs/* and would
+ * fail mid-call. Better to fail loudly here than silently in the loop.
+ */
+async function pushPlanModeContext(sessionId, content) {
+  // Bug #H fix: aggregate failures into one structured log line at the
+  // end so a misconfigured session is visible in a single grep, not
+  // spread across three separate errors. Includes sessionId + content
+  // identifiers so the line is correlatable in multi-tenant logs.
+  const failures = [];
+
+  const mode = content.mode || 'chat';
+  const allowed = MODE_ALLOWED_TOOLS[mode] || [];
+  try {
+    await writingEngine.pushMode(sessionId, mode, allowed);
+  } catch (err) {
+    failures.push({ step: 'pushMode', error: err.message });
+  }
+
+  // Plan resolution mirrors planController.get: proposed > draft > approved.
+  let plan = null;
+  try {
+    plan = await Plan.findProposed(content._id);
+    if (!plan) plan = await Plan.findDraft(content._id);
+    if (!plan && content.activePlanId) {
+      plan = await Plan.findById(content.activePlanId);
+    }
+  } catch (err) {
+    failures.push({ step: 'planLookup', error: err.message });
+  }
+
+  try {
+    await writingEngine.pushPlan(sessionId, plan ? toGoPlan(plan) : null);
+  } catch (err) {
+    failures.push({ step: 'pushPlan', error: err.message });
+  }
+
+  // CFS config — required for Go's context tools. Without it, Go's
+  // CFS client constructor returns nil and the tools error out. Fail
+  // loud rather than letting that surface mid-loop.
+  const apiKey = process.env.INTERNAL_API_KEY;
+  const expressBaseUrl = process.env.EXPRESS_INTERNAL_BASE_URL ||
+    process.env.PUBLIC_BASE_URL ||
+    'http://localhost:4001';
+  if (!apiKey) {
+    failures.push({ step: 'cfsConfig', error: 'INTERNAL_API_KEY not set — context tools will be unavailable' });
+  } else {
+    // Workspace number is denormalized only on Workspace, not Content —
+    // do one targeted lookup to resolve it.
+    let workspaceNumber = 0;
+    try {
+      const ws = await Workspace.findById(content.workspaceId).select('workspaceNumber');
+      if (ws) workspaceNumber = ws.workspaceNumber;
+    } catch (err) {
+      failures.push({ step: 'workspaceLookup', error: err.message });
+    }
+
+    try {
+      await writingEngine.pushCFSConfig(sessionId, {
+        baseUrl: expressBaseUrl,
+        apiKey,
+        workspaceNumber,
+        contentNumber: content.contentNumber || 0,
+      });
+    } catch (err) {
+      failures.push({ step: 'pushCFSConfig', error: err.message });
+    }
+  }
+
+  if (failures.length > 0) {
+    console.warn('[setupSession] plan-mode push had failures', {
+      sessionId,
+      contentId: content._id,
+      contentNumber: content.contentNumber,
+      mode,
+      failures,
+    });
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -223,12 +387,15 @@ const chat = async (req, res) => {
     // All event transformation (document_diff → patch/draft) is now handled
     // client-side in EditorChatBar.tsx.
     const reader = chatRes.body.getReader();
+    const usageTap = makeUsageTap();
 
     const processEvents = async () => {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        res.write(Buffer.from(value));
+        const buf = Buffer.from(value);
+        usageTap.addChunk(buf);
+        res.write(buf);
       }
     };
 
@@ -260,6 +427,7 @@ const chat = async (req, res) => {
       CreditTransaction.findByIdAndUpdate(creditTxId, { status: 'settled' }).catch(() => {});
     }
 
+    persistUsage(content, usageTap, 'chat');
     if (!clientDisconnected) res.end();
   } catch (err) {
     // Refund credits on error
@@ -362,12 +530,15 @@ const agent = async (req, res) => {
     // client-side in EditorChatBar.tsx. This eliminates per-event JSON
     // parse/serialize overhead for text_delta and thinking_delta events.
     const reader = agentRes.body.getReader();
+    const usageTap = makeUsageTap();
 
     const processEvents = async () => {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        res.write(Buffer.from(value));
+        const buf = Buffer.from(value);
+        usageTap.addChunk(buf);
+        res.write(buf);
       }
     };
 
@@ -399,6 +570,7 @@ const agent = async (req, res) => {
       CreditTransaction.findByIdAndUpdate(creditTxId, { status: 'settled' }).catch(() => {});
     }
 
+    persistUsage(content, usageTap, 'agent');
     if (!clientDisconnected) res.end();
   } catch (err) {
     // Refund credits on error
@@ -946,4 +1118,19 @@ const setExecutionMode = async (req, res) => {
   }
 };
 
-module.exports = { chat, agent, generateImage, uploadImage, clarifyAnswer, planConfirm, toolConfirm, setExecutionMode };
+// ─────────────────────────────────────────────────────────────
+// GET /skills — user-facing wrapper around the internal skills bridge.
+// Auth is the workspaceRoutes global token check; we don't require a
+// workspaceNumber because skills are global to the writing-engine.
+// ─────────────────────────────────────────────────────────────
+const listSkills = async (req, res) => {
+  try {
+    const skills = await writingEngine.listSkills();
+    res.json({ skills: Array.isArray(skills) ? skills : [] });
+  } catch (err) {
+    console.error('[skills] proxy failed:', err.message);
+    res.status(502).json({ error: 'writing-engine unreachable', detail: err.message });
+  }
+};
+
+module.exports = { chat, agent, generateImage, uploadImage, clarifyAnswer, planConfirm, toolConfirm, setExecutionMode, listSkills };

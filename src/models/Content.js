@@ -254,9 +254,57 @@ const contentSchema = new mongoose.Schema(
 
     // Downgrade locking — locked resources are read-only until the org upgrades
     locked: { type: Boolean, default: false },
+
+    // Plan mode (v4 spec). mode is the persistent source of truth — frontend
+    // reads it on load and disables incompatible UI. Per-request mode is NOT
+    // threaded through; conflicts are surfaced as 409 at the application layer.
+    // activePlanId points at the currently-approved Plan (if any). Reconciled
+    // by Plan.js status-change hook when the active plan transitions away.
+    mode: {
+      type: String,
+      enum: ['chat', 'plan', 'execute'],
+      default: 'chat',
+    },
+    activePlanId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Plan',
+      default: null,
+    },
   },
   { timestamps: true }
 );
+
+// Cascade: when a Content is removed, archive its Plans (do NOT delete — audit
+// trail). Mongoose has two delete paths (document.deleteOne vs Model.deleteOne)
+// — register on both. Plan model is required lazily to avoid a require-cycle
+// since Plan refs Content.
+async function archivePlansForContent(contentId) {
+  if (!contentId) return;
+  const Plan = require('./Plan');
+  await Plan.updateMany(
+    { contentId, status: { $nin: ['archived'] } },
+    { $set: { status: 'archived' } }
+  );
+}
+
+contentSchema.pre('deleteOne', { document: true, query: false }, async function () {
+  await archivePlansForContent(this._id);
+});
+
+contentSchema.pre('deleteOne', { document: false, query: true }, async function () {
+  const doc = await this.model.findOne(this.getFilter()).select('_id');
+  if (doc) await archivePlansForContent(doc._id);
+});
+
+contentSchema.pre('deleteMany', { document: false, query: true }, async function () {
+  const docs = await this.model.find(this.getFilter()).select('_id');
+  for (const d of docs) await archivePlansForContent(d._id);
+});
+
+contentSchema.pre('findOneAndDelete', async function () {
+  const doc = await this.model.findOne(this.getFilter()).select('_id');
+  if (doc) await archivePlansForContent(doc._id);
+});
  
 // Compound indexes
 contentSchema.index({ workspaceId: 1, contentNumber: 1 });

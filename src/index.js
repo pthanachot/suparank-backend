@@ -47,12 +47,20 @@ app.post('/api/billing/webhooks', express.raw({ type: 'application/json' }), han
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Rate limiting
+// Rate limiting — skip the internal API. Internal traffic comes from the Go
+// writing-engine (server-to-server, authenticated by INTERNAL_API_KEY) and
+// can legitimately make many CFS reads per plan-mode turn. Throttling it
+// like user traffic would intermittently break plan mode.
+//
+// Uses req.originalUrl (always the full pathname) rather than req.path
+// (which depends on Express's mount-stripping behavior). (Bug 4 from M2
+// second-round review.)
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: process.env.NODE_ENV === 'production' ? 100 : 1000,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => req.originalUrl.startsWith('/api/internal/'),
 });
 app.use('/api/', apiLimiter);
 
@@ -68,6 +76,7 @@ const imageRoutes = require('./routes/imageRoutes');
 const brandVoiceRoutes = require('./routes/brandVoiceRoutes');
 const orgRoutes = require('./routes/orgRoutes');
 const organizationRoutes = require('./routes/organizationRoutes');
+const internalCfsRoutes = require('./routes/internalCfsRoutes');
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/billing', billingRoutes);
@@ -79,6 +88,11 @@ app.use('/api/workspace', workspaceRoutes);
 app.use('/api/workspaces', workspaceCrudRoutes);
 app.use('/api/org', orgRoutes);
 app.use('/api/organizations', organizationRoutes);
+
+// Internal API for the Go writing-engine (CFS reads, plan writes, skills
+// bridge). Gated by internalAuth middleware — NOT user-facing.
+app.use('/api/internal/cfs', internalCfsRoutes);
+app.use('/api/internal/skills', require('./routes/internalSkillsRoutes'));
 
 // Dev-only routes (never in production, file may not exist)
 if (process.env.NODE_ENV !== 'production') {

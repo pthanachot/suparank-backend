@@ -265,4 +265,4 @@ function stripHtml(html) {
   return html.replace(/<[^>]*>/g, '');
 }
 
-module.exports = { markdownToBlocks, mdInlineToHtml };
+module.exports = { markdownToBlocks, mdInlineToHtml, stripHtml };

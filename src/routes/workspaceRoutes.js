@@ -4,6 +4,8 @@ const workspaceController = require('../controllers/workspaceController');
 const contentController = require('../controllers/contentController');
 const analysisController = require('../controllers/analysisController');
 const aiController = require('../controllers/aiController');
+const planController = require('../controllers/planController');
+const contextController = require('../controllers/contextController');
 const { authenticateToken } = require('../middleware/auth');
 const { resolveWorkspaceWithRole: rwr, requirePermission: rp, requireFeature: rf } = require('../middleware/permissions');
 const { requireQuota: rq } = require('../middleware/tierEnforcement');
@@ -15,6 +17,11 @@ router.use(authenticateToken);
 
 // Workspace (no RBAC — finds/creates for authenticated user)
 router.get('/', workspaceController.getWorkspace);
+
+// M5 user-facing skills endpoint — proxies the internal bridge so the
+// frontend (which doesn't hold INTERNAL_API_KEY) can list skills loaded
+// by the Go writing-engine. Auth is the workspaceRoutes-global token check.
+router.get('/skills', aiController.listSkills);
 
 // Content under workspace: /api/workspace/:workspaceNumber/content
 router.get('/:workspaceNumber/content', rwr, rp('content', 'read'), contentController.listContents);
@@ -49,5 +56,21 @@ router.post('/:workspaceNumber/content/:contentNumber/ai/clarify-answer', rwr, r
 router.post('/:workspaceNumber/content/:contentNumber/ai/plan-confirm', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.planConfirm);
 router.post('/:workspaceNumber/content/:contentNumber/ai/tool-confirm', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.toolConfirm);
 router.post('/:workspaceNumber/content/:contentNumber/ai/execution-mode', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.setExecutionMode);
+
+// Plan mode under content (M1 — writing-engine plan mode)
+router.post('/:workspaceNumber/content/:contentNumber/plan/enter', planController.enter);
+router.post('/:workspaceNumber/content/:contentNumber/plan/fast', planController.fast);
+router.get('/:workspaceNumber/content/:contentNumber/plan', planController.get);
+router.patch('/:workspaceNumber/content/:contentNumber/plan', planController.patch);
+router.post('/:workspaceNumber/content/:contentNumber/plan/approve', planController.approve);
+router.post('/:workspaceNumber/content/:contentNumber/plan/reject', planController.reject);
+router.post('/:workspaceNumber/content/:contentNumber/plan/reopen', planController.reopen);
+router.post('/:workspaceNumber/content/:contentNumber/plan/continue', planController.continueResume);
+router.get('/:workspaceNumber/content/:contentNumber/plan/history', planController.history);
+router.get('/:workspaceNumber/content/:contentNumber/plan/estimate', planController.estimate);
+
+// CFS read-only endpoints for the frontend (M2 — user-facing transparency)
+router.get('/:workspaceNumber/content/:contentNumber/context/list', contextController.userList);
+router.get('/:workspaceNumber/content/:contentNumber/context/read', contextController.userRead);
 
 module.exports = router;

@@ -149,6 +149,7 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
       models: p.models,
       frequency: p.frequency,
       active: p.active,
+      locked: p.locked || false,
       suggestions: generatePromptSuggestions(null),
       trendHistory: [],
     }));
@@ -196,6 +197,7 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
       models: p.models,
       frequency: p.frequency,
       active: p.active,
+      locked: p.locked || false,
       suggestions: generatePromptSuggestions(scanResult),
       trendHistory: (recentScans || []).map((scan) => {
         const result = scan.results.find((r) => r.promptId.equals(p._id));

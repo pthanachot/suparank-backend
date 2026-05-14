@@ -1,5 +1,6 @@
 /**
- * Migration: Backfill `createdOnPlan` field on Content, BrandVoice, Avatar.
+ * Migration: Backfill `createdOnPlan` field on Content, BrandVoice, Avatar,
+ * KeywordResearchHistory, and AiTrackerPrompt.
  *
  * For each organization:
  *   - Look up current tier
@@ -19,6 +20,9 @@ const Workspace = require('../models/Workspace');
 const Content = require('../models/Content');
 const BrandVoice = require('../models/BrandVoice');
 const Avatar = require('../models/Avatar');
+const AiTracker = require('../models/AiTracker');
+const AiTrackerPrompt = require('../models/AiTrackerPrompt');
+const KeywordResearchHistory = require('../models/KeywordResearchHistory');
 const tierService = require('../services/tierService');
 
 async function migrate() {
@@ -33,6 +37,8 @@ async function migrate() {
   let contentUpdated = 0;
   let bvUpdated = 0;
   let avatarUpdated = 0;
+  let kwHistoryUpdated = 0;
+  let promptUpdated = 0;
 
   for (const org of orgs) {
     const { tier } = await tierService.getOrgTierConfig(org._id);
@@ -60,12 +66,28 @@ async function migrate() {
     );
     avatarUpdated += avatarResult.modifiedCount;
 
-    if (contentResult.modifiedCount + bvResult.modifiedCount + avatarResult.modifiedCount > 0) {
-      console.log(`  ${org.name || org._id}: tier=${tier} → ${createdOnPlan} (content: ${contentResult.modifiedCount}, bv: ${bvResult.modifiedCount}, avatar: ${avatarResult.modifiedCount})`);
+    const kwResult = await KeywordResearchHistory.updateMany(
+      { workspaceId: { $in: wsIds }, createdOnPlan: { $exists: false } },
+      { $set: { createdOnPlan } }
+    );
+    kwHistoryUpdated += kwResult.modifiedCount;
+
+    const trackerIds = await AiTracker.find({ workspaceId: { $in: wsIds } }).distinct('_id');
+    if (trackerIds.length > 0) {
+      const promptResult = await AiTrackerPrompt.updateMany(
+        { trackerId: { $in: trackerIds }, createdOnPlan: { $exists: false } },
+        { $set: { createdOnPlan } }
+      );
+      promptUpdated += promptResult.modifiedCount;
+    }
+
+    const total = contentResult.modifiedCount + bvResult.modifiedCount + avatarResult.modifiedCount + kwResult.modifiedCount;
+    if (total > 0) {
+      console.log(`  ${org.name || org._id}: tier=${tier} → ${createdOnPlan} (content: ${contentResult.modifiedCount}, bv: ${bvResult.modifiedCount}, avatar: ${avatarResult.modifiedCount}, kw: ${kwResult.modifiedCount})`);
     }
   }
 
-  console.log(`\nMigration complete: ${contentUpdated} content, ${bvUpdated} brand voices, ${avatarUpdated} avatars updated`);
+  console.log(`\nMigration complete: ${contentUpdated} content, ${bvUpdated} brand voices, ${avatarUpdated} avatars, ${kwHistoryUpdated} keyword histories, ${promptUpdated} AI tracker prompts updated`);
   await mongoose.disconnect();
 }
 

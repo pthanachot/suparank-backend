@@ -10,6 +10,10 @@ const aiTrackerPromptSchema = new mongoose.Schema({
   models: { type: [String], default: ['chatgpt', 'gemini', 'claude', 'perplexity'] },
   frequency: { type: String, enum: ['Weekly', 'Bi-weekly', 'Monthly'], default: 'Weekly' },
   active: { type: Boolean, default: true },
+
+  // Downgrade locking
+  locked: { type: Boolean, default: false },
+  createdOnPlan: { type: String, enum: ['free', 'paid'], default: 'free' },
 }, { timestamps: true });
 
 aiTrackerPromptSchema.index({ trackerId: 1 });

@@ -9,6 +9,10 @@ const keywordResearchHistorySchema = new mongoose.Schema({
   seedKeyword: { type: String, required: true, trim: true, lowercase: true },
   country: { type: String, default: 'US', uppercase: true },
   searchedAt: { type: Date, default: Date.now },
+
+  // Downgrade locking
+  locked: { type: Boolean, default: false },
+  createdOnPlan: { type: String, enum: ['free', 'paid'], default: 'free' },
 }, { timestamps: true });
 
 // Fast history listing per workspace

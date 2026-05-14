@@ -126,7 +126,29 @@ const getTierInfo = async (req, res) => {
       expiresAt: creditDoc?.subscriptionCreditsExpireAt || null,
     };
 
-    res.json({ tier, config, usage, creditBalance });
+    // Always include free-tier lifetime usage so paid users can see
+    // remaining free slots for the quota source selector.
+    const freeTierConfig = await tierService.getTierConfig('free');
+    const freeQuotaSlots = freeTierConfig ? {
+      articlesCreated: {
+        used: lifetimeUsage?.articlesCreated ?? 0,
+        limit: freeTierConfig.maxArticlesPerMonth ?? 3,
+      },
+      keywordSearches: {
+        used: lifetimeUsage?.keywordSearches ?? 0,
+        limit: freeTierConfig.maxKeywordLookupsPerMonth ?? 50,
+      },
+      aiTrackerPromptsCreated: {
+        used: lifetimeUsage?.aiTrackerPromptsCreated ?? 0,
+        limit: freeTierConfig.maxAiTrackerPromptsPerMonth ?? 5,
+      },
+      auditsRun: {
+        used: lifetimeUsage?.auditsRun ?? 0,
+        limit: freeTierConfig.maxAuditsPerMonth ?? 5,
+      },
+    } : null;
+
+    res.json({ tier, config, usage, creditBalance, freeQuotaSlots });
   } catch (err) {
     console.error('getTierInfo error:', err.message);
     res.status(500).json({ error: 'Failed to get tier info' });

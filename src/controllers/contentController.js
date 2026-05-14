@@ -65,12 +65,17 @@ const createContent = async (req, res) => {
     const contentNumber = await Content.getNextContentNumber();
     const { title, slug, description, blocks, targetKeywords, country, device, score, wordCount, status, folder, platform, versions } = req.body;
 
-    // Determine plan tier at creation time
+    // Determine plan tier at creation time.
+    // Paid users can opt to use a free lifetime slot (quotaSource='free').
     const orgId = workspace.organizationId;
     let createdOnPlan = 'free';
     if (orgId) {
-      const { tier } = await tierService.getOrgTierConfig(orgId);
-      createdOnPlan = tier === 'free' ? 'free' : 'paid';
+      if (req.body.quotaSource === 'free') {
+        createdOnPlan = 'free';
+      } else {
+        const { tier } = await tierService.getOrgTierConfig(orgId);
+        createdOnPlan = tier === 'free' ? 'free' : 'paid';
+      }
     }
 
     const content = await Content.create({

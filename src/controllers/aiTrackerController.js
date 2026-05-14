@@ -974,11 +974,21 @@ const addPrompt = async (req, res) => {
       return res.status(409).json({ error: 'This prompt is already being tracked' });
     }
 
+    // Determine createdOnPlan based on quotaSource or current tier
+    let createdOnPlan = 'free';
+    if (req.body.quotaSource === 'free') {
+      createdOnPlan = 'free';
+    } else if (workspace.organizationId) {
+      const { tier } = await tierService.getOrgTierConfig(workspace.organizationId);
+      createdOnPlan = tier === 'free' ? 'free' : 'paid';
+    }
+
     const doc = await AiTrackerPrompt.create({
       trackerId: tracker._id,
       prompt: prompt.trim(),
       ...(Array.isArray(models) && models.length > 0 ? { models } : {}),
       ...(frequency ? { frequency } : {}),
+      createdOnPlan,
     });
 
     // Track prompt creation against tier quota
@@ -1492,11 +1502,21 @@ const addMonitorPrompt = async (req, res) => {
       return res.status(409).json({ error: 'This prompt is already being tracked' });
     }
 
+    // Determine createdOnPlan based on quotaSource or current tier
+    let createdOnPlan = 'free';
+    if (req.body.quotaSource === 'free') {
+      createdOnPlan = 'free';
+    } else if (workspace.organizationId) {
+      const { tier } = await tierService.getOrgTierConfig(workspace.organizationId);
+      createdOnPlan = tier === 'free' ? 'free' : 'paid';
+    }
+
     const doc = await AiTrackerPrompt.create({
       trackerId: tracker._id,
       prompt: prompt.trim(),
       ...(Array.isArray(models) && models.length > 0 ? { models } : {}),
       ...(frequency ? { frequency } : {}),
+      createdOnPlan,
     });
 
     // Track prompt creation against tier quota

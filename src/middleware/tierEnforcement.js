@@ -58,14 +58,29 @@ function requireQuota(counterKey, tierLimitKey, tierLimitTypeKey) {
         return next();
       }
 
-      const limit = config[tierLimitKey];
+      // ── Quota source override ──
+      // Paid users can opt to use a free lifetime slot instead of their
+      // paid monthly quota. When quotaSource='free', we check against the
+      // free tier's limits and lifetime counter instead.
+      const quotaSource = req.body?.quotaSource;
+      let activeConfig = config;
+      let activeTier = tier;
+
+      if (quotaSource === 'free' && tier !== 'free') {
+        const freeConfig = await tierService.getTierConfig('free');
+        if (!freeConfig) return next(); // fail open
+        activeConfig = freeConfig;
+        activeTier = 'free';
+      }
+
+      const limit = activeConfig[tierLimitKey];
       // null/undefined = unlimited
       if (limit == null) {
         req.tierQuota = { orgId, counterKey, period: null };
         return next();
       }
 
-      const limitType = config[tierLimitTypeKey] || 'monthly';
+      const limitType = activeConfig[tierLimitTypeKey] || 'monthly';
 
       // Lifetime limits use UsageTracker with period='lifetime' — the counter
       // increments on creation and never decrements on deletion, so deleting
@@ -76,12 +91,14 @@ function requireQuota(counterKey, tierLimitKey, tierLimitTypeKey) {
 
       if (used >= limit) {
         return res.status(429).json({
-          error: `${config.displayName || tier} plan limit reached for this feature`,
+          error: quotaSource === 'free'
+            ? 'No free lifetime slots remaining for this feature'
+            : `${activeConfig.displayName || activeTier} plan limit reached for this feature`,
           code: 'QUOTA_EXCEEDED',
           quota: {
             limit,
             used,
-            tier,
+            tier: activeTier,
             limitKey: tierLimitKey,
             limitType,
             upgradeHint: tierService._upgradeHint(tier, tierLimitKey),

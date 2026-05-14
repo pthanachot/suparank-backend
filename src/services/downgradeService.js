@@ -22,6 +22,8 @@ const BrandVoice = require('../models/BrandVoice');
 const OrgMember = require('../models/OrgMember');
 const Subscription = require('../models/Subscription');
 const AiTracker = require('../models/AiTracker');
+const AiTrackerPrompt = require('../models/AiTrackerPrompt');
+const KeywordResearchHistory = require('../models/KeywordResearchHistory');
 const tierService = require('./tierService');
 
 // ─── Helpers ────────────────────────────────────────────────────
@@ -208,6 +210,9 @@ async function lockPaidCreatedResources(orgId) {
   const wsIds = await getOrgWorkspaceIds(orgId);
   if (wsIds.length === 0) return;
 
+  // Resolve AI Tracker IDs for prompt locking
+  const trackerIds = await AiTracker.find({ workspaceId: { $in: wsIds } }).distinct('_id');
+
   await Promise.all([
     Content.updateMany(
       { workspaceId: { $in: wsIds }, createdOnPlan: 'paid' },
@@ -221,6 +226,16 @@ async function lockPaidCreatedResources(orgId) {
       { workspace: { $in: wsIds }, createdOnPlan: 'paid' },
       { $set: { locked: true } }
     ),
+    KeywordResearchHistory.updateMany(
+      { workspaceId: { $in: wsIds }, createdOnPlan: 'paid' },
+      { $set: { locked: true } }
+    ),
+    ...(trackerIds.length > 0 ? [
+      AiTrackerPrompt.updateMany(
+        { trackerId: { $in: trackerIds }, createdOnPlan: 'paid' },
+        { $set: { locked: true } }
+      ),
+    ] : []),
   ]);
 
   console.log(`[downgradeService] Locked paid-created resources for org ${orgId}`);
@@ -229,6 +244,8 @@ async function lockPaidCreatedResources(orgId) {
 async function unlockPaidCreatedResources(orgId) {
   const wsIds = await getOrgWorkspaceIds(orgId);
   if (wsIds.length === 0) return;
+
+  const trackerIds = await AiTracker.find({ workspaceId: { $in: wsIds } }).distinct('_id');
 
   await Promise.all([
     Content.updateMany(
@@ -243,6 +260,16 @@ async function unlockPaidCreatedResources(orgId) {
       { workspace: { $in: wsIds }, createdOnPlan: 'paid', locked: true },
       { $set: { locked: false } }
     ),
+    KeywordResearchHistory.updateMany(
+      { workspaceId: { $in: wsIds }, createdOnPlan: 'paid', locked: true },
+      { $set: { locked: false } }
+    ),
+    ...(trackerIds.length > 0 ? [
+      AiTrackerPrompt.updateMany(
+        { trackerId: { $in: trackerIds }, createdOnPlan: 'paid', locked: true },
+        { $set: { locked: false } }
+      ),
+    ] : []),
   ]);
 }
 

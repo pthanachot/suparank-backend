@@ -3,6 +3,7 @@ const KeywordDetail = require('../models/KeywordDetail');
 const KeywordResearchHistory = require('../models/KeywordResearchHistory');
 const { resolveCountry, fetchRelatedKeywords, fetchSerpResults, SUPPORTED_COUNTRIES } = require('../services/keywordService');
 const UsageTracker = require('../models/UsageTracker');
+const tierService = require('../services/tierService');
 
 // Workspace resolved by permissions middleware (req.workspace).
 
@@ -33,6 +34,15 @@ async function searchKeywords(req, res) {
       await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
     }
 
+    // Determine createdOnPlan for history entry
+    let createdOnPlan = 'free';
+    if (req.body.quotaSource === 'free') {
+      createdOnPlan = 'free';
+    } else if (workspace.organizationId) {
+      const { tier } = await tierService.getOrgTierConfig(workspace.organizationId);
+      createdOnPlan = tier === 'free' ? 'free' : 'paid';
+    }
+
     // Check cache (global — not workspace-scoped)
     const cached = await KeywordSearch.findOne({
       seedKeyword,
@@ -44,7 +54,7 @@ async function searchKeywords(req, res) {
       // Record in workspace history (fire-and-forget)
       KeywordResearchHistory.findOneAndUpdate(
         { workspaceId: workspace._id, seedKeyword, country: countryCode },
-        { searchedAt: new Date() },
+        { searchedAt: new Date(), createdOnPlan },
         { upsert: true },
       ).catch(() => {});
 
@@ -79,7 +89,7 @@ async function searchKeywords(req, res) {
     // Record in workspace history (fire-and-forget)
     KeywordResearchHistory.findOneAndUpdate(
       { workspaceId: workspace._id, seedKeyword, country: countryCode },
-      { searchedAt: new Date() },
+      { searchedAt: new Date(), createdOnPlan },
       { upsert: true },
     ).catch(() => {});
 
@@ -185,6 +195,8 @@ async function getSearchHistory(req, res) {
           country: entry.country,
           searchedAt: entry.searchedAt,
           totalCount: cached?.totalCount ?? 0,
+          locked: entry.locked || false,
+          createdOnPlan: entry.createdOnPlan || 'free',
         };
       }),
     );

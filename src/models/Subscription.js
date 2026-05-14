@@ -38,6 +38,9 @@ const subscriptionSchema = new mongoose.Schema(
     currentPeriodEnd: Date,
     cancelAtPeriodEnd: { type: Boolean, default: false },
     canceledAt: Date,
+    purchasedExtraSeats: { type: Number, default: 0 },
+    stripeExtraSeatItemId: { type: String, default: null },
+    extraSeatsUpdatedAt: { type: Date, default: null },
     defaultPaymentMethod: {
       brand: String,
       last4: String,

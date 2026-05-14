@@ -1,6 +1,7 @@
 const User = require('../models/User');
 const Organization = require('../models/Organization');
 const OrgMember = require('../models/OrgMember');
+const Subscription = require('../models/Subscription');
 const Role = require('../models/Role');
 const FeatureFlag = require('../models/FeatureFlag');
 const tierService = require('../services/tierService');
@@ -119,17 +120,24 @@ const inviteMember = async (req, res) => {
       return res.status(400).json({ error: `Role must be one of: ${validRoles.join(', ')}` });
     }
 
-    // Check seat limit from TierConfig
+    // Check seat limit from TierConfig (base + purchased extra seats)
     const { config, tier } = await tierService.getOrgTierConfig(org._id);
     if (config?.maxSeats != null) {
+      const sub = await Subscription.findOne({
+        organizationId: org._id,
+        status: { $in: ['active', 'trialing'] },
+      }).lean();
+      const extraSeats = sub?.purchasedExtraSeats || 0;
+      const effectiveMaxSeats = config.maxSeats + extraSeats;
+
       const memberCount = await OrgMember.countDocuments({ organizationId: org._id, locked: { $ne: true } });
       // +1 because the org owner is not in OrgMember but counts as a seat
       const totalSeats = memberCount + 1;
-      if (totalSeats >= config.maxSeats) {
+      if (totalSeats >= effectiveMaxSeats) {
         return res.status(429).json({
-          error: `Your ${config.displayName || tier} plan allows ${config.maxSeats} seat(s). Upgrade for more.`,
+          error: `Your ${config.displayName || tier} plan allows ${effectiveMaxSeats} seat(s).${extraSeats > 0 ? '' : ' Upgrade or purchase extra seats for more.'}`,
           code: 'QUOTA_EXCEEDED',
-          quota: { limit: config.maxSeats, used: totalSeats, tier, limitKey: 'maxSeats' },
+          quota: { limit: effectiveMaxSeats, used: totalSeats, tier, limitKey: 'maxSeats' },
         });
       }
     }

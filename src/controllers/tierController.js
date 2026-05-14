@@ -1,5 +1,6 @@
 const Organization = require('../models/Organization');
 const OrgMember = require('../models/OrgMember');
+const Subscription = require('../models/Subscription');
 const Workspace = require('../models/Workspace');
 const Avatar = require('../models/Avatar');
 const BrandVoice = require('../models/BrandVoice');
@@ -73,6 +74,13 @@ const getTierInfo = async (req, res) => {
       UsageTracker.getUsage(orgId, 'lifetime'),
     ]);
 
+    // Extra seats from active subscription
+    const sub = await Subscription.findOne({
+      organizationId: orgId,
+      status: { $in: ['active', 'trialing'] },
+    }).lean();
+    const extraSeats = sub?.purchasedExtraSeats || 0;
+
     // Total counts (live from documents, unlocked only for consistency with creation checks)
     const wsIds = await Workspace.find({ organizationId: orgId }).distinct('_id');
     const [memberCount, avatarCount, brandVoiceCount, wsCount] = await Promise.all([
@@ -103,7 +111,7 @@ const getTierInfo = async (req, res) => {
       aiTrackerPromptsCreated: usageEntry('aiTrackerPromptsCreated', 'maxAiTrackerPromptsPerMonth', 'aiTrackerPromptLimitType'),
       creditsUsed: usageEntry('creditsUsed', 'creditsPerMonth', 'creditLimitType'),
       // Total counts (not periodic)
-      seats: { used: memberCount + 1, limit: config.maxSeats }, // +1 for owner
+      seats: { used: memberCount + 1, limit: config.maxSeats + extraSeats, baseLimit: config.maxSeats, extraSeats }, // +1 for owner
       brandVoices: { used: brandVoiceCount, limit: config.maxBrandVoices },
       avatars: { used: avatarCount, limit: config.maxAvatars },
       workspaces: { used: wsCount, limit: config.maxWorkspaces },

@@ -1,25 +1,15 @@
 const Stripe = require('stripe');
 const User = require('../models/User');
 const Organization = require('../models/Organization');
+const OrgMember = require('../models/OrgMember');
 const Subscription = require('../models/Subscription');
-const { clearTierCache } = require('../services/tierService');
+const { clearTierCache, getOrgTierConfig } = require('../services/tierService');
 const { applyLocksForOrg } = require('../services/downgradeService');
+const { getPlanFromPriceId, EXTRA_SEAT_PRICES } = require('../config/stripePrices');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const APP_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
-
-// Map Stripe price IDs to internal plan IDs
-const PRICE_TO_PLAN = {
-  [process.env.STRIPE_STANDARD_MONTHLY_PRICE_ID || 'price_1TCaMYPViW8Lznb8OykrDOqY']: 'standard-monthly',
-  [process.env.STRIPE_STANDARD_YEARLY_PRICE_ID || 'price_1TCaMYPViW8Lznb8SOYEOsk2']: 'standard-yearly',
-  [process.env.STRIPE_PRO_MONTHLY_PRICE_ID || 'price_1TCaUDPViW8Lznb8599QuBfr']: 'pro-monthly',
-  [process.env.STRIPE_PRO_YEARLY_PRICE_ID || 'price_1TCaUDPViW8Lznb86MXvgr4Z']: 'pro-yearly',
-};
-
-function getPlanFromPriceId(priceId) {
-  return PRICE_TO_PLAN[priceId] || null;
-}
 
 // Convert Stripe Unix timestamps (seconds) to Date objects
 function parseStripeDate(ts) {
@@ -203,6 +193,7 @@ const getSubscription = async (req, res) => {
       plan: planInfo,
       planId: sub.planId,
       status: sub.status,
+      extraSeats: sub.purchasedExtraSeats || 0,
       pendingPlanChange,
     });
   } catch (error) {
@@ -557,6 +548,113 @@ const getInvoices = async (req, res) => {
   }
 };
 
+// ─── UPDATE EXTRA SEATS ─────────────────────────────────────
+
+const updateExtraSeats = async (req, res) => {
+  try {
+    const { orgId, quantity } = req.body;
+
+    const org = await validateOrgOwner(req, res, orgId);
+    if (!org) return;
+
+    const qty = parseInt(quantity, 10);
+    if (isNaN(qty) || qty < 0) {
+      return res.status(400).json({ error: 'Quantity must be a non-negative integer' });
+    }
+
+    // Must have an active subscription
+    const sub = await Subscription.findOne({
+      organizationId: orgId,
+      status: { $in: ['active', 'trialing'] },
+      stripeSubscriptionId: { $exists: true, $ne: null },
+    });
+
+    if (!sub) {
+      return res.status(400).json({ error: 'No active subscription found' });
+    }
+
+    // Validate tier supports extra seats
+    const { config, tier } = await getOrgTierConfig(orgId);
+    if (!config || !config.extraSeatPrice || config.extraSeatPrice <= 0) {
+      return res.status(400).json({
+        error: `Extra seats are not available on the ${config?.displayName || tier} plan.`,
+      });
+    }
+
+    // Get the correct extra seat price ID for this plan's billing interval
+    const seatPriceId = EXTRA_SEAT_PRICES[sub.planId];
+    if (!seatPriceId) {
+      return res.status(400).json({
+        error: 'Extra seat pricing is not configured for this plan. Please contact support.',
+      });
+    }
+
+    // If reducing seats, ensure we don't go below currently occupied extra seats
+    if (qty < (sub.purchasedExtraSeats || 0)) {
+      const memberCount = await OrgMember.countDocuments({
+        organizationId: orgId,
+        locked: { $ne: true },
+      });
+      const totalSeats = memberCount + 1; // +1 for owner
+      const baseSeats = config.maxSeats || 0;
+      const occupiedExtraSeats = Math.max(0, totalSeats - baseSeats);
+
+      if (qty < occupiedExtraSeats) {
+        return res.status(400).json({
+          error: `Cannot reduce to ${qty} extra seat(s). You currently have ${occupiedExtraSeats} member(s) using extra seats. Remove members first.`,
+          occupiedExtraSeats,
+        });
+      }
+    }
+
+    // Apply changes to Stripe subscription.
+    // 'always_invoice' charges immediately when adding/increasing seats,
+    // preventing free usage if the card later declines.
+    // Removals use 'create_prorations' (credit applied to next invoice).
+    if (qty > 0 && !sub.stripeExtraSeatItemId) {
+      // Create new subscription item — charge immediately
+      const item = await stripe.subscriptionItems.create({
+        subscription: sub.stripeSubscriptionId,
+        price: seatPriceId,
+        quantity: qty,
+        proration_behavior: 'always_invoice',
+      });
+      sub.stripeExtraSeatItemId = item.id;
+    } else if (qty > 0 && sub.stripeExtraSeatItemId) {
+      // Update existing subscription item — charge immediately if increasing
+      await stripe.subscriptionItems.update(sub.stripeExtraSeatItemId, {
+        quantity: qty,
+        proration_behavior: qty > (sub.purchasedExtraSeats || 0) ? 'always_invoice' : 'create_prorations',
+      });
+    } else if (qty === 0 && sub.stripeExtraSeatItemId) {
+      // Remove subscription item — credit on next invoice
+      await stripe.subscriptionItems.del(sub.stripeExtraSeatItemId, {
+        proration_behavior: 'create_prorations',
+      });
+      sub.stripeExtraSeatItemId = null;
+    }
+
+    sub.purchasedExtraSeats = qty;
+    sub.extraSeatsUpdatedAt = new Date();
+    await sub.save();
+
+    clearTierCache();
+    applyLocksForOrg(orgId).catch((err) =>
+      console.error(`[downgradeService] extra seats lock error for org=${orgId}:`, err.message)
+    );
+
+    res.json({
+      extraSeats: qty,
+      effectiveMaxSeats: (config.maxSeats || 0) + qty,
+      pricePerSeat: config.extraSeatPrice,
+      monthlyCost: config.extraSeatPrice * qty,
+    });
+  } catch (error) {
+    console.error('Update extra seats error:', error);
+    res.status(500).json({ error: 'Failed to update extra seats' });
+  }
+};
+
 module.exports = {
   getSubscription,
   createCheckoutSession,
@@ -565,4 +663,5 @@ module.exports = {
   cancelSubscription,
   reactivateSubscription,
   getInvoices,
+  updateExtraSeats,
 };

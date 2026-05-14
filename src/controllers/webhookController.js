@@ -5,20 +5,9 @@ const Subscription = require('../models/Subscription');
 const { clearTierCache, getOrgTierConfig, getTierConfig } = require('../services/tierService');
 const { applyLocksForOrg } = require('../services/downgradeService');
 const creditService = require('../services/creditService');
+const { getPlanFromPriceId, EXTRA_SEAT_PRICE_SET } = require('../config/stripePrices');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-
-// Map Stripe price IDs to internal plan IDs
-const PRICE_TO_PLAN = {
-  [process.env.STRIPE_STANDARD_MONTHLY_PRICE_ID || 'price_1TCaMYPViW8Lznb8OykrDOqY']: 'standard-monthly',
-  [process.env.STRIPE_STANDARD_YEARLY_PRICE_ID || 'price_1TCaMYPViW8Lznb8SOYEOsk2']: 'standard-yearly',
-  [process.env.STRIPE_PRO_MONTHLY_PRICE_ID || 'price_1TCaUDPViW8Lznb8599QuBfr']: 'pro-monthly',
-  [process.env.STRIPE_PRO_YEARLY_PRICE_ID || 'price_1TCaUDPViW8Lznb86MXvgr4Z']: 'pro-yearly',
-};
-
-function getPlanFromPriceId(priceId) {
-  return PRICE_TO_PLAN[priceId] || null;
-}
 
 // Convert Stripe Unix timestamps (seconds) to Date objects
 function parseStripeDate(ts) {
@@ -257,6 +246,27 @@ async function handleSubscriptionUpdated(stripeSub) {
     }
   }
 
+  // Sync extra seats from Stripe subscription items.
+  // Skip if a direct update via updateExtraSeats happened within the last 30s
+  // to prevent stale webhook events from overwriting the correct value.
+  const recentDirectUpdate =
+    sub.extraSeatsUpdatedAt && Date.now() - new Date(sub.extraSeatsUpdatedAt).getTime() < 30_000;
+
+  if (!recentDirectUpdate) {
+    const seatItem = stripeSub.items.data.find((item) => {
+      const pid = item.price?.id;
+      return pid && EXTRA_SEAT_PRICE_SET.has(pid);
+    });
+    if (seatItem) {
+      sub.purchasedExtraSeats = seatItem.quantity || 0;
+      sub.stripeExtraSeatItemId = seatItem.id;
+    } else if (sub.purchasedExtraSeats > 0) {
+      // Extra seat item was removed externally (e.g. from Stripe Dashboard)
+      sub.purchasedExtraSeats = 0;
+      sub.stripeExtraSeatItemId = null;
+    }
+  }
+
   await sub.save();
   clearTierCache();
   // Re-evaluate resource locks for the new tier (locks on downgrade, unlocks on upgrade)
@@ -305,6 +315,8 @@ async function handleSubscriptionDeleted(stripeSub) {
 
   sub.status = 'canceled';
   sub.canceledAt = sub.canceledAt || new Date();
+  sub.purchasedExtraSeats = 0;
+  sub.stripeExtraSeatItemId = null;
   await sub.save();
 
   clearTierCache();

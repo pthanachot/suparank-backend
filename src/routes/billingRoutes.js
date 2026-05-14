@@ -14,5 +14,6 @@ router.post('/revoke-schedule', rf('billing'), billingController.revokeScheduled
 router.post('/cancel', rf('billing'), billingController.cancelSubscription);
 router.post('/reactivate', rf('billing'), billingController.reactivateSubscription);
 router.get('/invoices', rf('billing'), billingController.getInvoices);
+router.post('/extra-seats', rf('billing'), billingController.updateExtraSeats);
 
 module.exports = router;

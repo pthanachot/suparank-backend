@@ -259,7 +259,14 @@ async function main() {
 
   // ── 7. AI Tracker + Prompts (5 prompts: 2 free + 3 locked paid) ──
   console.log('\n=== 7. AI Tracker + Prompts ===');
-  await aiTrackers.deleteMany({ workspaceId: wsIds[0], domain: 'downgrade-test.com' });
+  // Clean ALL trackers with this domain (including orphaned ones from previous script runs)
+  const orphanedTrackers = await aiTrackers.find({ domain: 'downgrade-test.com' }).toArray();
+  if (orphanedTrackers.length > 0) {
+    const orphanedIds = orphanedTrackers.map(t => t._id);
+    await aiPrompts.deleteMany({ trackerId: { $in: orphanedIds } });
+    await aiTrackers.deleteMany({ _id: { $in: orphanedIds } });
+    console.log(`  Cleaned ${orphanedTrackers.length} old tracker(s) + their prompts`);
+  }
 
   const trackerResult = await aiTrackers.insertOne({
     workspaceId: wsIds[0],

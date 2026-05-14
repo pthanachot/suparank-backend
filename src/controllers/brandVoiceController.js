@@ -1,34 +1,16 @@
-const Workspace = require('../models/Workspace');
 const BrandVoice = require('../models/BrandVoice');
 const Avatar = require('../models/Avatar');
 const BrandVoiceTestLog = require('../models/BrandVoiceTestLog');
+const Workspace = require('../models/Workspace');
 const { generateBrandVoiceMarkdown, generateAvatarMarkdown } = require('../services/brandVoiceMarkdown');
 const { parseFile } = require('../services/fileParser');
 const { uploadBuffer, uploadImage, deleteObject, deleteAllWithPrefix } = require('../services/imageStorage');
 const writingEngine = require('../services/writingEngine');
 const crypto = require('crypto');
+const tierService = require('../services/tierService');
+const creditService = require('../services/creditService');
 
-/* ── Shared: resolve workspace ─────────────────────────────────────────── */
-
-async function resolveWorkspace(req, res) {
-  const { workspaceNumber } = req.params;
-  if (!workspaceNumber || isNaN(Number(workspaceNumber))) {
-    res.status(400).json({ error: 'Invalid workspace number' });
-    return null;
-  }
-  const workspace = await Workspace.findOne({
-    workspaceNumber: Number(workspaceNumber),
-    $or: [
-      { userId: req.user.userId },
-      { 'members.userId': req.user.userId },
-    ],
-  });
-  if (!workspace) {
-    res.status(404).json({ error: 'Workspace not found' });
-    return null;
-  }
-  return workspace;
-}
+// Workspace resolved by permissions middleware (req.workspace).
 
 /* ── Rate limit helpers ───────────────────────────────────────────────── */
 
@@ -324,26 +306,39 @@ const DEFAULT_SETTINGS = {
   avoidWords: [],
 };
 
-/* ── 1. GET Brand Voice ────────────────────────────────────────────────── */
+/* ── 1. GET Brand Voice (active one) ──────────────────────────────────── */
 
 const getBrandVoice = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
-    const settings = DEFAULT_SETTINGS;
-    const content = generateBrandVoiceMarkdown(settings);
-    const b2Key = `brand-voice/${workspace._id}/brand_voice.md`;
+    // Find the active brand voice, or auto-create the first one
+    let brandVoice = await BrandVoice.findOne({ workspace: workspace._id, active: true }).lean();
 
-    // Atomic upsert — auto-creates on first visit, no race condition
-    const brandVoice = await BrandVoice.findOneAndUpdate(
-      { workspace: workspace._id },
-      { $setOnInsert: { createdBy: req.user.userId, settings, content, b2Key, filename: 'brand_voice.md' } },
-      { upsert: true, new: true, lean: true }
-    );
+    if (!brandVoice) {
+      // Check if any brand voice exists (maybe all inactive / locked)
+      brandVoice = await BrandVoice.findOne({ workspace: workspace._id }).lean();
+    }
 
-    // Fire-and-forget B2 upload (idempotent PUT to same key)
-    if (!brandVoice.content || brandVoice.content === content) {
+    if (!brandVoice) {
+      // First visit — create default brand voice
+      const settings = DEFAULT_SETTINGS;
+      const content = generateBrandVoiceMarkdown(settings);
+      const b2Key = `brand-voice/${workspace._id}/brand_voice.md`;
+
+      brandVoice = await BrandVoice.create({
+        workspace: workspace._id,
+        createdBy: req.user.userId,
+        name: 'Default',
+        active: true,
+        settings,
+        content,
+        b2Key,
+        filename: 'brand_voice.md',
+      });
+      brandVoice = brandVoice.toObject();
+
+      // Fire-and-forget B2 upload
       uploadBuffer(Buffer.from(content, 'utf-8'), 'text/markdown', b2Key).catch(() => {});
     }
 
@@ -354,37 +349,44 @@ const getBrandVoice = async (req, res) => {
   }
 };
 
-/* ── 2. PUT (upsert) Brand Voice ───────────────────────────────────────── */
+/* ── 2. PUT Brand Voice (update by ID or active) ─────────────────────── */
 
 const saveBrandVoice = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
-    const { settings } = req.body;
+    const { settings, name } = req.body;
     if (!settings) {
       return res.status(400).json({ error: 'settings is required' });
     }
 
     const content = generateBrandVoiceMarkdown(settings);
 
+    // Find target brand voice: by brandVoiceId param, or active one
+    const brandVoiceId = req.params.brandVoiceId;
+    const filter = brandVoiceId
+      ? { _id: brandVoiceId, workspace: workspace._id }
+      : { workspace: workspace._id, active: true };
+
+    const updateFields = { settings, content, filename: 'brand_voice.md' };
+    if (name) updateFields.name = name;
+
+    const brandVoice = await BrandVoice.findOne(filter);
+    if (!brandVoice) {
+      return res.status(404).json({ error: 'Brand voice not found' });
+    }
+
     // Upload brand_voice.md to B2
-    const b2Key = `brand-voice/${workspace._id}/brand_voice.md`;
+    const b2Key = `brand-voice/${workspace._id}/bv-${brandVoice._id}.md`;
     const t0 = Date.now();
     await uploadBuffer(Buffer.from(content, 'utf-8'), 'text/markdown', b2Key);
     console.log(`[saveBrandVoice] B2 upload took ${Date.now() - t0}ms`);
 
-    const t1 = Date.now();
-    const brandVoice = await BrandVoice.findOneAndUpdate(
-      { workspace: workspace._id },
-      {
-        $set: { settings, content, b2Key, filename: 'brand_voice.md' },
-        $setOnInsert: { createdBy: req.user.userId, workspace: workspace._id },
-      },
-      { upsert: true, new: true, runValidators: true }
-    );
+    updateFields.b2Key = b2Key;
+    Object.assign(brandVoice, updateFields);
+    await brandVoice.save();
 
-    console.log(`[saveBrandVoice] DB save took ${Date.now() - t1}ms, total=${Date.now() - t0}ms`);
+    console.log(`[saveBrandVoice] DB save took ${Date.now() - t0}ms`);
     res.json({ brandVoice });
   } catch (err) {
     console.error('saveBrandVoice error:', err.message);
@@ -396,8 +398,7 @@ const saveBrandVoice = async (req, res) => {
 
 const testBrandVoice = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const input = (req.body.input || '').trim();
     if (!input) {
@@ -407,10 +408,10 @@ const testBrandVoice = async (req, res) => {
       return res.status(400).json({ error: `Input must be ${MAX_TEST_WORDS} words or less` });
     }
 
-    // Parallelize rate limit check + brand voice fetch
+    // Parallelize rate limit check + brand voice fetch (active voice)
     const [rateCheck, brandVoice] = await Promise.all([
       checkTestRateLimit(req.user.userId),
-      BrandVoice.findOne({ workspace: workspace._id }),
+      BrandVoice.findOne({ workspace: workspace._id, active: true }),
     ]);
 
     if (!rateCheck.allowed) {
@@ -422,6 +423,21 @@ const testBrandVoice = async (req, res) => {
 
     if (!brandVoice || !brandVoice.content) {
       return res.status(400).json({ error: 'Save your brand voice settings first' });
+    }
+
+    // Deduct credits (fixed cost: 3 credits for ~150 words)
+    if (req.creditContext?.deductionEnabled) {
+      try {
+        await creditService.preDeduct(
+          req.creditContext.orgId, req.user.userId, 3,
+          req.creditContext.featureKey, { feature: 'brandVoiceTest' }
+        );
+      } catch (creditErr) {
+        return res.status(402).json({
+          error: creditErr.message,
+          code: 'INSUFFICIENT_CREDITS',
+        });
+      }
     }
 
     await recordTestUsage(req.user.userId);
@@ -438,8 +454,7 @@ const testBrandVoice = async (req, res) => {
 
 const listAvatars = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const avatars = await Avatar.find({ workspace: workspace._id })
       .sort({ createdAt: -1 })
@@ -455,14 +470,29 @@ const listAvatars = async (req, res) => {
 
 const createAvatar = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { name, emoji, role, experience, tagline, traits, writingQuirks,
             toneOverrides, vocabulary, openingStyle, sample } = req.body;
 
     if (!name || typeof name !== 'string') {
       return res.status(400).json({ error: 'name is required' });
+    }
+
+    // Check avatar count against tier limit (per workspace)
+    const orgId = workspace.organizationId;
+    if (orgId) {
+      const { config, tier } = await tierService.getOrgTierConfig(orgId);
+      if (config?.maxAvatars != null) {
+        const avatarCount = await Avatar.countDocuments({ workspace: workspace._id, locked: { $ne: true } });
+        if (avatarCount >= config.maxAvatars) {
+          return res.status(429).json({
+            error: `Your ${tier} plan allows ${config.maxAvatars} avatar(s) per workspace`,
+            code: 'QUOTA_EXCEEDED',
+            quota: { limit: config.maxAvatars, used: avatarCount, tier, limitKey: 'maxAvatars' },
+          });
+        }
+      }
     }
 
     const avatarData = {
@@ -495,8 +525,7 @@ const createAvatar = async (req, res) => {
 
 const getAvatar = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId } = req.params;
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
@@ -515,8 +544,7 @@ const getAvatar = async (req, res) => {
 
 const updateAvatar = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId } = req.params;
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
@@ -563,7 +591,7 @@ const updateAvatar = async (req, res) => {
 
     // Fire-and-forget: generate preview texts in the background
     if (!rateLimited) {
-      const brandVoice = await BrandVoice.findOne({ workspace: workspace._id }).lean();
+      const brandVoice = await BrandVoice.findOne({ workspace: workspace._id, active: true }).lean();
       const result = await generateAvatarPreviews(avatar, brandVoice);
       await avatar.save();
       console.log(`[brand-voice] Background generation finished: ${result}`);
@@ -578,8 +606,7 @@ const updateAvatar = async (req, res) => {
 
 const deleteAvatar = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId } = req.params;
     const avatar = await Avatar.findOneAndDelete({ _id: avatarId, workspace: workspace._id });
@@ -607,8 +634,7 @@ const deleteAvatar = async (req, res) => {
 
 const toggleAvatar = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId } = req.params;
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
@@ -629,8 +655,7 @@ const toggleAvatar = async (req, res) => {
 
 const testAvatar = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId } = req.params;
     const input = (req.body.input || '').trim();
@@ -649,10 +674,10 @@ const testAvatar = async (req, res) => {
       });
     }
 
-    // Parallelize DB lookups
+    // Parallelize DB lookups (use active brand voice)
     const [avatar, brandVoice] = await Promise.all([
       Avatar.findOne({ _id: avatarId, workspace: workspace._id }).lean(),
-      BrandVoice.findOne({ workspace: workspace._id }).lean(),
+      BrandVoice.findOne({ workspace: workspace._id, active: true }).lean(),
     ]);
     if (!avatar || !avatar.content) {
       return res.status(400).json({ error: 'Save your avatar settings first' });
@@ -662,6 +687,21 @@ const testAvatar = async (req, res) => {
     const combinedContent = brandVoice?.content
       ? brandVoice.content + '\n\n---\n\n' + avatar.content
       : avatar.content;
+
+    // Deduct credits (fixed cost: 3 credits for ~150 words)
+    if (req.creditContext?.deductionEnabled) {
+      try {
+        await creditService.preDeduct(
+          req.creditContext.orgId, req.user.userId, 3,
+          req.creditContext.featureKey, { feature: 'avatarTest', avatarId }
+        );
+      } catch (creditErr) {
+        return res.status(402).json({
+          error: creditErr.message,
+          code: 'INSUFFICIENT_CREDITS',
+        });
+      }
+    }
 
     await recordTestUsage(req.user.userId);
     await streamRewriteResponse(req, res, combinedContent, input);
@@ -677,8 +717,7 @@ const testAvatar = async (req, res) => {
 
 const uploadAvatarFile = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId } = req.params;
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
@@ -798,8 +837,7 @@ Provide a concise style summary (max 200 words) that can be used to replicate th
 
 const deleteAvatarUpload = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId, uploadId } = req.params;
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
@@ -851,8 +889,7 @@ const getTestRateLimit = async (req, res) => {
 
 const uploadAvatarImage = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId } = req.params;
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
@@ -890,8 +927,7 @@ const uploadAvatarImage = async (req, res) => {
 
 const deleteAvatarImage = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId } = req.params;
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
@@ -920,8 +956,7 @@ const GOOGLE_DOC_REGEX = /docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]+)/;
 
 const importGoogleDoc = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { avatarId } = req.params;
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
@@ -1061,10 +1096,165 @@ Provide a concise style summary (max 200 words) that can be used to replicate th
   }
 };
 
+/* ── Brand Voice CRUD (multiple voices per workspace) ─────────────────── */
+
+const listBrandVoices = async (req, res) => {
+  try {
+    const workspace = req.workspace;
+    const voices = await BrandVoice.find({ workspace: workspace._id })
+      .sort({ createdAt: 1 })
+      .lean();
+
+    // Auto-create default if none exist
+    if (voices.length === 0) {
+      const settings = DEFAULT_SETTINGS;
+      const content = generateBrandVoiceMarkdown(settings);
+      const b2Key = `brand-voice/${workspace._id}/brand_voice.md`;
+      const created = await BrandVoice.create({
+        workspace: workspace._id,
+        createdBy: req.user.userId,
+        name: 'Default',
+        active: true,
+        settings,
+        content,
+        b2Key,
+        filename: 'brand_voice.md',
+      });
+      uploadBuffer(Buffer.from(content, 'utf-8'), 'text/markdown', b2Key).catch(() => {});
+      return res.json({ voices: [created.toObject()] });
+    }
+
+    res.json({ voices });
+  } catch (err) {
+    console.error('listBrandVoices error:', err.message);
+    res.status(500).json({ error: 'Failed to list brand voices' });
+  }
+};
+
+const createBrandVoice = async (req, res) => {
+  try {
+    const workspace = req.workspace;
+    const { name } = req.body;
+
+    if (!name || typeof name !== 'string') {
+      return res.status(400).json({ error: 'name is required' });
+    }
+
+    // Check brand voice count against tier limit (per workspace)
+    const orgId = workspace.organizationId;
+    if (orgId) {
+      const { config, tier } = await tierService.getOrgTierConfig(orgId);
+      if (config?.maxBrandVoices != null) {
+        const count = await BrandVoice.countDocuments({ workspace: workspace._id, locked: { $ne: true } });
+        if (count >= config.maxBrandVoices) {
+          return res.status(429).json({
+            error: `Your ${tier} plan allows ${config.maxBrandVoices} brand voice(s) per workspace`,
+            code: 'QUOTA_EXCEEDED',
+            quota: { limit: config.maxBrandVoices, used: count, tier, limitKey: 'maxBrandVoices' },
+          });
+        }
+      }
+    }
+
+    const settings = DEFAULT_SETTINGS;
+    const content = generateBrandVoiceMarkdown(settings);
+
+    const brandVoice = await BrandVoice.create({
+      workspace: workspace._id,
+      createdBy: req.user.userId,
+      name: name.trim(),
+      active: false, // new voices start inactive
+      settings,
+      content,
+      filename: 'brand_voice.md',
+    });
+
+    // Upload to B2
+    const b2Key = `brand-voice/${workspace._id}/bv-${brandVoice._id}.md`;
+    await uploadBuffer(Buffer.from(content, 'utf-8'), 'text/markdown', b2Key);
+    brandVoice.b2Key = b2Key;
+    await brandVoice.save();
+
+    res.status(201).json({ brandVoice });
+  } catch (err) {
+    console.error('createBrandVoice error:', err.message);
+    res.status(500).json({ error: 'Failed to create brand voice' });
+  }
+};
+
+const deleteBrandVoice = async (req, res) => {
+  try {
+    const workspace = req.workspace;
+    const { brandVoiceId } = req.params;
+
+    const bv = await BrandVoice.findOne({ _id: brandVoiceId, workspace: workspace._id });
+    if (!bv) {
+      return res.status(404).json({ error: 'Brand voice not found' });
+    }
+
+    // Prevent deleting the last brand voice
+    const count = await BrandVoice.countDocuments({ workspace: workspace._id });
+    if (count <= 1) {
+      return res.status(400).json({ error: 'Cannot delete the last brand voice' });
+    }
+
+    const wasActive = bv.active;
+    await bv.deleteOne();
+
+    // Clean up B2
+    if (bv.b2Key) {
+      deleteObject(bv.b2Key).catch(() => {});
+    }
+
+    // If deleted voice was active, activate the oldest remaining
+    if (wasActive) {
+      await BrandVoice.findOneAndUpdate(
+        { workspace: workspace._id, locked: { $ne: true } },
+        { $set: { active: true } },
+        { sort: { createdAt: 1 } }
+      );
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('deleteBrandVoice error:', err.message);
+    res.status(500).json({ error: 'Failed to delete brand voice' });
+  }
+};
+
+const toggleBrandVoice = async (req, res) => {
+  try {
+    const workspace = req.workspace;
+    const { brandVoiceId } = req.params;
+
+    const bv = await BrandVoice.findOne({ _id: brandVoiceId, workspace: workspace._id });
+    if (!bv) {
+      return res.status(404).json({ error: 'Brand voice not found' });
+    }
+
+    // Deactivate all others in the workspace, activate this one
+    await BrandVoice.updateMany(
+      { workspace: workspace._id, _id: { $ne: bv._id } },
+      { $set: { active: false } }
+    );
+    bv.active = true;
+    await bv.save();
+
+    res.json({ brandVoice: bv });
+  } catch (err) {
+    console.error('toggleBrandVoice error:', err.message);
+    res.status(500).json({ error: 'Failed to toggle brand voice' });
+  }
+};
+
 module.exports = {
   getBrandVoice,
   saveBrandVoice,
   testBrandVoice,
+  listBrandVoices,
+  createBrandVoice,
+  deleteBrandVoice,
+  toggleBrandVoice,
   listAvatars,
   getAvatar,
   createAvatar,

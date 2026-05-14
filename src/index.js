@@ -9,14 +9,16 @@ const cookieParser = require('cookie-parser');
 dotenv.config();
 
 const { connectDB, checkConnectionHealth } = require('./config/database');
+const { syncConfig } = require('./scripts/configSync');
 
 const app = express();
 
 // Trust proxy for production
 app.set('trust proxy', 1);
 
-// Connect to MongoDB
+// Connect to MongoDB, then sync config from seed files
 connectDB()
+  .then(() => syncConfig())
   .then(() => console.log('Database ready'))
   .catch((error) => {
     console.error('Failed to connect to database:', error.message);
@@ -64,6 +66,8 @@ const aiTrackerRoutes = require('./routes/aiTrackerRoutes');
 const keywordRoutes = require('./routes/keywordRoutes');
 const imageRoutes = require('./routes/imageRoutes');
 const brandVoiceRoutes = require('./routes/brandVoiceRoutes');
+const orgRoutes = require('./routes/orgRoutes');
+const organizationRoutes = require('./routes/organizationRoutes');
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/billing', billingRoutes);
@@ -73,6 +77,8 @@ app.use('/api/workspace', keywordRoutes);
 app.use('/api/workspace', brandVoiceRoutes);
 app.use('/api/workspace', workspaceRoutes);
 app.use('/api/workspaces', workspaceCrudRoutes);
+app.use('/api/org', orgRoutes);
+app.use('/api/organizations', organizationRoutes);
 
 // Dev-only routes (never in production, file may not exist)
 if (process.env.NODE_ENV !== 'production') {

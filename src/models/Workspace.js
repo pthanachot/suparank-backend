@@ -10,6 +10,13 @@ const workspaceSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    organizationId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Organization',
+      default: null,
+      index: true,
+      // Links workspace to an organization. null = personal (legacy, pre-migration).
+    },
     name: { type: String, trim: true, maxlength: 50, default: 'My Workspace' },
     color: { type: String, default: '#6366F1' },
     isDefault: { type: Boolean, default: false },
@@ -24,6 +31,9 @@ const workspaceSchema = new mongoose.Schema(
       default: [],
       validate: [arr => arr.length <= 3, 'Maximum 3 members allowed per workspace'],
     },
+
+    // Downgrade locking — locked workspaces are inaccessible until the org upgrades
+    locked: { type: Boolean, default: false },
   },
   { timestamps: true }
 );

@@ -1,20 +1,13 @@
 const Stripe = require('stripe');
 const User = require('../models/User');
+const Organization = require('../models/Organization');
 const Subscription = require('../models/Subscription');
+const { clearTierCache, getOrgTierConfig, getTierConfig } = require('../services/tierService');
+const { applyLocksForOrg } = require('../services/downgradeService');
+const creditService = require('../services/creditService');
+const { getPlanFromPriceId, EXTRA_SEAT_PRICE_SET } = require('../config/stripePrices');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-
-// Map Stripe price IDs to internal plan IDs
-const PRICE_TO_PLAN = {
-  [process.env.STRIPE_STANDARD_MONTHLY_PRICE_ID || 'price_1TCaMYPViW8Lznb8OykrDOqY']: 'standard-monthly',
-  [process.env.STRIPE_STANDARD_YEARLY_PRICE_ID || 'price_1TCaMYPViW8Lznb8SOYEOsk2']: 'standard-yearly',
-  [process.env.STRIPE_PRO_MONTHLY_PRICE_ID || 'price_1TCaUDPViW8Lznb8599QuBfr']: 'pro-monthly',
-  [process.env.STRIPE_PRO_YEARLY_PRICE_ID || 'price_1TCaUDPViW8Lznb86MXvgr4Z']: 'pro-yearly',
-};
-
-function getPlanFromPriceId(priceId) {
-  return PRICE_TO_PLAN[priceId] || null;
-}
 
 // Convert Stripe Unix timestamps (seconds) to Date objects
 function parseStripeDate(ts) {
@@ -74,17 +67,54 @@ const handleWebhook = async (req, res) => {
   }
 };
 
+// ─── HELPERS ─────────────────────────────────────────────────
+
+/**
+ * Resolve organizationId from session/subscription metadata.
+ * Handles both new (organizationId in metadata) and legacy (userId only) checkouts.
+ */
+async function resolveOrgId(metadata) {
+  // New flow: organizationId directly in metadata
+  if (metadata?.organizationId) {
+    return metadata.organizationId;
+  }
+
+  // Legacy fallback: find user's personal org
+  if (metadata?.userId) {
+    const personalOrg = await Organization.findOne({
+      ownerId: metadata.userId,
+      isPersonal: true,
+    }).lean();
+
+    if (personalOrg) {
+      console.warn(`Legacy checkout: resolved org from user's personal org. userId=${metadata.userId} orgId=${personalOrg._id}`);
+      return personalOrg._id.toString();
+    }
+  }
+
+  return null;
+}
+
 // ─── EVENT HANDLERS ───────────────────────────────────────────
 
 async function handleCheckoutCompleted(session) {
+  if (session.mode !== 'subscription') return;
+
+  const organizationId = await resolveOrgId(session.metadata);
   const userId = session.metadata?.userId;
-  if (!userId || session.mode !== 'subscription') return;
+
+  if (!organizationId) {
+    console.error('Checkout completed but could not resolve organizationId. metadata:', session.metadata);
+    return;
+  }
 
   const subscriptionId = session.subscription;
   const customerId = session.customer;
 
-  // Store stripeCustomerId on user
-  await User.findByIdAndUpdate(userId, { stripeCustomerId: customerId });
+  // Store stripeCustomerId on user (backward compat)
+  if (userId) {
+    await User.findByIdAndUpdate(userId, { stripeCustomerId: customerId });
+  }
 
   // Fetch full subscription from Stripe
   const stripeSub = await stripe.subscriptions.retrieve(subscriptionId, {
@@ -103,9 +133,10 @@ async function handleCheckoutCompleted(session) {
   const paymentMethod = stripeSub.default_payment_method;
 
   await Subscription.findOneAndUpdate(
-    { userId },
+    { organizationId },
     {
-      userId,
+      organizationId,
+      userId: userId || undefined,
       stripeCustomerId: customerId,
       stripeSubscriptionId: subscriptionId,
       planId,
@@ -125,7 +156,25 @@ async function handleCheckoutCompleted(session) {
     { upsert: true, new: true }
   );
 
-  console.log(`Checkout completed: user=${userId} plan=${planId}`);
+  clearTierCache();
+  // Re-evaluate resource locks for the new tier (unlocks on upgrade)
+  applyLocksForOrg(organizationId).catch((err) =>
+    console.error(`[downgradeService] checkout lock error for org=${organizationId}:`, err.message)
+  );
+
+  // Grant subscription credits for new plan
+  try {
+    const { config } = await getOrgTierConfig(organizationId);
+    if (config?.creditsPerMonth) {
+      const periodEnd = parseStripeDate(subItem?.current_period_end || stripeSub.current_period_end);
+      await creditService.grantSubscriptionCredits(organizationId, config.creditsPerMonth, periodEnd || null);
+      console.log(`[credits] Granted ${config.creditsPerMonth} credits for org=${organizationId}`);
+    }
+  } catch (err) {
+    console.error(`[credits] Failed to grant on checkout for org=${organizationId}:`, err.message);
+  }
+
+  console.log(`Checkout completed: org=${organizationId} plan=${planId}`);
 }
 
 async function handleSubscriptionUpdated(stripeSub) {
@@ -136,21 +185,31 @@ async function handleSubscriptionUpdated(stripeSub) {
   const priceId = stripeSub.items.data[0]?.price?.id;
   const planId = getPlanFromPriceId(priceId);
 
-  // If no local record, try to create one by looking up user via stripeCustomerId
+  // If no local record, try to create one by resolving org from subscription metadata
   if (!sub) {
-    const customerId = typeof stripeSub.customer === 'string' ? stripeSub.customer : stripeSub.customer?.id;
-    const user = await User.findOne({ stripeCustomerId: customerId });
-    if (!user || !planId) return;
-
-    sub = new Subscription({
-      userId: user._id,
-      stripeCustomerId: customerId,
-      stripeSubscriptionId: stripeSub.id,
-      planId,
-      status: stripeSub.status,
-    });
-    console.log(`Creating missing subscription record: user=${user._id} sub=${stripeSub.id}`);
+    const organizationId = await resolveOrgId(stripeSub.metadata);
+    if (organizationId && planId) {
+      sub = new Subscription({
+        organizationId,
+        stripeCustomerId: typeof stripeSub.customer === 'string' ? stripeSub.customer : stripeSub.customer?.id,
+        stripeSubscriptionId: stripeSub.id,
+        planId,
+        status: stripeSub.status,
+      });
+      console.log(`Creating missing subscription record: org=${organizationId} sub=${stripeSub.id}`);
+    } else {
+      // Fallback: try finding via stripeCustomerId on existing subscription records
+      const customerId = typeof stripeSub.customer === 'string' ? stripeSub.customer : stripeSub.customer?.id;
+      const existingSub = await Subscription.findOne({ stripeCustomerId: customerId });
+      if (!existingSub || !planId) return;
+      sub = existingSub;
+      console.log(`Matched subscription via stripeCustomerId: org=${sub.organizationId} sub=${stripeSub.id}`);
+    }
   }
+
+  // Detect plan change for credit pro-rating
+  const oldPlanId = sub.planId;
+  const isPlanChange = planId && oldPlanId && planId !== oldPlanId;
 
   if (planId) sub.planId = planId;
 
@@ -187,7 +246,64 @@ async function handleSubscriptionUpdated(stripeSub) {
     }
   }
 
+  // Sync extra seats from Stripe subscription items.
+  // Skip if a direct update via updateExtraSeats happened within the last 30s
+  // to prevent stale webhook events from overwriting the correct value.
+  const recentDirectUpdate =
+    sub.extraSeatsUpdatedAt && Date.now() - new Date(sub.extraSeatsUpdatedAt).getTime() < 30_000;
+
+  if (!recentDirectUpdate) {
+    const seatItem = stripeSub.items.data.find((item) => {
+      const pid = item.price?.id;
+      return pid && EXTRA_SEAT_PRICE_SET.has(pid);
+    });
+    if (seatItem) {
+      sub.purchasedExtraSeats = seatItem.quantity || 0;
+      sub.stripeExtraSeatItemId = seatItem.id;
+    } else if (sub.purchasedExtraSeats > 0) {
+      // Extra seat item was removed externally (e.g. from Stripe Dashboard)
+      sub.purchasedExtraSeats = 0;
+      sub.stripeExtraSeatItemId = null;
+    }
+  }
+
   await sub.save();
+  clearTierCache();
+  // Re-evaluate resource locks for the new tier (locks on downgrade, unlocks on upgrade)
+  if (sub.organizationId) {
+    applyLocksForOrg(sub.organizationId).catch((err) =>
+      console.error(`[downgradeService] subscription update lock error for org=${sub.organizationId}:`, err.message)
+    );
+  }
+
+  // Handle credit pro-rating on plan change
+  if (isPlanChange && sub.organizationId) {
+    try {
+      await creditService.expireSubscriptionCredits(sub.organizationId);
+
+      const newTier = planId.split('-')[0] === 'pro' ? 'professional' : planId.split('-')[0];
+      const newConfig = await getTierConfig(newTier);
+
+      if (newConfig?.creditsPerMonth) {
+        const periodEnd = parseStripeDate(subItem?.current_period_end || stripeSub.current_period_end);
+        const periodStart = parseStripeDate(subItem?.current_period_start || stripeSub.current_period_start);
+
+        if (periodEnd && periodStart) {
+          const totalDays = Math.max(1, (periodEnd - periodStart) / (1000 * 60 * 60 * 24));
+          const daysRemaining = Math.max(0, (periodEnd - Date.now()) / (1000 * 60 * 60 * 24));
+          const proRatedCredits = Math.ceil(newConfig.creditsPerMonth * (daysRemaining / totalDays));
+          await creditService.grantSubscriptionCredits(sub.organizationId, proRatedCredits, periodEnd);
+          console.log(`[credits] Plan change: granted ${proRatedCredits} pro-rated credits for org=${sub.organizationId}`);
+        } else {
+          await creditService.grantSubscriptionCredits(sub.organizationId, newConfig.creditsPerMonth, periodEnd || null);
+          console.log(`[credits] Plan change: granted ${newConfig.creditsPerMonth} full credits for org=${sub.organizationId}`);
+        }
+      }
+    } catch (err) {
+      console.error(`[credits] Plan change credit error for org=${sub.organizationId}:`, err.message);
+    }
+  }
+
   console.log(`Subscription updated: sub=${stripeSub.id} status=${stripeSub.status}`);
 }
 
@@ -199,7 +315,23 @@ async function handleSubscriptionDeleted(stripeSub) {
 
   sub.status = 'canceled';
   sub.canceledAt = sub.canceledAt || new Date();
+  sub.purchasedExtraSeats = 0;
+  sub.stripeExtraSeatItemId = null;
   await sub.save();
+
+  clearTierCache();
+  // Lock excess resources — org falls back to free tier
+  applyLocksForOrg(sub.organizationId).catch((err) =>
+    console.error(`[downgradeService] subscription delete lock error for org=${sub.organizationId}:`, err.message)
+  );
+
+  // Expire remaining subscription credits
+  try {
+    await creditService.expireSubscriptionCredits(sub.organizationId);
+    console.log(`[credits] Expired credits for canceled org=${sub.organizationId}`);
+  } catch (err) {
+    console.error(`[credits] Failed to expire on cancel for org=${sub.organizationId}:`, err.message);
+  }
 
   console.log(`Subscription deleted: sub=${stripeSub.id}`);
 }
@@ -228,6 +360,21 @@ async function handlePaymentSucceeded(invoice) {
     date: parseStripeDate(invoice.created),
   });
   await sub.save();
+
+  // Grant credits on subscription renewal (not initial checkout)
+  if (invoice.billing_reason === 'subscription_cycle') {
+    try {
+      const { config } = await getOrgTierConfig(sub.organizationId);
+      if (config?.creditsPerMonth) {
+        await creditService.expireSubscriptionCredits(sub.organizationId);
+        const newPeriodEnd = parseStripeDate(invoice.lines?.data?.[0]?.period?.end);
+        await creditService.grantSubscriptionCredits(sub.organizationId, config.creditsPerMonth, newPeriodEnd || null);
+        console.log(`[credits] Renewed ${config.creditsPerMonth} credits for org=${sub.organizationId}`);
+      }
+    } catch (err) {
+      console.error(`[credits] Failed to renew credits for org=${sub.organizationId}:`, err.message);
+    }
+  }
 
   console.log(`Invoice saved: ${invoice.id} for sub=${invoice.subscription}`);
 }
@@ -259,6 +406,7 @@ async function handlePaymentFailed(invoice) {
   }
 
   await sub.save();
+  clearTierCache();
 
   console.log(`Payment failed: sub=${invoice.subscription}`);
 }

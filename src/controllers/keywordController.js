@@ -1,26 +1,10 @@
-const Workspace = require('../models/Workspace');
 const KeywordSearch = require('../models/KeywordSearch');
 const KeywordDetail = require('../models/KeywordDetail');
 const KeywordResearchHistory = require('../models/KeywordResearchHistory');
 const { resolveCountry, fetchRelatedKeywords, fetchSerpResults, SUPPORTED_COUNTRIES } = require('../services/keywordService');
+const UsageTracker = require('../models/UsageTracker');
 
-// ─── Workspace Resolution (same pattern as aiTrackerController.js) ──────────
-
-async function resolveWorkspace(req, res) {
-  const { workspaceNumber } = req.params;
-  const workspace = await Workspace.findOne({
-    workspaceNumber: Number(workspaceNumber),
-    $or: [
-      { userId: req.user.userId },
-      { 'members.userId': req.user.userId },
-    ],
-  });
-  if (!workspace) {
-    res.status(404).json({ error: 'Workspace not found' });
-    return null;
-  }
-  return workspace;
-}
+// Workspace resolved by permissions middleware (req.workspace).
 
 // ─── Cache TTL (24 hours) ───────────────────────────────────────────────────
 
@@ -33,8 +17,7 @@ const CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 
 async function searchKeywords(req, res) {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { keyword, country } = req.body;
     if (!keyword || typeof keyword !== 'string' || !keyword.trim()) {
@@ -44,6 +27,11 @@ async function searchKeywords(req, res) {
     const seedKeyword = keyword.trim().toLowerCase();
     const countryConfig = resolveCountry(country || 'United States');
     const countryCode = countryConfig.gl.toUpperCase();
+
+    // Track keyword search against tier quota
+    if (req.tierQuota) {
+      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+    }
 
     // Check cache (global — not workspace-scoped)
     const cached = await KeywordSearch.findOne({
@@ -112,8 +100,7 @@ async function searchKeywords(req, res) {
 
 async function getKeywordDetail(req, res) {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { kw, country } = req.query;
     if (!kw || typeof kw !== 'string' || !kw.trim()) {
@@ -123,6 +110,11 @@ async function getKeywordDetail(req, res) {
     const keyword = kw.trim().toLowerCase();
     const countryConfig = resolveCountry(country || 'United States');
     const countryCode = countryConfig.gl.toUpperCase();
+
+    // Track keyword detail lookup against tier quota
+    if (req.tierQuota) {
+      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+    }
 
     // Check cache (global)
     const cached = await KeywordDetail.findOne({
@@ -170,8 +162,7 @@ async function getKeywordDetail(req, res) {
 
 async function getSearchHistory(req, res) {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const historyEntries = await KeywordResearchHistory.find({ workspaceId: workspace._id })
       .sort({ searchedAt: -1 })
@@ -211,8 +202,7 @@ async function getSearchHistory(req, res) {
 
 async function deleteSearchHistory(req, res) {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { historyId } = req.params;
 
@@ -240,10 +230,43 @@ function getCountries(req, res) {
   return res.json({ countries: SUPPORTED_COUNTRIES });
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// GET /:workspaceNumber/keywords/cached?kw=...&country=US
+// Returns cached results only (no DataForSEO call). For viewers loading history.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function getCachedResults(req, res) {
+  try {
+    const { kw, country } = req.query;
+    if (!kw || typeof kw !== 'string' || !kw.trim()) {
+      return res.status(400).json({ error: 'kw query parameter is required' });
+    }
+
+    const seedKeyword = kw.trim().toLowerCase();
+    const countryCode = (country || 'US').toUpperCase();
+
+    const cached = await KeywordSearch.findOne({ seedKeyword, country: countryCode });
+
+    if (!cached) {
+      return res.status(404).json({ error: 'No cached results found' });
+    }
+
+    return res.json({
+      seedMetrics: cached.seedMetrics,
+      relatedKeywords: cached.relatedKeywords,
+      totalCount: cached.totalCount,
+    });
+  } catch (err) {
+    console.error('[keywordController] getCachedResults error:', err.message);
+    return res.status(500).json({ error: err.message || 'Failed to get cached results' });
+  }
+}
+
 module.exports = {
   searchKeywords,
   getKeywordDetail,
   getSearchHistory,
   deleteSearchHistory,
   getCountries,
+  getCachedResults,
 };

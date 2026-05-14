@@ -251,6 +251,9 @@ const contentSchema = new mongoose.Schema(
     // Scheduling
     publishedAt: Date,
     scheduledAt: Date,
+
+    // Downgrade locking — locked resources are read-only until the org upgrades
+    locked: { type: Boolean, default: false },
   },
   { timestamps: true }
 );
@@ -296,7 +299,7 @@ contentSchema.statics.findSummariesByWorkspace = function (workspaceId, { status
   if (status) query.status = status;
   if (folder) query.folder = folder;
   return this.find(query)
-    .select('contentNumber title slug description targetKeywords country device score wordCount status folder platform contentType analysisStatus analyzedAt publishedAt scheduledAt createdAt updatedAt')
+    .select('contentNumber title slug description targetKeywords country device score wordCount status folder platform contentType analysisStatus analyzedAt publishedAt scheduledAt locked createdAt updatedAt')
     .sort({ updatedAt: -1 });
 };
 

@@ -2,17 +2,31 @@ const mongoose = require('mongoose');
 
 const subscriptionSchema = new mongoose.Schema(
   {
+    organizationId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Organization',
+      required: false, // Will become required after migration
+      index: true,
+      unique: true,
+      sparse: true, // Allow null during migration
+    },
     userId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
-      required: true,
-      unique: true,
+      required: false, // Kept as billing contact / creator — no longer the lookup key
     },
-    stripeCustomerId: { type: String, required: true },
-    stripeSubscriptionId: { type: String, required: true, unique: true },
+    stripeCustomerId: { type: String, default: null },
+    stripeSubscriptionId: { type: String, default: null },
     planId: {
       type: String,
-      enum: ['standard-monthly', 'standard-yearly', 'pro-monthly', 'pro-yearly'],
+      enum: [
+        'free',
+        'standard-monthly', 'standard-yearly',
+        'professional-monthly', 'professional-yearly',
+        'agency-monthly', 'agency-yearly',
+        // Legacy aliases — keep for existing subscribers
+        'pro-monthly', 'pro-yearly',
+      ],
       required: true,
     },
     status: {
@@ -24,6 +38,9 @@ const subscriptionSchema = new mongoose.Schema(
     currentPeriodEnd: Date,
     cancelAtPeriodEnd: { type: Boolean, default: false },
     canceledAt: Date,
+    purchasedExtraSeats: { type: Number, default: 0 },
+    stripeExtraSeatItemId: { type: String, default: null },
+    extraSeatsUpdatedAt: { type: Date, default: null },
     defaultPaymentMethod: {
       brand: String,
       last4: String,
@@ -48,5 +65,7 @@ const subscriptionSchema = new mongoose.Schema(
 );
 
 subscriptionSchema.index({ stripeCustomerId: 1 });
+subscriptionSchema.index({ stripeSubscriptionId: 1 }, { unique: true, sparse: true });
+subscriptionSchema.index({ organizationId: 1, status: 1 });
 
 module.exports = mongoose.model('Subscription', subscriptionSchema);

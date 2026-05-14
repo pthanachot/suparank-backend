@@ -1,31 +1,17 @@
-const Workspace = require('../models/Workspace');
 const Content = require('../models/Content');
 const { runAnalysis } = require('./analysisController');
 const imageStorage = require('../services/imageStorage');
+const UsageTracker = require('../models/UsageTracker');
+const creditService = require('../services/creditService');
 
-// Middleware-style: resolve workspace from :workspaceNumber param
-async function resolveWorkspace(req, res) {
-  const { workspaceNumber } = req.params;
-  const workspace = await Workspace.findOne({
-    workspaceNumber: Number(workspaceNumber),
-    $or: [
-      { userId: req.user.userId },
-      { 'members.userId': req.user.userId },
-    ],
-  });
-  if (!workspace) {
-    res.status(404).json({ error: 'Workspace not found' });
-    return null;
-  }
-  return workspace;
-}
+// Workspace is resolved by the permissions middleware (resolveWorkspaceWithRole)
+// and available as req.workspace.
 
 // ─── LIST CONTENTS (summaries) ─────────────────────────────────
 
 const listContents = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { status, folder } = req.query;
     const contents = await Content.findSummariesByWorkspace(workspace._id, { status, folder });
@@ -40,8 +26,7 @@ const listContents = async (req, res) => {
 
 const getContent = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const content = await Content.findByNumber(workspace._id, req.params.contentNumber);
     if (!content) {
@@ -69,8 +54,7 @@ const getContent = async (req, res) => {
 
 const createContent = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const contentNumber = await Content.getNextContentNumber();
     const { title, slug, description, blocks, targetKeywords, country, device, score, wordCount, status, folder, platform, versions } = req.body;
@@ -100,6 +84,11 @@ const createContent = async (req, res) => {
       runAnalysis(content._id);
     }
 
+    // Track article creation against tier quota
+    if (req.tierQuota) {
+      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+    }
+
     res.status(201).json({ content });
   } catch (err) {
     console.error('createContent error:', err.message);
@@ -111,8 +100,7 @@ const createContent = async (req, res) => {
 
 const updateContent = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const allowedFields = [
       'title', 'slug', 'description', 'blocks', 'targetKeywords',
@@ -170,8 +158,7 @@ const updateContent = async (req, res) => {
 
 const deleteContent = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const content = await Content.findOneAndDelete({
       workspaceId: workspace._id,
@@ -193,8 +180,7 @@ const User = require('../models/User');
 
 const addComment = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { blockId, selectedText, text } = req.body;
     if (!blockId || !text) return res.status(400).json({ error: 'blockId and text are required' });
@@ -228,8 +214,7 @@ const addComment = async (req, res) => {
 
 const updateComment = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const { commentId } = req.params;
     const update = {};
@@ -257,8 +242,7 @@ const updateComment = async (req, res) => {
 
 const deleteComment = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const content = await Content.findOneAndUpdate(
       { workspaceId: workspace._id, contentNumber: Number(req.params.contentNumber) },
@@ -587,6 +571,22 @@ async function streamAudit(req, res, { prompt, contentHash, contentId, dbField, 
     console.error(`[${dbField}] DB save error:`, e.message);
   }
 
+  // Deduct credits based on actual output word count
+  if (req.creditContext?.deductionEnabled) {
+    try {
+      const wordCount = fullContent.trim().split(/\s+/).filter(Boolean).length;
+      const credits = creditService.wordsToCredits(wordCount);
+      if (credits > 0) {
+        await creditService.preDeduct(
+          req.creditContext.orgId, req.user.userId, credits,
+          req.creditContext.featureKey, { contentId: contentId.toString(), wordCount, feature: req.creditContext.featureKey }
+        );
+      }
+    } catch (creditErr) {
+      console.error(`[${dbField}] credit deduction failed (non-fatal):`, creditErr.message);
+    }
+  }
+
   // Emit final complete event
   if (!clientDisconnected) {
     res.write(`data: ${JSON.stringify({ type: 'complete', audit: auditResult })}\n\n`);
@@ -596,8 +596,7 @@ async function streamAudit(req, res, { prompt, contentHash, contentId, dbField, 
 
 const runAudit = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const content = await Content.findOne({
       workspaceId: workspace._id,
@@ -617,6 +616,11 @@ const runAudit = async (req, res) => {
     const keyword = content.targetKeywords?.[0] || req.body.keyword || '';
     const blocksText = (content.blocks || []).map((b) => stripTags(b.text)).join(' ');
     const wordCount = blocksText.trim().split(/\s+/).filter(Boolean).length;
+
+    // Track audit usage (only for non-cached audits)
+    if (req.tierQuota) {
+      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+    }
 
     await streamAudit(req, res, {
       prompt: buildAuditPrompt(markdown, keyword, wordCount),
@@ -688,8 +692,7 @@ Return ONLY valid JSON (no markdown fences, no extra text) in this exact format:
 
 const runWritingQualityAudit = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const content = await Content.findOne({
       workspaceId: workspace._id,
@@ -708,6 +711,11 @@ const runWritingQualityAudit = async (req, res) => {
     const markdown = blocksToText(content.blocks);
     const blocksText = (content.blocks || []).map((b) => stripTags(b.text)).join(' ');
     const wordCount = blocksText.trim().split(/\s+/).filter(Boolean).length;
+
+    // Track audit usage (only for non-cached audits)
+    if (req.tierQuota) {
+      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+    }
 
     await streamAudit(req, res, {
       prompt: buildWritingQualityPrompt(markdown, wordCount),

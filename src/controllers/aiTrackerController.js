@@ -1,9 +1,12 @@
-const Workspace = require('../models/Workspace');
 const AiTracker = require('../models/AiTracker');
 const AiTrackerPrompt = require('../models/AiTrackerPrompt');
 const AiTrackerCompetitor = require('../models/AiTrackerCompetitor');
 const AiTrackerScan = require('../models/AiTrackerScan');
+const Workspace = require('../models/Workspace');
 const { runScan, PLATFORMS } = require('../services/aiTrackerScanEngine');
+const UsageTracker = require('../models/UsageTracker');
+const tierService = require('../services/tierService');
+const creditService = require('../services/creditService');
 
 // ─── Platform display config (returned in platformStats) ──────────────────
 
@@ -26,23 +29,7 @@ const PLATFORM_DISPLAY = [
   },
 ];
 
-// ─── Workspace Resolution (same pattern as contentController.js) ──────────
-
-async function resolveWorkspace(req, res) {
-  const { workspaceNumber } = req.params;
-  const workspace = await Workspace.findOne({
-    workspaceNumber: Number(workspaceNumber),
-    $or: [
-      { userId: req.user.userId },
-      { 'members.userId': req.user.userId },
-    ],
-  });
-  if (!workspace) {
-    res.status(404).json({ error: 'Workspace not found' });
-    return null;
-  }
-  return workspace;
-}
+// Workspace resolved by permissions middleware (req.workspace).
 
 // ─── Helper: resolve tracker from workspace (legacy single-monitor) ──────
 
@@ -505,16 +492,27 @@ async function executeScan(trackerId) {
       $set: { status: 'ready', completedAt: now, results, competitorResults },
     });
 
+    // Determine refresh interval from tier config (daily or weekly)
+    let intervalDays = 7; // default weekly
+    const ws = await Workspace.findById(tracker.workspaceId);
+    if (ws?.organizationId) {
+      const { config } = await tierService.getOrgTierConfig(ws.organizationId);
+      intervalDays = config?.aiTrackerRefreshInterval === 'daily' ? 1 : 7;
+    }
+
     // Update tracker to ready
+    const scannedPlatforms = tracker.defaultModels && tracker.defaultModels.length > 0
+      ? tracker.defaultModels
+      : PLATFORM_DISPLAY.map((p) => p.platformId);
     await AiTracker.findByIdAndUpdate(trackerId, {
       $set: {
         scanStatus: 'ready',
         scanProgress: 100,
         lastScanAt: now,
-        nextScanAt: new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000),
+        nextScanAt: new Date(now.getTime() + intervalDays * 24 * 60 * 60 * 1000),
         currentScanId: null,
-        platformStatuses: PLATFORM_DISPLAY.map((p) => ({
-          platformId: p.platformId,
+        platformStatuses: scannedPlatforms.map((pid) => ({
+          platformId: pid,
           status: 'completed',
         })),
       },
@@ -574,8 +572,7 @@ async function buildDashboardResponse(tracker) {
 
 const getTracker = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await AiTracker.findOne({ workspaceId: workspace._id });
     if (!tracker) {
@@ -593,8 +590,7 @@ const getTracker = async (req, res) => {
 
 const updateTracker = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
@@ -602,7 +598,24 @@ const updateTracker = async (req, res) => {
     const { defaultModels } = req.body;
 
     const update = {};
-    if (Array.isArray(defaultModels)) update.defaultModels = defaultModels;
+    if (Array.isArray(defaultModels)) {
+      // Validate against tier limit
+      const validPlatformIds = PLATFORM_DISPLAY.map((p) => p.platformId);
+      const filtered = defaultModels.filter((p) => validPlatformIds.includes(p));
+      const orgId = workspace.organizationId;
+      if (orgId) {
+        const { config, tier } = await tierService.getOrgTierConfig(orgId);
+        const maxPlatforms = config?.maxAiTrackerPlatforms ?? validPlatformIds.length;
+        if (filtered.length > maxPlatforms) {
+          return res.status(400).json({
+            error: `Your ${tier} plan allows up to ${maxPlatforms} AI platform${maxPlatforms !== 1 ? 's' : ''}`,
+            code: 'PLATFORM_LIMIT',
+            quota: { limit: maxPlatforms, requested: filtered.length, tier },
+          });
+        }
+      }
+      update.defaultModels = filtered;
+    }
 
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ error: 'No fields to update' });
@@ -633,11 +646,7 @@ const DEFAULT_SUGGESTIONS = [
 const suggestPrompts = async (req, res) => {
   console.log('[suggest-prompts] route hit, body:', JSON.stringify(req.body));
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) {
-      console.log('[suggest-prompts] workspace not found');
-      return;
-    }
+    const workspace = req.workspace;
     console.log('[suggest-prompts] workspace resolved:', workspace.workspaceNumber);
 
     const { domain } = req.body;
@@ -726,16 +735,69 @@ Make prompts realistic — what real users would ask AI assistants.`,
 
 const setup = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
-    const { domain, name, prompts, competitors } = req.body;
+    const { domain, name, prompts, competitors, platforms } = req.body;
 
     if (!domain || typeof domain !== 'string' || !domain.trim()) {
       return res.status(400).json({ error: 'Domain is required' });
     }
     if (!Array.isArray(prompts) || prompts.length === 0) {
       return res.status(400).json({ error: 'At least one prompt is required' });
+    }
+
+    // Validate platforms and monitor count against tier limits
+    const validPlatformIds = PLATFORM_DISPLAY.map((p) => p.platformId);
+    let selectedPlatforms = validPlatformIds; // default: all
+    const orgId = workspace.organizationId;
+    let tierConfig = null;
+    let tierName = 'free';
+    if (orgId) {
+      const { config, tier } = await tierService.getOrgTierConfig(orgId);
+      tierConfig = config;
+      tierName = tier;
+
+      // Check monitor count limit (per workspace, tier from org)
+      if (config?.maxAiTrackerMonitors != null) {
+        const monitorCount = await AiTracker.countDocuments({ workspaceId: workspace._id });
+        if (monitorCount >= config.maxAiTrackerMonitors) {
+          return res.status(429).json({
+            error: `Your ${tier} plan allows up to ${config.maxAiTrackerMonitors} AI Tracker monitor${config.maxAiTrackerMonitors !== 1 ? 's' : ''} per workspace`,
+            code: 'QUOTA_EXCEEDED',
+            quota: { limit: config.maxAiTrackerMonitors, used: monitorCount, tier, limitKey: 'maxAiTrackerMonitors' },
+          });
+        }
+      }
+
+      // Check prompt quota
+      const promptCount = prompts.filter((p) => typeof p === 'string' && p.trim()).length;
+      if (config?.maxAiTrackerPromptsPerMonth != null && promptCount > 0) {
+        const limitType = config.aiTrackerPromptLimitType || 'monthly';
+        const period = tierService.getPeriod(limitType);
+        const used = await UsageTracker.getCount(orgId, 'aiTrackerPromptsCreated', period);
+        if (used + promptCount > config.maxAiTrackerPromptsPerMonth) {
+          return res.status(429).json({
+            error: `Your ${tier} plan allows ${config.maxAiTrackerPromptsPerMonth} AI Tracker prompts (${used} used, ${promptCount} requested)`,
+            code: 'QUOTA_EXCEEDED',
+            quota: { limit: config.maxAiTrackerPromptsPerMonth, used, tier, limitKey: 'maxAiTrackerPromptsPerMonth' },
+          });
+        }
+      }
+
+      // Validate platform count
+      const maxPlatforms = config?.maxAiTrackerPlatforms ?? validPlatformIds.length;
+      if (Array.isArray(platforms) && platforms.length > 0) {
+        selectedPlatforms = platforms.filter((p) => validPlatformIds.includes(p));
+        if (selectedPlatforms.length > maxPlatforms) {
+          return res.status(400).json({
+            error: `Your ${tier} plan allows up to ${maxPlatforms} AI platform${maxPlatforms !== 1 ? 's' : ''}`,
+            code: 'PLATFORM_LIMIT',
+            quota: { limit: maxPlatforms, requested: selectedPlatforms.length, tier },
+          });
+        }
+      } else {
+        selectedPlatforms = validPlatformIds.slice(0, maxPlatforms);
+      }
     }
 
     const monitorName = (name && typeof name === 'string' && name.trim()) ? name.trim() : domain.trim();
@@ -753,6 +815,7 @@ const setup = async (req, res) => {
         workspaceId: workspace._id,
         name: monitorName,
         domain: domain.trim(),
+        defaultModels: selectedPlatforms,
         scanStatus: 'pending',
       });
     } catch (createErr) {
@@ -771,6 +834,13 @@ const setup = async (req, res) => {
         // Ignore duplicate key errors from compound unique index
         if (err.code !== 11000) throw err;
       });
+    }
+
+    // Increment prompt usage counter for the bulk insert
+    if (orgId && promptDocs.length > 0) {
+      const limitType = tierConfig?.aiTrackerPromptLimitType || 'monthly';
+      const period = tierService.getPeriod(limitType);
+      await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, promptDocs.length);
     }
 
     // Create own-brand competitor
@@ -811,8 +881,7 @@ const setup = async (req, res) => {
 
 const getScanStatus = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
@@ -833,8 +902,7 @@ const getScanStatus = async (req, res) => {
 
 const triggerScan = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
@@ -849,6 +917,21 @@ const triggerScan = async (req, res) => {
       const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
       if (tracker.lastScanAt > hourAgo) {
         return res.status(429).json({ error: 'Please wait at least 1 hour between scans' });
+      }
+    }
+
+    // Deduct credits (fixed cost: 5 credits per scan)
+    if (req.creditContext?.deductionEnabled) {
+      try {
+        await creditService.preDeduct(
+          req.creditContext.orgId, req.user.userId, 5,
+          req.creditContext.featureKey, { feature: 'aiTrackerScan', trackerId: tracker._id.toString() }
+        );
+      } catch (creditErr) {
+        return res.status(402).json({
+          error: creditErr.message,
+          code: 'INSUFFICIENT_CREDITS',
+        });
       }
     }
 
@@ -872,8 +955,7 @@ const triggerScan = async (req, res) => {
 
 const addPrompt = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
@@ -899,6 +981,11 @@ const addPrompt = async (req, res) => {
       ...(frequency ? { frequency } : {}),
     });
 
+    // Track prompt creation against tier quota
+    if (req.tierQuota) {
+      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+    }
+
     res.status(201).json({ id: doc._id.toString(), prompt: doc.prompt });
   } catch (err) {
     console.error('addPrompt error:', err.message);
@@ -910,8 +997,7 @@ const addPrompt = async (req, res) => {
 
 const removePrompt = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
@@ -937,8 +1023,7 @@ const removePrompt = async (req, res) => {
 
 const updatePrompt = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
@@ -982,8 +1067,7 @@ const updatePrompt = async (req, res) => {
 
 const bulkDeletePrompts = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
@@ -1009,8 +1093,7 @@ const bulkDeletePrompts = async (req, res) => {
 
 const addCompetitor = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
@@ -1037,8 +1120,7 @@ const addCompetitor = async (req, res) => {
 
 const removeCompetitor = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
@@ -1068,8 +1150,7 @@ const removeCompetitor = async (req, res) => {
 
 const listMonitors = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const trackers = await AiTracker.find({ workspaceId: workspace._id })
       .sort({ createdAt: 1 })
@@ -1099,16 +1180,69 @@ const listMonitors = async (req, res) => {
 
 const createMonitor = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
-    const { domain, name, prompts, competitors } = req.body;
+    const { domain, name, prompts, competitors, platforms } = req.body;
 
     if (!domain || typeof domain !== 'string' || !domain.trim()) {
       return res.status(400).json({ error: 'Domain is required' });
     }
     if (!Array.isArray(prompts) || prompts.length === 0) {
       return res.status(400).json({ error: 'At least one prompt is required' });
+    }
+
+    // Validate platforms, monitor count, and prompt quota against tier limits
+    const validPlatformIds = PLATFORM_DISPLAY.map((p) => p.platformId);
+    let selectedPlatforms = validPlatformIds; // default: all
+    const orgId = workspace.organizationId;
+    let tierConfig = null;
+    let tierName = 'free';
+    if (orgId) {
+      const { config, tier } = await tierService.getOrgTierConfig(orgId);
+      tierConfig = config;
+      tierName = tier;
+
+      // Check monitor count limit (per workspace, tier from org)
+      if (config?.maxAiTrackerMonitors != null) {
+        const monitorCount = await AiTracker.countDocuments({ workspaceId: workspace._id });
+        if (monitorCount >= config.maxAiTrackerMonitors) {
+          return res.status(429).json({
+            error: `Your ${tier} plan allows up to ${config.maxAiTrackerMonitors} AI Tracker monitor${config.maxAiTrackerMonitors !== 1 ? 's' : ''} per workspace`,
+            code: 'QUOTA_EXCEEDED',
+            quota: { limit: config.maxAiTrackerMonitors, used: monitorCount, tier, limitKey: 'maxAiTrackerMonitors' },
+          });
+        }
+      }
+
+      // Check prompt quota
+      const promptCount = prompts.filter((p) => typeof p === 'string' && p.trim()).length;
+      if (config?.maxAiTrackerPromptsPerMonth != null && promptCount > 0) {
+        const limitType = config.aiTrackerPromptLimitType || 'monthly';
+        const period = tierService.getPeriod(limitType);
+        const used = await UsageTracker.getCount(orgId, 'aiTrackerPromptsCreated', period);
+        if (used + promptCount > config.maxAiTrackerPromptsPerMonth) {
+          return res.status(429).json({
+            error: `Your ${tier} plan allows ${config.maxAiTrackerPromptsPerMonth} AI Tracker prompts (${used} used, ${promptCount} requested)`,
+            code: 'QUOTA_EXCEEDED',
+            quota: { limit: config.maxAiTrackerPromptsPerMonth, used, tier, limitKey: 'maxAiTrackerPromptsPerMonth' },
+          });
+        }
+      }
+
+      // Validate platform count
+      const maxPlatforms = config?.maxAiTrackerPlatforms ?? validPlatformIds.length;
+      if (Array.isArray(platforms) && platforms.length > 0) {
+        selectedPlatforms = platforms.filter((p) => validPlatformIds.includes(p));
+        if (selectedPlatforms.length > maxPlatforms) {
+          return res.status(400).json({
+            error: `Your ${tier} plan allows up to ${maxPlatforms} AI platform${maxPlatforms !== 1 ? 's' : ''}`,
+            code: 'PLATFORM_LIMIT',
+            quota: { limit: maxPlatforms, requested: selectedPlatforms.length, tier },
+          });
+        }
+      } else {
+        selectedPlatforms = validPlatformIds.slice(0, maxPlatforms);
+      }
     }
 
     const monitorName = (name && typeof name === 'string' && name.trim()) ? name.trim() : domain.trim();
@@ -1126,6 +1260,7 @@ const createMonitor = async (req, res) => {
         workspaceId: workspace._id,
         name: monitorName,
         domain: domain.trim(),
+        defaultModels: selectedPlatforms,
         scanStatus: 'pending',
       });
     } catch (createErr) {
@@ -1143,6 +1278,13 @@ const createMonitor = async (req, res) => {
       await AiTrackerPrompt.insertMany(promptDocs, { ordered: false }).catch((err) => {
         if (err.code !== 11000) throw err;
       });
+    }
+
+    // Increment prompt usage counter for the bulk insert
+    if (orgId && promptDocs.length > 0) {
+      const limitType = tierConfig?.aiTrackerPromptLimitType || 'monthly';
+      const period = tierService.getPeriod(limitType);
+      await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, promptDocs.length);
     }
 
     // Create own-brand competitor
@@ -1184,8 +1326,7 @@ const createMonitor = async (req, res) => {
 
 const deleteMonitor = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
@@ -1207,8 +1348,7 @@ const deleteMonitor = async (req, res) => {
 
 const getMonitor = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
@@ -1224,8 +1364,7 @@ const getMonitor = async (req, res) => {
 
 const updateMonitor = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
 
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
@@ -1233,7 +1372,23 @@ const updateMonitor = async (req, res) => {
     const { defaultModels, name } = req.body;
 
     const update = {};
-    if (Array.isArray(defaultModels)) update.defaultModels = defaultModels;
+    if (Array.isArray(defaultModels)) {
+      const validPlatformIds = PLATFORM_DISPLAY.map((p) => p.platformId);
+      const filtered = defaultModels.filter((p) => validPlatformIds.includes(p));
+      const orgId = workspace.organizationId;
+      if (orgId) {
+        const { config, tier } = await tierService.getOrgTierConfig(orgId);
+        const maxPlatforms = config?.maxAiTrackerPlatforms ?? validPlatformIds.length;
+        if (filtered.length > maxPlatforms) {
+          return res.status(400).json({
+            error: `Your ${tier} plan allows up to ${maxPlatforms} AI platform${maxPlatforms !== 1 ? 's' : ''}`,
+            code: 'PLATFORM_LIMIT',
+            quota: { limit: maxPlatforms, requested: filtered.length, tier },
+          });
+        }
+      }
+      update.defaultModels = filtered;
+    }
     if (name && typeof name === 'string' && name.trim()) update.name = name.trim();
 
     if (Object.keys(update).length === 0) {
@@ -1260,8 +1415,7 @@ const updateMonitor = async (req, res) => {
 
 const getMonitorScanStatus = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 
@@ -1279,8 +1433,7 @@ const getMonitorScanStatus = async (req, res) => {
 
 const triggerMonitorScan = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 
@@ -1291,6 +1444,21 @@ const triggerMonitorScan = async (req, res) => {
       const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
       if (tracker.lastScanAt > hourAgo) {
         return res.status(429).json({ error: 'Please wait at least 1 hour between scans' });
+      }
+    }
+
+    // Deduct credits (fixed cost: 5 credits per scan)
+    if (req.creditContext?.deductionEnabled) {
+      try {
+        await creditService.preDeduct(
+          req.creditContext.orgId, req.user.userId, 5,
+          req.creditContext.featureKey, { feature: 'aiTrackerScan', trackerId: tracker._id.toString() }
+        );
+      } catch (creditErr) {
+        return res.status(402).json({
+          error: creditErr.message,
+          code: 'INSUFFICIENT_CREDITS',
+        });
       }
     }
 
@@ -1310,8 +1478,7 @@ const triggerMonitorScan = async (req, res) => {
 
 const addMonitorPrompt = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 
@@ -1332,6 +1499,11 @@ const addMonitorPrompt = async (req, res) => {
       ...(frequency ? { frequency } : {}),
     });
 
+    // Track prompt creation against tier quota
+    if (req.tierQuota) {
+      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+    }
+
     res.status(201).json({ id: doc._id.toString(), prompt: doc.prompt });
   } catch (err) {
     console.error('addMonitorPrompt error:', err.message);
@@ -1341,8 +1513,7 @@ const addMonitorPrompt = async (req, res) => {
 
 const updateMonitorPrompt = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 
@@ -1377,8 +1548,7 @@ const updateMonitorPrompt = async (req, res) => {
 
 const removeMonitorPrompt = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 
@@ -1397,8 +1567,7 @@ const removeMonitorPrompt = async (req, res) => {
 
 const bulkDeleteMonitorPrompts = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 
@@ -1417,8 +1586,7 @@ const bulkDeleteMonitorPrompts = async (req, res) => {
 
 const addMonitorCompetitor = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 
@@ -1437,8 +1605,7 @@ const addMonitorCompetitor = async (req, res) => {
 
 const removeMonitorCompetitor = async (req, res) => {
   try {
-    const workspace = await resolveWorkspace(req, res);
-    if (!workspace) return;
+    const workspace = req.workspace;
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 

@@ -11,6 +11,8 @@
 
 const Subscription = require('../models/Subscription');
 const TierConfig = require('../models/TierConfig');
+const UsageTracker = require('../models/UsageTracker');
+const UserUsageTracker = require('../models/UserUsageTracker');
 
 // ─── Cache (5 min TTL, shared with this module only) ────────────
 
@@ -112,11 +114,29 @@ function getPeriod(limitType) {
   return `${y}-${m}`;
 }
 
+/**
+ * Increment the correct usage tracker based on tierQuota context.
+ *
+ * Lifetime quotas → UserUsageTracker (user-level)
+ * Monthly quotas  → UsageTracker (org-level)
+ *
+ * @param {object} tierQuota - from req.tierQuota (set by requireQuota middleware)
+ */
+async function incrementQuota(tierQuota) {
+  if (!tierQuota?.counterKey) return;
+  if (tierQuota.isUserLevel && tierQuota.userId) {
+    await UserUsageTracker.increment(tierQuota.userId, tierQuota.counterKey);
+  } else if (tierQuota.orgId && tierQuota.period) {
+    await UsageTracker.increment(tierQuota.orgId, tierQuota.counterKey, tierQuota.period);
+  }
+}
+
 module.exports = {
   getOrgTier,
   getTierConfig,
   getOrgTierConfig,
   getPeriod,
+  incrementQuota,
   clearTierCache,
   _upgradeHint,
   TIER_ORDER,

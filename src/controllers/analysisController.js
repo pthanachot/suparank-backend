@@ -1,6 +1,6 @@
 const Content = require('../models/Content');
 const { scoreContent } = require('../services/scorer');
-const UsageTracker = require('../models/UsageTracker');
+const tierService = require('../services/tierService');
 
 const ENGINE_URL = process.env.ENGINE_URL || 'http://localhost:8090';
 
@@ -441,7 +441,7 @@ const triggerAnalysis = async (req, res) => {
 
     // Track audit usage before starting analysis
     if (req.tierQuota) {
-      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+      await tierService.incrementQuota(req.tierQuota);
     }
 
     // Fire-and-forget: run analysis in background

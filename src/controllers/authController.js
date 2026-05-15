@@ -8,6 +8,8 @@ const { generateTokens, generateAccessToken } = require('../utils/jwt');
 const ResetToken = require('../models/ResetToken');
 const { sendEmail, sendVerificationCodeEmail, sendPasswordResetCodeEmail } = require('../utils/emailService');
 const { verifyGoogleToken } = require('../middleware/auth');
+const creditService = require('../services/creditService');
+const tierService = require('../services/tierService');
 
 // Helper: is onboarding considered done (completed, skipped, or pre-existing user)?
 // Mongoose applies defaults for inline subdocs, so user.onboarding always exists in memory.
@@ -86,6 +88,16 @@ const emailSignup = async (req, res) => {
     }
 
     await user.save();
+
+    // Grant free credits to the new user
+    try {
+      const freeTierConfig = await tierService.getTierConfig('free');
+      if (freeTierConfig?.creditsPerMonth) {
+        await creditService.grantFreeCredits(user._id, freeTierConfig.creditsPerMonth);
+      }
+    } catch (err) {
+      console.error(`[auth] Failed to grant free credits for user=${user._id}:`, err.message);
+    }
 
     // Send verification email if not already verified
     if (!user.verified) {
@@ -545,6 +557,16 @@ const googleAuth = async (req, res) => {
         },
         verified: true,
       });
+
+      // Grant free credits to the new user
+      try {
+        const freeTierConfig = await tierService.getTierConfig('free');
+        if (freeTierConfig?.creditsPerMonth) {
+          await creditService.grantFreeCredits(user._id, freeTierConfig.creditsPerMonth);
+        }
+      } catch (err) {
+        console.error(`[auth] Failed to grant free credits for user=${user._id}:`, err.message);
+      }
     }
 
     const session = await Session.create({

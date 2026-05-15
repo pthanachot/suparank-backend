@@ -6,6 +6,8 @@ const Avatar = require('../models/Avatar');
 const BrandVoice = require('../models/BrandVoice');
 const UsageTracker = require('../models/UsageTracker');
 const Credit = require('../models/Credit');
+const UserCredit = require('../models/UserCredit');
+const UserUsageTracker = require('../models/UserUsageTracker');
 const tierService = require('../services/tierService');
 
 /**
@@ -69,9 +71,9 @@ const getTierInfo = async (req, res) => {
     const now = new Date();
     const monthPeriod = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
 
-    const [monthlyUsage, lifetimeUsage] = await Promise.all([
+    const [monthlyUsage, userLifetimeUsage] = await Promise.all([
       UsageTracker.getUsage(orgId, monthPeriod),
-      UsageTracker.getUsage(orgId, 'lifetime'),
+      UserUsageTracker.getUsage(req.user.userId),
     ]);
 
     // Extra seats from active subscription
@@ -91,10 +93,11 @@ const getTierInfo = async (req, res) => {
     ]);
 
     // Build usage response keyed by counter name
+    // Lifetime quotas are now user-level, so read from userLifetimeUsage.
     function usageEntry(counterKey, limitKey, limitTypeKey) {
       const limit = config[limitKey];
       const limitType = config[limitTypeKey] || 'monthly';
-      const source = limitType === 'lifetime' ? lifetimeUsage : monthlyUsage;
+      const source = limitType === 'lifetime' ? userLifetimeUsage : monthlyUsage;
       const used = source?.[counterKey] ?? 0;
       return {
         used,
@@ -117,33 +120,39 @@ const getTierInfo = async (req, res) => {
       workspaces: { used: wsCount, limit: config.maxWorkspaces },
     };
 
-    // ── Credit balance ──
-    const creditDoc = await Credit.findOne({ organizationId: orgId }).lean();
+    // ── Credit balance (org + user free) ──
+    const [creditDoc, userCreditDoc] = await Promise.all([
+      Credit.findOne({ organizationId: orgId }).lean(),
+      UserCredit.findOne({ userId: req.user.userId }).lean(),
+    ]);
+    const userFree = userCreditDoc?.freeCredits || 0;
     const creditBalance = {
       subscription: creditDoc?.subscriptionCredits || 0,
       general: creditDoc?.generalCredits || 0,
-      total: (creditDoc?.subscriptionCredits || 0) + (creditDoc?.generalCredits || 0),
+      userFree,
+      total: (creditDoc?.subscriptionCredits || 0) + userFree + (creditDoc?.generalCredits || 0),
       expiresAt: creditDoc?.subscriptionCreditsExpireAt || null,
     };
 
     // Always include free-tier lifetime usage so paid users can see
     // remaining free slots for the quota source selector.
+    // Reuse userLifetimeUsage (already fetched above) for user-level counters.
     const freeTierConfig = await tierService.getTierConfig('free');
     const freeQuotaSlots = freeTierConfig ? {
       articlesCreated: {
-        used: lifetimeUsage?.articlesCreated ?? 0,
+        used: userLifetimeUsage?.articlesCreated ?? 0,
         limit: freeTierConfig.maxArticlesPerMonth ?? 3,
       },
       keywordSearches: {
-        used: lifetimeUsage?.keywordSearches ?? 0,
+        used: userLifetimeUsage?.keywordSearches ?? 0,
         limit: freeTierConfig.maxKeywordLookupsPerMonth ?? 50,
       },
       aiTrackerPromptsCreated: {
-        used: lifetimeUsage?.aiTrackerPromptsCreated ?? 0,
+        used: userLifetimeUsage?.aiTrackerPromptsCreated ?? 0,
         limit: freeTierConfig.maxAiTrackerPromptsPerMonth ?? 5,
       },
       auditsRun: {
-        used: lifetimeUsage?.auditsRun ?? 0,
+        used: userLifetimeUsage?.auditsRun ?? 0,
         limit: freeTierConfig.maxAuditsPerMonth ?? 5,
       },
     } : null;

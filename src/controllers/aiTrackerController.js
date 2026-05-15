@@ -5,6 +5,7 @@ const AiTrackerScan = require('../models/AiTrackerScan');
 const Workspace = require('../models/Workspace');
 const { runScan, PLATFORMS } = require('../services/aiTrackerScanEngine');
 const UsageTracker = require('../models/UsageTracker');
+const UserUsageTracker = require('../models/UserUsageTracker');
 const tierService = require('../services/tierService');
 const creditService = require('../services/creditService');
 
@@ -455,7 +456,7 @@ function formatRelativeDate(date) {
 // BACKGROUND SCAN EXECUTION (fire-and-forget)
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function executeScan(trackerId) {
+async function executeScan(trackerId, userId = null) {
   let creditTxId = null;
   let orgId = null;
 
@@ -487,7 +488,7 @@ async function executeScan(trackerId) {
       const estimatedCredits = Math.max(1, promptCount * platformCount * 4);
       try {
         const { transactionId } = await creditService.preDeduct(
-          orgId, null, estimatedCredits,
+          orgId, userId, estimatedCredits,
           'aiTracker', { feature: 'aiTrackerScan', trackerId: trackerId.toString(), estimatedCredits }
         );
         creditTxId = transactionId;
@@ -818,8 +819,13 @@ const setup = async (req, res) => {
       const promptCount = prompts.filter((p) => typeof p === 'string' && p.trim()).length;
       if (config?.maxAiTrackerPromptsPerMonth != null && promptCount > 0) {
         const limitType = config.aiTrackerPromptLimitType || 'monthly';
-        const period = tierService.getPeriod(limitType);
-        const used = await UsageTracker.getCount(orgId, 'aiTrackerPromptsCreated', period);
+        let used;
+        if (limitType === 'lifetime' && req.user?.userId) {
+          used = await UserUsageTracker.getCount(req.user.userId, 'aiTrackerPromptsCreated');
+        } else {
+          const period = tierService.getPeriod(limitType);
+          used = await UsageTracker.getCount(orgId, 'aiTrackerPromptsCreated', period);
+        }
         if (used + promptCount > config.maxAiTrackerPromptsPerMonth) {
           return res.status(429).json({
             error: `Your ${tier} plan allows ${config.maxAiTrackerPromptsPerMonth} AI Tracker prompts (${used} used, ${promptCount} requested)`,
@@ -884,8 +890,12 @@ const setup = async (req, res) => {
     // Increment prompt usage counter for the bulk insert
     if (orgId && promptDocs.length > 0) {
       const limitType = tierConfig?.aiTrackerPromptLimitType || 'monthly';
-      const period = tierService.getPeriod(limitType);
-      await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, promptDocs.length);
+      if (limitType === 'lifetime' && req.user?.userId) {
+        await UserUsageTracker.increment(req.user.userId, 'aiTrackerPromptsCreated', promptDocs.length);
+      } else {
+        const period = tierService.getPeriod(limitType);
+        await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, promptDocs.length);
+      }
     }
 
     // Create own-brand competitor
@@ -907,8 +917,8 @@ const setup = async (req, res) => {
       }
     }
 
-    // Fire-and-forget: start first scan
-    executeScan(tracker._id).catch((err) => {
+    // Fire-and-forget: start first scan (pass userId so user free credits can be used)
+    executeScan(tracker._id, req.user?.userId).catch((err) => {
       console.error('[ai-tracker-setup] scan failed:', err.message);
     });
 
@@ -971,7 +981,7 @@ const triggerScan = async (req, res) => {
       const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id }).countDocuments();
       const platforms = tracker.defaultModels?.length || 0;
       const estimatedCredits = Math.max(1, prompts * platforms * 4);
-      const canPay = await creditService.canAfford(req.creditContext.orgId, estimatedCredits);
+      const canPay = await creditService.canAfford(req.creditContext.orgId, estimatedCredits, req.user?.userId);
       if (!canPay) {
         return res.status(402).json({
           error: 'Insufficient credits',
@@ -986,7 +996,7 @@ const triggerScan = async (req, res) => {
       $set: { scanStatus: 'pending', scanProgress: 0, scanError: null },
     });
 
-    executeScan(tracker._id).catch((err) => {
+    executeScan(tracker._id, req.user?.userId).catch((err) => {
       console.error('[ai-tracker-scan] manual scan failed:', err.message);
     });
 
@@ -1039,7 +1049,7 @@ const addPrompt = async (req, res) => {
 
     // Track prompt creation against tier quota
     if (req.tierQuota) {
-      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+      await tierService.incrementQuota(req.tierQuota);
     }
 
     res.status(201).json({ id: doc._id.toString(), prompt: doc.prompt });
@@ -1274,8 +1284,13 @@ const createMonitor = async (req, res) => {
       const promptCount = prompts.filter((p) => typeof p === 'string' && p.trim()).length;
       if (config?.maxAiTrackerPromptsPerMonth != null && promptCount > 0) {
         const limitType = config.aiTrackerPromptLimitType || 'monthly';
-        const period = tierService.getPeriod(limitType);
-        const used = await UsageTracker.getCount(orgId, 'aiTrackerPromptsCreated', period);
+        let used;
+        if (limitType === 'lifetime' && req.user?.userId) {
+          used = await UserUsageTracker.getCount(req.user.userId, 'aiTrackerPromptsCreated');
+        } else {
+          const period = tierService.getPeriod(limitType);
+          used = await UsageTracker.getCount(orgId, 'aiTrackerPromptsCreated', period);
+        }
         if (used + promptCount > config.maxAiTrackerPromptsPerMonth) {
           return res.status(429).json({
             error: `Your ${tier} plan allows ${config.maxAiTrackerPromptsPerMonth} AI Tracker prompts (${used} used, ${promptCount} requested)`,
@@ -1339,8 +1354,12 @@ const createMonitor = async (req, res) => {
     // Increment prompt usage counter for the bulk insert
     if (orgId && promptDocs.length > 0) {
       const limitType = tierConfig?.aiTrackerPromptLimitType || 'monthly';
-      const period = tierService.getPeriod(limitType);
-      await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, promptDocs.length);
+      if (limitType === 'lifetime' && req.user?.userId) {
+        await UserUsageTracker.increment(req.user.userId, 'aiTrackerPromptsCreated', promptDocs.length);
+      } else {
+        const period = tierService.getPeriod(limitType);
+        await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, promptDocs.length);
+      }
     }
 
     // Create own-brand competitor
@@ -1362,8 +1381,8 @@ const createMonitor = async (req, res) => {
       }
     }
 
-    // Fire-and-forget: start first scan
-    executeScan(tracker._id).catch((err) => {
+    // Fire-and-forget: start first scan (pass userId so user free credits can be used)
+    executeScan(tracker._id, req.user?.userId).catch((err) => {
       console.error('[ai-tracker-monitor] scan failed:', err.message);
     });
 
@@ -1509,7 +1528,7 @@ const triggerMonitorScan = async (req, res) => {
       const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id }).countDocuments();
       const platforms = tracker.defaultModels?.length || 0;
       const estimatedCredits = Math.max(1, prompts * platforms * 4);
-      const canPay = await creditService.canAfford(req.creditContext.orgId, estimatedCredits);
+      const canPay = await creditService.canAfford(req.creditContext.orgId, estimatedCredits, req.user?.userId);
       if (!canPay) {
         return res.status(402).json({
           error: 'Insufficient credits',
@@ -1523,7 +1542,7 @@ const triggerMonitorScan = async (req, res) => {
     await AiTracker.findByIdAndUpdate(tracker._id, {
       $set: { scanStatus: 'pending', scanProgress: 0, scanError: null },
     });
-    executeScan(tracker._id).catch((err) => {
+    executeScan(tracker._id, req.user?.userId).catch((err) => {
       console.error('[ai-tracker-scan] manual scan failed:', err.message);
     });
 
@@ -1569,7 +1588,7 @@ const addMonitorPrompt = async (req, res) => {
 
     // Track prompt creation against tier quota
     if (req.tierQuota) {
-      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+      await tierService.incrementQuota(req.tierQuota);
     }
 
     res.status(201).json({ id: doc._id.toString(), prompt: doc.prompt });

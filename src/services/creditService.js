@@ -1,17 +1,24 @@
 /**
  * Credit service — central credit management for SupaRank.
  *
- * Two credit pools per organization:
- *   - subscriptionCredits: expire at billing cycle end
- *   - generalCredits: never expire
+ * Three credit pools, two levels:
  *
- * Deduction priority: subscription first, then general.
- * Refunds always go to general pool.
+ *   USER-LEVEL (personal, shared across all orgs the user belongs to):
+ *     - UserCredit.freeCredits: granted once on account creation, never expire.
+ *
+ *   ORG-LEVEL (shared by all members of the org):
+ *     - Credit.subscriptionCredits: expire at billing cycle end.
+ *     - Credit.generalCredits: purchased credits, promos — never expire.
+ *
+ * Deduction priority: org subscription → user free → org purchased.
+ * Refunds go back to whichever pool they came from.
  *
  * 1 credit = 50 words of AI-generated content.
  */
 
+const mongoose = require('mongoose');
 const Credit = require('../models/Credit');
+const UserCredit = require('../models/UserCredit');
 const CreditTransaction = require('../models/CreditTransaction');
 const UsageTracker = require('../models/UsageTracker');
 const tierService = require('./tierService');
@@ -50,10 +57,13 @@ async function getOrCreateCredit(orgId) {
 }
 
 /**
- * Get credit balance for an organization.
- * @returns {{ subscription: number, general: number, total: number, expiresAt: Date|null }}
+ * Get combined credit balance (org + user free credits).
+ *
+ * @param {string} orgId
+ * @param {string} [userId] - if provided, includes user's free credits in total
+ * @returns {{ subscription: number, general: number, userFree: number, total: number, expiresAt: Date|null }}
  */
-async function getBalance(orgId) {
+async function getBalance(orgId, userId = null) {
   const credit = await getOrCreateCredit(orgId);
 
   // Auto-expire subscription credits if past expiration date
@@ -75,134 +85,311 @@ async function getBalance(orgId) {
     }
   }
 
+  // Fetch user free credits if userId provided
+  let userFree = 0;
+  if (userId) {
+    const userCredit = await UserCredit.findOne({ userId }).lean();
+    userFree = userCredit?.freeCredits || 0;
+  }
+
   return {
     subscription: credit.subscriptionCredits,
     general: credit.generalCredits,
-    total: credit.subscriptionCredits + credit.generalCredits,
+    userFree,
+    total: credit.subscriptionCredits + userFree + credit.generalCredits,
     expiresAt: credit.subscriptionCreditsExpireAt,
   };
 }
 
 /**
- * Check if organization can afford a credit cost.
+ * Check if organization + user can afford a credit cost.
  */
-async function canAfford(orgId, amount) {
-  const { total } = await getBalance(orgId);
+async function canAfford(orgId, amount, userId = null) {
+  const { total } = await getBalance(orgId, userId);
   return total >= amount;
 }
+
+// ─── User free credit grants ────────────────────────────────
+
+/**
+ * Grant free credits to a user. Sets grantedAt on first grant.
+ *
+ * @param {string} userId
+ * @param {number} amount
+ * @param {string} [description]
+ */
+async function grantFreeCredits(userId, amount, description = 'Free-tier initial credits') {
+  if (!amount || amount <= 0) return;
+
+  const updated = await UserCredit.findOneAndUpdate(
+    { userId },
+    {
+      $inc: { freeCredits: amount },
+      $setOnInsert: { grantedAt: new Date() },
+    },
+    { new: true, upsert: true, setDefaultsOnInsert: true }
+  );
+
+  // If grantedAt wasn't set by $setOnInsert (doc already existed), set it now if null
+  if (!updated.grantedAt) {
+    updated.grantedAt = new Date();
+    await updated.save();
+  }
+
+  await CreditTransaction.logTransaction({
+    orgId: null,
+    userId,
+    type: 'general_grant',
+    amount,
+    pool: 'user_free',
+    description,
+    balanceAfter: updated.freeCredits,
+  });
+
+  console.log(`[creditService] Granted ${amount} free credits to user ${userId}`);
+}
+
+/**
+ * Idempotent free credit grant — only grants if user has never received free credits.
+ *
+ * @param {string} userId
+ * @param {number} amount
+ */
+async function grantFreeCreditsIfNew(userId, amount) {
+  const existing = await UserCredit.findOne({ userId }).lean();
+  if (existing?.grantedAt) return; // already granted
+  await grantFreeCredits(userId, amount);
+}
+
+// ─── Pre-deduction (three-way split) ────────────────────────
+
+const MAX_TX_RETRIES = 3;
 
 /**
  * Pre-deduct credits (reserve for a pending operation).
  *
- * Deducts from subscription first, then general.
- * Creates a CreditTransaction with status='pending'.
- * Also increments UsageTracker.creditsUsed.
+ * Deduction order: org subscription → org purchased → user free.
+ * Uses a MongoDB transaction for cross-collection atomicity.
  *
  * @param {string} orgId
  * @param {string} userId - user who triggered the operation
  * @param {number} amount - credits to deduct
  * @param {string} feature - feature key (e.g. 'aiChat')
  * @param {object} [metadata] - extra context
- * @returns {{ transactionId: string, deducted: number, balanceAfter: { subscription: number, general: number } }}
+ * @returns {{ transactionId: string, deducted: number, balanceAfter: object }}
  */
 async function preDeduct(orgId, userId, amount, feature, metadata = {}) {
   if (amount <= 0) {
-    return { transactionId: null, deducted: 0, balanceAfter: { subscription: 0, general: 0 } };
+    return { transactionId: null, deducted: 0, balanceAfter: { subscription: 0, general: 0, userFree: 0 } };
   }
 
-  // Read current balance (getBalance auto-expires if needed)
-  const credit = await getOrCreateCredit(orgId);
+  for (let attempt = 0; attempt < MAX_TX_RETRIES; attempt++) {
+    const session = await mongoose.startSession();
+    try {
+      session.startTransaction();
 
-  // Auto-expire if past date
-  if (credit.subscriptionCreditsExpireAt && new Date() > credit.subscriptionCreditsExpireAt) {
-    credit.subscriptionCredits = 0;
-    credit.subscriptionCreditsExpireAt = null;
+      const credit = await Credit.findOne({ organizationId: orgId }).session(session);
+      const userCredit = userId
+        ? await UserCredit.findOne({ userId }).session(session)
+        : null;
+
+      const subAvail = credit?.subscriptionCredits || 0;
+      const userFreeAvail = userCredit?.freeCredits || 0;
+      const orgGeneralAvail = credit?.generalCredits || 0;
+
+      // Auto-expire subscription credits
+      let subEffective = subAvail;
+      if (credit?.subscriptionCreditsExpireAt && new Date() > credit.subscriptionCreditsExpireAt) {
+        subEffective = 0;
+      }
+
+      // Three-way split: subscription → org purchased → user free (personal credits last)
+      const fromSubscription = Math.min(subEffective, amount);
+      let remaining = amount - fromSubscription;
+      const fromOrgGeneral = Math.min(orgGeneralAvail, remaining);
+      remaining -= fromOrgGeneral;
+      const fromUserFree = Math.min(userFreeAvail, remaining);
+      const totalDeducted = fromSubscription + fromUserFree + fromOrgGeneral;
+
+      if (totalDeducted < amount) {
+        await session.abortTransaction();
+        throw new Error('Insufficient credits');
+      }
+
+      // Atomic decrements within the transaction
+      if (credit && (fromSubscription > 0 || fromOrgGeneral > 0)) {
+        const subExpired = subAvail - subEffective; // credits lost to expiry
+        await Credit.findOneAndUpdate(
+          { organizationId: orgId },
+          {
+            $inc: {
+              subscriptionCredits: -(fromSubscription + subExpired),
+              generalCredits: -fromOrgGeneral,
+            },
+            ...(subExpired > 0 ? { $set: { subscriptionCreditsExpireAt: null } } : {}),
+          },
+          { session }
+        );
+      }
+
+      if (fromUserFree > 0 && userId) {
+        await UserCredit.findOneAndUpdate(
+          { userId },
+          { $inc: { freeCredits: -fromUserFree } },
+          { session }
+        );
+      }
+
+      await session.commitTransaction();
+      session.endSession();
+
+      // Log transactions AFTER commit (one per pool touched)
+      const transactions = [];
+
+      if (fromSubscription > 0) {
+        const tx = await CreditTransaction.logTransaction({
+          orgId,
+          userId,
+          type: 'deduction',
+          amount: -fromSubscription,
+          pool: 'subscription',
+          description: `${feature}: ${amount} credits`,
+          metadata: { ...metadata, feature, estimatedTotal: amount },
+          balanceAfter: subEffective - fromSubscription,
+          status: 'pending',
+        });
+        transactions.push(tx);
+      }
+
+      if (fromUserFree > 0) {
+        const tx = await CreditTransaction.logTransaction({
+          orgId,
+          userId,
+          type: 'deduction',
+          amount: -fromUserFree,
+          pool: 'user_free',
+          description: `${feature}: ${amount} credits`,
+          metadata: { ...metadata, feature, estimatedTotal: amount },
+          balanceAfter: userFreeAvail - fromUserFree,
+          status: 'pending',
+        });
+        transactions.push(tx);
+      }
+
+      if (fromOrgGeneral > 0) {
+        const tx = await CreditTransaction.logTransaction({
+          orgId,
+          userId,
+          type: 'deduction',
+          amount: -fromOrgGeneral,
+          pool: 'general',
+          description: `${feature}: ${amount} credits`,
+          metadata: { ...metadata, feature, estimatedTotal: amount },
+          balanceAfter: orgGeneralAvail - fromOrgGeneral,
+          status: 'pending',
+        });
+        transactions.push(tx);
+      }
+
+      // Increment UsageTracker.creditsUsed (org-level)
+      const { config } = await tierService.getOrgTierConfig(orgId);
+      const limitType = config?.creditLimitType || 'monthly';
+      const period = tierService.getPeriod(limitType);
+      await UsageTracker.increment(orgId, 'creditsUsed', period, totalDeducted);
+
+      return {
+        transactionId: transactions[0]?._id?.toString() || null,
+        deducted: totalDeducted,
+        balanceAfter: {
+          subscription: subEffective - fromSubscription,
+          userFree: userFreeAvail - fromUserFree,
+          general: orgGeneralAvail - fromOrgGeneral,
+        },
+      };
+    } catch (err) {
+      await session.abortTransaction();
+      session.endSession();
+
+      // Retry on transient transaction errors (write conflicts)
+      if (err.hasErrorLabel?.('TransientTransactionError') && attempt < MAX_TX_RETRIES - 1) {
+        continue;
+      }
+      throw err;
+    }
   }
-
-  // Calculate split: subscription first, then general
-  const fromSubscription = Math.min(credit.subscriptionCredits, amount);
-  const fromGeneral = Math.min(credit.generalCredits, amount - fromSubscription);
-  const totalDeducted = fromSubscription + fromGeneral;
-
-  if (totalDeducted <= 0) {
-    throw new Error('Insufficient credits');
-  }
-
-  // Atomic deduction using $inc (prevents race conditions)
-  const updated = await Credit.findOneAndUpdate(
-    {
-      organizationId: orgId,
-      subscriptionCredits: { $gte: fromSubscription },
-      generalCredits: { $gte: fromGeneral },
-    },
-    {
-      $inc: {
-        subscriptionCredits: -fromSubscription,
-        generalCredits: -fromGeneral,
-      },
-    },
-    { new: true }
-  );
-
-  if (!updated) {
-    // Race condition: balance changed between read and update
-    throw new Error('Insufficient credits (concurrent deduction)');
-  }
-
-  // Log transactions — one per pool touched
-  const transactions = [];
-
-  if (fromSubscription > 0) {
-    const tx = await CreditTransaction.logTransaction({
-      orgId,
-      userId,
-      type: 'deduction',
-      amount: -fromSubscription,
-      pool: 'subscription',
-      description: `${feature}: ${amount} credits`,
-      metadata: { ...metadata, feature, estimatedTotal: amount },
-      balanceAfter: updated.subscriptionCredits,
-      status: 'pending',
-    });
-    transactions.push(tx);
-  }
-
-  if (fromGeneral > 0) {
-    const tx = await CreditTransaction.logTransaction({
-      orgId,
-      userId,
-      type: 'deduction',
-      amount: -fromGeneral,
-      pool: 'general',
-      description: `${feature}: ${amount} credits`,
-      metadata: { ...metadata, feature, estimatedTotal: amount },
-      balanceAfter: updated.generalCredits,
-      status: 'pending',
-    });
-    transactions.push(tx);
-  }
-
-  // Increment UsageTracker.creditsUsed
-  const { config } = await tierService.getOrgTierConfig(orgId);
-  const limitType = config?.creditLimitType || 'monthly';
-  const period = tierService.getPeriod(limitType);
-  await UsageTracker.increment(orgId, 'creditsUsed', period, totalDeducted);
-
-  return {
-    transactionId: transactions[0]?._id?.toString() || null,
-    deducted: totalDeducted,
-    balanceAfter: {
-      subscription: updated.subscriptionCredits,
-      general: updated.generalCredits,
-    },
-  };
 }
+
+// ─── Pool-aware refund helper ───────────────────────────────
+
+/**
+ * Refund credits back to the pool they were deducted from.
+ * @param {object} tx - CreditTransaction document
+ * @param {number} refundAmount
+ */
+async function _refundToPool(tx, refundAmount) {
+  if (refundAmount <= 0) return;
+
+  if (tx.pool === 'user_free' && tx.userId) {
+    await UserCredit.findOneAndUpdate(
+      { userId: tx.userId },
+      { $inc: { freeCredits: refundAmount } }
+    );
+    const uc = await UserCredit.findOne({ userId: tx.userId }).lean();
+    await CreditTransaction.logTransaction({
+      orgId: tx.organizationId,
+      userId: tx.userId,
+      type: 'refund',
+      amount: refundAmount,
+      pool: 'user_free',
+      description: 'Refund to user free credits',
+      metadata: { feature: tx.metadata?.feature },
+      balanceAfter: uc?.freeCredits || 0,
+      relatedTransactionId: tx._id,
+    });
+  } else if (tx.pool === 'subscription' && tx.organizationId) {
+    await Credit.findOneAndUpdate(
+      { organizationId: tx.organizationId },
+      { $inc: { subscriptionCredits: refundAmount } }
+    );
+    const c = await Credit.findOne({ organizationId: tx.organizationId }).lean();
+    await CreditTransaction.logTransaction({
+      orgId: tx.organizationId,
+      userId: tx.userId,
+      type: 'refund',
+      amount: refundAmount,
+      pool: 'subscription',
+      description: 'Refund to subscription credits',
+      metadata: { feature: tx.metadata?.feature },
+      balanceAfter: c?.subscriptionCredits || 0,
+      relatedTransactionId: tx._id,
+    });
+  } else if (tx.organizationId) {
+    // 'general' pool (org purchased credits)
+    await Credit.findOneAndUpdate(
+      { organizationId: tx.organizationId },
+      { $inc: { generalCredits: refundAmount } }
+    );
+    const c = await Credit.findOne({ organizationId: tx.organizationId }).lean();
+    await CreditTransaction.logTransaction({
+      orgId: tx.organizationId,
+      userId: tx.userId,
+      type: 'refund',
+      amount: refundAmount,
+      pool: 'general',
+      description: 'Refund to org purchased credits',
+      metadata: { feature: tx.metadata?.feature },
+      balanceAfter: c?.generalCredits || 0,
+      relatedTransactionId: tx._id,
+    });
+  }
+}
+
+// ─── Settle / Refund ────────────────────────────────────────
 
 /**
  * Settle a pending pre-deduction with actual credit cost.
  *
- * If actual < estimated: refund the difference to general pool.
- * Marks the original transaction as 'settled'.
+ * If actual < estimated: refund difference back to each pool proportionally.
  *
  * @param {string} transactionId - the original pending transaction ID
  * @param {number} actualAmount - the real credit cost
@@ -214,43 +401,42 @@ async function settle(transactionId, actualAmount) {
   const tx = await CreditTransaction.findById(transactionId);
   if (!tx || tx.status !== 'pending') return { refunded: 0 };
 
-  // Get the total estimated amount from all related transactions
+  // Get all related pending transactions (subscription + user_free + general)
   const relatedTxs = await CreditTransaction.find({
-    organizationId: tx.organizationId,
     status: 'pending',
     'metadata.estimatedTotal': tx.metadata?.estimatedTotal,
     createdAt: tx.createdAt,
+    $or: [
+      { organizationId: tx.organizationId },
+      { userId: tx.userId, pool: 'user_free' },
+    ],
   });
 
   const totalDeducted = relatedTxs.reduce((sum, t) => sum + Math.abs(t.amount), 0);
-  const refundAmount = Math.max(0, totalDeducted - actualAmount);
+  let refundRemaining = Math.max(0, totalDeducted - actualAmount);
 
-  if (refundAmount > 0) {
-    // Refund difference to general pool
-    await Credit.findOneAndUpdate(
-      { organizationId: tx.organizationId },
-      { $inc: { generalCredits: refundAmount } }
-    );
-
-    const credit = await Credit.findOne({ organizationId: tx.organizationId }).lean();
-
-    await CreditTransaction.logTransaction({
-      orgId: tx.organizationId,
-      userId: tx.userId,
-      type: 'refund',
-      amount: refundAmount,
-      pool: 'general',
-      description: `Settlement refund: estimated ${totalDeducted}, actual ${actualAmount}`,
-      metadata: { feature: tx.metadata?.feature, actualAmount },
-      balanceAfter: credit?.generalCredits || 0,
-      relatedTransactionId: tx._id,
+  if (refundRemaining > 0) {
+    // Refund in reverse deduction order: user free → org purchased → subscription
+    const refundOrder = [...relatedTxs].sort((a, b) => {
+      const order = { user_free: 0, general: 1, subscription: 2 };
+      return (order[a.pool] ?? 9) - (order[b.pool] ?? 9);
     });
 
-    // Decrement UsageTracker for the refunded amount
-    const { config } = await tierService.getOrgTierConfig(tx.organizationId);
-    const limitType = config?.creditLimitType || 'monthly';
-    const period = tierService.getPeriod(limitType);
-    await UsageTracker.increment(tx.organizationId, 'creditsUsed', period, -refundAmount);
+    for (const rtx of refundOrder) {
+      if (refundRemaining <= 0) break;
+      const amt = Math.min(Math.abs(rtx.amount), refundRemaining);
+      await _refundToPool(rtx, amt);
+      refundRemaining -= amt;
+    }
+
+    // Decrement UsageTracker for the refunded total
+    const totalRefunded = Math.max(0, totalDeducted - actualAmount);
+    if (tx.organizationId) {
+      const { config } = await tierService.getOrgTierConfig(tx.organizationId);
+      const limitType = config?.creditLimitType || 'monthly';
+      const period = tierService.getPeriod(limitType);
+      await UsageTracker.increment(tx.organizationId, 'creditsUsed', period, -totalRefunded);
+    }
   }
 
   // Mark all related pending transactions as settled
@@ -259,13 +445,13 @@ async function settle(transactionId, actualAmount) {
     { $set: { status: 'settled' } }
   );
 
-  return { refunded: refundAmount };
+  return { refunded: Math.max(0, totalDeducted - actualAmount) };
 }
 
 /**
  * Full refund of a pending pre-deduction (operation failed/aborted).
  *
- * Adds refund to general pool. Marks original as 'refunded'.
+ * Refunds each pool's portion back to that pool.
  *
  * @param {string} transactionId
  * @returns {{ refunded: number }}
@@ -276,42 +462,30 @@ async function refund(transactionId) {
   const tx = await CreditTransaction.findById(transactionId);
   if (!tx || tx.status === 'refunded') return { refunded: 0 };
 
-  // Get all related pending transactions (subscription + general)
+  // Get all related pending transactions
   const relatedTxs = await CreditTransaction.find({
-    organizationId: tx.organizationId,
     status: 'pending',
     'metadata.estimatedTotal': tx.metadata?.estimatedTotal,
     createdAt: tx.createdAt,
+    $or: [
+      { organizationId: tx.organizationId },
+      { userId: tx.userId, pool: 'user_free' },
+    ],
   });
 
-  const totalToRefund = relatedTxs.reduce((sum, t) => sum + Math.abs(t.amount), 0);
+  let totalRefunded = 0;
+  for (const rtx of relatedTxs) {
+    const amt = Math.abs(rtx.amount);
+    await _refundToPool(rtx, amt);
+    totalRefunded += amt;
+  }
 
-  if (totalToRefund > 0) {
-    // Refund to general pool
-    await Credit.findOneAndUpdate(
-      { organizationId: tx.organizationId },
-      { $inc: { generalCredits: totalToRefund } }
-    );
-
-    const credit = await Credit.findOne({ organizationId: tx.organizationId }).lean();
-
-    await CreditTransaction.logTransaction({
-      orgId: tx.organizationId,
-      userId: tx.userId,
-      type: 'refund',
-      amount: totalToRefund,
-      pool: 'general',
-      description: `Full refund: operation failed/aborted`,
-      metadata: { feature: tx.metadata?.feature, originalAmount: totalToRefund },
-      balanceAfter: credit?.generalCredits || 0,
-      relatedTransactionId: tx._id,
-    });
-
+  if (totalRefunded > 0 && tx.organizationId) {
     // Decrement UsageTracker for the refunded amount
     const { config } = await tierService.getOrgTierConfig(tx.organizationId);
     const limitType = config?.creditLimitType || 'monthly';
     const period = tierService.getPeriod(limitType);
-    await UsageTracker.increment(tx.organizationId, 'creditsUsed', period, -totalToRefund);
+    await UsageTracker.increment(tx.organizationId, 'creditsUsed', period, -totalRefunded);
   }
 
   // Mark all related transactions as refunded
@@ -320,18 +494,14 @@ async function refund(transactionId) {
     { $set: { status: 'refunded' } }
   );
 
-  return { refunded: totalToRefund };
+  return { refunded: totalRefunded };
 }
+
+// ─── Subscription / org-level grants ────────────────────────
 
 /**
  * Grant subscription credits for a billing cycle.
- *
  * REPLACES the current subscription balance (not additive).
- * Call expireSubscriptionCredits() first if there's an old balance.
- *
- * @param {string} orgId
- * @param {number} amount - credits to grant
- * @param {Date|null} expiresAt - when these credits expire (null = lifetime/never)
  */
 async function grantSubscriptionCredits(orgId, amount, expiresAt) {
   const credit = await getOrCreateCredit(orgId);
@@ -357,13 +527,8 @@ async function grantSubscriptionCredits(orgId, amount, expiresAt) {
 }
 
 /**
- * Grant general (non-expiring) credits — used for free-tier initial grant, promos, purchases.
- *
- * ADDITIVE — adds to existing general balance (does not overwrite).
- *
- * @param {string} orgId
- * @param {number} amount
- * @param {string} [description]
+ * Grant general (non-expiring) credits to an org — for purchases and promos.
+ * ADDITIVE — adds to existing balance.
  */
 async function grantGeneralCredits(orgId, amount, description = 'General credits granted') {
   if (!amount || amount <= 0) return;
@@ -388,9 +553,6 @@ async function grantGeneralCredits(orgId, amount, description = 'General credits
 
 /**
  * Expire remaining subscription credits (on cancellation or before renewal).
- *
- * @param {string} orgId
- * @returns {{ expired: number }}
  */
 async function expireSubscriptionCredits(orgId) {
   const credit = await getOrCreateCredit(orgId);
@@ -424,6 +586,8 @@ module.exports = {
   preDeduct,
   settle,
   refund,
+  grantFreeCredits,
+  grantFreeCreditsIfNew,
   grantSubscriptionCredits,
   grantGeneralCredits,
   expireSubscriptionCredits,

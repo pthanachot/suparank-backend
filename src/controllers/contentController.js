@@ -1,7 +1,6 @@
 const Content = require('../models/Content');
 const { runAnalysis } = require('./analysisController');
 const imageStorage = require('../services/imageStorage');
-const UsageTracker = require('../models/UsageTracker');
 const creditService = require('../services/creditService');
 const tierService = require('../services/tierService');
 
@@ -106,7 +105,7 @@ const createContent = async (req, res) => {
 
     // Track article creation against tier quota
     if (req.tierQuota) {
-      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+      await tierService.incrementQuota(req.tierQuota);
     }
 
     res.status(201).json({ content });
@@ -590,7 +589,7 @@ async function streamAudit(req, res, { prompt, contentHash, contentId, dbField, 
 
     // Track quota only after successful audit completion + DB save
     if (tierQuota) {
-      await UsageTracker.increment(tierQuota.orgId, tierQuota.counterKey, tierQuota.period);
+      await tierService.incrementQuota(tierQuota);
     }
   } catch (e) {
     console.error(`[${dbField}] DB save error:`, e.message);

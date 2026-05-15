@@ -2,7 +2,6 @@ const KeywordSearch = require('../models/KeywordSearch');
 const KeywordDetail = require('../models/KeywordDetail');
 const KeywordResearchHistory = require('../models/KeywordResearchHistory');
 const { resolveCountry, fetchRelatedKeywords, fetchSerpResults, SUPPORTED_COUNTRIES } = require('../services/keywordService');
-const UsageTracker = require('../models/UsageTracker');
 const tierService = require('../services/tierService');
 
 // Workspace resolved by permissions middleware (req.workspace).
@@ -56,7 +55,7 @@ async function searchKeywords(req, res) {
 
       // Track quota only after successful result
       if (req.tierQuota) {
-        await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+        await tierService.incrementQuota(req.tierQuota);
       }
 
       return res.json({
@@ -97,7 +96,7 @@ async function searchKeywords(req, res) {
 
     // Track quota only after successful result
     if (req.tierQuota) {
-      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+      await tierService.incrementQuota(req.tierQuota);
     }
 
     return res.json({
@@ -138,7 +137,7 @@ async function getKeywordDetail(req, res) {
     if (cached) {
       // Track quota only after successful result
       if (req.tierQuota) {
-        await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+        await tierService.incrementQuota(req.tierQuota);
       }
 
       return res.json({
@@ -164,7 +163,7 @@ async function getKeywordDetail(req, res) {
 
     // Track quota only after successful result
     if (req.tierQuota) {
-      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+      await tierService.incrementQuota(req.tierQuota);
     }
 
     return res.json({

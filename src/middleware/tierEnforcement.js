@@ -15,6 +15,7 @@
 
 const Organization = require('../models/Organization');
 const UsageTracker = require('../models/UsageTracker');
+const UserUsageTracker = require('../models/UserUsageTracker');
 const tierService = require('../services/tierService');
 
 // ─── Resolve org from workspace (handles legacy null organizationId) ─
@@ -76,7 +77,7 @@ function requireQuota(counterKey, tierLimitKey, tierLimitTypeKey) {
       const limit = activeConfig[tierLimitKey];
       // null/undefined = unlimited
       if (limit == null) {
-        req.tierQuota = { orgId, counterKey, period: null };
+        req.tierQuota = { orgId, userId: req.user?.userId, counterKey, period: null, isUserLevel: false };
         return next();
       }
 
@@ -86,8 +87,11 @@ function requireQuota(counterKey, tierLimitKey, tierLimitTypeKey) {
       // increments on creation and never decrements on deletion, so deleting
       // a resource does NOT free a creation slot. On tier change (downgrade),
       // downgradeService resets the lifetime counter to match unlocked counts.
+      const isUserLevel = limitType === 'lifetime' && req.user?.userId;
       const period = tierService.getPeriod(limitType);
-      const used = await UsageTracker.getCount(orgId, counterKey, period);
+      const used = isUserLevel
+        ? await UserUsageTracker.getCount(req.user.userId, counterKey)
+        : await UsageTracker.getCount(orgId, counterKey, period);
 
       if (used >= limit) {
         return res.status(429).json({
@@ -107,7 +111,7 @@ function requireQuota(counterKey, tierLimitKey, tierLimitTypeKey) {
       }
 
       // Attach context so controller can increment after success
-      req.tierQuota = { orgId, counterKey, period, limit, used };
+      req.tierQuota = { orgId, userId: req.user?.userId, counterKey, period, limit, used, isUserLevel: !!isUserLevel };
       return next();
     } catch (err) {
       console.error('[requireQuota]', err.message);

@@ -12,7 +12,7 @@ const creditTransactionSchema = new mongoose.Schema(
     organizationId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Organization',
-      required: true,
+      default: null,
       index: true,
     },
     userId: {
@@ -33,7 +33,7 @@ const creditTransactionSchema = new mongoose.Schema(
     },
     pool: {
       type: String,
-      enum: ['subscription', 'general'],
+      enum: ['subscription', 'general', 'user_free'],
       required: true,
       // Which credit pool was affected.
     },

@@ -12,7 +12,7 @@ const { verifyGoogleToken } = require('../middleware/auth');
 // Helper: is onboarding considered done (completed, skipped, or pre-existing user)?
 // Mongoose applies defaults for inline subdocs, so user.onboarding always exists in memory.
 // Use createdAt cutoff to grandfather users created before the onboarding feature.
-const ONBOARDING_LAUNCH = new Date('2026-05-16T00:00:00Z');
+const ONBOARDING_LAUNCH = new Date('2026-05-15T00:00:00Z');
 
 function isOnboardingDone(user) {
   if (user.onboarding?.completed || user.onboarding?.skippedAt) return true;

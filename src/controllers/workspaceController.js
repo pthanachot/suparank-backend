@@ -74,33 +74,9 @@ const getWorkspace = async (req, res) => {
   }
 };
 
-// ─── ENSURE DEFAULT WORKSPACE ──────────────────────────────────
-async function ensureDefaultWorkspace(userId) {
-  const count = await Workspace.countDocuments({ userId });
-  if (count === 0) {
-    try {
-      const workspaceNumber = await Workspace.getNextNumber();
-      return await Workspace.create({
-        workspaceNumber,
-        name: 'My Workspace',
-        userId,
-        color: '#6366F1',
-        isDefault: true,
-      });
-    } catch (error) {
-      // Handle race condition: another request already created it
-      if (error.code === 11000) return null;
-      throw error;
-    }
-  }
-  return null;
-}
-
 // ─── LIST WORKSPACES ─────────────────────────────────────────────
 const listWorkspaces = async (req, res) => {
   try {
-    await ensureDefaultWorkspace(req.user.userId);
-
     // Get org memberships (new RBAC system)
     const memberships = await OrgMember.find({
       userId: req.user.userId,

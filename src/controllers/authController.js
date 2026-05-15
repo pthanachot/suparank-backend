@@ -9,6 +9,18 @@ const ResetToken = require('../models/ResetToken');
 const { sendEmail, sendVerificationCodeEmail, sendPasswordResetCodeEmail } = require('../utils/emailService');
 const { verifyGoogleToken } = require('../middleware/auth');
 
+// Helper: is onboarding considered done (completed, skipped, or pre-existing user)?
+// Mongoose applies defaults for inline subdocs, so user.onboarding always exists in memory.
+// Use createdAt cutoff to grandfather users created before the onboarding feature.
+const ONBOARDING_LAUNCH = new Date('2026-05-16T00:00:00Z');
+
+function isOnboardingDone(user) {
+  if (user.onboarding?.completed || user.onboarding?.skippedAt) return true;
+  // Users created before onboarding feature — grandfather them in
+  if (user.createdAt < ONBOARDING_LAUNCH) return true;
+  return false;
+}
+
 // Auto-increment userId
 async function getNextUserId() {
   const counter = await Counter.findByIdAndUpdate(
@@ -112,6 +124,7 @@ const emailSignup = async (req, res) => {
         verified: user.verified,
         connectedProviders: user.getConnectedProviders(),
         activeWorkspaceId: user.activeWorkspaceId || null,
+        onboardingCompleted: isOnboardingDone(user),
       },
       ...tokens,
       isNewUser: true,
@@ -171,6 +184,7 @@ const emailLogin = async (req, res) => {
         verified: user.verified,
         connectedProviders: user.getConnectedProviders(),
         activeWorkspaceId: user.activeWorkspaceId || null,
+        onboardingCompleted: isOnboardingDone(user),
       },
       ...tokens,
     });
@@ -551,6 +565,7 @@ const googleAuth = async (req, res) => {
         verified: user.verified,
         connectedProviders: user.getConnectedProviders(),
         activeWorkspaceId: user.activeWorkspaceId || null,
+        onboardingCompleted: isOnboardingDone(user),
       },
       ...tokens,
       isNewUser,
@@ -608,6 +623,7 @@ const refreshToken = async (req, res) => {
             : null,
         },
         activeWorkspaceId: user.activeWorkspaceId || null,
+        onboardingCompleted: isOnboardingDone(user),
       },
     });
   } catch (error) {
@@ -656,6 +672,7 @@ const getProfile = async (req, res) => {
           : null,
       },
       activeWorkspaceId: user.activeWorkspaceId || null,
+      onboardingCompleted: isOnboardingDone(user),
       createdAt: user.createdAt,
     });
   } catch (error) {
@@ -694,6 +711,7 @@ const verify = async (req, res) => {
             : null,
         },
         activeWorkspaceId: user.activeWorkspaceId || null,
+        onboardingCompleted: isOnboardingDone(user),
       },
     });
   } catch (error) {

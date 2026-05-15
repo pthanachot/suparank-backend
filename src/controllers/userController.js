@@ -242,6 +242,40 @@ const connectAccount = async (req, res) => {
   }
 };
 
+// ─── SAVE ONBOARDING ──────────────────────────────────────────
+
+const saveOnboarding = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const { skip, businessType, teamSize, role, interests, referralSources } = req.body;
+
+    user.onboarding = user.onboarding || {};
+
+    if (skip) {
+      user.onboarding.skippedAt = new Date();
+    } else {
+      if (businessType) user.onboarding.businessType = businessType;
+      if (teamSize) user.onboarding.teamSize = teamSize;
+      if (role) user.onboarding.role = role;
+      if (interests) user.onboarding.interests = interests;
+      if (referralSources) user.onboarding.referralSources = referralSources;
+      user.onboarding.completed = true;
+      user.onboarding.completedAt = new Date();
+    }
+
+    await user.save();
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Save onboarding error:', error);
+    res.status(500).json({ error: 'Failed to save onboarding' });
+  }
+};
+
 module.exports = {
   updateProfile,
   changePassword,
@@ -249,4 +283,5 @@ module.exports = {
   revokeSession,
   disconnectAccount,
   connectAccount,
+  saveOnboarding,
 };

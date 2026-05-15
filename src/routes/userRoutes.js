@@ -7,6 +7,7 @@ const { authenticateToken } = require('../middleware/auth');
 router.use(authenticateToken);
 
 router.put('/profile', userController.updateProfile);
+router.post('/onboarding', userController.saveOnboarding);
 router.post('/change-password', userController.changePassword);
 router.get('/sessions', userController.getSessions);
 router.delete('/sessions/:sessionId', userController.revokeSession);

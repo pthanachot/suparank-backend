@@ -23,7 +23,7 @@ const creditTransactionSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ['deduction', 'subscription_grant', 'purchase', 'refund', 'adjustment', 'expiration'],
+      enum: ['deduction', 'subscription_grant', 'general_grant', 'purchase', 'refund', 'adjustment', 'expiration'],
       required: true,
     },
     amount: {
@@ -33,7 +33,7 @@ const creditTransactionSchema = new mongoose.Schema(
     },
     pool: {
       type: String,
-      enum: ['subscription', 'purchased'],
+      enum: ['subscription', 'general'],
       required: true,
       // Which credit pool was affected.
     },

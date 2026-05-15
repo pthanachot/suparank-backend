@@ -3,10 +3,10 @@
  *
  * Two credit pools per organization:
  *   - subscriptionCredits: expire at billing cycle end
- *   - purchasedCredits: never expire
+ *   - generalCredits: never expire
  *
- * Deduction priority: subscription first, then purchased.
- * Refunds always go to purchased pool.
+ * Deduction priority: subscription first, then general.
+ * Refunds always go to general pool.
  *
  * 1 credit = 50 words of AI-generated content.
  */
@@ -51,7 +51,7 @@ async function getOrCreateCredit(orgId) {
 
 /**
  * Get credit balance for an organization.
- * @returns {{ subscription: number, purchased: number, total: number, expiresAt: Date|null }}
+ * @returns {{ subscription: number, general: number, total: number, expiresAt: Date|null }}
  */
 async function getBalance(orgId) {
   const credit = await getOrCreateCredit(orgId);
@@ -77,8 +77,8 @@ async function getBalance(orgId) {
 
   return {
     subscription: credit.subscriptionCredits,
-    purchased: credit.purchasedCredits,
-    total: credit.subscriptionCredits + credit.purchasedCredits,
+    general: credit.generalCredits,
+    total: credit.subscriptionCredits + credit.generalCredits,
     expiresAt: credit.subscriptionCreditsExpireAt,
   };
 }
@@ -94,7 +94,7 @@ async function canAfford(orgId, amount) {
 /**
  * Pre-deduct credits (reserve for a pending operation).
  *
- * Deducts from subscription first, then purchased.
+ * Deducts from subscription first, then general.
  * Creates a CreditTransaction with status='pending'.
  * Also increments UsageTracker.creditsUsed.
  *
@@ -103,11 +103,11 @@ async function canAfford(orgId, amount) {
  * @param {number} amount - credits to deduct
  * @param {string} feature - feature key (e.g. 'aiChat')
  * @param {object} [metadata] - extra context
- * @returns {{ transactionId: string, deducted: number, balanceAfter: { subscription: number, purchased: number } }}
+ * @returns {{ transactionId: string, deducted: number, balanceAfter: { subscription: number, general: number } }}
  */
 async function preDeduct(orgId, userId, amount, feature, metadata = {}) {
   if (amount <= 0) {
-    return { transactionId: null, deducted: 0, balanceAfter: { subscription: 0, purchased: 0 } };
+    return { transactionId: null, deducted: 0, balanceAfter: { subscription: 0, general: 0 } };
   }
 
   // Read current balance (getBalance auto-expires if needed)
@@ -119,10 +119,10 @@ async function preDeduct(orgId, userId, amount, feature, metadata = {}) {
     credit.subscriptionCreditsExpireAt = null;
   }
 
-  // Calculate split: subscription first, then purchased
+  // Calculate split: subscription first, then general
   const fromSubscription = Math.min(credit.subscriptionCredits, amount);
-  const fromPurchased = Math.min(credit.purchasedCredits, amount - fromSubscription);
-  const totalDeducted = fromSubscription + fromPurchased;
+  const fromGeneral = Math.min(credit.generalCredits, amount - fromSubscription);
+  const totalDeducted = fromSubscription + fromGeneral;
 
   if (totalDeducted <= 0) {
     throw new Error('Insufficient credits');
@@ -133,12 +133,12 @@ async function preDeduct(orgId, userId, amount, feature, metadata = {}) {
     {
       organizationId: orgId,
       subscriptionCredits: { $gte: fromSubscription },
-      purchasedCredits: { $gte: fromPurchased },
+      generalCredits: { $gte: fromGeneral },
     },
     {
       $inc: {
         subscriptionCredits: -fromSubscription,
-        purchasedCredits: -fromPurchased,
+        generalCredits: -fromGeneral,
       },
     },
     { new: true }
@@ -167,16 +167,16 @@ async function preDeduct(orgId, userId, amount, feature, metadata = {}) {
     transactions.push(tx);
   }
 
-  if (fromPurchased > 0) {
+  if (fromGeneral > 0) {
     const tx = await CreditTransaction.logTransaction({
       orgId,
       userId,
       type: 'deduction',
-      amount: -fromPurchased,
-      pool: 'purchased',
+      amount: -fromGeneral,
+      pool: 'general',
       description: `${feature}: ${amount} credits`,
       metadata: { ...metadata, feature, estimatedTotal: amount },
-      balanceAfter: updated.purchasedCredits,
+      balanceAfter: updated.generalCredits,
       status: 'pending',
     });
     transactions.push(tx);
@@ -193,7 +193,7 @@ async function preDeduct(orgId, userId, amount, feature, metadata = {}) {
     deducted: totalDeducted,
     balanceAfter: {
       subscription: updated.subscriptionCredits,
-      purchased: updated.purchasedCredits,
+      general: updated.generalCredits,
     },
   };
 }
@@ -201,7 +201,7 @@ async function preDeduct(orgId, userId, amount, feature, metadata = {}) {
 /**
  * Settle a pending pre-deduction with actual credit cost.
  *
- * If actual < estimated: refund the difference to purchased pool.
+ * If actual < estimated: refund the difference to general pool.
  * Marks the original transaction as 'settled'.
  *
  * @param {string} transactionId - the original pending transaction ID
@@ -226,10 +226,10 @@ async function settle(transactionId, actualAmount) {
   const refundAmount = Math.max(0, totalDeducted - actualAmount);
 
   if (refundAmount > 0) {
-    // Refund difference to purchased pool
+    // Refund difference to general pool
     await Credit.findOneAndUpdate(
       { organizationId: tx.organizationId },
-      { $inc: { purchasedCredits: refundAmount } }
+      { $inc: { generalCredits: refundAmount } }
     );
 
     const credit = await Credit.findOne({ organizationId: tx.organizationId }).lean();
@@ -239,10 +239,10 @@ async function settle(transactionId, actualAmount) {
       userId: tx.userId,
       type: 'refund',
       amount: refundAmount,
-      pool: 'purchased',
+      pool: 'general',
       description: `Settlement refund: estimated ${totalDeducted}, actual ${actualAmount}`,
       metadata: { feature: tx.metadata?.feature, actualAmount },
-      balanceAfter: credit?.purchasedCredits || 0,
+      balanceAfter: credit?.generalCredits || 0,
       relatedTransactionId: tx._id,
     });
 
@@ -265,7 +265,7 @@ async function settle(transactionId, actualAmount) {
 /**
  * Full refund of a pending pre-deduction (operation failed/aborted).
  *
- * Adds refund to purchased pool. Marks original as 'refunded'.
+ * Adds refund to general pool. Marks original as 'refunded'.
  *
  * @param {string} transactionId
  * @returns {{ refunded: number }}
@@ -276,7 +276,7 @@ async function refund(transactionId) {
   const tx = await CreditTransaction.findById(transactionId);
   if (!tx || tx.status === 'refunded') return { refunded: 0 };
 
-  // Get all related pending transactions (subscription + purchased)
+  // Get all related pending transactions (subscription + general)
   const relatedTxs = await CreditTransaction.find({
     organizationId: tx.organizationId,
     status: 'pending',
@@ -287,10 +287,10 @@ async function refund(transactionId) {
   const totalToRefund = relatedTxs.reduce((sum, t) => sum + Math.abs(t.amount), 0);
 
   if (totalToRefund > 0) {
-    // Refund to purchased pool
+    // Refund to general pool
     await Credit.findOneAndUpdate(
       { organizationId: tx.organizationId },
-      { $inc: { purchasedCredits: totalToRefund } }
+      { $inc: { generalCredits: totalToRefund } }
     );
 
     const credit = await Credit.findOne({ organizationId: tx.organizationId }).lean();
@@ -300,10 +300,10 @@ async function refund(transactionId) {
       userId: tx.userId,
       type: 'refund',
       amount: totalToRefund,
-      pool: 'purchased',
+      pool: 'general',
       description: `Full refund: operation failed/aborted`,
       metadata: { feature: tx.metadata?.feature, originalAmount: totalToRefund },
-      balanceAfter: credit?.purchasedCredits || 0,
+      balanceAfter: credit?.generalCredits || 0,
       relatedTransactionId: tx._id,
     });
 
@@ -357,6 +357,36 @@ async function grantSubscriptionCredits(orgId, amount, expiresAt) {
 }
 
 /**
+ * Grant general (non-expiring) credits — used for free-tier initial grant, promos, purchases.
+ *
+ * ADDITIVE — adds to existing general balance (does not overwrite).
+ *
+ * @param {string} orgId
+ * @param {number} amount
+ * @param {string} [description]
+ */
+async function grantGeneralCredits(orgId, amount, description = 'General credits granted') {
+  if (!amount || amount <= 0) return;
+
+  const updated = await Credit.findOneAndUpdate(
+    { organizationId: orgId },
+    { $inc: { generalCredits: amount } },
+    { new: true, upsert: true, setDefaultsOnInsert: true }
+  );
+
+  await CreditTransaction.logTransaction({
+    orgId,
+    type: 'general_grant',
+    amount,
+    pool: 'general',
+    description,
+    balanceAfter: updated.generalCredits,
+  });
+
+  console.log(`[creditService] Granted ${amount} general credits for org ${orgId}`);
+}
+
+/**
  * Expire remaining subscription credits (on cancellation or before renewal).
  *
  * @param {string} orgId
@@ -395,5 +425,6 @@ module.exports = {
   settle,
   refund,
   grantSubscriptionCredits,
+  grantGeneralCredits,
   expireSubscriptionCredits,
 };

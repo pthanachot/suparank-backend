@@ -94,11 +94,11 @@ const createOrganization = async (req, res) => {
       });
     }
 
-    // Grant free-tier credits (lifetime, no expiry)
+    // Grant free-tier credits as general (non-expiring) credits
     try {
       const { config } = await tierService.getOrgTierConfig(org._id);
       if (config?.creditsPerMonth) {
-        await creditService.grantSubscriptionCredits(org._id, config.creditsPerMonth, null);
+        await creditService.grantGeneralCredits(org._id, config.creditsPerMonth, 'Free-tier initial credits');
       }
     } catch (err) {
       console.error(`[credits] Failed to grant free-tier credits for org=${org._id}:`, err.message);

@@ -6,7 +6,7 @@ const mongoose = require('mongoose');
  * Credits: 1 credit = 50 words of AI-generated content.
  * Two pools:
  *   - subscriptionCredits: granted each billing cycle, expire at cycle end.
- *   - purchasedCredits: bought via credit packs, never expire.
+ *   - generalCredits: free-tier grant, purchases, promos — never expire.
  *
  * See TierConfig for per-tier credit allotments.
  */
@@ -25,11 +25,11 @@ const creditSchema = new mongoose.Schema(
       min: 0,
       // Expiring credits — reset each billing cycle based on TierConfig.creditsPerMonth.
     },
-    purchasedCredits: {
+    generalCredits: {
       type: Number,
       default: 0,
       min: 0,
-      // Non-expiring credits — purchased via credit packs.
+      // Non-expiring credits — free-tier grant, purchases, promos.
     },
     subscriptionCreditsExpireAt: {
       type: Date,
@@ -51,7 +51,7 @@ const creditSchema = new mongoose.Schema(
  * Total balance across both pools.
  */
 creditSchema.methods.totalBalance = function () {
-  return this.subscriptionCredits + this.purchasedCredits;
+  return this.subscriptionCredits + this.generalCredits;
 };
 
 // ─── Static methods ──────────────────────────────────────────
@@ -63,7 +63,7 @@ creditSchema.methods.totalBalance = function () {
 creditSchema.statics.getOrCreateForOrg = function (orgId) {
   return this.findOneAndUpdate(
     { organizationId: orgId },
-    { $setOnInsert: { organizationId: orgId, subscriptionCredits: 0, purchasedCredits: 0 } },
+    { $setOnInsert: { organizationId: orgId, subscriptionCredits: 0, generalCredits: 0 } },
     { upsert: true, new: true, setDefaultsOnInsert: true }
   );
 };

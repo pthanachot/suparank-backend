@@ -10,6 +10,7 @@ router.use(authenticateToken);
 router.get('/', workspaceController.listWorkspaces);
 router.post('/', workspaceController.createWorkspace);
 router.put('/:workspaceId', rejectIfLocked(Workspace, 'workspaceId'), workspaceController.updateWorkspace);
+router.get('/:workspaceId/content-summary', workspaceController.getContentSummary);
 router.delete('/:workspaceId', workspaceController.deleteWorkspace);
 router.put('/:workspaceId/activate', rejectIfLocked(Workspace, 'workspaceId'), workspaceController.setActiveWorkspace);
 router.put('/:workspaceId/move', workspaceController.moveWorkspace);

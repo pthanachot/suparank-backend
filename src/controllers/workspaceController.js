@@ -249,13 +249,32 @@ const deleteWorkspace = async (req, res) => {
     } else if (!workspace.userId.equals(req.user.userId)) {
       return res.status(404).json({ error: 'Workspace not found' });
     }
-    // Block deletion if workspace has content (articles)
-    const Article = mongoose.models.Article;
-    if (Article) {
-      const articleCount = await Article.countDocuments({ workspaceId: workspaceId });
-      if (articleCount > 0) {
-        return res.status(400).json({ error: 'Cannot delete a workspace that has content. Move or delete its articles first.' });
-      }
+    // Cascade-delete all workspace content
+    const trackerIds = [];
+    const AiTracker = mongoose.models.AiTracker;
+    if (AiTracker) {
+      const trackers = await AiTracker.find({ workspaceId }, '_id').lean();
+      trackerIds.push(...trackers.map(t => t._id));
+    }
+    if (trackerIds.length > 0) {
+      const AiTrackerPrompt = mongoose.models.AiTrackerPrompt;
+      const AiTrackerCompetitor = mongoose.models.AiTrackerCompetitor;
+      const AiTrackerScan = mongoose.models.AiTrackerScan;
+      if (AiTrackerPrompt) await AiTrackerPrompt.deleteMany({ trackerId: { $in: trackerIds } });
+      if (AiTrackerCompetitor) await AiTrackerCompetitor.deleteMany({ trackerId: { $in: trackerIds } });
+      if (AiTrackerScan) await AiTrackerScan.deleteMany({ trackerId: { $in: trackerIds } });
+      await AiTracker.deleteMany({ workspaceId });
+    }
+    const cascadeModels = [
+      { model: 'Content',                filter: { workspaceId } },
+      { model: 'KeywordResearchHistory', filter: { workspaceId } },
+      { model: 'BrandVoice',             filter: { workspace: workspaceId } },
+      { model: 'Avatar',                 filter: { workspace: workspaceId } },
+      { model: 'Site',                   filter: { workspaceId } },
+    ];
+    for (const { model: name, filter } of cascadeModels) {
+      const Model = mongoose.models[name];
+      if (Model) await Model.deleteMany(filter);
     }
     // If deleting the default workspace, promote the next oldest in the same org
     if (workspace.isDefault) {
@@ -466,4 +485,31 @@ const moveWorkspace = async (req, res) => {
   }
 };
 
-module.exports = { getWorkspace, listWorkspaces, createWorkspace, updateWorkspace, deleteWorkspace, setActiveWorkspace, getMembers, addMember, removeMember, moveWorkspace };
+// ─── CONTENT SUMMARY (counts for delete confirmation) ───────────────
+const getContentSummary = async (req, res) => {
+  try {
+    const { workspaceId } = req.params;
+    const workspace = await Workspace.findById(workspaceId).lean();
+    if (!workspace) return res.status(404).json({ error: 'Workspace not found' });
+
+    const counts = {};
+    const items = [
+      { model: 'Content',              filter: { workspaceId },            key: 'articles' },
+      { model: 'AiTracker',            filter: { workspaceId },            key: 'monitors' },
+      { model: 'KeywordResearchHistory', filter: { workspaceId },          key: 'keywordSearches' },
+      { model: 'BrandVoice',           filter: { workspace: workspaceId }, key: 'brandVoices' },
+      { model: 'Avatar',               filter: { workspace: workspaceId }, key: 'avatars' },
+      { model: 'Site',                 filter: { workspaceId },            key: 'sites' },
+    ];
+    for (const { model: name, filter, key } of items) {
+      const Model = mongoose.models[name];
+      counts[key] = Model ? await Model.countDocuments(filter) : 0;
+    }
+    res.json(counts);
+  } catch (error) {
+    console.error('Content summary error:', error);
+    res.status(500).json({ error: 'Failed to fetch content summary' });
+  }
+};
+
+module.exports = { getWorkspace, listWorkspaces, createWorkspace, updateWorkspace, deleteWorkspace, setActiveWorkspace, getMembers, addMember, removeMember, moveWorkspace, getContentSummary };

@@ -13,12 +13,18 @@ const transporter = nodemailer.createTransport({
 /**
  * Send an email
  */
-const sendEmail = async ({ to, subject, html }) => {
+const sendEmail = async ({ to, subject, html, fromName, replyTo }) => {
+  const defaultFrom = process.env.EMAIL_FROM || 'SupaRank <no-reply@suparank.com>';
+  const from = fromName
+    ? `${fromName} <${defaultFrom.match(/<(.+)>/)?.[1] || 'no-reply@suparank.ai'}>`
+    : defaultFrom;
+
   const mailOptions = {
-    from: process.env.EMAIL_FROM || 'SupaRank <no-reply@suparank.com>',
+    from,
     to,
     subject,
     html,
+    ...(replyTo && { replyTo }),
   };
 
   try {

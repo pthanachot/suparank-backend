@@ -53,6 +53,12 @@ const createOrganization = async (req, res) => {
       return res.status(400).json({ error: 'Organization name is required' });
     }
 
+    // ── Block users with pending account deletion ──
+    const callingUser = await User.findById(req.user.userId).select('status').lean();
+    if (callingUser?.status === 'pending_deletion') {
+      return res.status(403).json({ error: 'Cannot create organizations while account deletion is pending' });
+    }
+
     // ── Enforce maxOrganizationsPerUser (global limit from configOrganization.js) ──
     const maxOrgs = ORG_CONFIG.maxOrganizationsPerUser;
     if (maxOrgs != null) {

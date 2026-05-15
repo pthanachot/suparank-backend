@@ -693,6 +693,7 @@ const getProfile = async (req, res) => {
           ? { email: user.socialAccounts.google.email, connected: !!user.socialAccounts.google.id }
           : null,
       },
+      status: user.status,
       activeWorkspaceId: user.activeWorkspaceId || null,
       onboardingCompleted: isOnboardingDone(user),
       createdAt: user.createdAt,

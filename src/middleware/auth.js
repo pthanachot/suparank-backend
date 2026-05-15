@@ -32,7 +32,7 @@ const authenticateToken = (req, res, next) => {
         return res.status(401).json({ error: 'Token revoked, please login again' });
       }
 
-      if (user.status !== 'active') {
+      if (user.status !== 'active' && user.status !== 'pending_deletion') {
         return res.status(401).json({ error: 'Account is not active' });
       }
 
@@ -82,7 +82,7 @@ const optionalAuth = (req, res, next) => {
 
     try {
       const user = await User.findById(decoded.userId);
-      if (!user || user.status !== 'active') {
+      if (!user || (user.status !== 'active' && user.status !== 'pending_deletion')) {
         req.user = null;
         return next();
       }

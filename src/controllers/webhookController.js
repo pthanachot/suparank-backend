@@ -2,10 +2,16 @@ const Stripe = require('stripe');
 const User = require('../models/User');
 const Organization = require('../models/Organization');
 const Subscription = require('../models/Subscription');
+const UsageTracker = require('../models/UsageTracker');
+const Session = require('../models/Session');
+const OrgMember = require('../models/OrgMember');
+const Workspace = require('../models/Workspace');
 const { clearTierCache, getOrgTierConfig, getTierConfig } = require('../services/tierService');
 const { applyLocksForOrg } = require('../services/downgradeService');
 const creditService = require('../services/creditService');
 const { getPlanFromPriceId, EXTRA_SEAT_PRICE_SET } = require('../config/stripePrices');
+const { applyCustomTemplate } = require('./emailPortalController');
+const { sendEmail } = require('../utils/emailService');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -331,6 +337,71 @@ async function handleSubscriptionDeleted(stripeSub) {
     console.log(`[credits] Expired credits for canceled org=${sub.organizationId}`);
   } catch (err) {
     console.error(`[credits] Failed to expire on cancel for org=${sub.organizationId}:`, err.message);
+  }
+
+  // Reset monthly usage counters — org has no free tier, so stale counters
+  // would block the user when they re-subscribe to a new paid plan.
+  try {
+    const now = new Date();
+    const currentPeriod = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    await UsageTracker.deleteMany({ organizationId: sub.organizationId, period: currentPeriod });
+    console.log(`[usage] Reset monthly counters for canceled org=${sub.organizationId}`);
+  } catch (err) {
+    console.error(`[usage] Failed to reset counters for org=${sub.organizationId}:`, err.message);
+  }
+
+  // Send cancellation email via triggerable template
+  try {
+    const org = await Organization.findById(sub.organizationId).lean();
+    const owner = org?.ownerId ? await User.findById(org.ownerId).lean() : null;
+    if (owner?.email) {
+      const planName = sub.planId ? sub.planId.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()) : 'Your Plan';
+      const endDate = sub.currentPeriodEnd
+        ? new Date(sub.currentPeriodEnd).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+        : 'N/A';
+      const emailOptions = {
+        to: owner.email,
+        data: {
+          userName: owner.profile?.name || 'there',
+          planName,
+          endDate,
+        },
+      };
+      await applyCustomTemplate('subscription_canceled', emailOptions);
+      await sendEmail(emailOptions);
+      console.log(`[email] Cancellation email sent to ${owner.email} for org=${sub.organizationId}`);
+    }
+  } catch (err) {
+    console.error(`[email] Failed to send cancellation email for org=${sub.organizationId}:`, err.message);
+  }
+
+  // Auto-delete user account if they requested deletion while subscription was active
+  try {
+    const org = await Organization.findById(sub.organizationId).lean();
+    if (org?.ownerId) {
+      const owner = await User.findById(org.ownerId);
+      if (owner && owner.status === 'pending_deletion') {
+        const originalEmail = owner.email;
+        // Soft-delete user
+        owner.status = 'deleted';
+        owner.email = `deleted_${Date.now()}_${originalEmail}`;
+        owner.tokenVersion = (owner.tokenVersion || 0) + 1;
+        await owner.save();
+        // Clean up sessions
+        await Session.deleteMany({ userId: owner._id });
+        // Remove from all org memberships
+        await OrgMember.deleteMany({ userId: owner._id });
+        // Cascade-delete personal org and its workspaces
+        const personalOrg = await Organization.findOne({ ownerId: owner._id, isPersonal: true });
+        if (personalOrg) {
+          await Workspace.deleteMany({ organizationId: personalOrg._id });
+          await Organization.deleteOne({ _id: personalOrg._id });
+        }
+        console.log(`[auto-delete] Account deleted for pending_deletion user="${originalEmail}" org=${sub.organizationId}`);
+      }
+    }
+  } catch (err) {
+    console.error(`[auto-delete] Failed for org=${sub.organizationId}:`, err.message);
   }
 
   console.log(`Subscription deleted: sub=${stripeSub.id}`);

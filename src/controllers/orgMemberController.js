@@ -314,6 +314,12 @@ const transferOwnership = async (req, res) => {
     const successorUserId = successor.userId;
     const oldOwnerId = org.ownerId;
 
+    // ── Block transfer to users with pending account deletion ──
+    const successorUser = await User.findById(successorUserId).select('status').lean();
+    if (successorUser?.status === 'pending_deletion') {
+      return res.status(400).json({ error: 'Cannot transfer ownership to a user with pending account deletion' });
+    }
+
     // ── Check if successor can own another org (global limit from configOrganization.js) ──
     const maxOrgs = ORG_CONFIG.maxOrganizationsPerUser;
     if (maxOrgs != null) {

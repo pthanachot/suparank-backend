@@ -4,7 +4,10 @@ const billingController = require('../controllers/billingController');
 const { authenticateToken } = require('../middleware/auth');
 const { requireFeature: rf } = require('../middleware/permissions');
 
-// All billing routes require authentication + feature flag
+// Public (no auth) — prices are not secret
+router.get('/prices', billingController.getPrices);
+
+// All other billing routes require authentication + feature flag
 router.use(authenticateToken);
 
 router.get('/subscription', rf('billing'), billingController.getSubscription);

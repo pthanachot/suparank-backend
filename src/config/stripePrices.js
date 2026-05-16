@@ -12,6 +12,8 @@ const PRICE_TO_PLAN = {
   [process.env.STRIPE_STANDARD_YEARLY_PRICE_ID || 'price_1TCaMYPViW8Lznb8SOYEOsk2']: 'standard-yearly',
   [process.env.STRIPE_PRO_MONTHLY_PRICE_ID || 'price_1TCaUDPViW8Lznb8599QuBfr']: 'pro-monthly',
   [process.env.STRIPE_PRO_YEARLY_PRICE_ID || 'price_1TCaUDPViW8Lznb86MXvgr4Z']: 'pro-yearly',
+  [process.env.STRIPE_AGENCY_MONTHLY_PRICE_ID || 'price_1TWnXePViW8Lznb8eesFJjnR']: 'agency-monthly',
+  [process.env.STRIPE_AGENCY_YEARLY_PRICE_ID || 'price_1TXcfBPViW8Lznb8647tzgfh']: 'agency-yearly',
 };
 
 function getPlanFromPriceId(priceId) {

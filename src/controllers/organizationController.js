@@ -24,17 +24,20 @@ const listOrganizations = async (req, res) => {
       ? await Organization.find({ _id: { $in: memberOrgIds } }).lean()
       : [];
 
-    // Build role map
+    // Build role map and locked map
     const roleMap = {};
+    const lockedMap = {};
     for (const m of memberships) {
-      roleMap[m.organizationId.toString()] = m.role;
+      const key = m.organizationId.toString();
+      roleMap[key] = m.role;
+      lockedMap[key] = m.locked || false;
     }
 
     const orgs = [
-      ...ownedOrgs.map((o) => ({ ...o, role: 'owner' })),
+      ...ownedOrgs.map((o) => ({ ...o, role: 'owner', locked: false })),
       ...memberOrgs
         .filter((o) => !o.ownerId.equals(req.user.userId)) // exclude owned (avoid dupes)
-        .map((o) => ({ ...o, role: roleMap[o._id.toString()] || 'viewer' })),
+        .map((o) => ({ ...o, role: roleMap[o._id.toString()] || 'viewer', locked: lockedMap[o._id.toString()] || false })),
     ];
 
     res.json({ organizations: orgs, maxOrganizationsPerUser: ORG_CONFIG.maxOrganizationsPerUser });

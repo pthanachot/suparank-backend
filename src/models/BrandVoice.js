@@ -16,6 +16,7 @@ const brandVoiceSchema = new mongoose.Schema(
     name: { type: String, required: true, default: 'Default' },
     active: { type: Boolean, default: true },
     locked: { type: Boolean, default: false },
+    createdOnPlan: { type: String, enum: ['free', 'paid'], default: 'free' },
     filename: { type: String, default: 'brand_voice.md' },
     b2Key: { type: String, default: '' },
     content: { type: String, default: '' },

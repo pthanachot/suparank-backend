@@ -15,6 +15,7 @@
 
 const Organization = require('../models/Organization');
 const UsageTracker = require('../models/UsageTracker');
+const UserUsageTracker = require('../models/UserUsageTracker');
 const tierService = require('../services/tierService');
 
 // ─── Resolve org from workspace (handles legacy null organizationId) ─
@@ -58,30 +59,50 @@ function requireQuota(counterKey, tierLimitKey, tierLimitTypeKey) {
         return next();
       }
 
-      const limit = config[tierLimitKey];
+      // ── Quota source override ──
+      // Paid users can opt to use a free lifetime slot instead of their
+      // paid monthly quota. When quotaSource='free', we check against the
+      // free tier's limits and lifetime counter instead.
+      const quotaSource = req.body?.quotaSource;
+      let activeConfig = config;
+      let activeTier = tier;
+
+      if (quotaSource === 'free' && tier !== 'free') {
+        const freeConfig = await tierService.getTierConfig('free');
+        if (!freeConfig) return next(); // fail open
+        activeConfig = freeConfig;
+        activeTier = 'free';
+      }
+
+      const limit = activeConfig[tierLimitKey];
       // null/undefined = unlimited
       if (limit == null) {
-        req.tierQuota = { orgId, counterKey, period: null };
+        req.tierQuota = { orgId, userId: req.user?.userId, counterKey, period: null, isUserLevel: false };
         return next();
       }
 
-      const limitType = config[tierLimitTypeKey] || 'monthly';
+      const limitType = activeConfig[tierLimitTypeKey] || 'monthly';
 
       // Lifetime limits use UsageTracker with period='lifetime' — the counter
       // increments on creation and never decrements on deletion, so deleting
       // a resource does NOT free a creation slot. On tier change (downgrade),
       // downgradeService resets the lifetime counter to match unlocked counts.
+      const isUserLevel = limitType === 'lifetime' && req.user?.userId;
       const period = tierService.getPeriod(limitType);
-      const used = await UsageTracker.getCount(orgId, counterKey, period);
+      const used = isUserLevel
+        ? await UserUsageTracker.getCount(req.user.userId, counterKey)
+        : await UsageTracker.getCount(orgId, counterKey, period);
 
       if (used >= limit) {
         return res.status(429).json({
-          error: `${config.displayName || tier} plan limit reached for this feature`,
+          error: quotaSource === 'free'
+            ? 'No free lifetime slots remaining for this feature'
+            : `${activeConfig.displayName || activeTier} plan limit reached for this feature`,
           code: 'QUOTA_EXCEEDED',
           quota: {
             limit,
             used,
-            tier,
+            tier: activeTier,
             limitKey: tierLimitKey,
             limitType,
             upgradeHint: tierService._upgradeHint(tier, tierLimitKey),
@@ -90,7 +111,7 @@ function requireQuota(counterKey, tierLimitKey, tierLimitTypeKey) {
       }
 
       // Attach context so controller can increment after success
-      req.tierQuota = { orgId, counterKey, period, limit, used };
+      req.tierQuota = { orgId, userId: req.user?.userId, counterKey, period, limit, used, isUserLevel: !!isUserLevel };
       return next();
     } catch (err) {
       console.error('[requireQuota]', err.message);

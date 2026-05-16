@@ -22,6 +22,8 @@ const BrandVoice = require('../models/BrandVoice');
 const OrgMember = require('../models/OrgMember');
 const Subscription = require('../models/Subscription');
 const AiTracker = require('../models/AiTracker');
+const AiTrackerPrompt = require('../models/AiTrackerPrompt');
+const KeywordResearchHistory = require('../models/KeywordResearchHistory');
 const tierService = require('./tierService');
 
 // ─── Helpers ────────────────────────────────────────────────────
@@ -190,12 +192,94 @@ async function resetAiTrackerPlatforms(orgId, maxPlatforms) {
 
   if (trackers.length === 0) return;
 
-  await AiTracker.updateMany(
-    { _id: { $in: trackers.map((t) => t._id) } },
-    { $set: { defaultModels: [] } }
-  );
+  const trackerIds = trackers.map((t) => t._id);
 
-  console.log(`[downgradeService] Cleared defaultModels on ${trackers.length} AI Tracker monitor(s) for org ${orgId}`);
+  await Promise.all([
+    AiTracker.updateMany(
+      { _id: { $in: trackerIds } },
+      { $set: { defaultModels: [] } }
+    ),
+    // Also clear prompt-level models so they re-inherit from tracker after reselection
+    AiTrackerPrompt.updateMany(
+      { trackerId: { $in: trackerIds } },
+      { $set: { models: [] } }
+    ),
+  ]);
+
+  console.log(`[downgradeService] Cleared defaultModels on ${trackers.length} AI Tracker monitor(s) and their prompt models for org ${orgId}`);
+}
+
+// ─── Free-tier plan-origin locking ──────────────────────────────
+//
+// When an org downgrades to free, lock all resources created while on a paid
+// plan. Users can only access resources they created on the free tier.
+// On upgrade back to any paid tier, unlock those resources.
+
+async function lockPaidCreatedResources(orgId) {
+  const wsIds = await getOrgWorkspaceIds(orgId);
+  if (wsIds.length === 0) return;
+
+  // Resolve AI Tracker IDs for prompt locking
+  const trackerIds = await AiTracker.find({ workspaceId: { $in: wsIds } }).distinct('_id');
+
+  await Promise.all([
+    Content.updateMany(
+      { workspaceId: { $in: wsIds }, createdOnPlan: 'paid' },
+      { $set: { locked: true } }
+    ),
+    BrandVoice.updateMany(
+      { workspace: { $in: wsIds }, createdOnPlan: 'paid' },
+      { $set: { locked: true } }
+    ),
+    Avatar.updateMany(
+      { workspace: { $in: wsIds }, createdOnPlan: 'paid' },
+      { $set: { locked: true } }
+    ),
+    KeywordResearchHistory.updateMany(
+      { workspaceId: { $in: wsIds }, createdOnPlan: 'paid' },
+      { $set: { locked: true } }
+    ),
+    ...(trackerIds.length > 0 ? [
+      AiTrackerPrompt.updateMany(
+        { trackerId: { $in: trackerIds }, createdOnPlan: 'paid' },
+        { $set: { locked: true } }
+      ),
+    ] : []),
+  ]);
+
+  console.log(`[downgradeService] Locked paid-created resources for org ${orgId}`);
+}
+
+async function unlockPaidCreatedResources(orgId) {
+  const wsIds = await getOrgWorkspaceIds(orgId);
+  if (wsIds.length === 0) return;
+
+  const trackerIds = await AiTracker.find({ workspaceId: { $in: wsIds } }).distinct('_id');
+
+  await Promise.all([
+    Content.updateMany(
+      { workspaceId: { $in: wsIds }, createdOnPlan: 'paid', locked: true },
+      { $set: { locked: false } }
+    ),
+    BrandVoice.updateMany(
+      { workspace: { $in: wsIds }, createdOnPlan: 'paid', locked: true },
+      { $set: { locked: false } }
+    ),
+    Avatar.updateMany(
+      { workspace: { $in: wsIds }, createdOnPlan: 'paid', locked: true },
+      { $set: { locked: false } }
+    ),
+    KeywordResearchHistory.updateMany(
+      { workspaceId: { $in: wsIds }, createdOnPlan: 'paid', locked: true },
+      { $set: { locked: false } }
+    ),
+    ...(trackerIds.length > 0 ? [
+      AiTrackerPrompt.updateMany(
+        { trackerId: { $in: trackerIds }, createdOnPlan: 'paid', locked: true },
+        { $set: { locked: false } }
+      ),
+    ] : []),
+  ]);
 }
 
 // ─── Main orchestrator ──────────────────────────────────────────
@@ -209,7 +293,7 @@ async function resetAiTrackerPlatforms(orgId, maxPlatforms) {
  * @param {string} orgId - Organization ID
  */
 async function applyLocksForOrg(orgId) {
-  const { config } = await tierService.getOrgTierConfig(orgId);
+  const { tier, config } = await tierService.getOrgTierConfig(orgId);
   if (!config) {
     console.warn(`[downgradeService] No tier config found for org ${orgId}, skipping lock`);
     return;
@@ -222,9 +306,17 @@ async function applyLocksForOrg(orgId) {
   }).lean();
   const extraSeats = sub?.purchasedExtraSeats || 0;
 
+  // Free tier: lock all paid-created resources; Paid tier: unlock them
+  if (tier === 'free') {
+    await lockPaidCreatedResources(orgId);
+  } else {
+    await unlockPaidCreatedResources(orgId);
+  }
+
   await Promise.all([
     // Quota resources: unlock any previously locked articles (cleanup)
-    unlockAllArticles(orgId),
+    // Skip for free tier — lockPaidCreatedResources already handled article locks
+    ...(tier !== 'free' ? [unlockAllArticles(orgId)] : []),
     // Capacity resources: lock excess beyond new tier limits
     lockWorkspaces(orgId, config.maxWorkspaces),
     lockBrandVoiceConfigs(orgId, config.maxBrandVoices),

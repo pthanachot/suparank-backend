@@ -76,6 +76,9 @@ const imageRoutes = require('./routes/imageRoutes');
 const brandVoiceRoutes = require('./routes/brandVoiceRoutes');
 const orgRoutes = require('./routes/orgRoutes');
 const organizationRoutes = require('./routes/organizationRoutes');
+const adminRoutes = require('./routes/adminRoutes');
+const feedbackRoutes = require('./routes/feedbackRoutes');
+const contactRoutes = require('./routes/contactRoutes');
 const internalCfsRoutes = require('./routes/internalCfsRoutes');
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
@@ -88,6 +91,9 @@ app.use('/api/workspace', workspaceRoutes);
 app.use('/api/workspaces', workspaceCrudRoutes);
 app.use('/api/org', orgRoutes);
 app.use('/api/organizations', organizationRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/feedback', feedbackRoutes);
+app.use('/api/contact', contactRoutes);
 
 // Internal API for the Go writing-engine (CFS reads, plan writes, skills
 // bridge). Gated by internalAuth middleware — NOT user-facing.

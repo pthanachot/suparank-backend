@@ -1,8 +1,8 @@
 const Content = require('../models/Content');
 const { runAnalysis } = require('./analysisController');
 const imageStorage = require('../services/imageStorage');
-const UsageTracker = require('../models/UsageTracker');
 const creditService = require('../services/creditService');
+const tierService = require('../services/tierService');
 
 // Workspace is resolved by the permissions middleware (resolveWorkspaceWithRole)
 // and available as req.workspace.
@@ -33,6 +33,11 @@ const getContent = async (req, res) => {
       return res.status(404).json({ error: 'Content not found' });
     }
 
+    // Block access to locked content (e.g. paid-created content on free tier)
+    if (content.locked) {
+      return res.status(403).json({ error: 'This content is locked. Upgrade your plan to regain access.', locked: true });
+    }
+
     // Migrate old public B2 URLs to new /api/b2-image/ path format
     if (content.blocks && Array.isArray(content.blocks)) {
       for (const block of content.blocks) {
@@ -59,6 +64,19 @@ const createContent = async (req, res) => {
     const contentNumber = await Content.getNextContentNumber();
     const { title, slug, description, blocks, targetKeywords, country, device, score, wordCount, status, folder, platform, versions } = req.body;
 
+    // Determine plan tier at creation time.
+    // Paid users can opt to use a free lifetime slot (quotaSource='free').
+    const orgId = workspace.organizationId;
+    let createdOnPlan = 'free';
+    if (orgId) {
+      if (req.body.quotaSource === 'free') {
+        createdOnPlan = 'free';
+      } else {
+        const { tier } = await tierService.getOrgTierConfig(orgId);
+        createdOnPlan = tier === 'free' ? 'free' : 'paid';
+      }
+    }
+
     const content = await Content.create({
       userId: req.user.userId,
       workspaceId: workspace._id,
@@ -76,6 +94,7 @@ const createContent = async (req, res) => {
       folder,
       platform,
       versions: versions || [],
+      createdOnPlan,
     });
 
     // Auto-trigger analysis if keywords are provided
@@ -86,7 +105,7 @@ const createContent = async (req, res) => {
 
     // Track article creation against tier quota
     if (req.tierQuota) {
-      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+      await tierService.incrementQuota(req.tierQuota);
     }
 
     res.status(201).json({ content });
@@ -442,7 +461,7 @@ function extractCriteria(buffer) {
   return criteria;
 }
 
-async function streamAudit(req, res, { prompt, contentHash, contentId, dbField, errorPrefix }) {
+async function streamAudit(req, res, { prompt, contentHash, contentId, dbField, errorPrefix, tierQuota }) {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) return res.status(500).json({ error: 'OpenRouter API key not configured' });
 
@@ -567,6 +586,11 @@ async function streamAudit(req, res, { prompt, contentHash, contentId, dbField, 
       { _id: contentId },
       { $push: { [dbField]: { $each: [auditResult], $slice: -10 } } }
     );
+
+    // Track quota only after successful audit completion + DB save
+    if (tierQuota) {
+      await tierService.incrementQuota(tierQuota);
+    }
   } catch (e) {
     console.error(`[${dbField}] DB save error:`, e.message);
   }
@@ -617,17 +641,13 @@ const runAudit = async (req, res) => {
     const blocksText = (content.blocks || []).map((b) => stripTags(b.text)).join(' ');
     const wordCount = blocksText.trim().split(/\s+/).filter(Boolean).length;
 
-    // Track audit usage (only for non-cached audits)
-    if (req.tierQuota) {
-      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
-    }
-
     await streamAudit(req, res, {
       prompt: buildAuditPrompt(markdown, keyword, wordCount),
       contentHash,
       contentId: content._id,
       dbField: 'audits',
       errorPrefix: 'AI audit failed',
+      tierQuota: req.tierQuota || null,
     });
   } catch (err) {
     if (err.name === 'AbortError') return;
@@ -712,17 +732,13 @@ const runWritingQualityAudit = async (req, res) => {
     const blocksText = (content.blocks || []).map((b) => stripTags(b.text)).join(' ');
     const wordCount = blocksText.trim().split(/\s+/).filter(Boolean).length;
 
-    // Track audit usage (only for non-cached audits)
-    if (req.tierQuota) {
-      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
-    }
-
     await streamAudit(req, res, {
       prompt: buildWritingQualityPrompt(markdown, wordCount),
       contentHash,
       contentId: content._id,
       dbField: 'writingQualityAudits',
       errorPrefix: 'AI writing quality check failed',
+      tierQuota: req.tierQuota || null,
     });
   } catch (err) {
     if (err.name === 'AbortError') return;

@@ -5,7 +5,7 @@ const OrgMember = require('../models/OrgMember');
 const Subscription = require('../models/Subscription');
 const { clearTierCache, getOrgTierConfig } = require('../services/tierService');
 const { applyLocksForOrg } = require('../services/downgradeService');
-const { getPlanFromPriceId, EXTRA_SEAT_PRICES } = require('../config/stripePrices');
+const { getPlanFromPriceId, PRICE_TO_PLAN, EXTRA_SEAT_PRICES } = require('../config/stripePrices');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -25,6 +25,8 @@ const PLAN_INFO = {
   'standard-yearly': { name: 'Standard', optimizations: 30, aiModel: 'Advanced' },
   'pro-monthly': { name: 'Pro', optimizations: -1, aiModel: 'Custom' },
   'pro-yearly': { name: 'Pro', optimizations: -1, aiModel: 'Custom' },
+  'agency-monthly': { name: 'Agency', optimizations: -1, aiModel: 'Custom' },
+  'agency-yearly': { name: 'Agency', optimizations: -1, aiModel: 'Custom' },
 };
 
 // ─── HELPERS ─────────────────────────────────────────────────
@@ -144,10 +146,23 @@ const getSubscription = async (req, res) => {
 
     const planInfo = PLAN_INFO[sub.planId] || PLAN_INFO.free;
 
-    // Check for pending plan change (subscription schedule from portal-initiated changes)
+    // Fetch live subscription from Stripe for price info and schedule checks
     let pendingPlanChange = null;
+    let billing = null;
     try {
       const stripeSub = await stripe.subscriptions.retrieve(sub.stripeSubscriptionId);
+
+      // Extract actual price from Stripe
+      const subItem = stripeSub.items.data[0];
+      if (subItem?.price) {
+        billing = {
+          amount: (subItem.price.unit_amount || 0) / 100,
+          currency: (subItem.price.currency || 'usd').toUpperCase(),
+          interval: subItem.price.recurring?.interval || 'month',       // "month" | "year"
+          intervalCount: subItem.price.recurring?.interval_count || 1,
+        };
+      }
+
       if (stripeSub.schedule) {
         const schedule = await stripe.subscriptionSchedules.retrieve(stripeSub.schedule);
         const now = Date.now() / 1000;
@@ -194,6 +209,7 @@ const getSubscription = async (req, res) => {
       planId: sub.planId,
       status: sub.status,
       extraSeats: sub.purchasedExtraSeats || 0,
+      billing,
       pendingPlanChange,
     });
   } catch (error) {
@@ -273,7 +289,7 @@ const createCheckoutSession = async (req, res) => {
       payment_method_collection: 'if_required',
       line_items: [{ price: priceId, quantity: 1 }],
       success_url: `${APP_URL}/settings/billing?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${APP_URL}/settings/billing/plans`,
+      cancel_url: `${APP_URL}/pricing`,
       metadata: {
         organizationId: orgId.toString(),
         userId: user._id.toString(),
@@ -655,6 +671,52 @@ const updateExtraSeats = async (req, res) => {
   }
 };
 
+// ─── GET PLAN PRICES (public, cached) ────────────────────────
+
+let _priceCache = null;
+let _priceCacheExpiry = 0;
+const PRICE_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+
+const getPrices = async (_req, res) => {
+  try {
+    if (_priceCache && Date.now() < _priceCacheExpiry) {
+      return res.json(_priceCache);
+    }
+
+    // Fetch all plan prices from Stripe in parallel
+    const priceIds = Object.keys(PRICE_TO_PLAN);
+    const stripeResults = await Promise.all(
+      priceIds.map((id) => stripe.prices.retrieve(id).catch(() => null))
+    );
+
+    const plans = {};
+    for (let i = 0; i < priceIds.length; i++) {
+      const sp = stripeResults[i];
+      if (!sp) continue;
+      const planId = PRICE_TO_PLAN[priceIds[i]]; // e.g. "standard-monthly"
+      const tier = planId.split('-')[0];          // e.g. "standard"
+      const interval = planId.includes('yearly') ? 'year' : 'month';
+
+      if (!plans[tier]) plans[tier] = {};
+      plans[tier][interval] = {
+        priceId: sp.id,
+        amount: (sp.unit_amount || 0) / 100,
+        currency: (sp.currency || 'usd').toUpperCase(),
+        interval,
+      };
+    }
+
+    const result = { plans };
+    _priceCache = result;
+    _priceCacheExpiry = Date.now() + PRICE_CACHE_TTL;
+
+    res.json(result);
+  } catch (error) {
+    console.error('Get prices error:', error);
+    res.status(500).json({ error: 'Failed to fetch prices' });
+  }
+};
+
 module.exports = {
   getSubscription,
   createCheckoutSession,
@@ -664,4 +726,5 @@ module.exports = {
   reactivateSubscription,
   getInvoices,
   updateExtraSeats,
+  getPrices,
 };

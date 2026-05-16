@@ -1,12 +1,20 @@
+const Stripe = require('stripe');
 const User = require('../models/User');
 const Session = require('../models/Session');
+const Organization = require('../models/Organization');
+const OrgMember = require('../models/OrgMember');
+const Subscription = require('../models/Subscription');
+const Workspace = require('../models/Workspace');
 const { verifyGoogleToken } = require('../middleware/auth');
+const { clearTierCache } = require('../services/tierService');
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 // ─── UPDATE PROFILE ────────────────────────────────────────────
 
 const updateProfile = async (req, res) => {
   try {
-    const { name, email, timezone, picture } = req.body;
+    const { name, email, timezone, picture, emailNotifications } = req.body;
     const user = await User.findById(req.user.userId);
 
     if (!user) {
@@ -26,6 +34,12 @@ const updateProfile = async (req, res) => {
     if (timezone !== undefined) {
       user.preferences = user.preferences || {};
       user.preferences.timezone = timezone;
+    }
+
+    // Update email notifications preference
+    if (emailNotifications !== undefined) {
+      user.preferences = user.preferences || {};
+      user.preferences.emailNotifications = !!emailNotifications;
     }
 
     // Handle email change (requires re-verification)
@@ -48,6 +62,7 @@ const updateProfile = async (req, res) => {
       name: user.profile?.name,
       picture: user.profile?.picture,
       timezone: user.preferences?.timezone,
+      emailNotifications: user.preferences?.emailNotifications ?? true,
       verified: user.verified,
     });
   } catch (error) {
@@ -242,6 +257,163 @@ const connectAccount = async (req, res) => {
   }
 };
 
+// ─── SAVE ONBOARDING ──────────────────────────────────────────
+
+const saveOnboarding = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const { skip, businessType, teamSize, role, interests, referralSources } = req.body;
+
+    user.onboarding = user.onboarding || {};
+
+    if (skip) {
+      user.onboarding.skippedAt = new Date();
+    } else {
+      if (businessType) user.onboarding.businessType = businessType;
+      if (teamSize) user.onboarding.teamSize = teamSize;
+      if (role) user.onboarding.role = role;
+      if (interests) user.onboarding.interests = interests;
+      if (referralSources) user.onboarding.referralSources = referralSources;
+      user.onboarding.completed = true;
+      user.onboarding.completedAt = new Date();
+    }
+
+    await user.save();
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Save onboarding error:', error);
+    res.status(500).json({ error: 'Failed to save onboarding' });
+  }
+};
+
+// ─── DELETE ACCOUNT ───────────────────────────────────────────
+
+const deleteAccount = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Guard: cannot delete if owning non-personal organizations
+    const ownedOrgs = await Organization.find({
+      ownerId: user._id,
+      isPersonal: { $ne: true },
+    }).select('_id name').lean();
+
+    if (ownedOrgs.length > 0) {
+      return res.status(409).json({
+        error: 'You must transfer ownership or delete your organizations before deleting your account.',
+        code: 'OWNS_ORGANIZATIONS',
+        orgs: ownedOrgs.map((o) => ({ id: o._id, name: o.name })),
+      });
+    }
+
+    // Find personal org for subscription check
+    const personalOrg = await Organization.findOne({
+      ownerId: user._id,
+      isPersonal: true,
+    }).lean();
+
+    // Check if user has an active paid subscription
+    if (personalOrg) {
+      const sub = await Subscription.findOne({
+        organizationId: personalOrg._id,
+        status: { $in: ['active', 'trialing'] },
+        stripeSubscriptionId: { $exists: true, $ne: null },
+      });
+
+      if (sub) {
+        // Paid user: schedule deletion (will complete when subscription ends via webhook)
+        user.status = 'pending_deletion';
+        await user.save();
+        console.log(`[account] Scheduled deletion for paid user="${user.email}"`);
+        return res.json({ status: 'pending_deletion' });
+      }
+    }
+
+    // Free user or no active subscription: immediate soft-delete
+    const originalEmail = user.email;
+    user.status = 'deleted';
+    user.email = `deleted_${Date.now()}_${originalEmail}`;
+    user.tokenVersion = (user.tokenVersion || 0) + 1;
+    await user.save();
+
+    // Clean up sessions
+    await Session.deleteMany({ userId: user._id });
+
+    // Remove from all org memberships
+    await OrgMember.deleteMany({ userId: user._id });
+
+    // Cascade-delete personal org and its workspaces
+    if (personalOrg) {
+      await Workspace.deleteMany({ organizationId: personalOrg._id });
+      await Organization.deleteOne({ _id: personalOrg._id });
+    }
+
+    console.log(`[account] Immediately deleted user="${originalEmail}"`);
+    res.json({ status: 'deleted' });
+  } catch (error) {
+    console.error('Delete account error:', error);
+    res.status(500).json({ error: 'Failed to delete account' });
+  }
+};
+
+// ─── CANCEL DELETION ─────────────────────────────────────────
+
+const cancelDeletion = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    if (user.status !== 'pending_deletion') {
+      return res.status(400).json({ error: 'Account is not scheduled for deletion' });
+    }
+
+    // Revert status
+    user.status = 'active';
+    await user.save();
+
+    // Try to reactivate subscription
+    let subscriptionReactivated = false;
+    try {
+      const personalOrg = await Organization.findOne({
+        ownerId: user._id,
+        isPersonal: true,
+      }).lean();
+
+      if (personalOrg) {
+        const sub = await Subscription.findOne({ organizationId: personalOrg._id });
+        if (sub && sub.cancelAtPeriodEnd && sub.stripeSubscriptionId) {
+          await stripe.subscriptions.update(sub.stripeSubscriptionId, {
+            cancel_at_period_end: false,
+          });
+          sub.cancelAtPeriodEnd = false;
+          sub.canceledAt = undefined;
+          await sub.save();
+          clearTierCache();
+          subscriptionReactivated = true;
+        }
+      }
+    } catch (err) {
+      console.error('[account] Failed to reactivate subscription:', err.message);
+    }
+
+    console.log(`[account] Cancelled deletion for user="${user.email}" subscriptionReactivated=${subscriptionReactivated}`);
+    res.json({ status: 'active', subscriptionReactivated });
+  } catch (error) {
+    console.error('Cancel deletion error:', error);
+    res.status(500).json({ error: 'Failed to cancel deletion' });
+  }
+};
+
 module.exports = {
   updateProfile,
   changePassword,
@@ -249,4 +421,7 @@ module.exports = {
   revokeSession,
   disconnectAccount,
   connectAccount,
+  saveOnboarding,
+  deleteAccount,
+  cancelDeletion,
 };

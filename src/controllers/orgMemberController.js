@@ -53,6 +53,20 @@ const listMembers = async (req, res) => {
       .sort({ createdAt: 1 })
       .lean();
 
+    // ── Enforce seat-based locking based on current tier ──
+    const { config } = await tierService.getOrgTierConfig(org._id);
+    let effectiveMaxSeats = null;
+    if (config?.maxSeats != null) {
+      const sub = await Subscription.findOne({
+        organizationId: org._id,
+        status: { $in: ['active', 'trialing'] },
+      }).lean();
+      const extraSeats = sub?.purchasedExtraSeats || 0;
+      effectiveMaxSeats = config.maxSeats + extraSeats;
+    }
+    // Owner takes 1 seat (implicit, not in OrgMember)
+    const memberSlots = effectiveMaxSeats != null ? Math.max(0, effectiveMaxSeats - 1) : null;
+
     // Populate user info for each member
     const userIds = members.map((m) => m.userId);
     const users = await User.find({ _id: { $in: userIds } })
@@ -63,8 +77,26 @@ const listMembers = async (req, res) => {
       userMap[u._id.toString()] = u;
     }
 
-    const enriched = members.map((m) => {
+    // Persist lock state to DB if it differs from computed state
+    if (memberSlots != null) {
+      const toLock = [];
+      const toUnlock = [];
+      for (let i = 0; i < members.length; i++) {
+        const shouldLock = i >= memberSlots;
+        if (shouldLock && !members[i].locked) toLock.push(members[i]._id);
+        if (!shouldLock && members[i].locked) toUnlock.push(members[i]._id);
+      }
+      if (toLock.length > 0) {
+        await OrgMember.updateMany({ _id: { $in: toLock } }, { $set: { locked: true } });
+      }
+      if (toUnlock.length > 0) {
+        await OrgMember.updateMany({ _id: { $in: toUnlock } }, { $set: { locked: false } });
+      }
+    }
+
+    const enriched = members.map((m, idx) => {
       const u = userMap[m.userId.toString()];
+      const locked = memberSlots != null ? idx >= memberSlots : false;
       return {
         _id: m._id,
         userId: m.userId,
@@ -73,7 +105,7 @@ const listMembers = async (req, res) => {
         picture: u?.profile?.picture || '',
         role: m.role,
         status: m.status,
-        locked: m.locked || false,
+        locked,
         invitedAt: m.invitedAt,
       };
     });
@@ -313,6 +345,12 @@ const transferOwnership = async (req, res) => {
 
     const successorUserId = successor.userId;
     const oldOwnerId = org.ownerId;
+
+    // ── Block transfer to users with pending account deletion ──
+    const successorUser = await User.findById(successorUserId).select('status').lean();
+    if (successorUser?.status === 'pending_deletion') {
+      return res.status(400).json({ error: 'Cannot transfer ownership to a user with pending account deletion' });
+    }
 
     // ── Check if successor can own another org (global limit from configOrganization.js) ──
     const maxOrgs = ORG_CONFIG.maxOrganizationsPerUser;

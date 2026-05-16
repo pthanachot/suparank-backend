@@ -2,7 +2,7 @@ const KeywordSearch = require('../models/KeywordSearch');
 const KeywordDetail = require('../models/KeywordDetail');
 const KeywordResearchHistory = require('../models/KeywordResearchHistory');
 const { resolveCountry, fetchRelatedKeywords, fetchSerpResults, SUPPORTED_COUNTRIES } = require('../services/keywordService');
-const UsageTracker = require('../models/UsageTracker');
+const tierService = require('../services/tierService');
 
 // Workspace resolved by permissions middleware (req.workspace).
 
@@ -28,9 +28,13 @@ async function searchKeywords(req, res) {
     const countryConfig = resolveCountry(country || 'United States');
     const countryCode = countryConfig.gl.toUpperCase();
 
-    // Track keyword search against tier quota
-    if (req.tierQuota) {
-      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
+    // Determine createdOnPlan for history entry
+    let createdOnPlan = 'free';
+    if (req.body.quotaSource === 'free') {
+      createdOnPlan = 'free';
+    } else if (workspace.organizationId) {
+      const { tier } = await tierService.getOrgTierConfig(workspace.organizationId);
+      createdOnPlan = tier === 'free' ? 'free' : 'paid';
     }
 
     // Check cache (global — not workspace-scoped)
@@ -42,11 +46,17 @@ async function searchKeywords(req, res) {
 
     if (cached) {
       // Record in workspace history (fire-and-forget)
+      // Reset locked=false so re-searching an old locked keyword unlocks it
       KeywordResearchHistory.findOneAndUpdate(
         { workspaceId: workspace._id, seedKeyword, country: countryCode },
-        { searchedAt: new Date() },
+        { searchedAt: new Date(), createdOnPlan, locked: false },
         { upsert: true },
       ).catch(() => {});
+
+      // Track quota only after successful result
+      if (req.tierQuota) {
+        await tierService.incrementQuota(req.tierQuota);
+      }
 
       return res.json({
         seedMetrics: cached.seedMetrics,
@@ -77,11 +87,17 @@ async function searchKeywords(req, res) {
     );
 
     // Record in workspace history (fire-and-forget)
+    // Reset locked=false so re-searching an old locked keyword unlocks it
     KeywordResearchHistory.findOneAndUpdate(
       { workspaceId: workspace._id, seedKeyword, country: countryCode },
-      { searchedAt: new Date() },
+      { searchedAt: new Date(), createdOnPlan, locked: false },
       { upsert: true },
     ).catch(() => {});
+
+    // Track quota only after successful result
+    if (req.tierQuota) {
+      await tierService.incrementQuota(req.tierQuota);
+    }
 
     return res.json({
       seedMetrics: seed,
@@ -111,11 +127,6 @@ async function getKeywordDetail(req, res) {
     const countryConfig = resolveCountry(country || 'United States');
     const countryCode = countryConfig.gl.toUpperCase();
 
-    // Track keyword detail lookup against tier quota
-    if (req.tierQuota) {
-      await UsageTracker.increment(req.tierQuota.orgId, req.tierQuota.counterKey, req.tierQuota.period);
-    }
-
     // Check cache (global)
     const cached = await KeywordDetail.findOne({
       keyword,
@@ -124,6 +135,11 @@ async function getKeywordDetail(req, res) {
     });
 
     if (cached) {
+      // Track quota only after successful result
+      if (req.tierQuota) {
+        await tierService.incrementQuota(req.tierQuota);
+      }
+
       return res.json({
         keyword: cached.keyword,
         serpResults: cached.serpResults,
@@ -144,6 +160,11 @@ async function getKeywordDetail(req, res) {
       },
       { upsert: true, new: true },
     );
+
+    // Track quota only after successful result
+    if (req.tierQuota) {
+      await tierService.incrementQuota(req.tierQuota);
+    }
 
     return res.json({
       keyword,
@@ -185,6 +206,8 @@ async function getSearchHistory(req, res) {
           country: entry.country,
           searchedAt: entry.searchedAt,
           totalCount: cached?.totalCount ?? 0,
+          locked: entry.locked || false,
+          createdOnPlan: entry.createdOnPlan || 'free',
         };
       }),
     );

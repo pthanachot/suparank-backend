@@ -24,17 +24,20 @@ const listOrganizations = async (req, res) => {
       ? await Organization.find({ _id: { $in: memberOrgIds } }).lean()
       : [];
 
-    // Build role map
+    // Build role map and locked map
     const roleMap = {};
+    const lockedMap = {};
     for (const m of memberships) {
-      roleMap[m.organizationId.toString()] = m.role;
+      const key = m.organizationId.toString();
+      roleMap[key] = m.role;
+      lockedMap[key] = m.locked || false;
     }
 
     const orgs = [
-      ...ownedOrgs.map((o) => ({ ...o, role: 'owner' })),
+      ...ownedOrgs.map((o) => ({ ...o, role: 'owner', locked: false })),
       ...memberOrgs
         .filter((o) => !o.ownerId.equals(req.user.userId)) // exclude owned (avoid dupes)
-        .map((o) => ({ ...o, role: roleMap[o._id.toString()] || 'viewer' })),
+        .map((o) => ({ ...o, role: roleMap[o._id.toString()] || 'viewer', locked: lockedMap[o._id.toString()] || false })),
     ];
 
     res.json({ organizations: orgs, maxOrganizationsPerUser: ORG_CONFIG.maxOrganizationsPerUser });
@@ -51,6 +54,12 @@ const createOrganization = async (req, res) => {
     const { name } = req.body;
     if (!name || !name.trim()) {
       return res.status(400).json({ error: 'Organization name is required' });
+    }
+
+    // ── Block users with pending account deletion ──
+    const callingUser = await User.findById(req.user.userId).select('status').lean();
+    if (callingUser?.status === 'pending_deletion') {
+      return res.status(403).json({ error: 'Cannot create organizations while account deletion is pending' });
     }
 
     // ── Enforce maxOrganizationsPerUser (global limit from configOrganization.js) ──
@@ -94,14 +103,14 @@ const createOrganization = async (req, res) => {
       });
     }
 
-    // Grant free-tier credits (lifetime, no expiry)
+    // Ensure user has free credits (idempotent — no-op if already granted on signup)
     try {
       const { config } = await tierService.getOrgTierConfig(org._id);
       if (config?.creditsPerMonth) {
-        await creditService.grantSubscriptionCredits(org._id, config.creditsPerMonth, null);
+        await creditService.grantFreeCreditsIfNew(req.user.userId, config.creditsPerMonth);
       }
     } catch (err) {
-      console.error(`[credits] Failed to grant free-tier credits for org=${org._id}:`, err.message);
+      console.error(`[credits] Failed to ensure free credits for user=${req.user.userId}:`, err.message);
     }
 
     res.status(201).json({

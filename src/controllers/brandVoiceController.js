@@ -495,12 +495,17 @@ const createAvatar = async (req, res) => {
       }
     }
 
+    // Determine plan tier at creation time
+    const { tier } = await tierService.getOrgTierConfig(orgId);
+    const createdOnPlan = tier === 'free' ? 'free' : 'paid';
+
     const avatarData = {
       workspace: workspace._id,
       createdBy: req.user.userId,
       name: name.trim(),
       emoji, role, experience, tagline, traits, writingQuirks,
       toneOverrides, vocabulary, openingStyle, sample,
+      createdOnPlan,
     };
 
     // Generate avatar-only markdown
@@ -1107,6 +1112,14 @@ const listBrandVoices = async (req, res) => {
 
     // Auto-create default if none exist
     if (voices.length === 0) {
+      // Determine plan tier for the auto-created default voice
+      const orgId = workspace.organizationId;
+      let autoCreatedOnPlan = 'free';
+      if (orgId) {
+        const { tier } = await tierService.getOrgTierConfig(orgId);
+        autoCreatedOnPlan = tier === 'free' ? 'free' : 'paid';
+      }
+
       const settings = DEFAULT_SETTINGS;
       const content = generateBrandVoiceMarkdown(settings);
       const b2Key = `brand-voice/${workspace._id}/brand_voice.md`;
@@ -1119,6 +1132,7 @@ const listBrandVoices = async (req, res) => {
         content,
         b2Key,
         filename: 'brand_voice.md',
+        createdOnPlan: autoCreatedOnPlan,
       });
       uploadBuffer(Buffer.from(content, 'utf-8'), 'text/markdown', b2Key).catch(() => {});
       return res.json({ voices: [created.toObject()] });
@@ -1156,6 +1170,10 @@ const createBrandVoice = async (req, res) => {
       }
     }
 
+    // Determine plan tier at creation time
+    const { tier } = await tierService.getOrgTierConfig(orgId);
+    const createdOnPlan = tier === 'free' ? 'free' : 'paid';
+
     const settings = DEFAULT_SETTINGS;
     const content = generateBrandVoiceMarkdown(settings);
 
@@ -1167,6 +1185,7 @@ const createBrandVoice = async (req, res) => {
       settings,
       content,
       filename: 'brand_voice.md',
+      createdOnPlan,
     });
 
     // Upload to B2

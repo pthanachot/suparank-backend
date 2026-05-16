@@ -23,7 +23,7 @@ const userSchema = new mongoose.Schema(
     verificationExpires: Date,
     status: {
       type: String,
-      enum: ['active', 'suspended', 'deleted'],
+      enum: ['active', 'suspended', 'deleted', 'pending_deletion'],
       default: 'active',
     },
     roles: { type: [String], default: ['member'] },
@@ -50,6 +50,17 @@ const userSchema = new mongoose.Schema(
     lastActive: Date,
     failedLoginAttempts: { type: Number, default: 0 },
     lockUntil: Date,
+
+    onboarding: {
+      completed: { type: Boolean, default: false },
+      skippedAt: Date,
+      completedAt: Date,
+      businessType: String,
+      teamSize: String,
+      role: String,
+      interests: [String],
+      referralSources: [String],
+    },
   },
   { timestamps: true }
 );

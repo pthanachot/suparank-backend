@@ -68,8 +68,8 @@ function requireCredits(featureKey, estimateCredits) {
         ? estimateCredits(req)
         : estimateCredits;
 
-      // Check if org can afford it
-      const balance = await creditService.getBalance(orgId);
+      // Check if org + user can afford it
+      const balance = await creditService.getBalance(orgId, req.user?.userId);
 
       if (balance.total < estimated) {
         return res.status(402).json({

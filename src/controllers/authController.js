@@ -2,12 +2,28 @@ const User = require('../models/User');
 const Session = require('../models/Session');
 const Counter = require('../models/Counter');
 const VerificationCode = require('../models/VerificationCode');
+const Organization = require('../models/Organization');
+const Workspace = require('../models/Workspace');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { generateTokens, generateAccessToken } = require('../utils/jwt');
 const ResetToken = require('../models/ResetToken');
 const { sendEmail, sendVerificationCodeEmail, sendPasswordResetCodeEmail } = require('../utils/emailService');
 const { verifyGoogleToken } = require('../middleware/auth');
+const creditService = require('../services/creditService');
+const tierService = require('../services/tierService');
+
+// Helper: is onboarding considered done (completed, skipped, or pre-existing user)?
+// Mongoose applies defaults for inline subdocs, so user.onboarding always exists in memory.
+// Use createdAt cutoff to grandfather users created before the onboarding feature.
+const ONBOARDING_LAUNCH = new Date('2026-05-15T00:00:00Z');
+
+function isOnboardingDone(user) {
+  if (user.onboarding?.completed || user.onboarding?.skippedAt) return true;
+  // Users created before onboarding feature — grandfather them in
+  if (user.createdAt < ONBOARDING_LAUNCH) return true;
+  return false;
+}
 
 // Auto-increment userId
 async function getNextUserId() {
@@ -22,6 +38,42 @@ async function getNextUserId() {
 // Generate 6-digit code
 function generateCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+// Helper: auto-create a default organization + workspace for a newly registered user
+// so they can land in the workspace immediately after registration/onboarding.
+async function bootstrapNewUser(userId, displayName) {
+  const orgName = displayName ? `${displayName}'s Organization` : 'My Organization';
+  const slug = await Organization.generateSlug(orgName, userId);
+  const org = await Organization.create({
+    name: orgName,
+    slug,
+    ownerId: userId,
+    isPersonal: false,
+  });
+
+  const workspaceNumber = await Workspace.getNextNumber();
+  const workspace = await Workspace.create({
+    workspaceNumber,
+    name: 'My Workspace',
+    userId,
+    organizationId: org._id,
+    isDefault: true,
+  });
+
+  await User.findByIdAndUpdate(userId, { activeWorkspaceId: workspace._id });
+
+  // Grant free credits to the org (idempotent — no-op if already granted on signup)
+  try {
+    const { config } = await tierService.getOrgTierConfig(org._id);
+    if (config?.creditsPerMonth) {
+      await creditService.grantFreeCreditsIfNew(userId, config.creditsPerMonth);
+    }
+  } catch (err) {
+    console.error(`[bootstrap] org credit grant failed user=${userId}:`, err.message);
+  }
+
+  return { org, workspace };
 }
 
 // ─── EMAIL SIGNUP ───────────────────────────────────────────────
@@ -75,6 +127,24 @@ const emailSignup = async (req, res) => {
 
     await user.save();
 
+    // Grant free credits to the new user
+    try {
+      const freeTierConfig = await tierService.getTierConfig('free');
+      if (freeTierConfig?.creditsPerMonth) {
+        await creditService.grantFreeCredits(user._id, freeTierConfig.creditsPerMonth);
+      }
+    } catch (err) {
+      console.error(`[auth] Failed to grant free credits for user=${user._id}:`, err.message);
+    }
+
+    // Auto-create default organization + workspace for the new user
+    let bootstrapResult = null;
+    try {
+      bootstrapResult = await bootstrapNewUser(user._id, user.profile.name);
+    } catch (err) {
+      console.error(`[auth] Failed to bootstrap org/workspace for user=${user._id}:`, err.message);
+    }
+
     // Send verification email if not already verified
     if (!user.verified) {
       const verifyUrl = `${process.env.FRONTEND_URL}/verify-email?token=${user.verificationToken}`;
@@ -111,7 +181,8 @@ const emailSignup = async (req, res) => {
         picture: user.profile?.picture,
         verified: user.verified,
         connectedProviders: user.getConnectedProviders(),
-        activeWorkspaceId: user.activeWorkspaceId || null,
+        activeWorkspaceId: bootstrapResult?.workspace?._id || user.activeWorkspaceId || null,
+        onboardingCompleted: isOnboardingDone(user),
       },
       ...tokens,
       isNewUser: true,
@@ -171,6 +242,7 @@ const emailLogin = async (req, res) => {
         verified: user.verified,
         connectedProviders: user.getConnectedProviders(),
         activeWorkspaceId: user.activeWorkspaceId || null,
+        onboardingCompleted: isOnboardingDone(user),
       },
       ...tokens,
     });
@@ -498,6 +570,7 @@ const googleAuth = async (req, res) => {
     });
 
     let isNewUser = false;
+    let bootstrapResult = null;
 
     if (user) {
       // Update Google account info
@@ -531,6 +604,23 @@ const googleAuth = async (req, res) => {
         },
         verified: true,
       });
+
+      // Grant free credits to the new user
+      try {
+        const freeTierConfig = await tierService.getTierConfig('free');
+        if (freeTierConfig?.creditsPerMonth) {
+          await creditService.grantFreeCredits(user._id, freeTierConfig.creditsPerMonth);
+        }
+      } catch (err) {
+        console.error(`[auth] Failed to grant free credits for user=${user._id}:`, err.message);
+      }
+
+      // Auto-create default organization + workspace for the new user
+      try {
+        bootstrapResult = await bootstrapNewUser(user._id, user.profile.name);
+      } catch (err) {
+        console.error(`[auth] Failed to bootstrap org/workspace for user=${user._id}:`, err.message);
+      }
     }
 
     const session = await Session.create({
@@ -550,7 +640,8 @@ const googleAuth = async (req, res) => {
         picture: user.profile?.picture,
         verified: user.verified,
         connectedProviders: user.getConnectedProviders(),
-        activeWorkspaceId: user.activeWorkspaceId || null,
+        activeWorkspaceId: bootstrapResult?.workspace?._id || user.activeWorkspaceId || null,
+        onboardingCompleted: isOnboardingDone(user),
       },
       ...tokens,
       isNewUser,
@@ -608,6 +699,7 @@ const refreshToken = async (req, res) => {
             : null,
         },
         activeWorkspaceId: user.activeWorkspaceId || null,
+        onboardingCompleted: isOnboardingDone(user),
       },
     });
   } catch (error) {
@@ -648,6 +740,7 @@ const getProfile = async (req, res) => {
       name: user.profile?.name,
       picture: user.profile?.picture,
       timezone: user.preferences?.timezone,
+      emailNotifications: user.preferences?.emailNotifications ?? true,
       verified: user.verified,
       connectedProviders: user.getConnectedProviders(),
       socialAccounts: {
@@ -655,7 +748,9 @@ const getProfile = async (req, res) => {
           ? { email: user.socialAccounts.google.email, connected: !!user.socialAccounts.google.id }
           : null,
       },
+      status: user.status,
       activeWorkspaceId: user.activeWorkspaceId || null,
+      onboardingCompleted: isOnboardingDone(user),
       createdAt: user.createdAt,
     });
   } catch (error) {
@@ -694,6 +789,7 @@ const verify = async (req, res) => {
             : null,
         },
         activeWorkspaceId: user.activeWorkspaceId || null,
+        onboardingCompleted: isOnboardingDone(user),
       },
     });
   } catch (error) {

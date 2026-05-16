@@ -10,19 +10,45 @@ const transporter = nodemailer.createTransport({
   },
 });
 
+// Secondary transporter for sending to support@suparank.ai via privateemail SMTP
+// (Brevo emails to privateemail get dropped due to SPF mismatch)
+const supportTransporter =
+  process.env.SUPPORT_SMTP_HOST
+    ? nodemailer.createTransport({
+        host: process.env.SUPPORT_SMTP_HOST,
+        port: parseInt(process.env.SUPPORT_SMTP_PORT) || 587,
+        secure: false,
+        auth: {
+          user: process.env.SUPPORT_SMTP_USER,
+          pass: process.env.SUPPORT_SMTP_PASS,
+        },
+      })
+    : null;
+
 /**
  * Send an email
  */
-const sendEmail = async ({ to, subject, html }) => {
+const sendEmail = async ({ to, subject, html, fromName, replyTo }) => {
+  const defaultFrom = process.env.EMAIL_FROM || 'SupaRank <no-reply@suparank.com>';
+  const from = fromName
+    ? `${fromName} <${defaultFrom.match(/<(.+)>/)?.[1] || 'no-reply@suparank.ai'}>`
+    : defaultFrom;
+
+  // Use privateemail SMTP when sending to support@suparank.ai (SPF workaround)
+  const useSupportTransport =
+    supportTransporter && typeof to === 'string' && to.includes('support@suparank.ai');
+
   const mailOptions = {
-    from: process.env.EMAIL_FROM || 'SupaRank <no-reply@suparank.com>',
+    from: useSupportTransport ? `SupaRank <${process.env.SUPPORT_SMTP_USER}>` : from,
     to,
     subject,
     html,
+    ...(replyTo && { replyTo }),
   };
 
   try {
-    const info = await transporter.sendMail(mailOptions);
+    const transport = useSupportTransport ? supportTransporter : transporter;
+    const info = await transport.sendMail(mailOptions);
     console.log(`Email sent to ${to}: ${info.messageId}`);
     return info;
   } catch (error) {

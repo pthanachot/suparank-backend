@@ -59,8 +59,8 @@ const getCredits = async (req, res) => {
 
     const balance = {
       subscription: creditDoc?.subscriptionCredits || 0,
-      purchased: creditDoc?.purchasedCredits || 0,
-      total: (creditDoc?.subscriptionCredits || 0) + (creditDoc?.purchasedCredits || 0),
+      general: creditDoc?.generalCredits || 0,
+      total: (creditDoc?.subscriptionCredits || 0) + (creditDoc?.generalCredits || 0),
       expiresAt: creditDoc?.subscriptionCreditsExpireAt || null,
     };
 

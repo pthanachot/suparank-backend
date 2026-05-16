@@ -95,6 +95,15 @@ const SYSTEM_TRIGGERS = [
     variables: ['feature', 'rating', 'stars', 'comment', 'userEmail', 'submittedAt'],
     triggerCount: 0,
   },
+  // Support
+  {
+    id: 'contact_submitted',
+    name: 'Contact Form Submitted',
+    description: 'Sent to support when a user submits the contact form',
+    category: 'support',
+    variables: ['userName', 'userEmail', 'subject', 'category', 'message', 'submittedAt'],
+    triggerCount: 0,
+  },
 ];
 
 // ─── Original default templates (hardcoded, used as fallback) ─
@@ -228,6 +237,22 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
   </table>
 </div>`,
     variables: ['feature', 'rating', 'stars', 'comment', 'userEmail', 'submittedAt'],
+  },
+  contact_submitted: {
+    subject: '[SupaRank Contact] {{category}} — {{subject}}',
+    html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;border:1px solid #e5e7eb;border-radius:8px;">
+  <h2 style="color:#111;margin-bottom:4px;">New Contact Form Submission</h2>
+  <p style="color:#6b7280;font-size:14px;margin-top:0;">SupaRank Help Center</p>
+  <table style="width:100%;border-collapse:collapse;margin:24px 0;">
+    <tr><td style="padding:8px 0;color:#374151;font-weight:600;width:140px;">User</td><td style="padding:8px 0;color:#111;">{{userName}}</td></tr>
+    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Email</td><td style="padding:8px 0;color:#111;">{{userEmail}}</td></tr>
+    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Category</td><td style="padding:8px 0;color:#111;">{{category}}</td></tr>
+    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Subject</td><td style="padding:8px 0;color:#111;">{{subject}}</td></tr>
+    <tr><td style="padding:8px 0;color:#374151;font-weight:600;vertical-align:top;">Message</td><td style="padding:8px 0;color:#111;white-space:pre-wrap;">{{message}}</td></tr>
+    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Submitted</td><td style="padding:8px 0;color:#6b7280;font-size:13px;">{{submittedAt}}</td></tr>
+  </table>
+</div>`,
+    variables: ['userName', 'userEmail', 'subject', 'category', 'message', 'submittedAt'],
   },
 };
 

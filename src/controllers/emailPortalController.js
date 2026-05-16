@@ -86,6 +86,15 @@ const SYSTEM_TRIGGERS = [
     variables: ['userName', 'remainingCredits', 'planName'],
     triggerCount: 0,
   },
+  // Feedback
+  {
+    id: 'feedback_submitted',
+    name: 'Feedback Submitted',
+    description: 'Sent to support@suparank.ai when a user submits in-app feedback',
+    category: 'engagement',
+    variables: ['feature', 'rating', 'stars', 'comment', 'userEmail', 'submittedAt'],
+    triggerCount: 0,
+  },
 ];
 
 // ─── Original default templates (hardcoded, used as fallback) ─
@@ -204,6 +213,21 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
   <p style="color:#555;font-size:16px;line-height:1.6;">Consider upgrading your plan to get more credits and continue using all features without interruption.</p>
 </div>`,
     variables: ['userName', 'remainingCredits', 'planName'],
+  },
+  feedback_submitted: {
+    subject: '[SupaRank Feedback] {{stars}} — {{feature}}',
+    html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;border:1px solid #e5e7eb;border-radius:8px;">
+  <h2 style="color:#111;margin-bottom:4px;">New Feedback Received</h2>
+  <p style="color:#6b7280;font-size:14px;margin-top:0;">SupaRank In-App Feedback</p>
+  <table style="width:100%;border-collapse:collapse;margin:24px 0;">
+    <tr><td style="padding:8px 0;color:#374151;font-weight:600;width:140px;">Feature</td><td style="padding:8px 0;color:#111;">{{feature}}</td></tr>
+    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Rating</td><td style="padding:8px 0;color:#FFA163;font-size:20px;">{{stars}}</td></tr>
+    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">User</td><td style="padding:8px 0;color:#111;">{{userEmail}}</td></tr>
+    <tr><td style="padding:8px 0;color:#374151;font-weight:600;vertical-align:top;">Comment</td><td style="padding:8px 0;color:#111;">{{comment}}</td></tr>
+    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Submitted</td><td style="padding:8px 0;color:#6b7280;font-size:13px;">{{submittedAt}}</td></tr>
+  </table>
+</div>`,
+    variables: ['feature', 'rating', 'stars', 'comment', 'userEmail', 'submittedAt'],
   },
 };
 

@@ -3,6 +3,7 @@ const router = express.Router();
 const { authenticateToken } = require('../middleware/auth');
 const adminController = require('../controllers/adminController');
 const emailPortalController = require('../controllers/emailPortalController');
+const feedbackController = require('../controllers/feedbackController');
 
 // ─── Admin email validation middleware ──────────────────────
 
@@ -64,5 +65,11 @@ router.delete('/email-portal/templates/:id', adminMiddleware, emailPortalControl
 router.get('/email-portal/triggers', adminMiddleware, emailPortalController.getTriggers);
 router.get('/email-portal/triggers/:triggerId/default', adminMiddleware, emailPortalController.getDefaultTemplate);
 router.put('/email-portal/triggers/:triggerId/default', adminMiddleware, emailPortalController.updateDefaultTemplate);
+
+// ─── Feedback routes ────────────────────────────────────────
+
+router.get('/feedback', adminMiddleware, feedbackController.getFeedbackList);
+router.get('/feedback/stats', adminMiddleware, feedbackController.getFeedbackStats);
+router.put('/feedback/:id', adminMiddleware, feedbackController.updateFeedback);
 
 module.exports = router;

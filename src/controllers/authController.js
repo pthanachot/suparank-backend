@@ -2,6 +2,8 @@ const User = require('../models/User');
 const Session = require('../models/Session');
 const Counter = require('../models/Counter');
 const VerificationCode = require('../models/VerificationCode');
+const Organization = require('../models/Organization');
+const Workspace = require('../models/Workspace');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { generateTokens, generateAccessToken } = require('../utils/jwt');
@@ -36,6 +38,42 @@ async function getNextUserId() {
 // Generate 6-digit code
 function generateCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+// Helper: auto-create a default organization + workspace for a newly registered user
+// so they can land in the workspace immediately after registration/onboarding.
+async function bootstrapNewUser(userId, displayName) {
+  const orgName = displayName ? `${displayName}'s Organization` : 'My Organization';
+  const slug = await Organization.generateSlug(orgName, userId);
+  const org = await Organization.create({
+    name: orgName,
+    slug,
+    ownerId: userId,
+    isPersonal: false,
+  });
+
+  const workspaceNumber = await Workspace.getNextNumber();
+  const workspace = await Workspace.create({
+    workspaceNumber,
+    name: 'My Workspace',
+    userId,
+    organizationId: org._id,
+    isDefault: true,
+  });
+
+  await User.findByIdAndUpdate(userId, { activeWorkspaceId: workspace._id });
+
+  // Grant free credits to the org (idempotent — no-op if already granted on signup)
+  try {
+    const { config } = await tierService.getOrgTierConfig(org._id);
+    if (config?.creditsPerMonth) {
+      await creditService.grantFreeCreditsIfNew(userId, config.creditsPerMonth);
+    }
+  } catch (err) {
+    console.error(`[bootstrap] org credit grant failed user=${userId}:`, err.message);
+  }
+
+  return { org, workspace };
 }
 
 // ─── EMAIL SIGNUP ───────────────────────────────────────────────
@@ -99,6 +137,14 @@ const emailSignup = async (req, res) => {
       console.error(`[auth] Failed to grant free credits for user=${user._id}:`, err.message);
     }
 
+    // Auto-create default organization + workspace for the new user
+    let bootstrapResult = null;
+    try {
+      bootstrapResult = await bootstrapNewUser(user._id, user.profile.name);
+    } catch (err) {
+      console.error(`[auth] Failed to bootstrap org/workspace for user=${user._id}:`, err.message);
+    }
+
     // Send verification email if not already verified
     if (!user.verified) {
       const verifyUrl = `${process.env.FRONTEND_URL}/verify-email?token=${user.verificationToken}`;
@@ -135,7 +181,7 @@ const emailSignup = async (req, res) => {
         picture: user.profile?.picture,
         verified: user.verified,
         connectedProviders: user.getConnectedProviders(),
-        activeWorkspaceId: user.activeWorkspaceId || null,
+        activeWorkspaceId: bootstrapResult?.workspace?._id || user.activeWorkspaceId || null,
         onboardingCompleted: isOnboardingDone(user),
       },
       ...tokens,
@@ -524,6 +570,7 @@ const googleAuth = async (req, res) => {
     });
 
     let isNewUser = false;
+    let bootstrapResult = null;
 
     if (user) {
       // Update Google account info
@@ -567,6 +614,13 @@ const googleAuth = async (req, res) => {
       } catch (err) {
         console.error(`[auth] Failed to grant free credits for user=${user._id}:`, err.message);
       }
+
+      // Auto-create default organization + workspace for the new user
+      try {
+        bootstrapResult = await bootstrapNewUser(user._id, user.profile.name);
+      } catch (err) {
+        console.error(`[auth] Failed to bootstrap org/workspace for user=${user._id}:`, err.message);
+      }
     }
 
     const session = await Session.create({
@@ -586,7 +640,7 @@ const googleAuth = async (req, res) => {
         picture: user.profile?.picture,
         verified: user.verified,
         connectedProviders: user.getConnectedProviders(),
-        activeWorkspaceId: user.activeWorkspaceId || null,
+        activeWorkspaceId: bootstrapResult?.workspace?._id || user.activeWorkspaceId || null,
         onboardingCompleted: isOnboardingDone(user),
       },
       ...tokens,

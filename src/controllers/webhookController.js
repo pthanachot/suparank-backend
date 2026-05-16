@@ -354,7 +354,7 @@ async function handleSubscriptionDeleted(stripeSub) {
   try {
     const org = await Organization.findById(sub.organizationId).lean();
     const owner = org?.ownerId ? await User.findById(org.ownerId).lean() : null;
-    if (owner?.email) {
+    if (owner?.email && owner.preferences?.emailNotifications !== false) {
       const planName = sub.planId ? sub.planId.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()) : 'Your Plan';
       const endDate = sub.currentPeriodEnd
         ? new Date(sub.currentPeriodEnd).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })

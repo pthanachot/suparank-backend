@@ -327,7 +327,7 @@ const applyCustomTemplate = async (triggerId, emailOptions) => {
 
 const getSubscribedUsers = async (req, res) => {
   try {
-    const users = await User.find({ status: 'active' })
+    const users = await User.find({ status: 'active', 'preferences.emailNotifications': { $ne: false } })
       .select('email profile')
       .lean();
 

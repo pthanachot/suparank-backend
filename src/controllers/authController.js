@@ -686,6 +686,7 @@ const getProfile = async (req, res) => {
       name: user.profile?.name,
       picture: user.profile?.picture,
       timezone: user.preferences?.timezone,
+      emailNotifications: user.preferences?.emailNotifications ?? true,
       verified: user.verified,
       connectedProviders: user.getConnectedProviders(),
       socialAccounts: {

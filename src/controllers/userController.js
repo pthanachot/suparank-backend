@@ -14,7 +14,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const updateProfile = async (req, res) => {
   try {
-    const { name, email, timezone, picture } = req.body;
+    const { name, email, timezone, picture, emailNotifications } = req.body;
     const user = await User.findById(req.user.userId);
 
     if (!user) {
@@ -34,6 +34,12 @@ const updateProfile = async (req, res) => {
     if (timezone !== undefined) {
       user.preferences = user.preferences || {};
       user.preferences.timezone = timezone;
+    }
+
+    // Update email notifications preference
+    if (emailNotifications !== undefined) {
+      user.preferences = user.preferences || {};
+      user.preferences.emailNotifications = !!emailNotifications;
     }
 
     // Handle email change (requires re-verification)
@@ -56,6 +62,7 @@ const updateProfile = async (req, res) => {
       name: user.profile?.name,
       picture: user.profile?.picture,
       timezone: user.preferences?.timezone,
+      emailNotifications: user.preferences?.emailNotifications ?? true,
       verified: user.verified,
     });
   } catch (error) {

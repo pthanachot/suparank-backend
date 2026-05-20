@@ -516,8 +516,8 @@ async function executeScan(trackerId, userId = null) {
     const ws = await Workspace.findById(tracker.workspaceId);
     orgId = ws?.organizationId?.toString() || null;
 
-    // ── 3. Load prompts & platforms to estimate credit cost (skip inactive prompts)
-    const allActivePrompts = await AiTrackerPrompt.find({ trackerId, active: { $ne: false } });
+    // ── 3. Load prompts & platforms to estimate credit cost (skip inactive + locked prompts)
+    const allActivePrompts = await AiTrackerPrompt.find({ trackerId, active: { $ne: false }, locked: { $ne: true } });
     const competitors = await AiTrackerCompetitor.find({ trackerId });
 
     // ── 3b. Filter prompts by frequency — only scan prompts that are due
@@ -645,7 +645,7 @@ async function executeScan(trackerId, userId = null) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function buildDashboardResponse(tracker) {
-  const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id, active: { $ne: false } });
+  const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id, active: { $ne: false }, locked: { $ne: true } });
   const competitors = await AiTrackerCompetitor.find({ trackerId: tracker._id });
 
   const recentScans = await AiTrackerScan.find({

@@ -775,7 +775,7 @@ const suggestPrompts = async (req, res) => {
     }
 
     const domainTrimmed = domain.trim();
-    if (domainTrimmed.includes(' ') || !/^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$/.test(domainTrimmed)) {
+    if (domainTrimmed.length > 253 || domainTrimmed.includes(' ') || !/^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$/.test(domainTrimmed)) {
       return res.status(400).json({ error: 'Invalid domain format' });
     }
 
@@ -870,7 +870,7 @@ const setup = async (req, res) => {
       return res.status(400).json({ error: 'Domain is required' });
     }
     const domainTrimmed = domain.trim();
-    if (domainTrimmed.includes(' ') || !/^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$/.test(domainTrimmed)) {
+    if (domainTrimmed.length > 253 || domainTrimmed.includes(' ') || !/^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$/.test(domainTrimmed)) {
       return res.status(400).json({ error: 'Please enter a valid domain (e.g. example.com)' });
     }
     if (!Array.isArray(prompts) || prompts.length === 0) {
@@ -1363,7 +1363,7 @@ const createMonitor = async (req, res) => {
       return res.status(400).json({ error: 'Domain is required' });
     }
     const domainTrimmed = domain.trim();
-    if (domainTrimmed.includes(' ') || !/^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$/.test(domainTrimmed)) {
+    if (domainTrimmed.length > 253 || domainTrimmed.includes(' ') || !/^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$/.test(domainTrimmed)) {
       return res.status(400).json({ error: 'Please enter a valid domain (e.g. example.com)' });
     }
     if (!Array.isArray(prompts) || prompts.length === 0) {

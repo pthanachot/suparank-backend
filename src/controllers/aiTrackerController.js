@@ -571,9 +571,18 @@ async function executeScan(trackerId, userId = null) {
 
     // ── 7. Settle credits with actual word count
     if (creditTxId) {
-      const actualCredits = Math.max(1, creditService.wordsToCredits(totalAnswerWords));
-      await creditService.settle(creditTxId, actualCredits);
-      console.log(`[ai-tracker-scan] settled credits for tracker ${trackerId}: estimated ${promptCount * platformCount * 4}, actual ${actualCredits} (${totalAnswerWords} words)`);
+      try {
+        const actualCredits = Math.max(1, creditService.wordsToCredits(totalAnswerWords));
+        await creditService.settle(creditTxId, actualCredits);
+        console.log(`[ai-tracker-scan] settled credits for tracker ${trackerId}: estimated ${promptCount * platformCount * 4}, actual ${actualCredits} (${totalAnswerWords} words)`);
+        creditTxId = null; // Mark as settled so outer catch doesn't double-refund
+      } catch (settleErr) {
+        console.error(`[ai-tracker-scan] settle failed for tracker ${trackerId}, refunding:`, settleErr.message);
+        await creditService.refund(creditTxId).catch((refundErr) => {
+          console.error(`[ai-tracker-scan] refund also failed for tracker ${trackerId}:`, refundErr.message);
+        });
+        creditTxId = null;
+      }
     }
 
     // ── 8. Save scan results

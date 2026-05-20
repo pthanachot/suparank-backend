@@ -1521,10 +1521,12 @@ const deleteMonitor = async (req, res) => {
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 
-    // Cascade delete all associated data
-    await AiTrackerScan.deleteMany({ trackerId: tracker._id });
-    await AiTrackerPrompt.deleteMany({ trackerId: tracker._id });
-    await AiTrackerCompetitor.deleteMany({ trackerId: tracker._id });
+    // Cascade delete all associated data (delete tracker last to avoid orphans)
+    await Promise.all([
+      AiTrackerScan.deleteMany({ trackerId: tracker._id }),
+      AiTrackerPrompt.deleteMany({ trackerId: tracker._id }),
+      AiTrackerCompetitor.deleteMany({ trackerId: tracker._id }),
+    ]);
     await AiTracker.findByIdAndDelete(tracker._id);
 
     res.json({ success: true });

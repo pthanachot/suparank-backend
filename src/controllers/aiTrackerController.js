@@ -67,7 +67,8 @@ function computeMetrics(latestScan, promptCount, competitors) {
   if (!latestScan) return null;
 
   const results = latestScan.results || [];
-  const platformCount = PLATFORMS.length;
+  // Use actual platform count from scan results instead of global PLATFORMS.length
+  const platformCount = results.length > 0 ? results[0].platforms.length : PLATFORMS.length;
   let totalMentions = 0;
   let totalCitations = 0;
   const totalPossible = results.length * platformCount;
@@ -175,8 +176,8 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
     else if (delta > 0) trend = 'up';
     else if (delta < 0) trend = 'down';
 
-    // Normalize trendDelta to percentage (out of total platforms)
-    const platformCount = PLATFORMS.length;
+    // Normalize trendDelta to percentage (out of actual scanned platforms)
+    const platformCount = scanResult ? scanResult.platforms.length : PLATFORMS.length;
     const trendDelta = platformCount > 0 ? Math.round((delta / platformCount) * 100) : 0;
 
     return {
@@ -326,7 +327,9 @@ function computeChanges(latestScan, previousScan) {
 
 function computeTrendData(scans) {
   return scans.map((scan) => {
-    const totalPossible = scan.results.length * PLATFORMS.length;
+    // Use actual platform count from scan results instead of global PLATFORMS.length
+    const platformCount = scan.results.length > 0 ? scan.results[0].platforms.length : PLATFORMS.length;
+    const totalPossible = scan.results.length * platformCount;
     let totalMentions = 0;
     for (const r of scan.results) {
       for (const p of r.platforms) {
@@ -412,7 +415,7 @@ function generateActionItems(latestScan) {
   // Platform gaps: mentioned on some but not all
   const platformGaps = latestScan.results.filter((r) => {
     const mentioned = r.platforms.filter((p) => p.mentioned);
-    return mentioned.length > 0 && mentioned.length < PLATFORMS.length;
+    return mentioned.length > 0 && mentioned.length < r.platforms.length;
   });
   if (platformGaps.length > 0) {
     const gapPlatformIds = [...new Set(

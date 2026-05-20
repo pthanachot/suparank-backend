@@ -13,6 +13,24 @@ const PLATFORMS = [
   { id: 'perplexity', name: 'Perplexity' },
 ];
 
+/**
+ * Retry a function with exponential backoff.
+ * @param {Function} fn - async function to retry
+ * @param {number} maxRetries - max retry attempts (default 2, so 3 total tries)
+ */
+async function withRetry(fn, maxRetries = 2) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt === maxRetries) throw err;
+      const delay = Math.min(1000 * Math.pow(2, attempt), 8000);
+      console.log(`[ai-tracker] retry ${attempt + 1}/${maxRetries} after ${delay}ms: ${err.message}`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // API CLIENTS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -550,7 +568,7 @@ async function runScan(tracker, prompts, competitors, onProgress) {
       let normalizedPosition = null;
 
       try {
-        const result = await searchPlatform(platform.id, prompt.prompt);
+        const result = await withRetry(() => searchPlatform(platform.id, prompt.prompt));
         answer = result.answer;
         citations = result.citations;
 

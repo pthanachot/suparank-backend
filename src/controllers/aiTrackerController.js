@@ -479,8 +479,18 @@ async function executeScan(trackerId, userId = null) {
     orgId = ws?.organizationId?.toString() || null;
 
     // ── 3. Load prompts & platforms to estimate credit cost (skip inactive prompts)
-    const prompts = await AiTrackerPrompt.find({ trackerId, active: { $ne: false } });
+    const allActivePrompts = await AiTrackerPrompt.find({ trackerId, active: { $ne: false } });
     const competitors = await AiTrackerCompetitor.find({ trackerId });
+
+    // ── 3b. Filter prompts by frequency — only scan prompts that are due
+    const scanStart = new Date();
+    const FREQ_DAYS = { 'Weekly': 7, 'Bi-weekly': 14, 'Monthly': 30 };
+    const prompts = allActivePrompts.filter((p) => {
+      if (!p.lastScannedAt) return true; // never scanned → always due
+      const freqDays = FREQ_DAYS[p.frequency] || 7;
+      const dueAt = new Date(p.lastScannedAt.getTime() + freqDays * 24 * 60 * 60 * 1000);
+      return scanStart >= dueAt;
+    });
 
     const platformCount = tracker.defaultModels?.length || 0;
     const promptCount = prompts.length;
@@ -533,6 +543,15 @@ async function executeScan(trackerId, userId = null) {
     await AiTrackerScan.findByIdAndUpdate(scan._id, {
       $set: { status: 'ready', completedAt: now, results, competitorResults },
     });
+
+    // ── 8b. Update lastScannedAt on all scanned prompts
+    const scannedPromptIds = prompts.map((p) => p._id);
+    if (scannedPromptIds.length > 0) {
+      await AiTrackerPrompt.updateMany(
+        { _id: { $in: scannedPromptIds } },
+        { $set: { lastScannedAt: now } }
+      );
+    }
 
     // ── 9. Determine refresh interval from tier config
     let intervalDays = 7;

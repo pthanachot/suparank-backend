@@ -10,6 +10,7 @@ const aiTrackerPromptSchema = new mongoose.Schema({
   models: { type: [String], default: ['chatgpt', 'gemini', 'claude', 'perplexity'] },
   frequency: { type: String, enum: ['Weekly', 'Bi-weekly', 'Monthly'], default: 'Weekly' },
   active: { type: Boolean, default: true },
+  lastScannedAt: { type: Date, default: null },
 
   // Downgrade locking
   locked: { type: Boolean, default: false },

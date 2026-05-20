@@ -63,6 +63,39 @@ async function resolveMonitor(req, workspace, res) {
 // DERIVED DATA COMPUTATION
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Weights for weighted visibility score
+const W_MENTION = 0.4;
+const W_POSITION = 0.3;
+const W_CITATION = 0.3;
+
+/**
+ * Compute weighted visibility score from platform results.
+ * Formula: mentionRate × W1 + positionScore × W2 + citationRate × W3
+ * @param {Array} platforms - Array of platform result objects
+ * @returns {number} Weighted visibility 0-100
+ */
+function computeWeightedVisibility(platforms) {
+  if (!platforms || platforms.length === 0) return 0;
+  const total = platforms.length;
+  const mentioned = platforms.filter((p) => p.mentioned);
+  const cited = platforms.filter((p) => p.cited);
+
+  const mentionRate = (mentioned.length / total) * 100;
+  const citationRate = (cited.length / total) * 100;
+
+  // Position score: average of (1 - normalizedPosition) for mentioned platforms
+  // Higher = mentioned earlier = better. Falls back to 50 if no position data.
+  let positionScore = 0;
+  if (mentioned.length > 0) {
+    const positionValues = mentioned.map((p) =>
+      p.normalizedPosition != null ? (1 - p.normalizedPosition) * 100 : 50
+    );
+    positionScore = positionValues.reduce((sum, v) => sum + v, 0) / mentioned.length;
+  }
+
+  return Math.round(mentionRate * W_MENTION + positionScore * W_POSITION + citationRate * W_CITATION);
+}
+
 function computeMetrics(latestScan, promptCount, competitors) {
   if (!latestScan) return null;
 
@@ -80,8 +113,12 @@ function computeMetrics(latestScan, promptCount, competitors) {
     }
   }
 
-  const visibility = totalPossible > 0 ? Math.round((totalMentions / totalPossible) * 100) : 0;
+  const mentionRate = totalPossible > 0 ? Math.round((totalMentions / totalPossible) * 100) : 0;
   const citationRate = totalMentions > 0 ? Math.round((totalCitations / totalMentions) * 100) : 0;
+
+  // Weighted visibility across all prompts
+  const allPlatforms = results.flatMap((r) => r.platforms);
+  const visibility = allPlatforms.length > 0 ? computeWeightedVisibility(allPlatforms) : 0;
 
   // Share of voice: own mentions vs total of all competitors + own
   const ownComp = competitors.find((c) => c.isOwn);
@@ -92,7 +129,7 @@ function computeMetrics(latestScan, promptCount, competitors) {
   const allCompMentions = (latestScan.competitorResults || []).reduce((sum, cr) => sum + cr.mentions, 0);
   const shareOfVoice = allCompMentions > 0 ? Math.round((ownMentions / allCompMentions) * 100) : 0;
 
-  return { visibility, shareOfVoice, citationRate, promptCount };
+  return { visibility, mentionRate, shareOfVoice, citationRate, promptCount };
 }
 
 function generatePromptSuggestions(scanResult) {
@@ -163,22 +200,20 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
       ? previousScan.results.find((r) => r.promptId.equals(p._id))
       : null;
 
-    const currentMentioned = scanResult
-      ? scanResult.platforms.filter((pl) => pl.mentioned).length
+    // Weighted visibility for current and previous scans
+    const currentVisibility = scanResult
+      ? computeWeightedVisibility(scanResult.platforms)
       : 0;
-    const prevMentioned = prevResult
-      ? prevResult.platforms.filter((pl) => pl.mentioned).length
+    const prevVisibility = prevResult
+      ? computeWeightedVisibility(prevResult.platforms)
       : 0;
-    const delta = currentMentioned - prevMentioned;
 
     let trend = 'stable';
     if (!prevResult) trend = 'new';
-    else if (delta > 0) trend = 'up';
-    else if (delta < 0) trend = 'down';
+    else if (currentVisibility > prevVisibility) trend = 'up';
+    else if (currentVisibility < prevVisibility) trend = 'down';
 
-    // Normalize trendDelta to percentage (out of actual scanned platforms)
-    const platformCount = scanResult ? scanResult.platforms.length : PLATFORMS.length;
-    const trendDelta = platformCount > 0 ? Math.round((delta / platformCount) * 100) : 0;
+    const trendDelta = currentVisibility - prevVisibility;
 
     return {
       id: p._id.toString(),
@@ -189,6 +224,7 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
         tier: pl.tier,
         cited: pl.cited,
         citedFrom: pl.citedFrom || null,
+        normalizedPosition: pl.normalizedPosition ?? null,
       })),
       lastChecked: latestScan.completedAt
         ? formatRelativeDate(latestScan.completedAt)
@@ -204,9 +240,7 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
       trendHistory: (recentScans || []).map((scan) => {
         const result = scan.results.find((r) => r.promptId.equals(p._id));
         if (!result) return 0;
-        const mentionedCount = result.platforms.filter((pl) => pl.mentioned).length;
-        const totalCount = result.platforms.length || PLATFORMS.length;
-        return Math.round((mentionedCount / totalCount) * 100);
+        return computeWeightedVisibility(result.platforms);
       }).reverse(),
       citationHistory: (recentScans || []).map((scan) => {
         const result = scan.results.find((r) => r.promptId.equals(p._id));
@@ -338,16 +372,9 @@ function computeChanges(latestScan, previousScan) {
 
 function computeTrendData(scans) {
   return scans.map((scan) => {
-    // Use actual platform count from scan results instead of global PLATFORMS.length
-    const platformCount = scan.results.length > 0 ? scan.results[0].platforms.length : PLATFORMS.length;
-    const totalPossible = scan.results.length * platformCount;
-    let totalMentions = 0;
-    for (const r of scan.results) {
-      for (const p of r.platforms) {
-        if (p.mentioned) totalMentions++;
-      }
-    }
-    const value = totalPossible > 0 ? Math.round((totalMentions / totalPossible) * 100) : 0;
+    // Weighted visibility across all platform results in this scan
+    const allPlatforms = scan.results.flatMap((r) => r.platforms);
+    const value = allPlatforms.length > 0 ? computeWeightedVisibility(allPlatforms) : 0;
     const d = scan.completedAt || scan.startedAt;
     const month = d.toLocaleString('en-US', { month: 'short' });
     const day = d.getDate();

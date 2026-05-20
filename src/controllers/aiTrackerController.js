@@ -900,18 +900,28 @@ const setup = async (req, res) => {
         }
       }
 
-      // Check prompt quota
+      // Check prompt quota (atomic: increment first, rollback if over)
       const promptCount = prompts.filter((p) => typeof p === 'string' && p.trim()).length;
       if (config?.maxAiTrackerPromptsPerMonth != null && promptCount > 0) {
         const limitType = config.aiTrackerPromptLimitType || 'monthly';
-        let used;
+        let newTotal;
         if (limitType === 'lifetime' && req.user?.userId) {
-          used = await UserUsageTracker.getCount(req.user.userId, 'aiTrackerPromptsCreated');
+          const doc = await UserUsageTracker.increment(req.user.userId, 'aiTrackerPromptsCreated', promptCount);
+          newTotal = doc?.aiTrackerPromptsCreated ?? promptCount;
         } else {
           const period = tierService.getPeriod(limitType);
-          used = await UsageTracker.getCount(orgId, 'aiTrackerPromptsCreated', period);
+          const doc = await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, promptCount);
+          newTotal = doc?.aiTrackerPromptsCreated ?? promptCount;
         }
-        if (used + promptCount > config.maxAiTrackerPromptsPerMonth) {
+        if (newTotal > config.maxAiTrackerPromptsPerMonth) {
+          // Rollback the increment
+          if (limitType === 'lifetime' && req.user?.userId) {
+            await UserUsageTracker.increment(req.user.userId, 'aiTrackerPromptsCreated', -promptCount);
+          } else {
+            const period = tierService.getPeriod(limitType);
+            await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, -promptCount);
+          }
+          const used = newTotal - promptCount;
           return res.status(429).json({
             error: `Your ${tier} plan allows ${config.maxAiTrackerPromptsPerMonth} AI Tracker prompts (${used} used, ${promptCount} requested)`,
             code: 'QUOTA_EXCEEDED',
@@ -972,16 +982,7 @@ const setup = async (req, res) => {
       });
     }
 
-    // Increment prompt usage counter for the bulk insert
-    if (orgId && promptDocs.length > 0) {
-      const limitType = tierConfig?.aiTrackerPromptLimitType || 'monthly';
-      if (limitType === 'lifetime' && req.user?.userId) {
-        await UserUsageTracker.increment(req.user.userId, 'aiTrackerPromptsCreated', promptDocs.length);
-      } else {
-        const period = tierService.getPeriod(limitType);
-        await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, promptDocs.length);
-      }
-    }
+    // Usage already incremented atomically above (no separate increment needed)
 
     // Create own-brand competitor
     const brandName = domain.trim().replace(/^(https?:\/\/)?(www\.)?/, '').split('.')[0];
@@ -1393,18 +1394,28 @@ const createMonitor = async (req, res) => {
         }
       }
 
-      // Check prompt quota
+      // Check prompt quota (atomic: increment first, rollback if over)
       const promptCount = prompts.filter((p) => typeof p === 'string' && p.trim()).length;
       if (config?.maxAiTrackerPromptsPerMonth != null && promptCount > 0) {
         const limitType = config.aiTrackerPromptLimitType || 'monthly';
-        let used;
+        let newTotal;
         if (limitType === 'lifetime' && req.user?.userId) {
-          used = await UserUsageTracker.getCount(req.user.userId, 'aiTrackerPromptsCreated');
+          const doc = await UserUsageTracker.increment(req.user.userId, 'aiTrackerPromptsCreated', promptCount);
+          newTotal = doc?.aiTrackerPromptsCreated ?? promptCount;
         } else {
           const period = tierService.getPeriod(limitType);
-          used = await UsageTracker.getCount(orgId, 'aiTrackerPromptsCreated', period);
+          const doc = await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, promptCount);
+          newTotal = doc?.aiTrackerPromptsCreated ?? promptCount;
         }
-        if (used + promptCount > config.maxAiTrackerPromptsPerMonth) {
+        if (newTotal > config.maxAiTrackerPromptsPerMonth) {
+          // Rollback the increment
+          if (limitType === 'lifetime' && req.user?.userId) {
+            await UserUsageTracker.increment(req.user.userId, 'aiTrackerPromptsCreated', -promptCount);
+          } else {
+            const period = tierService.getPeriod(limitType);
+            await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, -promptCount);
+          }
+          const used = newTotal - promptCount;
           return res.status(429).json({
             error: `Your ${tier} plan allows ${config.maxAiTrackerPromptsPerMonth} AI Tracker prompts (${used} used, ${promptCount} requested)`,
             code: 'QUOTA_EXCEEDED',
@@ -1464,16 +1475,7 @@ const createMonitor = async (req, res) => {
       });
     }
 
-    // Increment prompt usage counter for the bulk insert
-    if (orgId && promptDocs.length > 0) {
-      const limitType = tierConfig?.aiTrackerPromptLimitType || 'monthly';
-      if (limitType === 'lifetime' && req.user?.userId) {
-        await UserUsageTracker.increment(req.user.userId, 'aiTrackerPromptsCreated', promptDocs.length);
-      } else {
-        const period = tierService.getPeriod(limitType);
-        await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, promptDocs.length);
-      }
-    }
+    // Usage already incremented atomically above (no separate increment needed)
 
     // Create own-brand competitor
     const brandName = domain.trim().replace(/^(https?:\/\/)?(www\.)?/, '').split('.')[0];

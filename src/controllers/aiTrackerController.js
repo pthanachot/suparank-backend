@@ -478,8 +478,8 @@ async function executeScan(trackerId, userId = null) {
     const ws = await Workspace.findById(tracker.workspaceId);
     orgId = ws?.organizationId?.toString() || null;
 
-    // ── 3. Load prompts & platforms to estimate credit cost
-    const prompts = await AiTrackerPrompt.find({ trackerId });
+    // ── 3. Load prompts & platforms to estimate credit cost (skip inactive prompts)
+    const prompts = await AiTrackerPrompt.find({ trackerId, active: { $ne: false } });
     const competitors = await AiTrackerCompetitor.find({ trackerId });
 
     const platformCount = tracker.defaultModels?.length || 0;
@@ -579,7 +579,7 @@ async function executeScan(trackerId, userId = null) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function buildDashboardResponse(tracker) {
-  const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id });
+  const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id, active: { $ne: false } });
   const competitors = await AiTrackerCompetitor.find({ trackerId: tracker._id });
 
   const recentScans = await AiTrackerScan.find({

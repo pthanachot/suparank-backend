@@ -1227,7 +1227,12 @@ const updatePrompt = async (req, res) => {
     const VALID_PLATFORMS = ['chatgpt', 'gemini', 'claude', 'perplexity'];
     const update = {};
     if (Array.isArray(models)) update.models = models.filter((m) => VALID_PLATFORMS.includes(m));
-    if (frequency !== undefined) update.frequency = frequency;
+    if (frequency !== undefined) {
+      if (!VALID_FREQUENCIES.includes(frequency)) {
+        return res.status(400).json({ error: `Invalid frequency. Must be one of: ${VALID_FREQUENCIES.join(', ')}` });
+      }
+      update.frequency = frequency;
+    }
     if (active !== undefined) update.active = active;
 
     if (Object.keys(update).length === 0) {
@@ -1769,7 +1774,12 @@ const updateMonitorPrompt = async (req, res) => {
     const VALID_PLATFORMS = ['chatgpt', 'gemini', 'claude', 'perplexity'];
     const update = {};
     if (Array.isArray(models)) update.models = models.filter((m) => VALID_PLATFORMS.includes(m));
-    if (frequency !== undefined) update.frequency = frequency;
+    if (frequency !== undefined) {
+      if (!VALID_FREQUENCIES.includes(frequency)) {
+        return res.status(400).json({ error: `Invalid frequency. Must be one of: ${VALID_FREQUENCIES.join(', ')}` });
+      }
+      update.frequency = frequency;
+    }
     if (active !== undefined) update.active = active;
 
     if (Object.keys(update).length === 0) {

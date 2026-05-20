@@ -101,7 +101,7 @@ function computeMetrics(latestScan, promptCount, competitors) {
 
   const results = latestScan.results || [];
   // Use actual platform count from scan results instead of global PLATFORMS.length
-  const platformCount = results.length > 0 ? results[0].platforms.length : PLATFORMS.length;
+  const platformCount = (results.length > 0 && results[0].platforms?.length > 0) ? results[0].platforms.length : PLATFORMS.length;
   let totalMentions = 0;
   let totalCitations = 0;
   const totalPossible = results.length * platformCount;
@@ -861,7 +861,7 @@ Make prompts realistic — what real users would ask AI assistants.`,
         .map((s) => ({
           prompt: s.prompt.trim(),
           category: ['brand', 'feature', 'comparison', 'industry'].includes(s.category) ? s.category : 'industry',
-          reason: typeof s.reason === 'string' ? s.reason : 'Relevant to your brand visibility',
+          reason: typeof s.reason === 'string' ? s.reason.slice(0, 200) : 'Relevant to your brand visibility',
         }));
 
       res.json({ suggestions: valid.length > 0 ? valid : DEFAULT_SUGGESTIONS });

@@ -103,7 +103,7 @@ async function searchChatGPT(query) {
       throw new Error('ChatGPT returned empty response');
     }
 
-    console.log(`[chatgpt] query="${query.slice(0, 50)}" answer_len=${answer.length} citations=${citations.length}`);
+    console.log(`[chatgpt] query_len=${query.length} answer_len=${answer.length} citations=${citations.length}`);
     return { answer, citations };
   } finally {
     clearTimeout(timeout);
@@ -180,7 +180,7 @@ async function searchGemini(query) {
       throw new Error('Gemini returned empty response');
     }
 
-    console.log(`[gemini] query="${query.slice(0, 50)}" answer_len=${answer.length} citations=${citations.length}`);
+    console.log(`[gemini] query_len=${query.length} answer_len=${answer.length} citations=${citations.length}`);
     return { answer, citations };
   } finally {
     clearTimeout(timeout);
@@ -243,7 +243,7 @@ async function searchPerplexity(query) {
       throw new Error('Perplexity returned empty response');
     }
 
-    console.log(`[perplexity] query="${query.slice(0, 50)}" answer_len=${answer.length} citations=${citations.length}`);
+    console.log(`[perplexity] query_len=${query.length} answer_len=${answer.length} citations=${citations.length}`);
     return { answer, citations };
   } finally {
     clearTimeout(timeout);
@@ -325,7 +325,7 @@ async function searchClaude(query) {
       throw new Error('Claude returned empty response');
     }
 
-    console.log(`[claude] query="${query.slice(0, 50)}" answer_len=${answer.length} citations=${citations.length}`);
+    console.log(`[claude] query_len=${query.length} answer_len=${answer.length} citations=${citations.length}`);
     return { answer, citations };
   } finally {
     clearTimeout(timeout);
@@ -482,7 +482,9 @@ function detectBrand(answer, citations, domain) {
 function detectCompetitorInAnswer(answer, citations, competitorName) {
   const nameLower = competitorName.toLowerCase();
   const answerLower = answer.toLowerCase();
-  const mentioned = answerLower.includes(nameLower);
+  // S75: Use word-boundary regex (consistent with detectBrand)
+  const escaped = nameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const mentioned = new RegExp(`\\b${escaped}\\b`, 'i').test(answerLower);
   // Check citations: strip spaces from name for domain-style matching
   const nameSlug = nameLower.replace(/\s+/g, '');
   const cited = citations.some((url) => url.toLowerCase().includes(nameSlug));

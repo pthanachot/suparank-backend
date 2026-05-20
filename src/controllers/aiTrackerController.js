@@ -610,6 +610,15 @@ async function executeScan(trackerId, userId = null) {
           console.error(`[ai-tracker-scan] refund also failed for tracker ${trackerId}:`, refundErr.message);
         });
         creditTxId = null;
+
+        // S74: Don't save results if credits couldn't be settled — mark scan as failed
+        await AiTrackerScan.findByIdAndUpdate(scan._id, {
+          $set: { status: 'failed', completedAt: new Date() },
+        });
+        await AiTracker.findByIdAndUpdate(trackerId, {
+          $set: { scanStatus: 'failed', scanError: 'Credit settlement failed', currentScanId: null },
+        });
+        return;
       }
     }
 
@@ -1100,9 +1109,18 @@ const triggerScan = async (req, res) => {
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
 
-    // Check if scan is already in progress
+    // Check if scan is already in progress on this tracker
     if (tracker.scanStatus === 'pending' || tracker.scanStatus === 'scanning') {
       return res.status(409).json({ error: 'A scan is already in progress' });
+    }
+
+    // S81: Workspace-level concurrent scan limit (max 2 simultaneous scans)
+    const activeScans = await AiTracker.countDocuments({
+      workspaceId: tracker.workspaceId,
+      scanStatus: { $in: ['pending', 'scanning'] },
+    });
+    if (activeScans >= 2) {
+      return res.status(429).json({ error: 'Too many scans running in this workspace. Please wait for a scan to finish.' });
     }
 
     // Rate limit: at least 1 hour between scans

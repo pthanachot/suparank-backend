@@ -781,10 +781,14 @@ const SUGGEST_RATE_LIMIT = 5;
 const SUGGEST_RATE_WINDOW = 60000;
 // Prune stale entries every 5 minutes to prevent unbounded memory growth
 setInterval(() => {
-  const now = Date.now();
-  for (const [key, entry] of _suggestRateMap) {
-    entry.timestamps = entry.timestamps.filter((t) => now - t < SUGGEST_RATE_WINDOW);
-    if (entry.timestamps.length === 0) _suggestRateMap.delete(key);
+  try {
+    const now = Date.now();
+    for (const [key, entry] of _suggestRateMap) {
+      entry.timestamps = entry.timestamps.filter((t) => now - t < SUGGEST_RATE_WINDOW);
+      if (entry.timestamps.length === 0) _suggestRateMap.delete(key);
+    }
+  } catch (err) {
+    console.error('[ai-tracker] rate limiter cleanup failed:', err.message);
   }
 }, 5 * 60 * 1000).unref();
 

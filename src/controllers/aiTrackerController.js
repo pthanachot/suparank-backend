@@ -208,6 +208,13 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
         const totalCount = result.platforms.length || PLATFORMS.length;
         return Math.round((mentionedCount / totalCount) * 100);
       }).reverse(),
+      citationHistory: (recentScans || []).map((scan) => {
+        const result = scan.results.find((r) => r.promptId.equals(p._id));
+        if (!result) return 0;
+        const citedCount = result.platforms.filter((pl) => pl.cited).length;
+        const mentionedCount = result.platforms.filter((pl) => pl.mentioned).length;
+        return mentionedCount > 0 ? Math.round((citedCount / mentionedCount) * 100) : 0;
+      }).reverse(),
     };
   });
 }

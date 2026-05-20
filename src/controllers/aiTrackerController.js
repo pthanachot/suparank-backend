@@ -759,21 +759,21 @@ const DEFAULT_SUGGESTIONS = [
 ];
 
 const suggestPrompts = async (req, res) => {
-  console.log('[suggest-prompts] route hit, body:', JSON.stringify(req.body));
   try {
     const workspace = req.workspace;
-    console.log('[suggest-prompts] workspace resolved:', workspace.workspaceNumber);
 
     const { domain } = req.body;
     if (!domain || typeof domain !== 'string' || !domain.trim()) {
-      console.log('[suggest-prompts] missing domain');
       return res.status(400).json({ error: 'Domain is required' });
     }
 
+    const domainTrimmed = domain.trim();
+    if (domainTrimmed.includes(' ') || !/^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$/.test(domainTrimmed)) {
+      return res.status(400).json({ error: 'Invalid domain format' });
+    }
+
     const apiKey = process.env.CHATGPT_API_KEY;
-    console.log('[suggest-prompts] CHATGPT_API_KEY present:', !!apiKey);
     if (!apiKey) {
-      console.log('[suggest-prompts] no API key, returning default suggestions');
       return res.json({ suggestions: DEFAULT_SUGGESTIONS });
     }
 
@@ -805,7 +805,7 @@ Categories: brand, feature, comparison, industry.
 
 Make prompts realistic — what real users would ask AI assistants.`,
             },
-            { role: 'user', content: `Domain: ${domain.trim()}` },
+            { role: 'user', content: `Domain: ${domainTrimmed}` },
           ],
           response_format: { type: 'json_object' },
         }),
@@ -1793,6 +1793,9 @@ const addMonitorCompetitor = async (req, res) => {
     const { name } = req.body;
     if (!name || typeof name !== 'string' || !name.trim()) {
       return res.status(400).json({ error: 'Competitor name is required' });
+    }
+    if (name.trim().length > 100) {
+      return res.status(400).json({ error: 'Competitor name must be 100 characters or fewer' });
     }
 
     const doc = await AiTrackerCompetitor.create({ trackerId: tracker._id, name: name.trim(), isOwn: false });

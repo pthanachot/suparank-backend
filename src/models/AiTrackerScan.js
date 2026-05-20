@@ -12,6 +12,7 @@ const platformResultSchema = new mongoose.Schema({
   citedFrom: { type: String, default: null, maxlength: 2048 },
   normalizedPosition: { type: Number, default: null },
   aiResponse: { type: String, default: '' },
+  error: { type: Boolean, default: false },
 }, { _id: false });
 
 const promptResultSchema = new mongoose.Schema({

@@ -1368,6 +1368,7 @@ const listMonitors = async (req, res) => {
 
     const trackers = await AiTracker.find({ workspaceId: workspace._id })
       .sort({ createdAt: 1 })
+      .limit(100)
       .lean();
 
     // Single aggregation query instead of N+1 countDocuments

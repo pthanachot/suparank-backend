@@ -9,7 +9,7 @@ const platformResultSchema = new mongoose.Schema({
     default: 'not_mentioned',
   },
   cited: { type: Boolean, default: false },
-  citedFrom: { type: String, default: null },
+  citedFrom: { type: String, default: null, maxlength: 2048 },
   normalizedPosition: { type: Number, default: null },
   aiResponse: { type: String, default: '' },
 }, { _id: false });

@@ -382,7 +382,17 @@ function detectBrand(answer, citations, domain) {
     }
   }
 
-  return { mentioned, tier, cited, citedFrom };
+  // Normalized position: 0 = mentioned at very start, 1 = at the end, null = not mentioned
+  const normalizedPosition = mentioned && answer.length > 0
+    ? (() => {
+        const brandMatch = answer.search(brandRegex);
+        const domainMatch = answer.search(domainRegex);
+        const positions = [brandMatch, domainMatch].filter((i) => i >= 0);
+        return Math.min(...positions) / answer.length;
+      })()
+    : null;
+
+  return { mentioned, tier, cited, citedFrom, normalizedPosition };
 }
 
 /**
@@ -514,6 +524,7 @@ async function runScan(tracker, prompts, competitors, onProgress) {
       let tier = 'not_mentioned';
       let cited = false;
       let citedFrom = null;
+      let normalizedPosition = null;
 
       try {
         const result = await searchPlatform(platform.id, prompt.prompt);
@@ -526,6 +537,7 @@ async function runScan(tracker, prompts, competitors, onProgress) {
         tier = detection.tier;
         cited = detection.cited;
         citedFrom = detection.citedFrom;
+        normalizedPosition = detection.normalizedPosition;
 
         // Count words from full answer (before truncation)
         if (answer) {
@@ -547,6 +559,7 @@ async function runScan(tracker, prompts, competitors, onProgress) {
         tier,
         cited,
         citedFrom,
+        normalizedPosition,
         aiResponse: answer.slice(0, 500),
       });
 

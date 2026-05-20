@@ -44,7 +44,7 @@ async function withRetry(fn, maxRetries = 2) {
  */
 async function searchChatGPT(query) {
   const apiKey = process.env.CHATGPT_API_KEY;
-  if (!apiKey) throw new Error('CHATGPT_SEARCH_KEY not configured');
+  if (!apiKey) throw new Error('CHATGPT_API_KEY not configured');
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 90000);

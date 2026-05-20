@@ -57,7 +57,7 @@ async function searchChatGPT(query) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'gpt-4o-search-preview',
+        model: 'gpt-5-search-api',
         messages: [{ role: 'user', content: query }],
         web_search_options: {},
       }),

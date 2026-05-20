@@ -1083,7 +1083,7 @@ const triggerScan = async (req, res) => {
     // Pre-check credit affordability so we can return 402 immediately.
     // Actual deduction happens inside executeScan (shared with cron path).
     if (req.creditContext?.deductionEnabled) {
-      const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id }).countDocuments();
+      const prompts = await AiTrackerPrompt.countDocuments({ trackerId: tracker._id });
       const platforms = tracker.defaultModels?.length || 0;
       const estimatedCredits = Math.max(1, prompts * platforms * 4);
       const canPay = await creditService.canAfford(req.creditContext.orgId, estimatedCredits, req.user?.userId);
@@ -1662,7 +1662,7 @@ const triggerMonitorScan = async (req, res) => {
     // Pre-check credit affordability so we can return 402 immediately.
     // Actual deduction happens inside executeScan (shared with cron path).
     if (req.creditContext?.deductionEnabled) {
-      const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id }).countDocuments();
+      const prompts = await AiTrackerPrompt.countDocuments({ trackerId: tracker._id });
       const platforms = tracker.defaultModels?.length || 0;
       const estimatedCredits = Math.max(1, prompts * platforms * 4);
       const canPay = await creditService.canAfford(req.creditContext.orgId, estimatedCredits, req.user?.userId);

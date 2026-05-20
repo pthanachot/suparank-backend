@@ -99,6 +99,10 @@ async function searchChatGPT(query) {
       }
     }
 
+    if (!answer || answer.trim().length === 0) {
+      throw new Error('ChatGPT returned empty response');
+    }
+
     console.log(`[chatgpt] query="${query.slice(0, 50)}" answer_len=${answer.length} citations=${citations.length}`);
     return { answer, citations };
   } finally {
@@ -172,6 +176,10 @@ async function searchGemini(query) {
       }
     }
 
+    if (!answer || answer.trim().length === 0) {
+      throw new Error('Gemini returned empty response');
+    }
+
     console.log(`[gemini] query="${query.slice(0, 50)}" answer_len=${answer.length} citations=${citations.length}`);
     return { answer, citations };
   } finally {
@@ -229,6 +237,10 @@ async function searchPerplexity(query) {
           citations.push(url);
         }
       }
+    }
+
+    if (!answer || answer.trim().length === 0) {
+      throw new Error('Perplexity returned empty response');
     }
 
     console.log(`[perplexity] query="${query.slice(0, 50)}" answer_len=${answer.length} citations=${citations.length}`);
@@ -307,6 +319,10 @@ async function searchClaude(query) {
           citations.push(url);
         }
       }
+    }
+
+    if (!answer || answer.trim().length === 0) {
+      throw new Error('Claude returned empty response');
     }
 
     console.log(`[claude] query="${query.slice(0, 50)}" answer_len=${answer.length} citations=${citations.length}`);
@@ -585,6 +601,7 @@ async function runScan(tracker, prompts, competitors, onProgress) {
       let cited = false;
       let citedFrom = null;
       let normalizedPosition = null;
+      let error = false;
 
       try {
         const result = await withRetry(() => searchPlatform(platform.id, prompt.prompt));
@@ -609,6 +626,7 @@ async function runScan(tracker, prompts, competitors, onProgress) {
       } catch (err) {
         // Log and continue — don't fail the whole scan
         console.error(`[ai-tracker] ${platform.id} failed for "${prompt.prompt.slice(0, 40)}": ${err.message}`);
+        error = true;
       }
 
       // Add platform result to this prompt's results
@@ -621,6 +639,7 @@ async function runScan(tracker, prompts, competitors, onProgress) {
         citedFrom,
         normalizedPosition,
         aiResponse: answer.slice(0, 500),
+        error,
       });
 
       completedSteps++;

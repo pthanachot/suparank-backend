@@ -652,7 +652,7 @@ async function executeScan(trackerId, userId = null) {
     }
 
     await AiTracker.findByIdAndUpdate(trackerId, {
-      $set: { scanStatus: 'failed', scanError: err.message, currentScanId: null },
+      $set: { scanStatus: 'failed', scanError: (err.message || 'Scan failed').slice(0, 500), currentScanId: null },
     }).catch((e) => console.error(`[ai-tracker-scan] failed to update scan failure status for tracker ${trackerId}:`, e.message));
   }
 }

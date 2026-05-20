@@ -21,7 +21,7 @@ const aiTrackerSchema = new mongoose.Schema({
     default: 'idle',
   },
   scanProgress: { type: Number, default: 0, min: 0, max: 100 },
-  scanError: { type: String, default: null },
+  scanError: { type: String, default: null, maxlength: 500 },
   platformStatuses: { type: [platformStatusSchema], default: [] },
   lastScanAt: { type: Date, default: null },
   nextScanAt: { type: Date, default: null },

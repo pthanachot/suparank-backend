@@ -215,6 +215,10 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
         const mentionedCount = result.platforms.filter((pl) => pl.mentioned).length;
         return mentionedCount > 0 ? Math.round((citedCount / mentionedCount) * 100) : 0;
       }).reverse(),
+      trendDates: (recentScans || []).map((scan) => {
+        const d = scan.completedAt || scan.startedAt;
+        return d ? d.toISOString() : null;
+      }).reverse(),
     };
   });
 }
@@ -347,7 +351,7 @@ function computeTrendData(scans) {
     const d = scan.completedAt || scan.startedAt;
     const month = d.toLocaleString('en-US', { month: 'short' });
     const day = d.getDate();
-    return { week: `${month} ${day}`, value };
+    return { week: `${month} ${day}`, value, date: d.toISOString() };
   }).reverse(); // oldest first
 }
 

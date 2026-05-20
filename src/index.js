@@ -108,6 +108,7 @@ if (process.env.NODE_ENV !== 'production') {
 // Scheduled scan: check daily at 3:00 AM for trackers due for weekly scan
 const cron = require('node-cron');
 const AiTracker = require('./models/AiTracker');
+const Workspace = require('./models/Workspace');
 const { executeScan } = require('./controllers/aiTrackerController');
 
 cron.schedule('0 3 * * *', async () => {
@@ -121,7 +122,10 @@ cron.schedule('0 3 * * *', async () => {
     console.log(`[cron] Found ${dueTrackers.length} tracker(s) due for scan`);
 
     for (const tracker of dueTrackers) {
-      executeScan(tracker._id).catch((err) => {
+      // Resolve workspace owner so free credits can be used
+      const ws = await Workspace.findById(tracker.workspaceId);
+      const userId = ws?.userId?.toString() || null;
+      executeScan(tracker._id, userId).catch((err) => {
         console.error(`[cron] scan failed for tracker ${tracker._id}:`, err.message);
       });
     }

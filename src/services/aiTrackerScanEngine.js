@@ -317,10 +317,29 @@ async function searchClaude(query) {
 }
 
 /**
+ * Validate a URL is safe to fetch (SSRF prevention).
+ * Only allows https:// and blocks private/internal networks.
+ */
+function isSafeURL(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    if (u.protocol !== 'https:') return false;
+    const host = u.hostname.toLowerCase();
+    if (host === 'localhost' || host === '[::1]'
+        || host.startsWith('127.') || host.startsWith('10.')
+        || host.startsWith('192.168.') || host.startsWith('169.254.')
+        || /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+        || host.endsWith('.internal') || host.endsWith('.local')) return false;
+    return true;
+  } catch { return false; }
+}
+
+/**
  * Resolve a Google redirect URL by following the HEAD request.
  * Ported from engine/internal/aisearch/gemini.go:15-31
  */
 async function resolveRedirectURL(redirectURL) {
+  if (!isSafeURL(redirectURL)) return '';
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);

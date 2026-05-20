@@ -355,16 +355,17 @@ function detectBrand(answer, citations, domain) {
   const domainClean = cleanDomain(domain);
   const answerLower = answer.toLowerCase();
 
-  // Check if brand or domain mentioned in answer text
-  const mentioned = answerLower.includes(brand) || answerLower.includes(domainClean);
+  // Check if brand or domain mentioned in answer text (word boundary to avoid false positives)
+  const brandRegex = new RegExp(`\\b${brand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+  const domainRegex = new RegExp(`\\b${domainClean.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+  const mentioned = brandRegex.test(answer) || domainRegex.test(answer);
 
   // Determine tier based on position in answer
   let tier = 'not_mentioned';
   if (mentioned) {
-    const positions = [
-      answerLower.indexOf(brand),
-      answerLower.indexOf(domainClean),
-    ].filter((i) => i >= 0);
+    const brandMatch = answer.search(brandRegex);
+    const domainMatch = answer.search(domainRegex);
+    const positions = [brandMatch, domainMatch].filter((i) => i >= 0);
     const earliest = Math.min(...positions);
     // "top" if mentioned in the first 20% of the answer
     tier = earliest < answer.length * 0.2 ? 'top' : 'mentioned';

@@ -177,6 +177,13 @@ function generatePromptSuggestions(scanResult) {
 }
 
 function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
+  // Pre-build lookup: for each scan, promptId → result (avoids O(prompts × scans × results) find)
+  const scanResultMaps = (recentScans || []).map((scan) => {
+    const m = new Map();
+    for (const r of scan.results) m.set(r.promptId.toString(), r);
+    return m;
+  });
+
   if (!latestScan) {
     return prompts.map((p) => ({
       id: p._id.toString(),
@@ -237,13 +244,13 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
       active: p.active,
       locked: p.locked || false,
       suggestions: generatePromptSuggestions(scanResult),
-      trendHistory: (recentScans || []).map((scan) => {
-        const result = scan.results.find((r) => r.promptId.equals(p._id));
+      trendHistory: scanResultMaps.map((m) => {
+        const result = m.get(p._id.toString());
         if (!result) return 0;
         return computeWeightedVisibility(result.platforms);
       }).reverse(),
-      citationHistory: (recentScans || []).map((scan) => {
-        const result = scan.results.find((r) => r.promptId.equals(p._id));
+      citationHistory: scanResultMaps.map((m) => {
+        const result = m.get(p._id.toString());
         if (!result) return 0;
         const citedCount = result.platforms.filter((pl) => pl.cited).length;
         const mentionedCount = result.platforms.filter((pl) => pl.mentioned).length;

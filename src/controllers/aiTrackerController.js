@@ -1315,17 +1315,21 @@ const listMonitors = async (req, res) => {
       .sort({ createdAt: 1 })
       .lean();
 
-    const monitors = await Promise.all(trackers.map(async (t) => {
-      const promptCount = await AiTrackerPrompt.countDocuments({ trackerId: t._id });
-      return {
-        id: t._id.toString(),
-        name: t.name || t.domain,
-        domain: t.domain,
-        scanStatus: t.scanStatus,
-        lastScanAt: t.lastScanAt ? t.lastScanAt.toISOString() : null,
-        createdAt: t.createdAt.toISOString(),
-        promptCount,
-      };
+    // Single aggregation query instead of N+1 countDocuments
+    const promptCounts = await AiTrackerPrompt.aggregate([
+      { $match: { trackerId: { $in: trackers.map((t) => t._id) } } },
+      { $group: { _id: '$trackerId', count: { $sum: 1 } } },
+    ]);
+    const countMap = Object.fromEntries(promptCounts.map((p) => [p._id.toString(), p.count]));
+
+    const monitors = trackers.map((t) => ({
+      id: t._id.toString(),
+      name: t.name || t.domain,
+      domain: t.domain,
+      scanStatus: t.scanStatus,
+      lastScanAt: t.lastScanAt ? t.lastScanAt.toISOString() : null,
+      createdAt: t.createdAt.toISOString(),
+      promptCount: countMap[t._id.toString()] || 0,
     }));
 
     res.json({ monitors });

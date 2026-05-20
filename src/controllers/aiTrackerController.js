@@ -1117,6 +1117,11 @@ const addPrompt = async (req, res) => {
       ? models.filter((m) => VALID_PLATFORMS.includes(m))
       : undefined;
 
+    const VALID_FREQUENCIES = ['Weekly', 'Bi-weekly', 'Monthly'];
+    if (frequency && !VALID_FREQUENCIES.includes(frequency)) {
+      return res.status(400).json({ error: 'Invalid frequency. Must be Weekly, Bi-weekly, or Monthly' });
+    }
+
     // Check duplicate
     const existing = await AiTrackerPrompt.findOne({
       trackerId: tracker._id,
@@ -1682,6 +1687,11 @@ const addMonitorPrompt = async (req, res) => {
     const sanitizedModels = Array.isArray(models) && models.length > 0
       ? models.filter((m) => VALID_PLATFORMS.includes(m))
       : undefined;
+
+    const VALID_FREQUENCIES = ['Weekly', 'Bi-weekly', 'Monthly'];
+    if (frequency && !VALID_FREQUENCIES.includes(frequency)) {
+      return res.status(400).json({ error: 'Invalid frequency. Must be Weekly, Bi-weekly, or Monthly' });
+    }
 
     const existing = await AiTrackerPrompt.findOne({ trackerId: tracker._id, prompt: prompt.trim() });
     if (existing) {

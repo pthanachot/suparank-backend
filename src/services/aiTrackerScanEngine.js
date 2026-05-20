@@ -500,6 +500,14 @@ async function runScan(tracker, prompts, competitors, onProgress) {
 
     // Process each prompt for this platform
     for (const prompt of prompts) {
+      // Skip if this prompt has per-prompt model selection and current platform isn't included
+      if (prompt.models && prompt.models.length > 0 && !prompt.models.includes(platform.id)) {
+        completedSteps++;
+        const progress = totalSteps > 0 ? Math.round((completedSteps / totalSteps) * 100) : 100;
+        await onProgress(progress, platformStatuses);
+        continue;
+      }
+
       let answer = '';
       let citations = [];
       let mentioned = false;

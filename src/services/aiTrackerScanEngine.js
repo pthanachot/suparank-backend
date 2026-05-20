@@ -365,7 +365,9 @@ async function resolveRedirectURL(redirectURL) {
         redirect: 'manual',
         signal: controller.signal,
       });
-      return res.headers.get('location') || '';
+      const location = res.headers.get('location') || '';
+      if (location && !isSafeURL(location)) return '';
+      return location;
     } finally {
       clearTimeout(timeout);
     }

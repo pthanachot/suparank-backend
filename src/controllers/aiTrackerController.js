@@ -32,6 +32,11 @@ const PLATFORM_DISPLAY = [
 
 // Workspace resolved by permissions middleware (req.workspace).
 
+// ─── Helper: validate ObjectId format ─────────────────────────────────────
+
+const OBJECTID_RE = /^[0-9a-fA-F]{24}$/;
+function isValidObjectId(id) { return typeof id === 'string' && OBJECTID_RE.test(id); }
+
 // ─── Helper: resolve tracker from workspace (legacy single-monitor) ──────
 
 async function resolveTracker(workspace, res) {
@@ -211,11 +216,18 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
     }));
   }
 
+  // Pre-build Maps for O(1) lookup by promptId
+  const latestMap = new Map();
+  for (const r of latestScan.results) latestMap.set(r.promptId.toString(), r);
+  const prevMap = new Map();
+  if (previousScan) {
+    for (const r of previousScan.results) prevMap.set(r.promptId.toString(), r);
+  }
+
   return prompts.map((p) => {
-    const scanResult = latestScan.results.find((r) => r.promptId.equals(p._id));
-    const prevResult = previousScan
-      ? previousScan.results.find((r) => r.promptId.equals(p._id))
-      : null;
+    const pid = p._id.toString();
+    const scanResult = latestMap.get(pid) || null;
+    const prevResult = prevMap.get(pid) || null;
 
     // Weighted visibility for current and previous scans
     const currentVisibility = scanResult
@@ -311,11 +323,15 @@ function formatCompetitors(competitors, latestScan, previousScan) {
 function computeChanges(latestScan, previousScan) {
   if (!latestScan || !previousScan) return [];
 
+  // Pre-build Map for O(1) lookup
+  const prevMap = new Map();
+  for (const r of previousScan.results) prevMap.set(r.promptId.toString(), r);
+
   const changes = [];
   let changeId = 0;
 
   for (const result of latestScan.results) {
-    const prevResult = previousScan.results.find((r) => r.promptId.equals(result.promptId));
+    const prevResult = prevMap.get(result.promptId.toString());
     if (!prevResult) continue;
 
     for (const plat of result.platforms) {
@@ -515,6 +531,26 @@ function formatRelativeDate(date) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// STUCK SCAN RECOVERY
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Reset scans stuck in 'scanning' or 'pending' for more than 30 minutes
+async function recoverStuckScans(workspaceId) {
+  const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000);
+  const result = await AiTracker.updateMany(
+    {
+      workspaceId,
+      scanStatus: { $in: ['scanning', 'pending'] },
+      updatedAt: { $lt: thirtyMinAgo },
+    },
+    { $set: { scanStatus: 'failed', scanError: 'Scan timed out and was automatically recovered' } }
+  );
+  if (result.modifiedCount > 0) {
+    console.log(`[ai-tracker-scan] Recovered ${result.modifiedCount} stuck scan(s) in workspace ${workspaceId}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // BACKGROUND SCAN EXECUTION (fire-and-forget)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -538,8 +574,8 @@ async function executeScan(trackerId, userId = null) {
     orgId = ws?.organizationId?.toString() || null;
 
     // ── 3. Load prompts & platforms to estimate credit cost (skip inactive + locked prompts)
-    const allActivePrompts = await AiTrackerPrompt.find({ trackerId, active: { $ne: false }, locked: { $ne: true } });
-    const competitors = await AiTrackerCompetitor.find({ trackerId });
+    const allActivePrompts = await AiTrackerPrompt.find({ trackerId, active: { $ne: false }, locked: { $ne: true } }).limit(500);
+    const competitors = await AiTrackerCompetitor.find({ trackerId }).limit(200);
 
     // ── 3b. Filter prompts by frequency — only scan prompts that are due
     const scanStart = new Date();
@@ -1109,6 +1145,9 @@ const triggerScan = async (req, res) => {
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
 
+    // Recover any scans stuck for 30+ minutes before checking limits
+    await recoverStuckScans(tracker.workspaceId);
+
     // Check if scan is already in progress on this tracker
     if (tracker.scanStatus === 'pending' || tracker.scanStatus === 'scanning') {
       return res.status(409).json({ error: 'A scan is already in progress' });
@@ -1238,6 +1277,8 @@ const removePrompt = async (req, res) => {
     if (!tracker) return;
 
     const { promptId } = req.params;
+    if (!isValidObjectId(promptId)) return res.status(400).json({ error: 'Invalid prompt ID' });
+
     const deleted = await AiTrackerPrompt.findOneAndDelete({
       _id: promptId,
       trackerId: tracker._id,
@@ -1264,6 +1305,8 @@ const updatePrompt = async (req, res) => {
     if (!tracker) return;
 
     const { promptId } = req.params;
+    if (!isValidObjectId(promptId)) return res.status(400).json({ error: 'Invalid prompt ID' });
+
     const { models, frequency, active } = req.body;
 
     const VALID_PLATFORMS = ['chatgpt', 'gemini', 'claude', 'perplexity'];
@@ -1316,6 +1359,12 @@ const bulkDeletePrompts = async (req, res) => {
     const { ids } = req.body;
     if (!Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ error: 'ids array is required' });
+    }
+    if (ids.length > 500) {
+      return res.status(400).json({ error: 'Cannot delete more than 500 prompts at once' });
+    }
+    if (!ids.every(isValidObjectId)) {
+      return res.status(400).json({ error: 'All ids must be valid ObjectIds' });
     }
 
     const result = await AiTrackerPrompt.deleteMany({
@@ -1373,6 +1422,8 @@ const removeCompetitor = async (req, res) => {
     if (!tracker) return;
 
     const { competitorId } = req.params;
+    if (!isValidObjectId(competitorId)) return res.status(400).json({ error: 'Invalid competitor ID' });
+
     const deleted = await AiTrackerCompetitor.findOneAndDelete({
       _id: competitorId,
       trackerId: tracker._id,
@@ -1660,7 +1711,12 @@ const updateMonitor = async (req, res) => {
       }
       update.defaultModels = filtered;
     }
-    if (name && typeof name === 'string' && name.trim()) update.name = name.trim();
+    if (name && typeof name === 'string' && name.trim()) {
+      if (name.trim().length > 253) {
+        return res.status(400).json({ error: 'Monitor name must be 253 characters or fewer' });
+      }
+      update.name = name.trim();
+    }
 
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ error: 'No fields to update' });
@@ -1708,9 +1764,22 @@ const triggerMonitorScan = async (req, res) => {
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 
+    // Recover any scans stuck for 30+ minutes before checking limits
+    await recoverStuckScans(tracker.workspaceId);
+
     if (tracker.scanStatus === 'pending' || tracker.scanStatus === 'scanning') {
       return res.status(409).json({ error: 'A scan is already in progress' });
     }
+
+    // Workspace-level concurrent scan limit (max 2 simultaneous scans)
+    const activeScans = await AiTracker.countDocuments({
+      workspaceId: tracker.workspaceId,
+      scanStatus: { $in: ['pending', 'scanning'] },
+    });
+    if (activeScans >= 2) {
+      return res.status(429).json({ error: 'Too many scans running in this workspace. Please wait for a scan to finish.' });
+    }
+
     if (tracker.lastScanAt) {
       const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
       if (tracker.lastScanAt > hourAgo) {
@@ -1814,6 +1883,8 @@ const updateMonitorPrompt = async (req, res) => {
     if (!tracker) return;
 
     const { promptId } = req.params;
+    if (!isValidObjectId(promptId)) return res.status(400).json({ error: 'Invalid prompt ID' });
+
     const { models, frequency, active } = req.body;
 
     const VALID_PLATFORMS = ['chatgpt', 'gemini', 'claude', 'perplexity'];
@@ -1855,6 +1926,8 @@ const removeMonitorPrompt = async (req, res) => {
     if (!tracker) return;
 
     const { promptId } = req.params;
+    if (!isValidObjectId(promptId)) return res.status(400).json({ error: 'Invalid prompt ID' });
+
     const deleted = await AiTrackerPrompt.findOneAndDelete({ _id: promptId, trackerId: tracker._id });
     if (!deleted) {
       return res.status(404).json({ error: 'Prompt not found' });
@@ -1876,6 +1949,12 @@ const bulkDeleteMonitorPrompts = async (req, res) => {
     const { ids } = req.body;
     if (!Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ error: 'ids array is required' });
+    }
+    if (ids.length > 500) {
+      return res.status(400).json({ error: 'Cannot delete more than 500 prompts at once' });
+    }
+    if (!ids.every(isValidObjectId)) {
+      return res.status(400).json({ error: 'All ids must be valid ObjectIds' });
     }
 
     const result = await AiTrackerPrompt.deleteMany({ _id: { $in: ids }, trackerId: tracker._id });
@@ -1918,6 +1997,8 @@ const removeMonitorCompetitor = async (req, res) => {
     if (!tracker) return;
 
     const { competitorId } = req.params;
+    if (!isValidObjectId(competitorId)) return res.status(400).json({ error: 'Invalid competitor ID' });
+
     const deleted = await AiTrackerCompetitor.findOneAndDelete({ _id: competitorId, trackerId: tracker._id });
     if (!deleted) {
       return res.status(404).json({ error: 'Competitor not found' });

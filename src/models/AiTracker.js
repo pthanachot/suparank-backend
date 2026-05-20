@@ -11,7 +11,7 @@ const aiTrackerSchema = new mongoose.Schema({
     ref: 'Workspace',
     required: true,
   },
-  name: { type: String, trim: true, default: null },
+  name: { type: String, trim: true, default: null, maxlength: 253 },
   domain: { type: String, required: true, trim: true },
   defaultModels: { type: [String], default: ['chatgpt', 'gemini', 'claude', 'perplexity'] },
   scanCadence: { type: String, default: 'weekly' },

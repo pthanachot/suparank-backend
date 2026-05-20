@@ -765,9 +765,25 @@ const DEFAULT_SUGGESTIONS = [
   { prompt: 'tips and best practices in your domain', category: 'industry', reason: 'Educational content where your brand adds authority' },
 ];
 
+// Simple in-memory rate limiter for suggestPrompts (max 5 calls per 60s per workspace)
+const _suggestRateMap = new Map();
+const SUGGEST_RATE_LIMIT = 5;
+const SUGGEST_RATE_WINDOW = 60000;
+
 const suggestPrompts = async (req, res) => {
   try {
     const workspace = req.workspace;
+
+    // Rate limit: max 5 requests per 60s per workspace
+    const rateKey = workspace._id.toString();
+    const now = Date.now();
+    const entry = _suggestRateMap.get(rateKey) || { timestamps: [] };
+    entry.timestamps = entry.timestamps.filter((t) => now - t < SUGGEST_RATE_WINDOW);
+    if (entry.timestamps.length >= SUGGEST_RATE_LIMIT) {
+      return res.status(429).json({ error: 'Too many suggestion requests. Please wait a minute.' });
+    }
+    entry.timestamps.push(now);
+    _suggestRateMap.set(rateKey, entry);
 
     const { domain } = req.body;
     if (!domain || typeof domain !== 'string' || !domain.trim()) {

@@ -79,9 +79,12 @@ const W_CITATION = 0.3;
  */
 function computeWeightedVisibility(platforms) {
   if (!platforms || platforms.length === 0) return 0;
-  const total = platforms.length;
-  const mentioned = platforms.filter((p) => p.mentioned);
-  const cited = platforms.filter((p) => p.cited);
+  // Exclude errored platforms — API failures should not count as "not mentioned"
+  const valid = platforms.filter((p) => !p.error);
+  if (valid.length === 0) return 0;
+  const total = valid.length;
+  const mentioned = valid.filter((p) => p.mentioned);
+  const cited = valid.filter((p) => p.cited);
 
   const mentionRate = (mentioned.length / total) * 100;
   const citationRate = (cited.length / total) * 100;
@@ -107,14 +110,18 @@ function computeMetrics(latestScan, promptCount, competitors) {
   const platformCount = (results.length > 0 && results[0].platforms?.length > 0) ? results[0].platforms.length : PLATFORMS.length;
   let totalMentions = 0;
   let totalCitations = 0;
-  const totalPossible = results.length * platformCount;
+  let errorCount = 0;
 
   for (const r of results) {
     for (const p of r.platforms) {
+      if (p.error) { errorCount++; continue; }
       if (p.mentioned) totalMentions++;
       if (p.cited) totalCitations++;
     }
   }
+
+  // Exclude errored platforms from totalPossible so API failures don't lower scores
+  const totalPossible = results.length * platformCount - errorCount;
 
   const mentionRate = totalPossible > 0 ? Math.round((totalMentions / totalPossible) * 100) : 0;
   const citationRate = totalMentions > 0 ? Math.round((totalCitations / totalMentions) * 100) : 0;
@@ -235,6 +242,7 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
         cited: pl.cited,
         citedFrom: pl.citedFrom || null,
         normalizedPosition: pl.normalizedPosition ?? null,
+        error: pl.error || false,
       })),
       lastChecked: latestScan.completedAt
         ? formatRelativeDate(latestScan.completedAt)
@@ -397,11 +405,13 @@ function computePlatformStats(latestScan) {
     let mentionCount = 0;
     let citationCount = 0;
     let totalPrompts = 0;
+    let errorCount = 0;
 
     if (latestScan) {
       for (const r of latestScan.results) {
         const plat = r.platforms.find((pl) => pl.platformId === p.platformId);
         if (plat) {
+          if (plat.error) { errorCount++; continue; }
           totalPrompts++;
           if (plat.mentioned) mentionCount++;
           if (plat.cited) citationCount++;
@@ -419,6 +429,7 @@ function computePlatformStats(latestScan) {
       visibility: totalPrompts > 0 ? Math.round((mentionCount / totalPrompts) * 100) : 0,
       mentionCount,
       citationCount,
+      errorCount,
     };
   });
 }

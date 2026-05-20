@@ -652,8 +652,8 @@ async function executeScan(trackerId, userId = null) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function buildDashboardResponse(tracker) {
-  const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id, active: { $ne: false }, locked: { $ne: true } });
-  const competitors = await AiTrackerCompetitor.find({ trackerId: tracker._id });
+  const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id, active: { $ne: false }, locked: { $ne: true } }).limit(500);
+  const competitors = await AiTrackerCompetitor.find({ trackerId: tracker._id }).limit(200);
 
   const recentScans = await AiTrackerScan.find({
     trackerId: tracker._id,

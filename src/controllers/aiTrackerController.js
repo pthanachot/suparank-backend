@@ -993,10 +993,11 @@ const setup = async (req, res) => {
       isOwn: true,
     });
 
-    // Create additional competitors
+    // Create additional competitors (max 50)
     if (Array.isArray(competitors)) {
       const compDocs = competitors
         .filter((c) => typeof c === 'string' && c.trim())
+        .slice(0, 50)
         .map((c) => ({ trackerId: tracker._id, name: c.trim(), isOwn: false }));
       if (compDocs.length > 0) {
         await AiTrackerCompetitor.insertMany(compDocs, { ordered: false }).catch((err) => {
@@ -1486,10 +1487,11 @@ const createMonitor = async (req, res) => {
       isOwn: true,
     });
 
-    // Create additional competitors
+    // Create additional competitors (max 50)
     if (Array.isArray(competitors)) {
       const compDocs = competitors
         .filter((c) => typeof c === 'string' && c.trim())
+        .slice(0, 50)
         .map((c) => ({ trackerId: tracker._id, name: c.trim(), isOwn: false }));
       if (compDocs.length > 0) {
         await AiTrackerCompetitor.insertMany(compDocs, { ordered: false }).catch((err) => {

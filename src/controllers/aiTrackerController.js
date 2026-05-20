@@ -823,7 +823,12 @@ Make prompts realistic — what real users would ask AI assistants.`,
         return res.json({ suggestions: DEFAULT_SUGGESTIONS });
       }
 
-      const parsed = JSON.parse(content);
+      let parsed;
+      try {
+        parsed = JSON.parse(content);
+      } catch {
+        return res.json({ suggestions: DEFAULT_SUGGESTIONS });
+      }
       const suggestions = Array.isArray(parsed.suggestions) ? parsed.suggestions : Array.isArray(parsed) ? parsed : DEFAULT_SUGGESTIONS;
 
       // Validate shape

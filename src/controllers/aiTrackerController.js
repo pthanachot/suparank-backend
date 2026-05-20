@@ -63,6 +63,9 @@ async function resolveMonitor(req, workspace, res) {
 // DERIVED DATA COMPUTATION
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Valid prompt frequency values
+const VALID_FREQUENCIES = ['Weekly', 'Bi-weekly', 'Monthly'];
+
 // Weights for weighted visibility score
 const W_MENTION = 0.4;
 const W_POSITION = 0.3;
@@ -1143,7 +1146,6 @@ const addPrompt = async (req, res) => {
       ? models.filter((m) => VALID_PLATFORMS.includes(m))
       : undefined;
 
-    const VALID_FREQUENCIES = ['Weekly', 'Bi-weekly', 'Monthly'];
     if (frequency && !VALID_FREQUENCIES.includes(frequency)) {
       return res.status(400).json({ error: 'Invalid frequency. Must be Weekly, Bi-weekly, or Monthly' });
     }
@@ -1723,7 +1725,6 @@ const addMonitorPrompt = async (req, res) => {
       ? models.filter((m) => VALID_PLATFORMS.includes(m))
       : undefined;
 
-    const VALID_FREQUENCIES = ['Weekly', 'Bi-weekly', 'Monthly'];
     if (frequency && !VALID_FREQUENCIES.includes(frequency)) {
       return res.status(400).json({ error: 'Invalid frequency. Must be Weekly, Bi-weekly, or Monthly' });
     }

@@ -999,7 +999,7 @@ const setup = async (req, res) => {
         .map((c) => ({ trackerId: tracker._id, name: c.trim(), isOwn: false }));
       if (compDocs.length > 0) {
         await AiTrackerCompetitor.insertMany(compDocs, { ordered: false }).catch((err) => {
-          if (err.code !== 11000) console.error('[ai-tracker] competitor insertMany error:', err.message);
+          if (err.code !== 11000) throw err;
         });
       }
     }
@@ -1491,7 +1491,7 @@ const createMonitor = async (req, res) => {
         .map((c) => ({ trackerId: tracker._id, name: c.trim(), isOwn: false }));
       if (compDocs.length > 0) {
         await AiTrackerCompetitor.insertMany(compDocs, { ordered: false }).catch((err) => {
-          if (err.code !== 11000) console.error('[ai-tracker] competitor insertMany error:', err.message);
+          if (err.code !== 11000) throw err;
         });
       }
     }

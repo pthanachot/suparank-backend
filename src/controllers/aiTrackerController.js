@@ -543,6 +543,13 @@ async function executeScan(trackerId, userId = null) {
     const platformCount = tracker.defaultModels?.length || 0;
     const promptCount = prompts.length;
 
+    // ── 3c. Skip scan entirely if no prompts are due
+    if (promptCount === 0) {
+      console.log(`[ai-tracker-scan] No prompts due for ${trackerId}, skipping scan`);
+      await AiTracker.findByIdAndUpdate(trackerId, { $set: { scanStatus: 'ready', scanProgress: 0 } });
+      return;
+    }
+
     // ── 4. Pre-deduct estimated credits (1 credit per 50 words, ~200 words per answer)
     //       Estimate = prompts × platforms × 4 credits, minimum 1
     if (orgId && platformCount > 0 && promptCount > 0) {

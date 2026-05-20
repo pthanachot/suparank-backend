@@ -10,6 +10,7 @@ const platformResultSchema = new mongoose.Schema({
   },
   cited: { type: Boolean, default: false },
   citedFrom: { type: String, default: null },
+  normalizedPosition: { type: Number, default: null },
   aiResponse: { type: String, default: '' },
 }, { _id: false });
 

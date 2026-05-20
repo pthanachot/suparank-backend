@@ -1315,6 +1315,9 @@ const addCompetitor = async (req, res) => {
 
     res.status(201).json({ id: doc._id.toString(), name: doc.name });
   } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ error: 'This competitor is already being tracked' });
+    }
     console.error('addCompetitor error:', err.message);
     res.status(500).json({ error: 'Failed to add competitor' });
   }
@@ -1859,6 +1862,9 @@ const addMonitorCompetitor = async (req, res) => {
     const doc = await AiTrackerCompetitor.create({ trackerId: tracker._id, name: name.trim(), isOwn: false });
     res.status(201).json({ id: doc._id.toString(), name: doc.name });
   } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ error: 'This competitor is already being tracked' });
+    }
     console.error('addMonitorCompetitor error:', err.message);
     res.status(500).json({ error: 'Failed to add competitor' });
   }

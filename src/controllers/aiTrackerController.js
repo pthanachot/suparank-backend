@@ -848,6 +848,10 @@ const setup = async (req, res) => {
     if (!domain || typeof domain !== 'string' || !domain.trim()) {
       return res.status(400).json({ error: 'Domain is required' });
     }
+    const domainTrimmed = domain.trim();
+    if (domainTrimmed.includes(' ') || !/^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$/.test(domainTrimmed)) {
+      return res.status(400).json({ error: 'Please enter a valid domain (e.g. example.com)' });
+    }
     if (!Array.isArray(prompts) || prompts.length === 0) {
       return res.status(400).json({ error: 'At least one prompt is required' });
     }
@@ -1080,6 +1084,15 @@ const addPrompt = async (req, res) => {
     if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
       return res.status(400).json({ error: 'Prompt is required' });
     }
+    if (prompt.trim().length > 500) {
+      return res.status(400).json({ error: 'Prompt must be 500 characters or fewer' });
+    }
+
+    // Sanitize models to only valid platform IDs
+    const VALID_PLATFORMS = ['chatgpt', 'gemini', 'claude', 'perplexity'];
+    const sanitizedModels = Array.isArray(models) && models.length > 0
+      ? models.filter((m) => VALID_PLATFORMS.includes(m))
+      : undefined;
 
     // Check duplicate
     const existing = await AiTrackerPrompt.findOne({
@@ -1102,7 +1115,7 @@ const addPrompt = async (req, res) => {
     const doc = await AiTrackerPrompt.create({
       trackerId: tracker._id,
       prompt: prompt.trim(),
-      ...(Array.isArray(models) && models.length > 0 ? { models } : {}),
+      ...(sanitizedModels && sanitizedModels.length > 0 ? { models: sanitizedModels } : {}),
       ...(frequency ? { frequency } : {}),
       createdOnPlan,
     });
@@ -1157,8 +1170,9 @@ const updatePrompt = async (req, res) => {
     const { promptId } = req.params;
     const { models, frequency, active } = req.body;
 
+    const VALID_PLATFORMS = ['chatgpt', 'gemini', 'claude', 'perplexity'];
     const update = {};
-    if (Array.isArray(models)) update.models = models;
+    if (Array.isArray(models)) update.models = models.filter((m) => VALID_PLATFORMS.includes(m));
     if (frequency !== undefined) update.frequency = frequency;
     if (active !== undefined) update.active = active;
 
@@ -1227,6 +1241,9 @@ const addCompetitor = async (req, res) => {
     const { name } = req.body;
     if (!name || typeof name !== 'string' || !name.trim()) {
       return res.status(400).json({ error: 'Competitor name is required' });
+    }
+    if (name.trim().length > 100) {
+      return res.status(400).json({ error: 'Competitor name must be 100 characters or fewer' });
     }
 
     const doc = await AiTrackerCompetitor.create({
@@ -1312,6 +1329,10 @@ const createMonitor = async (req, res) => {
 
     if (!domain || typeof domain !== 'string' || !domain.trim()) {
       return res.status(400).json({ error: 'Domain is required' });
+    }
+    const domainTrimmed = domain.trim();
+    if (domainTrimmed.includes(' ') || !/^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$/.test(domainTrimmed)) {
+      return res.status(400).json({ error: 'Please enter a valid domain (e.g. example.com)' });
     }
     if (!Array.isArray(prompts) || prompts.length === 0) {
       return res.status(400).json({ error: 'At least one prompt is required' });
@@ -1623,6 +1644,15 @@ const addMonitorPrompt = async (req, res) => {
     if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
       return res.status(400).json({ error: 'Prompt is required' });
     }
+    if (prompt.trim().length > 500) {
+      return res.status(400).json({ error: 'Prompt must be 500 characters or fewer' });
+    }
+
+    // Sanitize models to only valid platform IDs
+    const VALID_PLATFORMS = ['chatgpt', 'gemini', 'claude', 'perplexity'];
+    const sanitizedModels = Array.isArray(models) && models.length > 0
+      ? models.filter((m) => VALID_PLATFORMS.includes(m))
+      : undefined;
 
     const existing = await AiTrackerPrompt.findOne({ trackerId: tracker._id, prompt: prompt.trim() });
     if (existing) {
@@ -1641,7 +1671,7 @@ const addMonitorPrompt = async (req, res) => {
     const doc = await AiTrackerPrompt.create({
       trackerId: tracker._id,
       prompt: prompt.trim(),
-      ...(Array.isArray(models) && models.length > 0 ? { models } : {}),
+      ...(sanitizedModels && sanitizedModels.length > 0 ? { models: sanitizedModels } : {}),
       ...(frequency ? { frequency } : {}),
       createdOnPlan,
     });
@@ -1667,8 +1697,9 @@ const updateMonitorPrompt = async (req, res) => {
     const { promptId } = req.params;
     const { models, frequency, active } = req.body;
 
+    const VALID_PLATFORMS = ['chatgpt', 'gemini', 'claude', 'perplexity'];
     const update = {};
-    if (Array.isArray(models)) update.models = models;
+    if (Array.isArray(models)) update.models = models.filter((m) => VALID_PLATFORMS.includes(m));
     if (frequency !== undefined) update.frequency = frequency;
     if (active !== undefined) update.active = active;
 

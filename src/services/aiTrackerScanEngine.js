@@ -176,7 +176,7 @@ async function searchPerplexity(query) {
   const timeout = setTimeout(() => controller.abort(), 60000);
 
   try {
-    const res = await fetch('https://api.perplexity.ai/v1/chat/completions', {
+    const res = await fetch('https://api.perplexity.ai/chat/completions', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,

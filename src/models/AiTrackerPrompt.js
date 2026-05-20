@@ -19,5 +19,6 @@ const aiTrackerPromptSchema = new mongoose.Schema({
 
 aiTrackerPromptSchema.index({ trackerId: 1 });
 aiTrackerPromptSchema.index({ trackerId: 1, prompt: 1 }, { unique: true });
+aiTrackerPromptSchema.index({ trackerId: 1, active: 1 });
 
 module.exports = mongoose.model('AiTrackerPrompt', aiTrackerPromptSchema);

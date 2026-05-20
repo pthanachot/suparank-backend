@@ -232,7 +232,7 @@ async function searchClaude(query) {
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY not configured');
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60000);
+  const timeout = setTimeout(() => controller.abort(), 90000);
 
   try {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -246,6 +246,7 @@ async function searchClaude(query) {
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 2048,
         messages: [{ role: 'user', content: query }],
+        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }],
       }),
       signal: controller.signal,
     });
@@ -257,19 +258,41 @@ async function searchClaude(query) {
 
     const data = await res.json();
     let answer = '';
+    const citations = [];
+    const seen = new Set();
 
-    // Claude response: content is an array of content blocks
+    // Claude web search response: content blocks include text (with citations),
+    // server_tool_use, and web_search_tool_result
     if (Array.isArray(data.content)) {
       for (const block of data.content) {
         if (block.type === 'text' && block.text) {
           answer += block.text;
+          // Extract citation URLs from inline citations
+          if (Array.isArray(block.citations)) {
+            for (const cite of block.citations) {
+              if (cite.url && !seen.has(cite.url)) {
+                seen.add(cite.url);
+                citations.push(cite.url);
+              }
+            }
+          }
         }
       }
     }
 
-    console.log(`[claude] query="${query.slice(0, 50)}" answer_len=${answer.length} citations=0 (no web search)`);
-    // Claude has no web search — always returns empty citations
-    return { answer, citations: [] };
+    // Fallback: parse markdown links if no structured citations
+    if (citations.length === 0 && answer) {
+      const fallback = extractCitationsFromText(answer);
+      for (const url of fallback) {
+        if (!seen.has(url)) {
+          seen.add(url);
+          citations.push(url);
+        }
+      }
+    }
+
+    console.log(`[claude] query="${query.slice(0, 50)}" answer_len=${answer.length} citations=${citations.length}`);
+    return { answer, citations };
   } finally {
     clearTimeout(timeout);
   }

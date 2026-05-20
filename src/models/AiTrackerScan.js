@@ -46,5 +46,6 @@ const aiTrackerScanSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 aiTrackerScanSchema.index({ trackerId: 1, completedAt: -1 });
+aiTrackerScanSchema.index({ trackerId: 1, status: 1, completedAt: -1 });
 
 module.exports = mongoose.model('AiTrackerScan', aiTrackerScanSchema);

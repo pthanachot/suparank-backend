@@ -435,7 +435,7 @@ function detectBrand(answer, citations, domain) {
   let cited = false;
   let citedFrom = null;
   for (const url of citations) {
-    if (url.toLowerCase().includes(domainClean)) {
+    if (typeof url === 'string' && url.length <= 2048 && url.toLowerCase().includes(domainClean)) {
       cited = true;
       citedFrom = url;
       break;

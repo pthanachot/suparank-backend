@@ -291,6 +291,28 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
         const mentionedCount = result.platforms.filter((pl) => pl.mentioned).length;
         return mentionedCount > 0 ? Math.round((citedCount / mentionedCount) * 100) : 0;
       }).reverse(),
+      mentionRateHistory: scanResultMaps.map((m) => {
+        const result = m.get(p._id.toString());
+        if (!result) return 0;
+        const valid = result.platforms.filter((pl) => !pl.error);
+        if (valid.length === 0) return 0;
+        return Math.round((valid.filter((pl) => pl.mentioned).length / valid.length) * 100);
+      }).reverse(),
+      positionHistory: scanResultMaps.map((m) => {
+        const result = m.get(p._id.toString());
+        if (!result) return null;
+        const mentioned = result.platforms.filter((pl) => pl.mentioned && !pl.error && pl.normalizedPosition != null);
+        if (mentioned.length === 0) return null;
+        const avg = mentioned.reduce((s, pl) => s + pl.normalizedPosition, 0) / mentioned.length;
+        return Math.round(avg * 100);
+      }).reverse(),
+      sentimentHistory: scanResultMaps.map((m) => {
+        const result = m.get(p._id.toString());
+        if (!result) return null;
+        const scores = result.platforms.filter((pl) => pl.mentioned && !pl.error && pl.sentimentScore != null).map((pl) => pl.sentimentScore);
+        if (scores.length === 0) return null;
+        return Math.round(scores.reduce((s, v) => s + v, 0) / scores.length);
+      }).reverse(),
       trendDates: (recentScans || []).map((scan) => {
         const d = scan.completedAt || scan.startedAt;
         return d ? d.toISOString() : null;

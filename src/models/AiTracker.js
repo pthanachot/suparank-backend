@@ -26,6 +26,7 @@ const aiTrackerSchema = new mongoose.Schema({
   lastScanAt: { type: Date, default: null },
   nextScanAt: { type: Date, default: null },
   currentScanId: { type: mongoose.Schema.Types.ObjectId, ref: 'AiTrackerScan', default: null },
+  dismissedCompetitors: { type: [String], default: [] },
 }, { timestamps: true });
 
 // Default name to domain if not set

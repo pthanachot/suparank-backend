@@ -31,6 +31,11 @@ const competitorResultSchema = new mongoose.Schema({
   visibility: { type: Number, default: 0 },
 }, { _id: false });
 
+const detectedBrandSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  mentionCount: { type: Number, default: 1 },
+}, { _id: false });
+
 const aiTrackerScanSchema = new mongoose.Schema({
   trackerId: {
     type: mongoose.Schema.Types.ObjectId,
@@ -46,6 +51,7 @@ const aiTrackerScanSchema = new mongoose.Schema({
   },
   results: { type: [promptResultSchema], default: [] },
   competitorResults: { type: [competitorResultSchema], default: [] },
+  detectedBrands: { type: [detectedBrandSchema], default: [] },
 }, { timestamps: true });
 
 aiTrackerScanSchema.index({ trackerId: 1, completedAt: -1 });

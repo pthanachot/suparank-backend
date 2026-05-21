@@ -135,7 +135,7 @@ const FLAGS = [
     displayName: 'Sites / GSC',
     description: 'Connect sites to Google Search Console for performance data.',
     enabled: true,
-    implemented: false,
+    implemented: true,
     conditions: {
       // Tier limit: free=1, standard=3, pro=10, agency=unlimited.
       custom: { tierLimitKey: 'maxSites' },

@@ -534,6 +534,117 @@ function _parseSentimentResponse(content) {
 }
 
 /**
+ * Extract brand/company names mentioned across all AI responses.
+ * Uses Claude Haiku to identify brands, excluding the user's own brand
+ * and already-tracked competitors.
+ *
+ * @param {Array<{platformId: string, answer: string}>} allAnswers
+ * @param {string} ownBrand - The user's brand name (extracted from domain)
+ * @param {string[]} trackedNames - Names of already-tracked competitors
+ * @returns {Promise<Array<{name: string, mentionCount: number}>>}
+ */
+async function extractBrandsFromResponses(allAnswers, ownBrand, trackedNames) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    console.warn('[ai-tracker] brand extraction skipped: no ANTHROPIC_API_KEY');
+    return [];
+  }
+
+  // Build a combined text from all answers (cap at ~8000 chars to stay within token limits)
+  const combinedParts = [];
+  let totalLen = 0;
+  for (const { answer } of allAnswers) {
+    if (!answer) continue;
+    const chunk = answer.slice(0, 1500);
+    if (totalLen + chunk.length > 8000) break;
+    combinedParts.push(chunk);
+    totalLen += chunk.length;
+  }
+
+  if (combinedParts.length === 0) return [];
+
+  const excludeList = [ownBrand, ...trackedNames].map((n) => n.toLowerCase());
+  const excludeStr = excludeList.join(', ');
+
+  const userPrompt = `Extract all brand names, company names, product names, and tool/service names mentioned in the following AI responses. Exclude these names (they are already tracked): ${excludeStr}
+
+Return ONLY a JSON array of objects with "name" (string) and "count" (number of times mentioned). Example: [{"name":"Ahrefs","count":3},{"name":"Moz","count":1}]
+
+If no brands are found, return an empty array: []
+
+AI Responses:
+${combinedParts.join('\n---\n')}`;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    try {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 300,
+          messages: [{ role: 'user', content: userPrompt }],
+        }),
+        signal: controller.signal,
+      });
+
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        console.warn(`[ai-tracker] brand extraction failed: ${res.status} ${res.statusText}`, body.slice(0, 200));
+        return [];
+      }
+
+      const data = await res.json();
+      const rawText = data.content?.[0]?.text?.trim();
+      console.log('[ai-tracker] brand extraction raw:', rawText?.slice(0, 200));
+
+      if (!rawText) return [];
+
+      // Parse — strip code fences if present
+      const cleaned = rawText.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
+      const parsed = JSON.parse(cleaned);
+
+      if (!Array.isArray(parsed)) return [];
+
+      // Deduplicate and filter out excluded names
+      const brandMap = new Map();
+      for (const item of parsed) {
+        if (!item.name || typeof item.name !== 'string') continue;
+        const name = item.name.trim();
+        if (!name || name.length > 100) continue;
+        if (excludeList.includes(name.toLowerCase())) continue;
+        const count = Math.max(1, Math.round(Number(item.count) || 1));
+        const existing = brandMap.get(name.toLowerCase());
+        if (existing) {
+          existing.mentionCount += count;
+        } else {
+          brandMap.set(name.toLowerCase(), { name, mentionCount: count });
+        }
+      }
+
+      // Sort by mention count descending, cap at 20
+      const brands = Array.from(brandMap.values())
+        .sort((a, b) => b.mentionCount - a.mentionCount)
+        .slice(0, 20);
+
+      console.log(`[ai-tracker] brand extraction found ${brands.length} brands`);
+      return brands;
+    } finally {
+      clearTimeout(timeout);
+    }
+  } catch (err) {
+    console.warn('[ai-tracker] brand extraction error:', err?.message || err);
+    return [];
+  }
+}
+
+/**
  * Detect if the user's brand/domain appears in an AI response.
  *
  * @param {string} answer - AI response text
@@ -655,7 +766,7 @@ async function runScan(tracker, prompts, competitors, onProgress) {
   // If defaultModels is empty (e.g. cleared after downgrade), skip scan entirely
   if (!tracker.defaultModels || tracker.defaultModels.length === 0) {
     await onProgress(100, []);
-    return { results: [], competitorResults: [] };
+    return { results: [], competitorResults: [], detectedBrands: [] };
   }
   availablePlatforms = availablePlatforms.filter((p) => tracker.defaultModels.includes(p.id));
 
@@ -672,7 +783,7 @@ async function runScan(tracker, prompts, competitors, onProgress) {
       visibility: 0,
     }));
     await onProgress(100, availablePlatforms.map((p) => ({ platformId: p.id, status: 'completed' })));
-    return { results: [], competitorResults };
+    return { results: [], competitorResults, detectedBrands: [] };
   }
 
   // Initialize per-prompt result buckets
@@ -827,7 +938,12 @@ async function runScan(tracker, prompts, competitors, onProgress) {
     };
   });
 
-  return { results, competitorResults, totalAnswerWords };
+  // Auto-detect brands mentioned in AI responses
+  const ownBrand = extractBrand(tracker.domain);
+  const trackedNames = competitors.map((c) => c.name);
+  const detectedBrands = await extractBrandsFromResponses(allAnswers, ownBrand, trackedNames);
+
+  return { results, competitorResults, detectedBrands, totalAnswerWords };
 }
 
 module.exports = { runScan, PLATFORMS };

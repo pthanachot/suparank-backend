@@ -155,7 +155,7 @@ function computeMetrics(latestScan, promptCount, competitors) {
   return { visibility, mentionRate, shareOfVoice, citationRate, promptCount, avgSentiment };
 }
 
-function generatePromptSuggestions(scanResult) {
+function generatePromptSuggestions(scanResult, prevResult) {
   if (!scanResult) {
     return [
       'Add a direct answer in the first paragraph',
@@ -173,29 +173,93 @@ function generatePromptSuggestions(scanResult) {
   const cited = valid.filter((p) => p.cited);
   const notMentioned = valid.filter((p) => !p.mentioned);
 
+  // Compute previous scan stats for comparison
+  const prevValid = prevResult ? prevResult.platforms.filter((p) => !p.error) : [];
+  const prevMentioned = prevValid.filter((p) => p.mentioned);
+  const prevCited = prevValid.filter((p) => p.cited);
+
+  // ── Mention-based suggestions ──
   if (mentioned.length === 0) {
     suggestions.push('Create comprehensive content targeting this exact query');
-    suggestions.push('Add a direct answer in the first paragraph');
-    suggestions.push('Use clear H2/H3 structure matching query intent');
-  }
-
-  if (mentioned.length > 0 && cited.length === 0) {
-    suggestions.push('Add structured data (FAQ schema) to improve citation chances');
-    suggestions.push('Include your domain URL naturally in authoritative content');
-  }
-
-  if (notMentioned.length > 0 && mentioned.length > 0) {
+    suggestions.push('Add a direct answer in the first paragraph of your page');
+    suggestions.push('Use clear H2/H3 headings that match the query intent');
+  } else if (mentioned.length < valid.length) {
     const names = notMentioned.map((p) => {
       const display = PLATFORM_DISPLAY.find((d) => d.platformId === p.platformId);
       return display ? display.name : p.platformId;
     });
-    suggestions.push(`Improve visibility on ${names.join(', ')} by diversifying content format`);
+    suggestions.push(`Improve visibility on ${names.join(', ')} with platform-specific content`);
   }
 
-  suggestions.push('Strengthen E-E-A-T signals (author bio, date, citations)');
-  suggestions.push('Add authoritative external citations and sources');
-  suggestions.push('Keyword in title and first 100 words');
-  suggestions.push('Include FAQ section with exact-match questions');
+  // ── Lost mention detection ──
+  if (prevResult && prevMentioned.length > mentioned.length) {
+    const lostPlatforms = prevMentioned
+      .filter((pm) => !mentioned.some((m) => m.platformId === pm.platformId))
+      .map((p) => {
+        const display = PLATFORM_DISPLAY.find((d) => d.platformId === p.platformId);
+        return display ? display.name : p.platformId;
+      });
+    if (lostPlatforms.length > 0) {
+      suggestions.push(`Lost mentions on ${lostPlatforms.join(', ')} — refresh and expand your content`);
+    }
+  }
+
+  // ── Citation suggestions ──
+  if (mentioned.length > 0 && cited.length === 0) {
+    suggestions.push('Add structured data (FAQ schema) to boost citation chances');
+    suggestions.push('Include your domain URL naturally in authoritative content');
+  } else if (cited.length > 0 && cited.length < mentioned.length) {
+    const uncitedNames = mentioned
+      .filter((m) => !m.cited)
+      .map((p) => {
+        const display = PLATFORM_DISPLAY.find((d) => d.platformId === p.platformId);
+        return display ? display.name : p.platformId;
+      });
+    suggestions.push(`Not cited on ${uncitedNames.join(', ')} despite mention — add structured data and source links`);
+  }
+
+  // ── Citation gained/lost ──
+  if (prevResult && cited.length > prevCited.length) {
+    suggestions.push('Citations growing — keep content fresh and add more authoritative sources');
+  } else if (prevResult && prevCited.length > 0 && cited.length < prevCited.length) {
+    suggestions.push('Lost citations since last scan — update content with recent data and statistics');
+  }
+
+  // ── Sentiment-based suggestions ──
+  const sentimentScores = valid
+    .filter((p) => p.mentioned && p.sentimentScore != null)
+    .map((p) => p.sentimentScore);
+  if (sentimentScores.length > 0) {
+    const avgSentiment = sentimentScores.reduce((s, v) => s + v, 0) / sentimentScores.length;
+    if (avgSentiment < 40) {
+      suggestions.push('Negative sentiment detected — address common complaints and highlight positive outcomes');
+    } else if (avgSentiment < 60) {
+      suggestions.push('Neutral sentiment — add case studies and testimonials to improve brand perception');
+    }
+  }
+
+  // ── Position-based suggestions ──
+  const positions = valid
+    .filter((p) => p.mentioned && p.normalizedPosition != null)
+    .map((p) => p.normalizedPosition);
+  if (positions.length > 0) {
+    const avgPos = positions.reduce((s, v) => s + v, 0) / positions.length;
+    if (avgPos < 0.3) {
+      suggestions.push('Low ranking position — create more comprehensive, authoritative content on this topic');
+    }
+  }
+
+  // ── Filler: only add generic suggestions to reach 6 if needed ──
+  const fillers = [
+    'Strengthen E-E-A-T signals (author bio, date, citations)',
+    'Add authoritative external citations and sources',
+    'Keyword in title and first 100 words',
+    'Include FAQ section with exact-match questions',
+  ];
+  for (const f of fillers) {
+    if (suggestions.length >= 6) break;
+    if (!suggestions.includes(f)) suggestions.push(f);
+  }
 
   return suggestions.slice(0, 6);
 }
@@ -220,7 +284,7 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
       frequency: p.frequency,
       active: p.active,
       locked: p.locked || false,
-      suggestions: generatePromptSuggestions(null),
+      suggestions: generatePromptSuggestions(null, null),
       trendHistory: [],
     }));
   }
@@ -278,7 +342,7 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
       frequency: p.frequency,
       active: p.active,
       locked: p.locked || false,
-      suggestions: generatePromptSuggestions(scanResult),
+      suggestions: generatePromptSuggestions(scanResult, prevResult),
       trendHistory: scanResultMaps.map((m) => {
         const result = m.get(p._id.toString());
         if (!result) return 0;
@@ -736,7 +800,7 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
     await AiTracker.findByIdAndUpdate(trackerId, { $set: { currentScanId: scan._id } });
 
     // ── 6. Run the scan engine
-    const { results, competitorResults, totalAnswerWords } = await runScan(
+    const { results, competitorResults, detectedBrands, totalAnswerWords } = await runScan(
       tracker,
       prompts,
       competitors,
@@ -775,7 +839,7 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
     // ── 8. Save scan results
     const now = new Date();
     await AiTrackerScan.findByIdAndUpdate(scan._id, {
-      $set: { status: 'ready', completedAt: now, results, competitorResults },
+      $set: { status: 'ready', completedAt: now, results, competitorResults, detectedBrands: detectedBrands || [] },
     });
 
     // ── 8b. Update lastScannedAt on all scanned prompts
@@ -854,11 +918,19 @@ async function buildDashboardResponse(tracker) {
   const actionItems = generateActionItems(latestScan);
   const platformStats = computePlatformStats(latestScan);
 
+  // Build suggested competitors from auto-detected brands
+  const trackedNames = competitors.map((c) => c.name.toLowerCase());
+  const dismissed = (tracker.dismissedCompetitors || []).map((n) => n.toLowerCase());
+  const suggestedCompetitors = (latestScan?.detectedBrands || [])
+    .filter((b) => !trackedNames.includes(b.name.toLowerCase()) && !dismissed.includes(b.name.toLowerCase()))
+    .map((b) => ({ name: b.name, mentionCount: b.mentionCount }));
+
   return {
     tracker: tracker.toTrackerState(),
     metrics,
     trackedPrompts,
     competitors: formattedCompetitors,
+    suggestedCompetitors,
     changes,
     trendData,
     actionItems,
@@ -1555,6 +1627,35 @@ const removeCompetitor = async (req, res) => {
   }
 };
 
+// ─── POST /:workspaceNumber/ai-tracker/competitors/dismiss ───────────────
+
+const dismissSuggestedCompetitor = async (req, res) => {
+  try {
+    const workspace = req.workspace;
+
+    const tracker = await resolveTracker(workspace, res);
+    if (!tracker) return;
+
+    const { name } = req.body;
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ error: 'Competitor name is required' });
+    }
+
+    const trimmed = name.trim();
+    // Add to dismissedCompetitors if not already there
+    if (!tracker.dismissedCompetitors.includes(trimmed)) {
+      await AiTracker.findByIdAndUpdate(tracker._id, {
+        $addToSet: { dismissedCompetitors: trimmed },
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('dismissSuggestedCompetitor error:', err.message);
+    res.status(500).json({ error: 'Failed to dismiss competitor' });
+  }
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // MULTI-MONITOR ENDPOINT HANDLERS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2127,6 +2228,31 @@ const removeMonitorCompetitor = async (req, res) => {
   }
 };
 
+const dismissMonitorSuggestedCompetitor = async (req, res) => {
+  try {
+    const workspace = req.workspace;
+    const tracker = await resolveMonitor(req, workspace, res);
+    if (!tracker) return;
+
+    const { name } = req.body;
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ error: 'Competitor name is required' });
+    }
+
+    const trimmed = name.trim();
+    if (!tracker.dismissedCompetitors.includes(trimmed)) {
+      await AiTracker.findByIdAndUpdate(tracker._id, {
+        $addToSet: { dismissedCompetitors: trimmed },
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('dismissMonitorSuggestedCompetitor error:', err.message);
+    res.status(500).json({ error: 'Failed to dismiss competitor' });
+  }
+};
+
 module.exports = {
   // Legacy single-monitor
   getTracker,
@@ -2141,6 +2267,7 @@ module.exports = {
   bulkDeletePrompts,
   addCompetitor,
   removeCompetitor,
+  dismissSuggestedCompetitor,
   executeScan,
   // Multi-monitor
   listMonitors,
@@ -2156,4 +2283,5 @@ module.exports = {
   bulkDeleteMonitorPrompts,
   addMonitorCompetitor,
   removeMonitorCompetitor,
+  dismissMonitorSuggestedCompetitor,
 };

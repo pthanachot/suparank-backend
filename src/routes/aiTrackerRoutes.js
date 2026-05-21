@@ -37,6 +37,7 @@ router.put('/:workspaceNumber/ai-tracker/prompts/:promptId', ...rwrAiTracker, rp
 router.delete('/:workspaceNumber/ai-tracker/prompts/:promptId', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.removePrompt);
 
 // Competitor CRUD
+router.post('/:workspaceNumber/ai-tracker/competitors/dismiss', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.dismissSuggestedCompetitor);
 router.post('/:workspaceNumber/ai-tracker/competitors', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.addCompetitor);
 router.delete('/:workspaceNumber/ai-tracker/competitors/:competitorId', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.removeCompetitor);
 
@@ -64,6 +65,7 @@ router.put('/:workspaceNumber/ai-tracker/monitors/:monitorId/prompts/:promptId',
 router.delete('/:workspaceNumber/ai-tracker/monitors/:monitorId/prompts/:promptId', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.removeMonitorPrompt);
 
 // Monitor-scoped competitors
+router.post('/:workspaceNumber/ai-tracker/monitors/:monitorId/competitors/dismiss', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.dismissMonitorSuggestedCompetitor);
 router.post('/:workspaceNumber/ai-tracker/monitors/:monitorId/competitors', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.addMonitorCompetitor);
 router.delete('/:workspaceNumber/ai-tracker/monitors/:monitorId/competitors/:competitorId', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.removeMonitorCompetitor);
 

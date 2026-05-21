@@ -1254,8 +1254,9 @@ const triggerScan = async (req, res) => {
       return res.status(429).json({ error: 'Too many scans running in this workspace. Please wait for a scan to finish.' });
     }
 
-    // Rate limit: at least 1 hour between scans
-    if (tracker.lastScanAt) {
+    // Rate limit: at least 1 hour between scans (skip in development)
+    const isDev = process.env.NODE_ENV === 'development';
+    if (!isDev && tracker.lastScanAt) {
       const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
       if (tracker.lastScanAt > hourAgo) {
         return res.status(429).json({ error: 'Please wait at least 1 hour between scans' });
@@ -1872,7 +1873,8 @@ const triggerMonitorScan = async (req, res) => {
       return res.status(429).json({ error: 'Too many scans running in this workspace. Please wait for a scan to finish.' });
     }
 
-    if (tracker.lastScanAt) {
+    const isDev = process.env.NODE_ENV === 'development';
+    if (!isDev && tracker.lastScanAt) {
       const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
       if (tracker.lastScanAt > hourAgo) {
         return res.status(429).json({ error: 'Please wait at least 1 hour between scans' });

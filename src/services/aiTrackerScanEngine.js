@@ -425,55 +425,110 @@ function cleanDomain(domain) {
  * Returns { sentiment, sentimentScore } or null if analysis fails.
  */
 async function analyzeSentiment(aiResponse, brandName) {
+  if (!aiResponse || !brandName) return null;
+
+  const prompt = `You analyze brand sentiment in AI responses. Respond ONLY with valid JSON: {"sentiment":"positive"|"neutral"|"negative","score":0-100} where 100=most positive. No other text.\n\nBrand: "${brandName}"\nAI Response (excerpt):\n${aiResponse.slice(0, 1000)}`;
+
+  // Try Claude first (reliable), fall back to OpenAI
+  const claudeResult = await _sentimentViaClaude(prompt);
+  if (claudeResult) return claudeResult;
+
+  const openaiResult = await _sentimentViaOpenAI(prompt);
+  return openaiResult;
+}
+
+async function _sentimentViaOpenAI(prompt) {
   const apiKey = process.env.CHATGPT_API_KEY;
-  if (!apiKey || !aiResponse || !brandName) return null;
+  if (!apiKey) return null;
 
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
-
+    const timeout = setTimeout(() => controller.abort(), 60000);
     try {
       const res = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: 'gpt-4o-mini',
           messages: [
-            {
-              role: 'system',
-              content: 'You analyze brand sentiment in AI responses. Respond ONLY with valid JSON: {"sentiment":"positive"|"neutral"|"negative","score":0-100} where 100=most positive. No other text.',
-            },
-            {
-              role: 'user',
-              content: `Brand: "${brandName}"\nAI Response (excerpt):\n${aiResponse.slice(0, 1000)}`,
-            },
+            { role: 'system', content: 'Respond ONLY with valid JSON. No other text.' },
+            { role: 'user', content: prompt },
           ],
           max_tokens: 30,
           temperature: 0,
         }),
         signal: controller.signal,
       });
-
-      if (!res.ok) return null;
-
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        console.warn(`[ai-tracker] OpenAI sentiment failed: ${res.status} ${res.statusText}`, body.slice(0, 200));
+        return null;
+      }
       const data = await res.json();
-      const content = data.choices?.[0]?.message?.content?.trim();
-      if (!content) return null;
-
-      const parsed = JSON.parse(content);
-      const validSentiments = ['positive', 'neutral', 'negative'];
-      if (!validSentiments.includes(parsed.sentiment)) return null;
-      const score = Math.max(0, Math.min(100, Math.round(Number(parsed.score) || 50)));
-
-      return { sentiment: parsed.sentiment, sentimentScore: score };
+      return _parseSentimentResponse(data.choices?.[0]?.message?.content?.trim());
     } finally {
       clearTimeout(timeout);
     }
   } catch (err) {
-    console.warn(`[ai-tracker] sentiment analysis failed for "${brandName}": ${err.message}`);
+    console.warn('[ai-tracker] OpenAI sentiment error:', err?.message || err);
+    return null;
+  }
+}
+
+async function _sentimentViaClaude(prompt) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    console.warn('[ai-tracker] Claude sentiment skipped: no ANTHROPIC_API_KEY');
+    return null;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60000);
+    try {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 60,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        console.warn(`[ai-tracker] Claude sentiment failed: ${res.status} ${res.statusText}`, body.slice(0, 200));
+        return null;
+      }
+      const data = await res.json();
+      const rawText = data.content?.[0]?.text?.trim();
+      console.log('[ai-tracker] Claude sentiment raw response:', rawText);
+      return _parseSentimentResponse(rawText);
+    } finally {
+      clearTimeout(timeout);
+    }
+  } catch (err) {
+    console.warn('[ai-tracker] Claude sentiment error:', err?.message || err);
+    return null;
+  }
+}
+
+function _parseSentimentResponse(content) {
+  if (!content) return null;
+  try {
+    // Strip markdown code fences (e.g. ```json ... ```) that Claude may wrap around responses
+    const cleaned = content.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
+    const parsed = JSON.parse(cleaned);
+    const validSentiments = ['positive', 'neutral', 'negative'];
+    if (!validSentiments.includes(parsed.sentiment)) return null;
+    const score = Math.max(0, Math.min(100, Math.round(Number(parsed.score) || 50)));
+    return { sentiment: parsed.sentiment, sentimentScore: score };
+  } catch {
     return null;
   }
 }
@@ -696,7 +751,9 @@ async function runScan(tracker, prompts, competitors, onProgress) {
       let sentimentScore = null;
       if (mentioned && !error && answer) {
         const brandName = extractBrand(tracker.domain);
+        console.log(`[ai-tracker] sentiment: calling for brand="${brandName}", platform=${platform.id}, answerLen=${answer.length}`);
         const sentimentResult = await analyzeSentiment(answer, brandName);
+        console.log(`[ai-tracker] sentiment result:`, sentimentResult);
         if (sentimentResult) {
           sentiment = sentimentResult.sentiment;
           sentimentScore = sentimentResult.sentimentScore;

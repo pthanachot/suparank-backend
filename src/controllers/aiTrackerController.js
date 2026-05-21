@@ -160,9 +160,10 @@ function generatePromptSuggestions(scanResult) {
   }
 
   const suggestions = [];
-  const mentioned = scanResult.platforms.filter((p) => p.mentioned);
-  const cited = scanResult.platforms.filter((p) => p.cited);
-  const notMentioned = scanResult.platforms.filter((p) => !p.mentioned);
+  const valid = scanResult.platforms.filter((p) => !p.error);
+  const mentioned = valid.filter((p) => p.mentioned);
+  const cited = valid.filter((p) => p.cited);
+  const notMentioned = valid.filter((p) => !p.mentioned);
 
   if (mentioned.length === 0) {
     suggestions.push('Create comprehensive content targeting this exact query');
@@ -330,72 +331,143 @@ function computeChanges(latestScan, previousScan) {
   const changes = [];
   let changeId = 0;
 
+  // Helper to build platform metadata fields
+  const platMeta = (plat) => {
+    const meta = PLATFORM_DISPLAY.find((p) => p.platformId === plat.platformId);
+    return {
+      platform: meta ? meta.name : plat.platformId,
+      platformLetter: meta ? meta.letter : plat.platformId[0].toUpperCase(),
+      platformColor: meta ? meta.color : 'text-gray-600',
+      platformBg: meta ? meta.bgColor : 'bg-gray-50',
+    };
+  };
+
   for (const result of latestScan.results) {
     const prevResult = prevMap.get(result.promptId.toString());
     if (!prevResult) continue;
 
     for (const plat of result.platforms) {
       const prevPlat = prevResult.platforms.find((pp) => pp.platformId === plat.platformId);
-      if (!prevPlat) continue;
+      const m = platMeta(plat);
 
-      const meta = PLATFORM_DISPLAY.find((p) => p.platformId === plat.platformId);
+      // ── New platform (not scanned previously) ──
+      if (!prevPlat) {
+        if (plat.mentioned) {
+          changes.push({
+            id: `ch_${changeId++}`, type: 'gained', prompt: result.prompt, ...m,
+            detail: `Now mentioned on ${m.platform} (newly tracked)`,
+          });
+          if (plat.cited) {
+            changes.push({
+              id: `ch_${changeId++}`, type: 'new_citation', prompt: result.prompt, ...m,
+              detail: `Cited on ${m.platform} (newly tracked)`,
+            });
+          }
+        }
+        continue;
+      }
 
+      // ── Mention gained / lost ──
       if (!prevPlat.mentioned && plat.mentioned) {
         changes.push({
-          id: `ch_${changeId++}`,
-          type: 'gained',
-          prompt: result.prompt,
-          platform: meta ? meta.name : plat.platformId,
-          platformLetter: meta ? meta.letter : plat.platformId[0].toUpperCase(),
-          platformColor: meta ? meta.color : 'text-gray-600',
-          platformBg: meta ? meta.bgColor : 'bg-gray-50',
-          detail: `Now mentioned on ${meta ? meta.name : plat.platformId}`,
+          id: `ch_${changeId++}`, type: 'gained', prompt: result.prompt, ...m,
+          detail: `Now mentioned on ${m.platform}`,
         });
       } else if (prevPlat.mentioned && !plat.mentioned) {
         changes.push({
-          id: `ch_${changeId++}`,
-          type: 'lost',
-          prompt: result.prompt,
-          platform: meta ? meta.name : plat.platformId,
-          platformLetter: meta ? meta.letter : plat.platformId[0].toUpperCase(),
-          platformColor: meta ? meta.color : 'text-gray-600',
-          platformBg: meta ? meta.bgColor : 'bg-gray-50',
-          detail: `Lost mention on ${meta ? meta.name : plat.platformId}`,
+          id: `ch_${changeId++}`, type: 'lost', prompt: result.prompt, ...m,
+          detail: `Lost mention on ${m.platform}`,
         });
       } else if (prevPlat.tier === 'mentioned' && plat.tier === 'top') {
+        // ── Tier upgrade ──
         changes.push({
-          id: `ch_${changeId++}`,
-          type: 'improved',
-          prompt: result.prompt,
-          platform: meta ? meta.name : plat.platformId,
-          platformLetter: meta ? meta.letter : plat.platformId[0].toUpperCase(),
-          platformColor: meta ? meta.color : 'text-gray-600',
-          platformBg: meta ? meta.bgColor : 'bg-gray-50',
-          detail: `Upgraded to top mention on ${meta ? meta.name : plat.platformId}`,
+          id: `ch_${changeId++}`, type: 'improved', prompt: result.prompt, ...m,
+          detail: `Upgraded to top mention on ${m.platform}`,
         });
       } else if (prevPlat.tier === 'top' && plat.tier === 'mentioned') {
+        // ── Tier downgrade ──
         changes.push({
-          id: `ch_${changeId++}`,
-          type: 'declined',
-          prompt: result.prompt,
-          platform: meta ? meta.name : plat.platformId,
-          platformLetter: meta ? meta.letter : plat.platformId[0].toUpperCase(),
-          platformColor: meta ? meta.color : 'text-gray-600',
-          platformBg: meta ? meta.bgColor : 'bg-gray-50',
-          detail: `Dropped from top to mentioned on ${meta ? meta.name : plat.platformId}`,
+          id: `ch_${changeId++}`, type: 'declined', prompt: result.prompt, ...m,
+          detail: `Dropped from top to mentioned on ${m.platform}`,
         });
       }
 
+      // ── Citation gained ──
       if (!prevPlat.cited && plat.cited) {
         changes.push({
-          id: `ch_${changeId++}`,
-          type: 'new_citation',
-          prompt: result.prompt,
-          platform: meta ? meta.name : plat.platformId,
-          platformLetter: meta ? meta.letter : plat.platformId[0].toUpperCase(),
-          platformColor: meta ? meta.color : 'text-gray-600',
-          platformBg: meta ? meta.bgColor : 'bg-gray-50',
-          detail: `New citation from ${plat.citedFrom || (meta ? meta.name : plat.platformId)}`,
+          id: `ch_${changeId++}`, type: 'new_citation', prompt: result.prompt, ...m,
+          detail: `New citation from ${plat.citedFrom || m.platform}`,
+        });
+      }
+
+      // ── Citation lost ──
+      if (prevPlat.cited && !plat.cited) {
+        changes.push({
+          id: `ch_${changeId++}`, type: 'declined', prompt: result.prompt, ...m,
+          detail: `Lost citation on ${m.platform}`,
+        });
+      }
+
+      // ── Position change (both mentioned — allow prev unknown → known) ──
+      if (plat.mentioned && prevPlat.mentioned && plat.tier === prevPlat.tier) {
+        const prevPos = prevPlat.normalizedPosition ?? null;
+        const currPos = plat.normalizedPosition ?? null;
+        if (prevPos == null && currPos != null) {
+          // Position data now available (wasn't tracked before)
+          if (currPos <= 0.3) {
+            changes.push({
+              id: `ch_${changeId++}`, type: 'improved', prompt: result.prompt, ...m,
+              detail: `Position now tracked on ${m.platform} — ranked high`,
+            });
+          }
+        } else if (prevPos != null && currPos != null) {
+          // normalizedPosition: 0 = top (best), 1 = bottom (worst)
+          // positive posDelta = moved down = declined
+          // negative posDelta = moved up = improved
+          const posDelta = currPos - prevPos;
+          if (posDelta <= -0.2) {
+            changes.push({
+              id: `ch_${changeId++}`, type: 'improved', prompt: result.prompt, ...m,
+              detail: `Position improved on ${m.platform}`,
+            });
+          } else if (posDelta >= 0.2) {
+            changes.push({
+              id: `ch_${changeId++}`, type: 'declined', prompt: result.prompt, ...m,
+              detail: `Position dropped on ${m.platform}`,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // ── Competitor changes ──
+  if (latestScan.competitorResults && previousScan.competitorResults) {
+    const prevCompMap = new Map();
+    for (const c of previousScan.competitorResults) {
+      prevCompMap.set(c.competitorId.toString(), c);
+    }
+
+    for (const comp of latestScan.competitorResults) {
+      const prevComp = prevCompMap.get(comp.competitorId.toString());
+      if (!prevComp) continue;
+
+      const mentionDelta = comp.mentions - prevComp.mentions;
+      const citationDelta = comp.citations - prevComp.citations;
+
+      if (mentionDelta > 0) {
+        changes.push({
+          id: `ch_${changeId++}`, type: 'competitor',
+          prompt: comp.name,
+          detail: `${comp.name} gained ${mentionDelta} new mention${mentionDelta > 1 ? 's' : ''}`,
+        });
+      }
+
+      if (citationDelta > 0) {
+        changes.push({
+          id: `ch_${changeId++}`, type: 'competitor',
+          prompt: comp.name,
+          detail: `${comp.name} gained ${citationDelta} new citation${citationDelta > 1 ? 's' : ''}`,
         });
       }
     }
@@ -405,14 +477,20 @@ function computeChanges(latestScan, previousScan) {
 }
 
 function computeTrendData(scans) {
-  return scans.map((scan) => {
+  // scans are sorted newest-first from the DB query
+  return scans.map((scan, idx) => {
     // Weighted visibility across all platform results in this scan
     const allPlatforms = scan.results.flatMap((r) => r.platforms);
     const value = allPlatforms.length > 0 ? computeWeightedVisibility(allPlatforms) : 0;
     const d = scan.completedAt || scan.startedAt;
     const month = d.toLocaleString('en-US', { month: 'short' });
     const day = d.getDate();
-    return { week: `${month} ${day}`, value, date: d.toISOString() };
+
+    // Compute changes between this scan and the next older one
+    const olderScan = scans[idx + 1] || null;
+    const changes = computeChanges(scan, olderScan);
+
+    return { week: `${month} ${day}`, value, date: d.toISOString(), changes };
   }).reverse(); // oldest first
 }
 
@@ -456,10 +534,11 @@ function generateActionItems(latestScan) {
   const items = [];
   let id = 0;
 
-  // Prompts not mentioned on any platform
-  const missingAll = latestScan.results.filter((r) =>
-    r.platforms.every((p) => !p.mentioned)
-  );
+  // Prompts not mentioned on any platform (exclude all-errored prompts)
+  const missingAll = latestScan.results.filter((r) => {
+    const valid = r.platforms.filter((p) => !p.error);
+    return valid.length > 0 && valid.every((p) => !p.mentioned);
+  });
   if (missingAll.length > 0) {
     items.push({
       id: `ai_${id++}`,
@@ -472,9 +551,9 @@ function generateActionItems(latestScan) {
     });
   }
 
-  // Mentioned but not cited
+  // Mentioned but not cited (exclude errored platforms)
   const mentionedNotCited = latestScan.results.filter((r) =>
-    r.platforms.some((p) => p.mentioned && !p.cited)
+    r.platforms.some((p) => !p.error && p.mentioned && !p.cited)
   );
   if (mentionedNotCited.length > 0) {
     items.push({
@@ -487,15 +566,16 @@ function generateActionItems(latestScan) {
     });
   }
 
-  // Platform gaps: mentioned on some but not all
+  // Platform gaps: mentioned on some but not all (exclude errored platforms)
   const platformGaps = latestScan.results.filter((r) => {
-    const mentioned = r.platforms.filter((p) => p.mentioned);
-    return mentioned.length > 0 && mentioned.length < r.platforms.length;
+    const valid = r.platforms.filter((p) => !p.error);
+    const mentioned = valid.filter((p) => p.mentioned);
+    return mentioned.length > 0 && mentioned.length < valid.length;
   });
   if (platformGaps.length > 0) {
     const gapPlatformIds = [...new Set(
       platformGaps.flatMap((r) =>
-        r.platforms.filter((p) => !p.mentioned).map((p) => p.platformId)
+        r.platforms.filter((p) => !p.mentioned && !p.error).map((p) => p.platformId)
       )
     )];
     const gapNames = gapPlatformIds
@@ -554,7 +634,7 @@ async function recoverStuckScans(workspaceId) {
 // BACKGROUND SCAN EXECUTION (fire-and-forget)
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function executeScan(trackerId, userId = null) {
+async function executeScan(trackerId, userId = null, { force = false } = {}) {
   let creditTxId = null;
   let orgId = null;
 
@@ -578,9 +658,10 @@ async function executeScan(trackerId, userId = null) {
     const competitors = await AiTrackerCompetitor.find({ trackerId }).limit(200);
 
     // ── 3b. Filter prompts by frequency — only scan prompts that are due
+    //        Manual scans (force=true) bypass frequency check and scan all prompts
     const scanStart = new Date();
     const FREQ_DAYS = { 'Weekly': 7, 'Bi-weekly': 14, 'Monthly': 30 };
-    const prompts = allActivePrompts.filter((p) => {
+    const prompts = force ? allActivePrompts : allActivePrompts.filter((p) => {
       if (!p.lastScannedAt) return true; // never scanned → always due
       const freqDays = FREQ_DAYS[p.frequency] || 7;
       const dueAt = new Date(p.lastScannedAt.getTime() + freqDays * 24 * 60 * 60 * 1000);
@@ -1101,7 +1182,7 @@ const setup = async (req, res) => {
     }
 
     // Fire-and-forget: start first scan (pass userId so user free credits can be used)
-    executeScan(tracker._id, req.user?.userId).catch((err) => {
+    executeScan(tracker._id, req.user?.userId, { force: true }).catch((err) => {
       console.error('[ai-tracker-setup] scan failed:', err.message);
     });
 
@@ -1191,7 +1272,7 @@ const triggerScan = async (req, res) => {
       $set: { scanStatus: 'pending', scanProgress: 0, scanError: null },
     });
 
-    executeScan(tracker._id, req.user?.userId).catch((err) => {
+    executeScan(tracker._id, req.user?.userId, { force: true }).catch((err) => {
       console.error('[ai-tracker-scan] manual scan failed:', err.message);
     });
 
@@ -1627,7 +1708,7 @@ const createMonitor = async (req, res) => {
     }
 
     // Fire-and-forget: start first scan (pass userId so user free credits can be used)
-    executeScan(tracker._id, req.user?.userId).catch((err) => {
+    executeScan(tracker._id, req.user?.userId, { force: true }).catch((err) => {
       console.error('[ai-tracker-monitor] scan failed:', err.message);
     });
 
@@ -1807,7 +1888,7 @@ const triggerMonitorScan = async (req, res) => {
     await AiTracker.findByIdAndUpdate(tracker._id, {
       $set: { scanStatus: 'pending', scanProgress: 0, scanError: null },
     });
-    executeScan(tracker._id, req.user?.userId).catch((err) => {
+    executeScan(tracker._id, req.user?.userId, { force: true }).catch((err) => {
       console.error('[ai-tracker-scan] manual scan failed:', err.message);
     });
 

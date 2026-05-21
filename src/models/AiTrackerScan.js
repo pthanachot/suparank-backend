@@ -12,6 +12,8 @@ const platformResultSchema = new mongoose.Schema({
   citedFrom: { type: String, default: null, maxlength: 2048 },
   normalizedPosition: { type: Number, default: null },
   aiResponse: { type: String, default: '' },
+  sentiment: { type: String, enum: ['positive', 'neutral', 'negative', null], default: null },
+  sentimentScore: { type: Number, default: null },
   error: { type: Boolean, default: false },
 }, { _id: false });
 

@@ -144,7 +144,15 @@ function computeMetrics(latestScan, promptCount, competitors) {
   const allCompMentions = (latestScan.competitorResults || []).reduce((sum, cr) => sum + cr.mentions, 0);
   const shareOfVoice = allCompMentions > 0 ? Math.round((ownMentions / allCompMentions) * 100) : 0;
 
-  return { visibility, mentionRate, shareOfVoice, citationRate, promptCount };
+  // Average sentiment score across all mentioned platforms with sentiment data
+  const sentimentScores = allPlatforms
+    .filter((p) => p.sentimentScore != null && p.mentioned && !p.error)
+    .map((p) => p.sentimentScore);
+  const avgSentiment = sentimentScores.length > 0
+    ? Math.round(sentimentScores.reduce((sum, s) => sum + s, 0) / sentimentScores.length)
+    : null;
+
+  return { visibility, mentionRate, shareOfVoice, citationRate, promptCount, avgSentiment };
 }
 
 function generatePromptSuggestions(scanResult) {
@@ -255,6 +263,9 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
         cited: pl.cited,
         citedFrom: pl.citedFrom || null,
         normalizedPosition: pl.normalizedPosition ?? null,
+        aiResponse: pl.aiResponse || null,
+        sentiment: pl.sentiment || null,
+        sentimentScore: pl.sentimentScore ?? null,
         error: pl.error || false,
       })),
       lastChecked: latestScan.completedAt

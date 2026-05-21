@@ -421,6 +421,64 @@ function cleanDomain(domain) {
 }
 
 /**
+ * Analyze sentiment of brand mention in an AI response using gpt-4o-mini.
+ * Returns { sentiment, sentimentScore } or null if analysis fails.
+ */
+async function analyzeSentiment(aiResponse, brandName) {
+  const apiKey = process.env.CHATGPT_API_KEY;
+  if (!apiKey || !aiResponse || !brandName) return null;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    try {
+      const res = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          messages: [
+            {
+              role: 'system',
+              content: 'You analyze brand sentiment in AI responses. Respond ONLY with valid JSON: {"sentiment":"positive"|"neutral"|"negative","score":0-100} where 100=most positive. No other text.',
+            },
+            {
+              role: 'user',
+              content: `Brand: "${brandName}"\nAI Response (excerpt):\n${aiResponse.slice(0, 1000)}`,
+            },
+          ],
+          max_tokens: 30,
+          temperature: 0,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!res.ok) return null;
+
+      const data = await res.json();
+      const content = data.choices?.[0]?.message?.content?.trim();
+      if (!content) return null;
+
+      const parsed = JSON.parse(content);
+      const validSentiments = ['positive', 'neutral', 'negative'];
+      if (!validSentiments.includes(parsed.sentiment)) return null;
+      const score = Math.max(0, Math.min(100, Math.round(Number(parsed.score) || 50)));
+
+      return { sentiment: parsed.sentiment, sentimentScore: score };
+    } finally {
+      clearTimeout(timeout);
+    }
+  } catch (err) {
+    console.warn(`[ai-tracker] sentiment analysis failed for "${brandName}": ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * Detect if the user's brand/domain appears in an AI response.
  *
  * @param {string} answer - AI response text
@@ -633,6 +691,18 @@ async function runScan(tracker, prompts, competitors, onProgress) {
         error = true;
       }
 
+      // Sentiment analysis — only for mentioned, non-errored results with an answer
+      let sentiment = null;
+      let sentimentScore = null;
+      if (mentioned && !error && answer) {
+        const brandName = extractBrand(tracker.domain);
+        const sentimentResult = await analyzeSentiment(answer, brandName);
+        if (sentimentResult) {
+          sentiment = sentimentResult.sentiment;
+          sentimentScore = sentimentResult.sentimentScore;
+        }
+      }
+
       // Add platform result to this prompt's results
       const promptResult = promptResultMap.get(prompt._id.toString());
       promptResult.platforms.push({
@@ -642,7 +712,9 @@ async function runScan(tracker, prompts, competitors, onProgress) {
         cited,
         citedFrom,
         normalizedPosition,
-        aiResponse: answer.slice(0, 500),
+        aiResponse: answer.slice(0, 2000),
+        sentiment,
+        sentimentScore,
         error,
       });
 

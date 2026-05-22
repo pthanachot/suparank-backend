@@ -62,6 +62,7 @@ const gscConnectionSchema = new mongoose.Schema(
     connectedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     connectedAt: { type: Date, default: null },
     lastRefreshedAt: { type: Date, default: null },
+    persistData: { type: Boolean, default: true },
   },
   { timestamps: true }
 );

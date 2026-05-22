@@ -17,6 +17,7 @@ router.get('/:workspaceNumber/sites/gsc/auth-url',   ...rwrSites, rp('sites', 'm
 router.get('/:workspaceNumber/sites/gsc/properties',  ...rwrSites, rp('sites', 'manage'), sitesController.listProperties);
 router.get('/:workspaceNumber/sites/gsc/status',      ...rwrSites, rp('sites', 'read'),   sitesController.getConnectionStatus);
 router.delete('/:workspaceNumber/sites/gsc/disconnect', ...rwrSites, rp('sites', 'manage'), sitesController.disconnectGsc);
+router.patch('/:workspaceNumber/sites/gsc/persist-data', ...rwrSites, rp('sites', 'manage'), sitesController.updatePersistData);
 
 // Site CRUD
 router.post('/:workspaceNumber/sites',                ...rwrSites, rp('sites', 'manage'), sitesController.createSite);

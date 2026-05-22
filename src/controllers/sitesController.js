@@ -92,6 +92,7 @@ const getConnectionStatus = async (req, res) => {
     res.json({
       connected: !!(conn && conn.refreshToken),
       googleEmail: conn?.googleEmail || null,
+      persistData: conn?.persistData !== false,
     });
   } catch (err) {
     console.error('getConnectionStatus error:', err.message);
@@ -109,6 +110,44 @@ const disconnectGsc = async (req, res) => {
   } catch (err) {
     console.error('disconnectGsc error:', err.message);
     res.status(500).json({ error: 'Failed to disconnect GSC' });
+  }
+};
+
+const updatePersistData = async (req, res) => {
+  try {
+    const orgId = req.workspace.organizationId;
+    const { persistData } = req.body;
+    if (typeof persistData !== 'boolean') {
+      return res.status(400).json({ error: 'persistData must be a boolean' });
+    }
+
+    await GscConnection.findOneAndUpdate(
+      { organizationId: orgId },
+      { $set: { persistData } }
+    );
+
+    // When toggling OFF: clear snapshotStats from all org sites
+    if (!persistData) {
+      await Site.updateMany(
+        { organizationId: orgId },
+        { $set: { snapshotStats: null, syncStatus: 'idle', syncError: null } }
+      );
+    }
+
+    // When toggling ON: trigger a fresh sync for all org sites
+    if (persistData) {
+      const sites = await Site.find({ organizationId: orgId, locked: false }).select('_id');
+      for (const s of sites) {
+        gscService.refreshSiteStats(s._id).catch((err) => {
+          console.error(`[sites] Re-sync failed for ${s._id}:`, err.message);
+        });
+      }
+    }
+
+    res.json({ persistData });
+  } catch (err) {
+    console.error('updatePersistData error:', err.message);
+    res.status(500).json({ error: 'Failed to update persist data preference' });
   }
 };
 
@@ -154,10 +193,21 @@ const createSite = async (req, res) => {
       verified: true,
     });
 
-    // Trigger initial stats refresh (async)
-    gscService.refreshSiteStats(site._id).catch((err) => {
-      console.error('[sites] Initial stats refresh failed:', err.message);
-    });
+    // Save persistData preference if provided (first site setup)
+    if (typeof req.body.persistData === 'boolean') {
+      await GscConnection.findOneAndUpdate(
+        { organizationId: orgId },
+        { $set: { persistData: req.body.persistData } }
+      );
+    }
+
+    // Trigger initial stats refresh only if persist data is ON
+    const conn = await GscConnection.findOne({ organizationId: orgId });
+    if (conn?.persistData !== false) {
+      gscService.refreshSiteStats(site._id).catch((err) => {
+        console.error('[sites] Initial stats refresh failed:', err.message);
+      });
+    }
 
     res.status(201).json({ site });
   } catch (err) {
@@ -278,6 +328,7 @@ module.exports = {
   listProperties,
   getConnectionStatus,
   disconnectGsc,
+  updatePersistData,
   createSite,
   listSites,
   getSite,

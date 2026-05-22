@@ -389,6 +389,10 @@ async function refreshSiteStats(siteId) {
   const site = await Site.findById(siteId);
   if (!site) return;
 
+  // Respect org-level persistData preference
+  const conn = await GscConnection.findOne({ organizationId: site.organizationId });
+  if (conn && conn.persistData === false) return;
+
   try {
     await Site.updateOne({ _id: siteId }, { $set: { syncStatus: 'syncing' } });
 

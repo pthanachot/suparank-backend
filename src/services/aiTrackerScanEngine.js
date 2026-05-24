@@ -534,16 +534,85 @@ function _parseSentimentResponse(content) {
 }
 
 /**
+ * Normalize a brand name to a canonical key for deduplication/matching.
+ * No hardcoded brand lists — works for any brand using generic rules:
+ *  - Lowercase, trim whitespace
+ *  - Strip domain suffixes (.com, .ai, .io, etc.)
+ *  - Strip leading "the "
+ *  - Collapse spaces and hyphens
+ */
+function normalizeBrandKey(name) {
+  let key = name.toLowerCase().trim();
+  // Strip domain suffixes
+  key = key.replace(/\.(com|ai|io|org|net|co|app|dev|tools?)$/i, '').trim();
+  // Strip leading "the "
+  key = key.replace(/^the\s+/i, '').trim();
+  // Collapse hyphens and extra spaces to single space
+  key = key.replace(/[-\s]+/g, ' ').trim();
+  return key;
+}
+
+/**
+ * Check if two brand names likely refer to the same entity.
+ * Uses word-level matching (not substring) to avoid false positives
+ * like "Uber" matching "Kubernetes".
+ *
+ * Matches when:
+ *  - Normalized keys are identical ("semrush" = "semrush")
+ *  - No-space forms match ("hub spot" = "hubspot")
+ *  - One name's words are a subset of the other's words
+ *    ("Gemini" ⊂ "Google Gemini", "Claude" ⊂ "Anthropic Claude")
+ */
+function isSameBrand(nameA, nameB) {
+  const a = normalizeBrandKey(nameA);
+  const b = normalizeBrandKey(nameB);
+  if (a === b) return true;
+  // Strip spaces and compare (e.g. "hub spot" vs "hubspot", "sem rush" vs "semrush")
+  const aNoSpace = a.replace(/\s/g, '');
+  const bNoSpace = b.replace(/\s/g, '');
+  if (aNoSpace === bNoSpace) return true;
+  // Word-level containment: all words of the shorter name must appear
+  // as whole words in the longer name. Prevents "uber" matching "kubernetes".
+  const aWords = a.split(/\s+/);
+  const bWords = b.split(/\s+/);
+  const [shorter, longer] = aWords.length <= bWords.length ? [aWords, bWords] : [bWords, aWords];
+  if (shorter.length >= 1 && shorter.every((w) => longer.includes(w))) return true;
+  return false;
+}
+
+/**
+ * Merge brands that refer to the same entity.
+ * Keeps the longest name as the canonical display name (more specific).
+ * Works for any brand — no hardcoded alias table needed.
+ */
+function deduplicateBrands(brands) {
+  const groups = []; // Array of { name, mentionCount }
+  for (const brand of brands) {
+    // Find an existing group this brand belongs to
+    const match = groups.find((g) => isSameBrand(g.name, brand.name));
+    if (match) {
+      match.mentionCount += brand.mentionCount;
+      // Prefer the longer (more specific) name as display name
+      if (brand.name.length > match.name.length) {
+        match.name = brand.name;
+      }
+    } else {
+      groups.push({ ...brand });
+    }
+  }
+  return groups;
+}
+
+/**
  * Extract brand/company names mentioned across all AI responses.
  * Uses Claude Haiku to identify brands, excluding the user's own brand
  * and already-tracked competitors.
  *
  * @param {Array<{platformId: string, answer: string}>} allAnswers
  * @param {string} ownBrand - The user's brand name (extracted from domain)
- * @param {string[]} trackedNames - Names of already-tracked competitors
  * @returns {Promise<Array<{name: string, mentionCount: number}>>}
  */
-async function extractBrandsFromResponses(allAnswers, ownBrand, trackedNames) {
+async function extractBrandsFromResponses(allAnswers, ownBrand, domain) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     console.warn('[ai-tracker] brand extraction skipped: no ANTHROPIC_API_KEY');
@@ -563,12 +632,24 @@ async function extractBrandsFromResponses(allAnswers, ownBrand, trackedNames) {
 
   if (combinedParts.length === 0) return [];
 
-  const excludeList = [ownBrand, ...trackedNames].map((n) => n.toLowerCase());
-  const excludeStr = excludeList.join(', ');
+  const userPrompt = `You are a brand-name extraction expert. The user's website is ${domain || ownBrand}. Extract all competitor brands mentioned in the following AI responses.
 
-  const userPrompt = `Extract all brand names, company names, product names, and tool/service names mentioned in the following AI responses. Exclude these names (they are already tracked): ${excludeStr}
+RULES:
+1. Use the official, canonical PRODUCT name (e.g. "Ahrefs" not "ahrefs.com", "SEMrush" not "Semrush tool", "HubSpot" not "Hubspot").
+2. CRITICAL — each company = ONE entry. Merge the parent company, its products, AND product versions into a single entry. Use the most recognizable product name. For example:
+   - "OpenAI" + "ChatGPT" + "GPT-4" + "GPT-4o" → output only "ChatGPT"
+   - "Google" + "Gemini" + "Gemini Pro" + "Gemini 1.5" → output only "Gemini"
+   - "Anthropic" + "Claude" + "Claude 3.5" → output only "Claude"
+   - "Microsoft" + "Copilot" + "Azure OpenAI" → output only "Copilot"
+   - "Meta" + "Llama" + "Llama 3" → output only "Llama"
+   This applies to ALL companies, not just these examples. Never list a parent company, its product, or version variants as separate entries.
+3. Also merge spelling/casing variations into one entry (e.g. "ChatGPT" and "chat gpt" → "ChatGPT").
+4. Only include real businesses, products, or services — not generic terms (e.g. skip "SEO", "machine learning", "content marketing").
+5. Exclude the user's own brand: ${ownBrand} (and any product made by ${ownBrand}).
+6. Count each distinct AI response that mentions the brand (not word occurrences within one response). If a company and its product both appear in one response, that still counts as 1.
+7. Only include brands that are relevant competitors or alternatives in the same industry as ${domain || ownBrand}. Skip brands mentioned in passing that operate in a completely different field.
 
-Return ONLY a JSON array of objects with "name" (string) and "count" (number of times mentioned). Example: [{"name":"Ahrefs","count":3},{"name":"Moz","count":1}]
+Return ONLY a JSON array of objects with "name" (string, canonical product name) and "count" (number of responses mentioning it). Example: [{"name":"Ahrefs","count":3},{"name":"Moz","count":1}]
 
 If no brands are found, return an empty array: []
 
@@ -588,7 +669,7 @@ ${combinedParts.join('\n---\n')}`;
         },
         body: JSON.stringify({
           model: 'claude-haiku-4-5-20251001',
-          max_tokens: 300,
+          max_tokens: 1024,
           messages: [{ role: 'user', content: userPrompt }],
         }),
         signal: controller.signal,
@@ -618,7 +699,7 @@ ${combinedParts.join('\n---\n')}`;
         if (!item.name || typeof item.name !== 'string') continue;
         const name = item.name.trim();
         if (!name || name.length > 100) continue;
-        if (excludeList.includes(name.toLowerCase())) continue;
+        if (isSameBrand(name, ownBrand)) continue;
         const count = Math.max(1, Math.round(Number(item.count) || 1));
         const existing = brandMap.get(name.toLowerCase());
         if (existing) {
@@ -628,12 +709,15 @@ ${combinedParts.join('\n---\n')}`;
         }
       }
 
-      // Sort by mention count descending, cap at 20
-      const brands = Array.from(brandMap.values())
+      // Deduplicate aliases (e.g. "GPT" + "ChatGPT" → "ChatGPT"), then sort and cap
+      const deduplicated = deduplicateBrands(Array.from(brandMap.values()));
+      // Re-check after dedup: merged brands may now match ownBrand (e.g. "Google Gemini" + "Google" → "Google Gemini")
+      const brands = deduplicated
+        .filter((b) => !isSameBrand(b.name, ownBrand))
         .sort((a, b) => b.mentionCount - a.mentionCount)
         .slice(0, 20);
 
-      console.log(`[ai-tracker] brand extraction found ${brands.length} brands`);
+      console.log(`[ai-tracker] brand extraction found ${brands.length} brands (after dedup)`);
       return brands;
     } finally {
       clearTimeout(timeout);
@@ -766,7 +850,7 @@ async function runScan(tracker, prompts, competitors, onProgress) {
   // If defaultModels is empty (e.g. cleared after downgrade), skip scan entirely
   if (!tracker.defaultModels || tracker.defaultModels.length === 0) {
     await onProgress(100, []);
-    return { results: [], competitorResults: [], detectedBrands: [] };
+    return { results: [], competitorResults: [], detectedBrands: [], totalAnswerWords: 0 };
   }
   availablePlatforms = availablePlatforms.filter((p) => tracker.defaultModels.includes(p.id));
 
@@ -775,15 +859,8 @@ async function runScan(tracker, prompts, competitors, onProgress) {
 
   // Guard: nothing to scan
   if (prompts.length === 0 || availablePlatforms.length === 0) {
-    const competitorResults = competitors.map((comp) => ({
-      competitorId: comp._id,
-      name: comp.name,
-      mentions: 0,
-      citations: 0,
-      visibility: 0,
-    }));
     await onProgress(100, availablePlatforms.map((p) => ({ platformId: p.id, status: 'completed' })));
-    return { results: [], competitorResults, detectedBrands: [] };
+    return { results: [], competitorResults: [], detectedBrands: [], totalAnswerWords: 0 };
   }
 
   // Initialize per-prompt result buckets
@@ -898,52 +975,56 @@ async function runScan(tracker, prompts, competitors, onProgress) {
     results.push(result);
   }
 
-  // Generate competitor results from real answer data
-  const competitorResults = competitors.map((comp) => {
-    if (comp.isOwn) {
-      // Own brand: aggregate from scan results (already computed via detectBrand)
-      let totalMentions = 0;
-      let totalCitations = 0;
-      for (const r of results) {
-        for (const p of r.platforms) {
-          if (p.mentioned) totalMentions++;
-          if (p.cited) totalCitations++;
-        }
-      }
-      const totalPossible = results.length * availablePlatforms.length;
-      return {
-        competitorId: comp._id,
-        name: comp.name,
-        mentions: totalMentions,
-        citations: totalCitations,
-        visibility: totalPossible > 0 ? Math.round((totalMentions / totalPossible) * 100) : 0,
-      };
+  // Own brand: aggregate from scan results (already computed via detectBrand)
+  let ownMentions = 0;
+  let ownCitations = 0;
+  for (const r of results) {
+    for (const p of r.platforms) {
+      if (p.mentioned) ownMentions++;
+      if (p.cited) ownCitations++;
     }
+  }
+  const ownTotalPossible = results.length * availablePlatforms.length;
+  const ownBrand = extractBrand(tracker.domain);
 
-    // Other competitors: scan all collected AI answers for their name
+  const ownBrandResult = {
+    competitorId: null,
+    name: ownBrand,
+    isOwn: true,
+    mentions: ownMentions,
+    citations: ownCitations,
+    visibility: ownTotalPossible > 0 ? Math.round((ownMentions / ownTotalPossible) * 100) : 0,
+  };
+
+  // Auto-detect competitor brands mentioned in AI responses
+  const detectedBrands = await extractBrandsFromResponses(allAnswers, ownBrand, tracker.domain);
+
+  // For each detected brand, compute full visibility/mentions/citations stats
+  // Defense-in-depth: filter out any brand that matches ownBrand (e.g. "Google Search" when monitoring google.com)
+  const filteredBrands = detectedBrands.filter((brand) => !isSameBrand(brand.name, ownBrand));
+  const detectedCompetitorResults = filteredBrands.map((brand) => {
     let mentions = 0;
     let citationCount = 0;
     for (const { answer, citations } of allAnswers) {
-      const detection = detectCompetitorInAnswer(answer, citations, comp.name);
+      const detection = detectCompetitorInAnswer(answer, citations, brand.name);
       if (detection.mentioned) mentions++;
       if (detection.cited) citationCount++;
     }
     const totalPossible = allAnswers.length;
     return {
-      competitorId: comp._id,
-      name: comp.name,
+      competitorId: null,
+      name: brand.name,
+      isOwn: false,
       mentions,
       citations: citationCount,
       visibility: totalPossible > 0 ? Math.round((mentions / totalPossible) * 100) : 0,
     };
   });
 
-  // Auto-detect brands mentioned in AI responses
-  const ownBrand = extractBrand(tracker.domain);
-  const trackedNames = competitors.map((c) => c.name);
-  const detectedBrands = await extractBrandsFromResponses(allAnswers, ownBrand, trackedNames);
+  // Combine own brand + auto-detected competitors
+  const competitorResults = [ownBrandResult, ...detectedCompetitorResults];
 
   return { results, competitorResults, detectedBrands, totalAnswerWords };
 }
 
-module.exports = { runScan, PLATFORMS };
+module.exports = { runScan, PLATFORMS, normalizeBrandKey, isSameBrand };

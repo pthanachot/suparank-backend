@@ -120,7 +120,7 @@ const { executeScan } = require('./controllers/aiTrackerController');
 cron.schedule('0 3 * * *', async () => {
   try {
     const dueTrackers = await AiTracker.find({
-      scanStatus: 'ready',
+      scanStatus: { $in: ['ready', 'failed'] },
       nextScanAt: { $lte: new Date() },
     });
 

@@ -15,6 +15,7 @@ const platformResultSchema = new mongoose.Schema({
   sentiment: { type: String, enum: ['positive', 'neutral', 'negative', null], default: null },
   sentimentScore: { type: Number, default: null },
   error: { type: Boolean, default: false },
+  fanoutQueries: { type: [String], default: [] },
 }, { _id: false });
 
 const promptResultSchema = new mongoose.Schema({

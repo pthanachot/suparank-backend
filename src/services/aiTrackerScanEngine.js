@@ -103,8 +103,16 @@ async function searchChatGPT(query) {
       throw new Error('ChatGPT returned empty response');
     }
 
-    console.log(`[chatgpt] query_len=${query.length} answer_len=${answer.length} citations=${citations.length}`);
-    return { answer, citations };
+    // ChatGPT doesn't expose internal search queries — ask it explicitly
+    const fanoutQueries = await generateSubQueries(
+      query,
+      'https://api.openai.com/v1/chat/completions',
+      apiKey,
+      'gpt-4o-mini',
+    );
+
+    console.log(`[chatgpt] query_len=${query.length} answer_len=${answer.length} citations=${citations.length} fanout=${fanoutQueries.length}`);
+    return { answer, citations, fanoutQueries };
   } finally {
     clearTimeout(timeout);
   }
@@ -147,6 +155,8 @@ async function searchGemini(query) {
     const citations = [];
     const seen = new Set();
 
+    let fanoutQueries = [];
+
     if (data.candidates && data.candidates.length > 0) {
       const candidate = data.candidates[0];
 
@@ -174,14 +184,17 @@ async function searchGemini(query) {
           citations.push(uri);
         }
       }
+
+      // Extract the actual search queries Gemini used (free, already in response)
+      fanoutQueries = candidate.groundingMetadata?.webSearchQueries || [];
     }
 
     if (!answer || answer.trim().length === 0) {
       throw new Error('Gemini returned empty response');
     }
 
-    console.log(`[gemini] query_len=${query.length} answer_len=${answer.length} citations=${citations.length}`);
-    return { answer, citations };
+    console.log(`[gemini] query_len=${query.length} answer_len=${answer.length} citations=${citations.length} fanout=${fanoutQueries.length}`);
+    return { answer, citations, fanoutQueries };
   } finally {
     clearTimeout(timeout);
   }
@@ -243,8 +256,16 @@ async function searchPerplexity(query) {
       throw new Error('Perplexity returned empty response');
     }
 
-    console.log(`[perplexity] query_len=${query.length} answer_len=${answer.length} citations=${citations.length}`);
-    return { answer, citations };
+    // Perplexity doesn't expose internal search queries — ask it explicitly
+    const fanoutQueries = await generateSubQueries(
+      query,
+      'https://api.perplexity.ai/chat/completions',
+      apiKey,
+      'sonar',
+    );
+
+    console.log(`[perplexity] query_len=${query.length} answer_len=${answer.length} citations=${citations.length} fanout=${fanoutQueries.length}`);
+    return { answer, citations, fanoutQueries };
   } finally {
     clearTimeout(timeout);
   }
@@ -292,9 +313,14 @@ async function searchClaude(query) {
     const seen = new Set();
 
     // Claude web search response: content blocks include text (with citations),
-    // server_tool_use, and web_search_tool_result
+    // server_tool_use (web search calls), and web_search_tool_result
+    const fanoutQueries = [];
     if (Array.isArray(data.content)) {
       for (const block of data.content) {
+        // Extract the actual search queries Claude sent to its web search tool
+        if (block.type === 'server_tool_use' && block.name === 'web_search' && block.input?.query) {
+          fanoutQueries.push(block.input.query);
+        }
         if (block.type === 'text' && block.text) {
           answer += block.text;
           // Extract citation URLs from inline citations
@@ -325,8 +351,8 @@ async function searchClaude(query) {
       throw new Error('Claude returned empty response');
     }
 
-    console.log(`[claude] query_len=${query.length} answer_len=${answer.length} citations=${citations.length}`);
-    return { answer, citations };
+    console.log(`[claude] query_len=${query.length} answer_len=${answer.length} citations=${citations.length} fanout=${fanoutQueries.length}`);
+    return { answer, citations, fanoutQueries };
   } finally {
     clearTimeout(timeout);
   }
@@ -823,6 +849,51 @@ function getAvailablePlatforms() {
 }
 
 /**
+ * Ask a platform to generate search sub-queries for a given prompt.
+ * Used for ChatGPT and Perplexity which don't expose their internal queries.
+ * Returns [] on any error — never throws.
+ *
+ * @param {string} query - The main prompt
+ * @param {string} endpoint - API endpoint URL
+ * @param {string} apiKey - API key
+ * @param {string} model - Model ID to use
+ * @returns {Promise<string[]>}
+ */
+async function generateSubQueries(query, endpoint, apiKey, model) {
+  if (!apiKey) return [];
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        max_tokens: 200,
+        messages: [{
+          role: 'user',
+          content: `For this question: "${query}"\n\nList up to 5 specific search queries you would use internally to research this comprehensively.\n\nRespond ONLY with a valid JSON array of strings. No extra text. Example: ["query one","query two","query three"]`,
+        }],
+      }),
+      signal: controller.signal,
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const content = (data.choices?.[0]?.message?.content || '').trim();
+    // Extract JSON array even if model adds surrounding text
+    const match = content.match(/\[[\s\S]*\]/);
+    if (!match) return [];
+    const parsed = JSON.parse(match[0]);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((q) => typeof q === 'string' && q.trim()).slice(0, 5);
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Call the appropriate platform's search function.
  */
 async function searchPlatform(platformId, query) {
@@ -901,6 +972,7 @@ async function runScan(tracker, prompts, competitors, onProgress) {
 
       let answer = '';
       let citations = [];
+      let fanoutQueries = [];
       let mentioned = false;
       let tier = 'not_mentioned';
       let cited = false;
@@ -912,6 +984,7 @@ async function runScan(tracker, prompts, competitors, onProgress) {
         const result = await withRetry(() => searchPlatform(platform.id, prompt.prompt));
         answer = result.answer;
         citations = result.citations;
+        fanoutQueries = result.fanoutQueries || [];
 
         // Detect brand in this response
         const detection = detectBrand(answer, citations, tracker.domain);
@@ -957,6 +1030,7 @@ async function runScan(tracker, prompts, competitors, onProgress) {
         cited,
         citedFrom,
         normalizedPosition,
+        fanoutQueries,
         aiResponse: answer.slice(0, 2000),
         sentiment,
         sentimentScore,

@@ -3,11 +3,14 @@ const AiTrackerPrompt = require('../models/AiTrackerPrompt');
 const AiTrackerCompetitor = require('../models/AiTrackerCompetitor');
 const AiTrackerScan = require('../models/AiTrackerScan');
 const Workspace = require('../models/Workspace');
+const User = require('../models/User');
 const { runScan, PLATFORMS, normalizeBrandKey, isSameBrand } = require('../services/aiTrackerScanEngine');
 const UsageTracker = require('../models/UsageTracker');
 const UserUsageTracker = require('../models/UserUsageTracker');
 const tierService = require('../services/tierService');
 const creditService = require('../services/creditService');
+const { sendEmail } = require('../utils/emailService');
+const { applyCustomTemplate } = require('./emailPortalController');
 
 // ─── Platform display config (returned in platformStats) ──────────────────
 
@@ -397,6 +400,7 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
         sentiment: pl.sentiment || null,
         sentimentScore: pl.sentimentScore ?? null,
         error: pl.error || false,
+        fanoutQueries: pl.fanoutQueries || [],
       })),
       competitors: promptCompetitors,
       lastChecked: latestScan.completedAt
@@ -954,6 +958,99 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
         })),
       },
     });
+
+    // ── 11. Send scan summary email to workspace owner
+    try {
+      const ownerId = userId || ws?.userId;
+      if (ownerId) {
+        const owner = await User.findById(ownerId).select('email profile preferences').lean();
+        if (owner?.email && owner.preferences?.emailNotifications !== false) {
+          const fakeScan = { results, competitorResults: competitorResults || [] };
+          const metrics = computeMetrics(fakeScan, prompts.length) || {};
+          const platStats = computePlatformStats(fakeScan);
+          const actionItems = generateActionItems(fakeScan);
+          const sortedCompetitors = [...(competitorResults || [])].sort((a, b) => b.visibility - a.visibility);
+
+          // Sentiment label
+          const avgSentimentLabel = metrics.avgSentiment == null ? '—'
+            : metrics.avgSentiment >= 60 ? `Positive (${metrics.avgSentiment})`
+            : metrics.avgSentiment >= 40 ? `Neutral (${metrics.avgSentiment})`
+            : `Negative (${metrics.avgSentiment})`;
+
+          // Per-platform rows
+          const platformRows = platStats.map((p) => {
+            const total = results.length - p.errorCount;
+            const errorCell = p.errorCount > 0
+              ? `<td style="padding:10px 16px;color:#ef4444;font-size:12px;">${p.errorCount} error${p.errorCount > 1 ? 's' : ''}</td>`
+              : '<td></td>';
+            return `<tr style="border-bottom:1px solid #f1f5f9;"><td style="padding:10px 16px;font-weight:600;color:#111;font-size:13px;">${p.name}</td><td style="padding:10px 16px;color:#555;font-size:13px;">${p.visibility}%</td><td style="padding:10px 16px;color:#555;font-size:13px;">${p.mentionCount} / ${total}</td><td style="padding:10px 16px;color:#555;font-size:13px;">${p.citationCount}</td>${errorCell}</tr>`;
+          }).join('');
+
+          // Per-prompt rows (sorted by mention rate desc, all prompts)
+          const promptRows = results
+            .map((r) => {
+              const valid = r.platforms.filter((p) => !p.error);
+              const mentioned = valid.filter((p) => p.mentioned).length;
+              const cited = valid.filter((p) => p.cited).length;
+              const mRate = valid.length > 0 ? Math.round((mentioned / valid.length) * 100) : 0;
+              const cRate = valid.length > 0 ? Math.round((cited / valid.length) * 100) : 0;
+              return { prompt: r.prompt, mentioned, total: valid.length, mRate, cRate };
+            })
+            .sort((a, b) => b.mRate - a.mRate)
+            .map((r, i) => {
+              const short = r.prompt.length > 70 ? r.prompt.slice(0, 70) + '\u2026' : r.prompt;
+              return `<tr style="border-bottom:1px solid #f1f5f9;"><td style="padding:9px 14px;color:#94a3b8;font-size:12px;">${i + 1}</td><td style="padding:9px 14px;color:#111;font-size:13px;">${short}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.mentioned}/${r.total}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.mRate}%</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.cRate}%</td></tr>`;
+            })
+            .join('');
+
+          // Competitor rows (top 10)
+          const competitorRows = sortedCompetitors.slice(0, 10).map((c, i) =>
+            `<tr style="border-bottom:1px solid #f1f5f9;"><td style="padding:9px 14px;color:#94a3b8;font-size:12px;">${i + 1}</td><td style="padding:9px 14px;color:#111;font-weight:600;font-size:13px;">${c.name}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${c.mentions}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${c.citations}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${c.visibility}%</td></tr>`
+          ).join('');
+
+          // Action item rows (high priority first, max 5)
+          const priOrder = { high: 0, medium: 1, low: 2 };
+          const actionRows = actionItems
+            .sort((a, b) => (priOrder[a.priority] || 0) - (priOrder[b.priority] || 0))
+            .slice(0, 5)
+            .map((item) => {
+              const bg = item.priority === 'high' ? '#ef4444' : item.priority === 'medium' ? '#f59e0b' : '#22c55e';
+              return `<tr style="border-bottom:1px solid #f1f5f9;"><td style="padding:10px 14px;white-space:nowrap;"><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;text-transform:uppercase;color:#fff;background:${bg};">${item.priority}</span></td><td style="padding:10px 14px;"><div style="color:#111;font-size:13px;font-weight:600;margin-bottom:2px;">${item.title}</div><div style="color:#64748b;font-size:12px;">${item.description}</div></td><td style="padding:10px 14px;color:#4f46e5;font-size:12px;font-weight:600;white-space:nowrap;">${item.impact}</td></tr>`;
+            })
+            .join('');
+
+          const appUrl = process.env.FRONTEND_URL || 'https://app.suparank.ai';
+          const dashboardUrl = `${appUrl}/workspace/${ws?.workspaceNumber || 1}/ai-tracker`;
+
+          const emailOptions = {
+            to: owner.email,
+            fromName: 'SupaRank',
+            data: {
+              userName: owner.profile?.name || owner.email.split('@')[0],
+              trackerName: tracker.name || tracker.domain,
+              domain: tracker.domain,
+              scanDate: now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+              promptsScanned: prompts.length,
+              visibility: metrics.visibility || 0,
+              mentionRate: metrics.mentionRate || 0,
+              shareOfVoice: metrics.shareOfVoice || 0,
+              citationRate: metrics.citationRate || 0,
+              avgSentiment: avgSentimentLabel,
+              platformRows,
+              promptRows,
+              competitorRows: competitorRows || '<tr><td colspan="5" style="padding:12px 14px;color:#94a3b8;font-size:13px;">No competitors detected</td></tr>',
+              actionRows: actionRows || '<tr><td colspan="3" style="padding:12px 14px;color:#94a3b8;font-size:13px;">No actions at this time</td></tr>',
+              dashboardUrl,
+            },
+          };
+          await applyCustomTemplate('scan_completed', emailOptions);
+          await sendEmail(emailOptions);
+          console.log(`[ai-tracker-scan] sent scan summary email to ${owner.email} for tracker ${trackerId}`);
+        }
+      }
+    } catch (emailErr) {
+      console.error(`[ai-tracker-scan] failed to send scan summary email for tracker ${trackerId}:`, emailErr.message);
+    }
   } catch (err) {
     console.error('[ai-tracker-scan] error:', err.message);
 

@@ -25,6 +25,13 @@ const supportTransporter =
       })
     : null;
 
+// Verify SMTP connection at startup so misconfiguration is caught early
+transporter.verify().then(() => {
+  console.log('[email] SMTP connection verified');
+}).catch((err) => {
+  console.error('[email] SMTP connection failed:', err.message);
+});
+
 /**
  * Send an email
  */

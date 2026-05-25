@@ -1074,7 +1074,9 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function buildDashboardResponse(tracker) {
-  const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id, active: { $ne: false }, locked: { $ne: true } }).limit(500);
+  // Fetch all non-locked prompts (including inactive) so ManagePromptsView can show them
+  const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id, locked: { $ne: true } }).limit(500);
+  const activePromptCount = prompts.filter(p => p.active !== false).length;
 
   const recentScans = await AiTrackerScan.find({
     trackerId: tracker._id,
@@ -1087,7 +1089,7 @@ async function buildDashboardResponse(tracker) {
   const latestScan = recentScans[0] || null;
   const previousScan = recentScans[1] || null;
 
-  const metrics = computeMetrics(latestScan, prompts.length);
+  const metrics = computeMetrics(latestScan, activePromptCount);
   const trackedPrompts = formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, tracker.domain);
   const formattedCompetitors = formatCompetitors(latestScan, previousScan, tracker.domain);
   const changes = computeChanges(latestScan, previousScan);
@@ -1577,7 +1579,7 @@ const addPrompt = async (req, res) => {
       return res.status(403).json({ error: 'Daily frequency requires a Professional or Agency plan' });
     }
 
-    // Check duplicate
+    // Check duplicate — block if prompt already exists (active or inactive)
     const existing = await AiTrackerPrompt.findOne({
       trackerId: tracker._id,
       prompt: prompt.trim(),

@@ -314,10 +314,11 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
   </table>
 
   <!-- Tracked Prompts -->
-  <h2 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#374151;margin:0 0 8px 0;padding-bottom:6px;border-bottom:2px solid #e2e8f0;">Tracked Prompts ({{promptsScanned}} total)</h2>
+  <h2 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#374151;margin:0 0 8px 0;padding-bottom:6px;border-bottom:2px solid #e2e8f0;">Tracked Prompts ({{promptsScanned}})</h2>
   <table style="width:100%;border-collapse:collapse;border:1px solid #e2e8f0;margin-bottom:24px;">
     <thead>
       <tr style="background:#f8fafc;">
+        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Status</th>
         <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">#</th>
         <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Prompt</th>
         <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Platforms</th>

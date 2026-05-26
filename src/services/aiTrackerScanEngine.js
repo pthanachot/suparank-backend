@@ -713,8 +713,14 @@ ${combinedParts.join('\n---\n')}`;
 
       if (!rawText) return [];
 
-      // Parse — strip code fences if present
-      const cleaned = rawText.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
+      // Parse — extract JSON from markdown code fences if present
+      let cleaned;
+      const fenceMatch = rawText.match(/```(?:json)?\s*\n([\s\S]*?)\n```/i);
+      if (fenceMatch) {
+        cleaned = fenceMatch[1].trim();
+      } else {
+        cleaned = rawText.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```[\s\S]*/i, '').trim();
+      }
       const parsed = JSON.parse(cleaned);
 
       if (!Array.isArray(parsed)) return [];

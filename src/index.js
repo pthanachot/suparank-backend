@@ -16,8 +16,20 @@ const app = express();
 // Trust proxy for production
 app.set('trust proxy', 1);
 
-// Connect to MongoDB, then sync config from seed files
+// Connect to MongoDB, recover dead scans, then sync config from seed files
 connectDB()
+  .then(async () => {
+    // On startup, any scan stuck in 'scanning'/'pending' is dead (server was restarted).
+    // Run BEFORE cron fires to prevent race condition.
+    const AiTrackerStartup = require('./models/AiTracker');
+    const recovered = await AiTrackerStartup.updateMany(
+      { scanStatus: { $in: ['scanning', 'pending'] } },
+      { $set: { scanStatus: 'failed', scanError: 'Scan interrupted by server restart' } }
+    );
+    if (recovered.modifiedCount > 0) {
+      console.log(`[startup] recovered ${recovered.modifiedCount} interrupted scan(s)`);
+    }
+  })
   .then(() => syncConfig())
   .then(() => console.log('Database ready'))
   .catch((error) => {
@@ -111,32 +123,69 @@ if (process.env.NODE_ENV !== 'production') {
   try { app.use(require('./routes/devRoutes')); } catch {}
 }
 
-// Scheduled scan: check daily at 3:00 AM for trackers due for weekly scan
+// Scheduled scan: check daily at 3:00 AM for trackers due for scan
+// In development, run every minute so frequency logic can be tested without waiting overnight
 const cron = require('node-cron');
 const AiTracker = require('./models/AiTracker');
 const Workspace = require('./models/Workspace');
 const { executeScan } = require('./controllers/aiTrackerController');
 
-cron.schedule('0 3 * * *', async () => {
+const cronSchedule = process.env.NODE_ENV !== 'production' ? '* * * * *' : '0 3 * * *';
+console.log(`[cron] AI scan scheduler: ${process.env.NODE_ENV !== 'production' ? 'every minute (dev)' : '3 AM daily (prod)'}`);
+
+let cronConsecutiveFailures = 0;
+
+cron.schedule(cronSchedule, async () => {
+  // Circuit breaker: skip ticks with exponential backoff when DB is unreachable
+  if (cronConsecutiveFailures > 0) {
+    const skipTicks = Math.min(Math.pow(2, cronConsecutiveFailures - 1), 30); // max ~30 min pause in dev
+    const shouldSkip = cronConsecutiveFailures > 1 && Math.random() > (1 / skipTicks);
+    if (shouldSkip) return; // silently skip to avoid log flood
+  }
+
   try {
+    // Recover scans stuck in 'scanning' for 30+ min (e.g. after internet drop)
+    const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000);
+    const recovered = await AiTracker.updateMany(
+      { scanStatus: { $in: ['scanning', 'pending'] }, updatedAt: { $lt: thirtyMinAgo } },
+      { $set: { scanStatus: 'failed', scanError: 'Scan timed out (recovered by cron)' } }
+    );
+    if (recovered.modifiedCount > 0) {
+      console.log(`[cron] recovered ${recovered.modifiedCount} stuck scan(s)`);
+    }
+
     const dueTrackers = await AiTracker.find({
       scanStatus: { $in: ['ready', 'failed'] },
       nextScanAt: { $lte: new Date() },
     });
 
+    // DB query succeeded — reset circuit breaker
+    if (cronConsecutiveFailures > 0) {
+      console.log(`[cron] DB connection recovered after ${cronConsecutiveFailures} failure(s)`);
+      cronConsecutiveFailures = 0;
+    }
+
+    console.log(`[cron] tick — ${dueTrackers.length} tracker(s) due`);
     if (dueTrackers.length === 0) return;
     console.log(`[cron] Found ${dueTrackers.length} tracker(s) due for scan`);
 
-    for (const tracker of dueTrackers) {
-      // Resolve workspace owner so free credits can be used
+    await Promise.allSettled(dueTrackers.map(async (tracker) => {
       const ws = await Workspace.findById(tracker.workspaceId);
       const userId = ws?.userId?.toString() || null;
-      executeScan(tracker._id, userId).catch((err) => {
+      try {
+        await executeScan(tracker._id, userId);
+      } catch (err) {
         console.error(`[cron] scan failed for tracker ${tracker._id}:`, err.message);
-      });
-    }
+      }
+    }));
   } catch (err) {
-    console.error('[cron] scheduled scan check failed:', err.message);
+    cronConsecutiveFailures++;
+    if (cronConsecutiveFailures <= 3) {
+      console.error('[cron] scheduled scan check failed:', err.message);
+    } else if (cronConsecutiveFailures === 4) {
+      console.error(`[cron] DB unreachable (${cronConsecutiveFailures} consecutive failures), suppressing further logs until recovery`);
+    }
+    // After 4+ failures, logs are silenced until recovery
   }
 });
 

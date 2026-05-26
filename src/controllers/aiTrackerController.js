@@ -12,6 +12,21 @@ const creditService = require('../services/creditService');
 const { sendEmail } = require('../utils/emailService');
 const { applyCustomTemplate } = require('./emailPortalController');
 
+// ─── Dev time scale (accelerate frequencies for testing, 1 = real time) ───
+// Set via POST /api/dev/set-time-scale { scale: 200 }
+// Scale 200 → Daily≈7min, Weekly≈50min relative to scan duration
+// Persisted to .dev-time-scale so it survives server restarts
+const _fs = require('fs');
+const _path = require('path');
+const _scaleFile = _path.join(__dirname, '..', '.dev-time-scale');
+let _devTimeScale = 1;
+try { const saved = Number(_fs.readFileSync(_scaleFile, 'utf8')); if (saved > 1) { _devTimeScale = saved; console.log(`[dev] restored time scale: ${saved}x`); } } catch {}
+const setDevTimeScale = (n) => {
+  _devTimeScale = Math.max(1, Number(n) || 1);
+  try { _fs.writeFileSync(_scaleFile, String(_devTimeScale)); } catch {}
+};
+const getDevTimeScale = () => _devTimeScale;
+
 // ─── Platform display config (returned in platformStats) ──────────────────
 
 const PLATFORM_DISPLAY = [
@@ -117,10 +132,23 @@ function computeWeightedVisibility(platforms) {
   return Math.round(mentionRate * W_MENTION + positionScore * W_POSITION + citationRate * W_CITATION);
 }
 
-function computeMetrics(latestScan, promptCount) {
+function computeMetrics(latestScan, promptCount, recentScans) {
   if (!latestScan) return null;
 
-  const results = latestScan.results || [];
+  // Build carry-forward results: latest known result per prompt across all recent scans
+  let results;
+  if (recentScans && recentScans.length > 0) {
+    const effectiveMap = new Map();
+    for (const scan of recentScans) {
+      for (const r of (scan.results || [])) {
+        const pid = r.promptId?.toString();
+        if (pid && !effectiveMap.has(pid)) effectiveMap.set(pid, r);
+      }
+    }
+    results = [...effectiveMap.values()];
+  } else {
+    results = latestScan.results || [];
+  }
   // Use actual platform count from scan results instead of global PLATFORMS.length
   const platformCount = (results.length > 0 && results[0].platforms?.length > 0) ? results[0].platforms.length : PLATFORMS.length;
   let totalMentions = 0;
@@ -337,15 +365,21 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
     };
   });
 
-  // Pre-build Maps for O(1) lookup by promptId
+  // Build carry-forward maps: latest/prev known result per prompt across ALL recent scans.
+  // Prompts on different frequencies (e.g. monthly) won't appear in every scan, but we
+  // still want to show their last known value rather than falling back to 0.
+  // recentScans is sorted newest-first, so first occurrence = most recent result.
+  const seenCount = new Map();
   const latestMap = new Map();
-  for (const r of latestScan.results) {
-    if (r.promptId) latestMap.set(r.promptId.toString(), r);
-  }
   const prevMap = new Map();
-  if (previousScan) {
-    for (const r of previousScan.results) {
-      if (r.promptId) prevMap.set(r.promptId.toString(), r);
+  for (const scan of (recentScans || [])) {
+    for (const r of (scan.results || [])) {
+      const pid = r.promptId?.toString();
+      if (!pid) continue;
+      const n = (seenCount.get(pid) || 0) + 1;
+      seenCount.set(pid, n);
+      if (n === 1) latestMap.set(pid, r);
+      else if (n === 2) prevMap.set(pid, r);
     }
   }
 
@@ -825,15 +859,28 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
     const allActivePrompts = await AiTrackerPrompt.find({ trackerId, active: { $ne: false }, locked: { $ne: true } }).limit(500);
 
     // ── 3b. Filter prompts by frequency — only scan prompts that are due
-    //        Manual scans (force=true) bypass frequency check and scan all prompts
+    //        Manual scans (force=true) scan all prompts but only reset timers for due ones
     const scanStart = new Date();
     const FREQ_DAYS = { 'Daily': 1, 'Weekly': 7, 'Bi-weekly': 14, 'Monthly': 30 };
-    const prompts = force ? allActivePrompts : allActivePrompts.filter((p) => {
+    const timeScale = _devTimeScale; // >1 in dev accelerated mode, 1 = real time
+    // Tolerance absorbs cron's 1-minute real-time granularity so prompts with harmonically
+    // related frequencies (weekly + bi-weekly) always land in the same scan.
+    // Capped at 10% of the shortest interval to prevent high time scales from making
+    // everything appear due (e.g. at 10000x, Daily=8.6s, old 2-min tolerance > interval).
+    const shortestIntervalMs = Math.min(...allActivePrompts.map(p =>
+      ((FREQ_DAYS[p.frequency] || 7) / timeScale) * 24 * 60 * 60 * 1000
+    ));
+    const CRON_TOLERANCE_MS = Math.min(2 * 60 * 1000, shortestIntervalMs * 0.1);
+    const isDuePrompt = (p) => {
       if (!p.lastScannedAt) return true; // never scanned → always due
-      const freqDays = FREQ_DAYS[p.frequency] || 7;
+      const freqDays = (FREQ_DAYS[p.frequency] || 7) / timeScale;
       const dueAt = new Date(p.lastScannedAt.getTime() + freqDays * 24 * 60 * 60 * 1000);
-      return scanStart >= dueAt;
-    });
+      return scanStart.getTime() + CRON_TOLERANCE_MS >= dueAt.getTime();
+    };
+    // Manual scans scan all prompts (user gets fresh data) but track which were due
+    // so we only reset lastScannedAt on due ones (preserving cooldown timers)
+    const duePromptIds = new Set(allActivePrompts.filter(isDuePrompt).map((p) => p._id.toString()));
+    const prompts = force ? allActivePrompts : allActivePrompts.filter(isDuePrompt);
 
     const platformCount = tracker.defaultModels?.length || 0;
     const promptCount = prompts.length;
@@ -846,12 +893,12 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
       let nextDueAt = null;
       for (const p of allActivePrompts) {
         if (!p.lastScannedAt) { nextDueAt = scanStart; break; } // should not happen (would have been included)
-        const freqDays = FREQ_DAYS[p.frequency] || 7;
+        const freqDays = (FREQ_DAYS[p.frequency] || 7) / timeScale;
         const due = new Date(p.lastScannedAt.getTime() + freqDays * 24 * 60 * 60 * 1000);
         if (!nextDueAt || due < nextDueAt) nextDueAt = due;
       }
-      // Fallback: if no active prompts at all, schedule 1 day out
-      if (!nextDueAt) nextDueAt = new Date(scanStart.getTime() + 24 * 60 * 60 * 1000);
+      // Fallback: if no active prompts at all, schedule 1 day out (scaled)
+      if (!nextDueAt) nextDueAt = new Date(scanStart.getTime() + (24 * 60 * 60 * 1000) / timeScale);
       await AiTracker.findByIdAndUpdate(trackerId, {
         $set: { scanStatus: 'ready', scanProgress: 0, nextScanAt: nextDueAt },
       });
@@ -869,10 +916,11 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
         );
         creditTxId = transactionId;
       } catch (creditErr) {
-        // Insufficient credits — abort scan, reset status
+        // Insufficient credits — push nextScanAt forward so cron doesn't retry every minute
         console.log(`[ai-tracker-scan] skipping scan for tracker ${trackerId}: ${creditErr.message}`);
+        const retryDelay = (60 * 60 * 1000) / (_devTimeScale || 1); // 1 hour, scaled in dev
         await AiTracker.findByIdAndUpdate(trackerId, {
-          $set: { scanStatus: 'ready', scanProgress: 0, scanError: 'Insufficient credits' },
+          $set: { scanStatus: 'ready', scanProgress: 0, scanError: 'Insufficient credits', nextScanAt: new Date(Date.now() + retryDelay) },
         });
         return;
       }
@@ -925,21 +973,46 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
       $set: { status: 'ready', completedAt: now, results, competitorResults, detectedBrands: detectedBrands || [] },
     });
 
-    // ── 8b. Update lastScannedAt on all scanned prompts
-    const scannedPromptIds = prompts.map((p) => p._id);
-    if (scannedPromptIds.length > 0) {
-      await AiTrackerPrompt.updateMany(
-        { _id: { $in: scannedPromptIds } },
-        { $set: { lastScannedAt: now } }
-      );
+    // ── 8b. Fixed-rate scheduling: advance lastScannedAt by exactly one frequency
+    //        interval instead of setting it to "now". This prevents scan execution
+    //        time from causing drift (e.g. Weekly firing after 6 Daily scans instead of 7).
+    //        Manual scans only reset timers on prompts that were actually due.
+    const promptsToResetTimer = prompts.filter((p) => duePromptIds.has(p._id.toString()));
+    let earliestNextDue = null;
+    for (const p of promptsToResetTimer) {
+      const freqMs = ((FREQ_DAYS[p.frequency] || 7) / timeScale) * 24 * 60 * 60 * 1000;
+      let newLastScannedAt;
+      if (p.lastScannedAt) {
+        // Fixed-rate: jump to the most recent interval boundary before scanStart.
+        // This prevents drift AND handles catch-up when multiple intervals have passed
+        // (e.g. after switching time scales or server downtime).
+        const elapsed = scanStart.getTime() - p.lastScannedAt.getTime();
+        const intervals = Math.max(1, Math.floor(elapsed / freqMs));
+        newLastScannedAt = new Date(p.lastScannedAt.getTime() + intervals * freqMs);
+      } else {
+        newLastScannedAt = now;
+      }
+      await AiTrackerPrompt.findByIdAndUpdate(p._id, { $set: { lastScannedAt: newLastScannedAt } });
+      // Track earliest next-due prompt to set tracker nextScanAt precisely
+      const nextDue = new Date(newLastScannedAt.getTime() + freqMs);
+      if (!earliestNextDue || nextDue < earliestNextDue) earliestNextDue = nextDue;
+    }
+    // Also check non-scanned prompts for earliest next-due
+    for (const p of allActivePrompts) {
+      if (duePromptIds.has(p._id.toString())) continue; // already handled above
+      if (!p.lastScannedAt) continue;
+      const freqMs = ((FREQ_DAYS[p.frequency] || 7) / timeScale) * 24 * 60 * 60 * 1000;
+      const nextDue = new Date(p.lastScannedAt.getTime() + freqMs);
+      if (!earliestNextDue || nextDue < earliestNextDue) earliestNextDue = nextDue;
     }
 
-    // ── 9. Determine refresh interval from tier config
+    // ── 9. Determine refresh interval from tier config (fallback for nextScanAt)
     let intervalDays = 7;
     if (orgId) {
       const { config } = await tierService.getOrgTierConfig(orgId);
       intervalDays = config?.aiTrackerRefreshInterval === 'daily' ? 1 : 7;
     }
+    const fallbackNextScan = new Date(now.getTime() + (intervalDays / timeScale) * 24 * 60 * 60 * 1000);
 
     // ── 10. Update tracker to ready
     const scannedPlatforms = tracker.defaultModels && tracker.defaultModels.length > 0
@@ -950,7 +1023,7 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
         scanStatus: 'ready',
         scanProgress: 100,
         lastScanAt: now,
-        nextScanAt: new Date(now.getTime() + intervalDays * 24 * 60 * 60 * 1000),
+        nextScanAt: earliestNextDue || fallbackNextScan,
         currentScanId: null,
         platformStatuses: scannedPlatforms.map((pid) => ({
           platformId: pid,
@@ -962,12 +1035,58 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
     // ── 11. Send scan summary email to workspace owner
     try {
       const ownerId = userId || ws?.userId;
-      if (ownerId) {
+      if (!ownerId) {
+        console.log(`[ai-tracker-scan] skipping email for tracker ${trackerId}: no ownerId (userId=${userId}, ws.userId=${ws?.userId})`);
+      } else {
         const owner = await User.findById(ownerId).select('email profile preferences').lean();
-        if (owner?.email && owner.preferences?.emailNotifications !== false) {
-          const fakeScan = { results, competitorResults: competitorResults || [] };
-          const metrics = computeMetrics(fakeScan, prompts.length) || {};
-          const platStats = computePlatformStats(fakeScan);
+        if (!owner) {
+          console.log(`[ai-tracker-scan] skipping email for tracker ${trackerId}: user ${ownerId} not found`);
+        } else if (!owner.email) {
+          console.log(`[ai-tracker-scan] skipping email for tracker ${trackerId}: user ${ownerId} has no email`);
+        } else if (owner.preferences?.emailNotifications === false) {
+          console.log(`[ai-tracker-scan] skipping email for tracker ${trackerId}: emailNotifications disabled for ${owner.email}`);
+        } else {
+          // Build carry-forward results for prompts not scanned this run
+          const scannedIds = new Set(results.map((r) => r.promptId?.toString()).filter(Boolean));
+          const notScannedPrompts = allActivePrompts.filter((p) => !scannedIds.has(p._id.toString()));
+          let carryForwardResults = [];
+          if (notScannedPrompts.length > 0) {
+            // Anchor on the oldest lastScannedAt among not-scanned prompts so we always
+            // reach back far enough — no fixed limit that could drop monthly/slow prompts
+            const notScannedWithHistory = notScannedPrompts.filter((p) => p.lastScannedAt);
+            const oldestNeeded = notScannedWithHistory.reduce((min, p) =>
+              p.lastScannedAt < min ? p.lastScannedAt : min,
+              notScannedWithHistory[0]?.lastScannedAt || new Date()
+            );
+            const prevScans = await AiTrackerScan.find({
+              trackerId,
+              status: 'ready',
+              _id: { $ne: scan._id },
+              completedAt: { $gte: oldestNeeded },
+            }).sort({ completedAt: -1 }).lean();
+            const notScannedIds = new Set(notScannedPrompts.map((p) => p._id.toString()));
+            const carryMap = new Map();
+            for (const prevScan of prevScans) {
+              for (const r of (prevScan.results || [])) {
+                const pid = r.promptId?.toString();
+                if (pid && notScannedIds.has(pid) && !carryMap.has(pid)) {
+                  carryMap.set(pid, { ...r, _isCarryForward: true, _carryDate: prevScan.completedAt });
+                }
+              }
+            }
+            carryForwardResults = [...carryMap.values()];
+          }
+
+          // Combined: newly scanned (fresh) + carry-forward (historical, last known)
+          const allEmailResults = [
+            ...results.map((r) => ({ ...r, _isCarryForward: false })),
+            ...carryForwardResults,
+          ];
+
+          const fakeScan = { results: allEmailResults, competitorResults: competitorResults || [] };
+          const metrics = computeMetrics(fakeScan, allActivePrompts.length) || {};
+          // Platform stats reflect only current scan (represents actual API calls made this run)
+          const platStats = computePlatformStats({ results, competitorResults: competitorResults || [] });
           const actionItems = generateActionItems(fakeScan);
           const sortedCompetitors = [...(competitorResults || [])].sort((a, b) => b.visibility - a.visibility);
 
@@ -977,7 +1096,7 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
             : metrics.avgSentiment >= 40 ? `Neutral (${metrics.avgSentiment})`
             : `Negative (${metrics.avgSentiment})`;
 
-          // Per-platform rows
+          // Per-platform rows (current scan only)
           const platformRows = platStats.map((p) => {
             const total = results.length - p.errorCount;
             const errorCell = p.errorCount > 0
@@ -986,20 +1105,26 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
             return `<tr style="border-bottom:1px solid #f1f5f9;"><td style="padding:10px 16px;font-weight:600;color:#111;font-size:13px;">${p.name}</td><td style="padding:10px 16px;color:#555;font-size:13px;">${p.visibility}%</td><td style="padding:10px 16px;color:#555;font-size:13px;">${p.mentionCount} / ${total}</td><td style="padding:10px 16px;color:#555;font-size:13px;">${p.citationCount}</td>${errorCell}</tr>`;
           }).join('');
 
-          // Per-prompt rows (sorted by mention rate desc, all prompts)
-          const promptRows = results
+          // Per-prompt rows: scanned-this-run first (green badge), then carry-forward (gray date)
+          const promptRows = allEmailResults
             .map((r) => {
               const valid = r.platforms.filter((p) => !p.error);
               const mentioned = valid.filter((p) => p.mentioned).length;
               const cited = valid.filter((p) => p.cited).length;
               const mRate = valid.length > 0 ? Math.round((mentioned / valid.length) * 100) : 0;
               const cRate = valid.length > 0 ? Math.round((cited / valid.length) * 100) : 0;
-              return { prompt: r.prompt, mentioned, total: valid.length, mRate, cRate };
+              return { prompt: r.prompt, mentioned, total: valid.length, mRate, cRate, isCarryForward: r._isCarryForward, carryDate: r._carryDate };
             })
-            .sort((a, b) => b.mRate - a.mRate)
+            .sort((a, b) => {
+              if (a.isCarryForward !== b.isCarryForward) return a.isCarryForward ? 1 : -1;
+              return b.mRate - a.mRate;
+            })
             .map((r, i) => {
               const short = r.prompt.length > 70 ? r.prompt.slice(0, 70) + '\u2026' : r.prompt;
-              return `<tr style="border-bottom:1px solid #f1f5f9;"><td style="padding:9px 14px;color:#94a3b8;font-size:12px;">${i + 1}</td><td style="padding:9px 14px;color:#111;font-size:13px;">${short}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.mentioned}/${r.total}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.mRate}%</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.cRate}%</td></tr>`;
+              const statusCell = r.isCarryForward
+                ? `<td style="padding:9px 14px;white-space:nowrap;"><span style="display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:600;background:#f1f5f9;color:#64748b;">${r.carryDate ? new Date(r.carryDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : 'prev'}</span></td>`
+                : `<td style="padding:9px 14px;white-space:nowrap;"><span style="display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700;background:#dcfce7;color:#15803d;">&#10003; New</span></td>`;
+              return `<tr style="border-bottom:1px solid #f1f5f9;">${statusCell}<td style="padding:9px 14px;color:#94a3b8;font-size:12px;">${i + 1}</td><td style="padding:9px 14px;color:#111;font-size:13px;">${short}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.mentioned}/${r.total}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.mRate}%</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.cRate}%</td></tr>`;
             })
             .join('');
 
@@ -1030,7 +1155,9 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
               trackerName: tracker.name || tracker.domain,
               domain: tracker.domain,
               scanDate: now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
-              promptsScanned: prompts.length,
+              promptsScanned: results.length === allActivePrompts.length
+                ? `${results.length} scanned`
+                : `${results.length} scanned, ${carryForwardResults.length} from history`,
               visibility: metrics.visibility || 0,
               mentionRate: metrics.mentionRate || 0,
               shareOfVoice: metrics.shareOfVoice || 0,
@@ -1078,6 +1205,7 @@ async function buildDashboardResponse(tracker) {
   const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id, locked: { $ne: true } }).limit(500);
   const activePromptCount = prompts.filter(p => p.active !== false).length;
 
+  // recentScans (limit 12): used for trend chart and latestScan/previousScan references
   const recentScans = await AiTrackerScan.find({
     trackerId: tracker._id,
     status: 'ready',
@@ -1086,11 +1214,25 @@ async function buildDashboardResponse(tracker) {
     .limit(12)
     .lean();
 
+  // carryScans: anchored on oldest lastScannedAt so carry-forward never loses slow-frequency prompts
+  // A monthly prompt last scanned 30 days ago will always be found, regardless of scan volume since then
+  const activePrompts = prompts.filter(p => p.active !== false && p.lastScannedAt);
+  const oldestNeeded = activePrompts.length > 0
+    ? activePrompts.reduce((min, p) => p.lastScannedAt < min ? p.lastScannedAt : min, activePrompts[0].lastScannedAt)
+    : null;
+  const carryScans = oldestNeeded
+    ? await AiTrackerScan.find({
+        trackerId: tracker._id,
+        status: 'ready',
+        completedAt: { $gte: oldestNeeded },
+      }).sort({ completedAt: -1 }).lean()
+    : recentScans;
+
   const latestScan = recentScans[0] || null;
   const previousScan = recentScans[1] || null;
 
-  const metrics = computeMetrics(latestScan, activePromptCount);
-  const trackedPrompts = formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, tracker.domain);
+  const metrics = computeMetrics(latestScan, activePromptCount, carryScans);
+  const trackedPrompts = formatTrackedPrompts(prompts, latestScan, previousScan, carryScans, tracker.domain);
   const formattedCompetitors = formatCompetitors(latestScan, previousScan, tracker.domain);
   const changes = computeChanges(latestScan, previousScan);
   const trendData = computeTrendData(recentScans);
@@ -2460,4 +2602,7 @@ module.exports = {
   addMonitorCompetitor,
   removeMonitorCompetitor,
   dismissMonitorSuggestedCompetitor,
+  // Dev helpers (no-op in production since _devTimeScale defaults to 1)
+  setDevTimeScale,
+  getDevTimeScale,
 };

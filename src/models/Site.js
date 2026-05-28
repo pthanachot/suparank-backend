@@ -2,13 +2,23 @@ const mongoose = require('mongoose');
 
 /**
  * Site — represents a website connected to Google Search Console.
- *
- * TODO: Not yet implemented. This is a placeholder model.
- *
- * Navigation item exists in the frontend sidebar ("Sites").
- * Backend GSC integration is not yet built.
  * See TierConfig.maxSites for per-tier limits.
  */
+
+const snapshotStatsSchema = new mongoose.Schema(
+  {
+    clicks: { type: Number, default: 0 },
+    impressions: { type: Number, default: 0 },
+    ctr: { type: Number, default: 0 },
+    position: { type: Number, default: 0 },
+    clicksTrend: { type: [Number], default: [] },
+    trendDirection: { type: String, enum: ['up', 'down', 'flat'], default: 'flat' },
+    pagesCount: { type: Number, default: 0 },
+    keywordsCount: { type: Number, default: 0 },
+    updatedAt: { type: Date, default: null },
+  },
+  { _id: false }
+);
 
 const siteSchema = new mongoose.Schema(
   {
@@ -27,31 +37,57 @@ const siteSchema = new mongoose.Schema(
       type: String,
       required: true,
       trim: true,
-      // The site URL as registered in GSC (e.g., "https://example.com/")
+    },
+    label: {
+      type: String,
+      trim: true,
+      maxlength: 100,
+      default: null,
     },
     gscPropertyId: {
       type: String,
       default: null,
-      // Google Search Console property identifier.
+    },
+    gscPropertyType: {
+      type: String,
+      enum: ['URL_PREFIX', 'DOMAIN'],
+      default: 'URL_PREFIX',
     },
     verified: {
       type: Boolean,
       default: false,
     },
+    syncFrequency: {
+      type: String,
+      enum: ['daily', 'weekly'],
+      default: 'daily',
+    },
+    syncStatus: {
+      type: String,
+      enum: ['idle', 'syncing', 'error'],
+      default: 'idle',
+    },
+    syncError: {
+      type: String,
+      default: null,
+    },
     lastSyncAt: {
       type: Date,
       default: null,
+    },
+    snapshotStats: {
+      type: snapshotStatsSchema,
+      default: null,
+    },
+    locked: {
+      type: Boolean,
+      default: false,
     },
   },
   { timestamps: true }
 );
 
 siteSchema.index({ organizationId: 1, url: 1 }, { unique: true });
-
-// TODO: Add instance methods:
-//   syncFromGSC()            — fetch performance data from Google Search Console API
-//   getPerformanceData(range) — return cached performance metrics for a date range
-//
-// TODO: Add GSC OAuth integration and API client
+siteSchema.index({ workspaceId: 1 });
 
 module.exports = mongoose.model('Site', siteSchema);

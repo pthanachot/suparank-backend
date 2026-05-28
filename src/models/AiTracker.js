@@ -11,7 +11,7 @@ const aiTrackerSchema = new mongoose.Schema({
     ref: 'Workspace',
     required: true,
   },
-  name: { type: String, trim: true, default: null },
+  name: { type: String, trim: true, default: null, maxlength: 253 },
   domain: { type: String, required: true, trim: true },
   defaultModels: { type: [String], default: ['chatgpt', 'gemini', 'claude', 'perplexity'] },
   scanCadence: { type: String, default: 'weekly' },
@@ -21,11 +21,12 @@ const aiTrackerSchema = new mongoose.Schema({
     default: 'idle',
   },
   scanProgress: { type: Number, default: 0, min: 0, max: 100 },
-  scanError: { type: String, default: null },
+  scanError: { type: String, default: null, maxlength: 500 },
   platformStatuses: { type: [platformStatusSchema], default: [] },
   lastScanAt: { type: Date, default: null },
   nextScanAt: { type: Date, default: null },
   currentScanId: { type: mongoose.Schema.Types.ObjectId, ref: 'AiTrackerScan', default: null },
+  dismissedCompetitors: { type: [String], default: [] },
 }, { timestamps: true });
 
 // Default name to domain if not set

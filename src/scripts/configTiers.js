@@ -32,6 +32,9 @@ const TIERS = [
     maxAvatars: 1,
     maxWorkspaces: 1,
     maxSites: 1,
+    sitesSyncFrequency: 'weekly',
+    maxSitemaps: 2,
+    maxCrawlPages: 500,
     maxSeats: 1,
     extraSeatPrice: 0,
     creditsPerMonth: 300,
@@ -69,6 +72,9 @@ const TIERS = [
     maxAvatars: 2,
     maxWorkspaces: 2,
     maxSites: 3,
+    sitesSyncFrequency: 'weekly',
+    maxSitemaps: 5,
+    maxCrawlPages: 5000,
     maxSeats: 2,
     extraSeatPrice: 0,
     creditsPerMonth: 3000,
@@ -106,6 +112,9 @@ const TIERS = [
     maxAvatars: 5,
     maxWorkspaces: 5,
     maxSites: 10,
+    sitesSyncFrequency: 'daily',
+    maxSitemaps: 15,
+    maxCrawlPages: 25000,
     maxSeats: 5,
     extraSeatPrice: 10,
     creditsPerMonth: 8000,
@@ -143,6 +152,9 @@ const TIERS = [
     maxAvatars: null,       // unlimited
     maxWorkspaces: 10,
     maxSites: null,          // unlimited
+    sitesSyncFrequency: 'daily',
+    maxSitemaps: 50,
+    maxCrawlPages: 100000,
     maxSeats: 15,
     extraSeatPrice: 15,
     creditsPerMonth: 25000,
@@ -180,6 +192,12 @@ async function syncTiers() {
 
   // Remove tiers no longer in config
   const removed = await TierConfig.deleteMany({ tier: { $nin: configTiers } });
+
+  // Flush the in-memory tier cache so stale data isn't served
+  try {
+    const { clearTierCache } = require('../services/tierService');
+    clearTierCache();
+  } catch { /* tierService may not be loaded yet during standalone sync */ }
 
   console.log(`[syncTiers] ${upserted} created, ${updated} updated, ${removed.deletedCount} removed`);
 }

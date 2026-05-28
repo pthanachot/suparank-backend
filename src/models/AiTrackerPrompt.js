@@ -6,10 +6,11 @@ const aiTrackerPromptSchema = new mongoose.Schema({
     ref: 'AiTracker',
     required: true,
   },
-  prompt: { type: String, required: true, trim: true },
-  models: { type: [String], default: ['chatgpt', 'gemini', 'claude', 'perplexity'] },
-  frequency: { type: String, enum: ['Weekly', 'Bi-weekly', 'Monthly'], default: 'Weekly' },
+  prompt: { type: String, required: true, trim: true, maxlength: 500 },
+  models: { type: [{ type: String, enum: ['chatgpt', 'gemini', 'claude', 'perplexity'] }], default: ['chatgpt', 'gemini', 'claude', 'perplexity'] },
+  frequency: { type: String, enum: ['Daily', 'Weekly', 'Bi-weekly', 'Monthly'], default: 'Weekly' },
   active: { type: Boolean, default: true },
+  lastScannedAt: { type: Date, default: null },
 
   // Downgrade locking
   locked: { type: Boolean, default: false },
@@ -18,5 +19,6 @@ const aiTrackerPromptSchema = new mongoose.Schema({
 
 aiTrackerPromptSchema.index({ trackerId: 1 });
 aiTrackerPromptSchema.index({ trackerId: 1, prompt: 1 }, { unique: true });
+aiTrackerPromptSchema.index({ trackerId: 1, active: 1 });
 
 module.exports = mongoose.model('AiTrackerPrompt', aiTrackerPromptSchema);

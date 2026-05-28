@@ -104,6 +104,15 @@ const SYSTEM_TRIGGERS = [
     variables: ['userName', 'userEmail', 'subject', 'category', 'message', 'submittedAt'],
     triggerCount: 0,
   },
+  // AI Tracker
+  {
+    id: 'scan_completed',
+    name: 'AI Scan Completed',
+    description: 'Sent to the workspace owner when an AI Tracker scan finishes',
+    category: 'ai-tracker',
+    variables: ['userName', 'trackerName', 'domain', 'scanDate', 'promptsScanned', 'visibility', 'mentionRate', 'shareOfVoice', 'citationRate', 'avgSentiment', 'platformRows', 'promptRows', 'competitorRows', 'actionRows', 'dashboardUrl'],
+    triggerCount: 0,
+  },
 ];
 
 // ─── Original default templates (hardcoded, used as fallback) ─
@@ -253,6 +262,101 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
   </table>
 </div>`,
     variables: ['userName', 'userEmail', 'subject', 'category', 'message', 'submittedAt'],
+  },
+  scan_completed: {
+    subject: 'AI Scan Complete – {{trackerName}}',
+    html: `<div style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto;padding:24px 16px;color:#111;">
+
+  <!-- Header -->
+  <h1 style="font-size:20px;font-weight:700;margin:0 0 6px 0;">AI Tracker Scan Complete</h1>
+  <p style="color:#64748b;font-size:14px;margin:0 0 24px 0;">Hi {{userName}} &mdash; <strong>{{domain}}</strong> was scanned on {{scanDate}}.</p>
+
+  <!-- Key Metrics -->
+  <h2 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#4f46e5;margin:0 0 8px 0;padding-bottom:6px;border-bottom:2px solid #4f46e5;">Key Metrics</h2>
+  <table style="width:100%;border-collapse:collapse;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;margin-bottom:24px;">
+    <tr>
+      <td style="padding:14px;text-align:center;border-right:1px solid #e2e8f0;background:#f8fafc;">
+        <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Visibility</div>
+        <div style="font-size:22px;font-weight:700;">{{visibility}}</div>
+      </td>
+      <td style="padding:14px;text-align:center;border-right:1px solid #e2e8f0;background:#f8fafc;">
+        <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Mention Rate</div>
+        <div style="font-size:22px;font-weight:700;">{{mentionRate}}%</div>
+      </td>
+      <td style="padding:14px;text-align:center;border-right:1px solid #e2e8f0;background:#f8fafc;">
+        <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Share of Voice</div>
+        <div style="font-size:22px;font-weight:700;">{{shareOfVoice}}%</div>
+      </td>
+      <td style="padding:14px;text-align:center;border-right:1px solid #e2e8f0;background:#f8fafc;">
+        <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Citation Rate</div>
+        <div style="font-size:22px;font-weight:700;">{{citationRate}}%</div>
+      </td>
+      <td style="padding:14px;text-align:center;background:#f8fafc;">
+        <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Sentiment</div>
+        <div style="font-size:14px;font-weight:600;">{{avgSentiment}}</div>
+      </td>
+    </tr>
+  </table>
+
+  <!-- Platform Breakdown -->
+  <h2 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#374151;margin:0 0 8px 0;padding-bottom:6px;border-bottom:2px solid #e2e8f0;">Platform Breakdown</h2>
+  <table style="width:100%;border-collapse:collapse;border:1px solid #e2e8f0;margin-bottom:24px;">
+    <thead>
+      <tr style="background:#f8fafc;">
+        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Platform</th>
+        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Visibility</th>
+        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Mentions</th>
+        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Citations</th>
+        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;"></th>
+      </tr>
+    </thead>
+    <tbody>{{platformRows}}</tbody>
+  </table>
+
+  <!-- Tracked Prompts -->
+  <h2 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#374151;margin:0 0 8px 0;padding-bottom:6px;border-bottom:2px solid #e2e8f0;">Tracked Prompts ({{promptsScanned}})</h2>
+  <table style="width:100%;border-collapse:collapse;border:1px solid #e2e8f0;margin-bottom:24px;">
+    <thead>
+      <tr style="background:#f8fafc;">
+        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Status</th>
+        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">#</th>
+        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Prompt</th>
+        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Platforms</th>
+        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Mention</th>
+        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Citation</th>
+      </tr>
+    </thead>
+    <tbody>{{promptRows}}</tbody>
+  </table>
+
+  <!-- Competitors -->
+  <h2 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#374151;margin:0 0 8px 0;padding-bottom:6px;border-bottom:2px solid #e2e8f0;">Top Competitors</h2>
+  <table style="width:100%;border-collapse:collapse;border:1px solid #e2e8f0;margin-bottom:24px;">
+    <thead>
+      <tr style="background:#f8fafc;">
+        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">#</th>
+        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Brand</th>
+        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Mentions</th>
+        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Citations</th>
+        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Visibility</th>
+      </tr>
+    </thead>
+    <tbody>{{competitorRows}}</tbody>
+  </table>
+
+  <!-- Recommended Actions -->
+  <h2 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#374151;margin:0 0 8px 0;padding-bottom:6px;border-bottom:2px solid #e2e8f0;">Recommended Actions</h2>
+  <table style="width:100%;border-collapse:collapse;border:1px solid #e2e8f0;margin-bottom:28px;">
+    <tbody>{{actionRows}}</tbody>
+  </table>
+
+  <!-- CTA -->
+  <div style="text-align:center;margin-bottom:24px;">
+    <a href="{{dashboardUrl}}" style="background:#4f46e5;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:700;font-size:14px;display:inline-block;">View Full Dashboard</a>
+  </div>
+  <p style="color:#94a3b8;font-size:11px;text-align:center;margin:0;">You&rsquo;re receiving this because email notifications are enabled on your SupaRank account.</p>
+</div>`,
+    variables: ['userName', 'trackerName', 'domain', 'scanDate', 'promptsScanned', 'visibility', 'mentionRate', 'shareOfVoice', 'citationRate', 'avgSentiment', 'platformRows', 'promptRows', 'competitorRows', 'actionRows', 'dashboardUrl'],
   },
 };
 

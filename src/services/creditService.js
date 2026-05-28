@@ -212,7 +212,6 @@ async function preDeduct(orgId, userId, amount, feature, metadata = {}) {
       const totalDeducted = fromSubscription + fromUserFree + fromOrgGeneral;
 
       if (totalDeducted < amount) {
-        await session.abortTransaction();
         throw new Error('Insufficient credits');
       }
 

@@ -3,11 +3,29 @@ const AiTrackerPrompt = require('../models/AiTrackerPrompt');
 const AiTrackerCompetitor = require('../models/AiTrackerCompetitor');
 const AiTrackerScan = require('../models/AiTrackerScan');
 const Workspace = require('../models/Workspace');
-const { runScan, PLATFORMS } = require('../services/aiTrackerScanEngine');
+const User = require('../models/User');
+const { runScan, PLATFORMS, normalizeBrandKey, isSameBrand } = require('../services/aiTrackerScanEngine');
 const UsageTracker = require('../models/UsageTracker');
 const UserUsageTracker = require('../models/UserUsageTracker');
 const tierService = require('../services/tierService');
 const creditService = require('../services/creditService');
+const { sendEmail } = require('../utils/emailService');
+const { applyCustomTemplate } = require('./emailPortalController');
+
+// ─── Dev time scale (accelerate frequencies for testing, 1 = real time) ───
+// Set via POST /api/dev/set-time-scale { scale: 200 }
+// Scale 200 → Daily≈7min, Weekly≈50min relative to scan duration
+// Persisted to .dev-time-scale so it survives server restarts
+const _fs = require('fs');
+const _path = require('path');
+const _scaleFile = _path.join(__dirname, '..', '.dev-time-scale');
+let _devTimeScale = 1;
+try { const saved = Number(_fs.readFileSync(_scaleFile, 'utf8')); if (saved > 1) { _devTimeScale = saved; console.log(`[dev] restored time scale: ${saved}x`); } } catch {}
+const setDevTimeScale = (n) => {
+  _devTimeScale = Math.max(1, Number(n) || 1);
+  try { _fs.writeFileSync(_scaleFile, String(_devTimeScale)); } catch {}
+};
+const getDevTimeScale = () => _devTimeScale;
 
 // ─── Platform display config (returned in platformStats) ──────────────────
 
@@ -31,6 +49,11 @@ const PLATFORM_DISPLAY = [
 ];
 
 // Workspace resolved by permissions middleware (req.workspace).
+
+// ─── Helper: validate ObjectId format ─────────────────────────────────────
+
+const OBJECTID_RE = /^[0-9a-fA-F]{24}$/;
+function isValidObjectId(id) { return typeof id === 'string' && OBJECTID_RE.test(id); }
 
 // ─── Helper: resolve tracker from workspace (legacy single-monitor) ──────
 
@@ -63,38 +86,112 @@ async function resolveMonitor(req, workspace, res) {
 // DERIVED DATA COMPUTATION
 // ═══════════════════════════════════════════════════════════════════════════
 
-function computeMetrics(latestScan, promptCount, competitors) {
+// Valid prompt frequency values
+const VALID_FREQUENCIES = ['Daily', 'Weekly', 'Bi-weekly', 'Monthly'];
+
+// Check if 'Daily' frequency is allowed for this workspace's tier
+async function isDailyFrequencyAllowed(workspace) {
+  if (!workspace.organizationId) return false;
+  const { config } = await tierService.getOrgTierConfig(workspace.organizationId);
+  return config?.aiTrackerRefreshInterval === 'daily';
+}
+
+// Weights for weighted visibility score
+const W_MENTION = 0.4;
+const W_POSITION = 0.3;
+const W_CITATION = 0.3;
+
+/**
+ * Compute weighted visibility score from platform results.
+ * Formula: mentionRate × W1 + positionScore × W2 + citationRate × W3
+ * @param {Array} platforms - Array of platform result objects
+ * @returns {number} Weighted visibility 0-100
+ */
+function computeWeightedVisibility(platforms) {
+  if (!platforms || platforms.length === 0) return 0;
+  // Exclude errored platforms — API failures should not count as "not mentioned"
+  const valid = platforms.filter((p) => !p.error);
+  if (valid.length === 0) return 0;
+  const total = valid.length;
+  const mentioned = valid.filter((p) => p.mentioned);
+  const cited = valid.filter((p) => p.cited);
+
+  const mentionRate = (mentioned.length / total) * 100;
+  const citationRate = (cited.length / total) * 100;
+
+  // Position score: average of (1 - normalizedPosition) for mentioned platforms
+  // Higher = mentioned earlier = better. Falls back to 50 if no position data.
+  let positionScore = 0;
+  if (mentioned.length > 0) {
+    const positionValues = mentioned.map((p) =>
+      p.normalizedPosition != null ? (1 - p.normalizedPosition) * 100 : 50
+    );
+    positionScore = positionValues.reduce((sum, v) => sum + v, 0) / mentioned.length;
+  }
+
+  return Math.round(mentionRate * W_MENTION + positionScore * W_POSITION + citationRate * W_CITATION);
+}
+
+function computeMetrics(latestScan, promptCount, recentScans) {
   if (!latestScan) return null;
 
-  const results = latestScan.results || [];
-  const platformCount = PLATFORMS.length;
+  // Build carry-forward results: latest known result per prompt across all recent scans
+  let results;
+  if (recentScans && recentScans.length > 0) {
+    const effectiveMap = new Map();
+    for (const scan of recentScans) {
+      for (const r of (scan.results || [])) {
+        const pid = r.promptId?.toString();
+        if (pid && !effectiveMap.has(pid)) effectiveMap.set(pid, r);
+      }
+    }
+    results = [...effectiveMap.values()];
+  } else {
+    results = latestScan.results || [];
+  }
+  // Use actual platform count from scan results instead of global PLATFORMS.length
+  const platformCount = (results.length > 0 && results[0].platforms?.length > 0) ? results[0].platforms.length : PLATFORMS.length;
   let totalMentions = 0;
   let totalCitations = 0;
-  const totalPossible = results.length * platformCount;
+  let errorCount = 0;
 
   for (const r of results) {
     for (const p of r.platforms) {
+      if (p.error) { errorCount++; continue; }
       if (p.mentioned) totalMentions++;
       if (p.cited) totalCitations++;
     }
   }
 
-  const visibility = totalPossible > 0 ? Math.round((totalMentions / totalPossible) * 100) : 0;
+  // Exclude errored platforms from totalPossible so API failures don't lower scores
+  const totalPossible = results.length * platformCount - errorCount;
+
+  const mentionRate = totalPossible > 0 ? Math.round((totalMentions / totalPossible) * 100) : 0;
   const citationRate = totalMentions > 0 ? Math.round((totalCitations / totalMentions) * 100) : 0;
 
+  // Weighted visibility across all prompts
+  const allPlatforms = results.flatMap((r) => r.platforms);
+  const visibility = allPlatforms.length > 0 ? computeWeightedVisibility(allPlatforms) : 0;
+
   // Share of voice: own mentions vs total of all competitors + own
-  const ownComp = competitors.find((c) => c.isOwn);
-  const ownCompResult = ownComp
-    ? (latestScan.competitorResults || []).find((cr) => cr.competitorId.equals(ownComp._id))
-    : null;
+  const competitorResults = latestScan.competitorResults || [];
+  const ownCompResult = competitorResults.find((cr) => cr.isOwn);
   const ownMentions = ownCompResult ? ownCompResult.mentions : totalMentions;
-  const allCompMentions = (latestScan.competitorResults || []).reduce((sum, cr) => sum + cr.mentions, 0);
+  const allCompMentions = competitorResults.reduce((sum, cr) => sum + cr.mentions, 0);
   const shareOfVoice = allCompMentions > 0 ? Math.round((ownMentions / allCompMentions) * 100) : 0;
 
-  return { visibility, shareOfVoice, citationRate, promptCount };
+  // Average sentiment score across all mentioned platforms with sentiment data
+  const sentimentScores = allPlatforms
+    .filter((p) => p.sentimentScore != null && p.mentioned && !p.error)
+    .map((p) => p.sentimentScore);
+  const avgSentiment = sentimentScores.length > 0
+    ? Math.round(sentimentScores.reduce((sum, s) => sum + s, 0) / sentimentScores.length)
+    : null;
+
+  return { visibility, mentionRate, shareOfVoice, citationRate, promptCount, avgSentiment };
 }
 
-function generatePromptSuggestions(scanResult) {
+function generatePromptSuggestions(scanResult, prevResult) {
   if (!scanResult) {
     return [
       'Add a direct answer in the first paragraph',
@@ -107,38 +204,112 @@ function generatePromptSuggestions(scanResult) {
   }
 
   const suggestions = [];
-  const mentioned = scanResult.platforms.filter((p) => p.mentioned);
-  const cited = scanResult.platforms.filter((p) => p.cited);
-  const notMentioned = scanResult.platforms.filter((p) => !p.mentioned);
+  const valid = scanResult.platforms.filter((p) => !p.error);
+  const mentioned = valid.filter((p) => p.mentioned);
+  const cited = valid.filter((p) => p.cited);
+  const notMentioned = valid.filter((p) => !p.mentioned);
 
+  // Compute previous scan stats for comparison
+  const prevValid = prevResult ? prevResult.platforms.filter((p) => !p.error) : [];
+  const prevMentioned = prevValid.filter((p) => p.mentioned);
+  const prevCited = prevValid.filter((p) => p.cited);
+
+  // ── Mention-based suggestions ──
   if (mentioned.length === 0) {
     suggestions.push('Create comprehensive content targeting this exact query');
-    suggestions.push('Add a direct answer in the first paragraph');
-    suggestions.push('Use clear H2/H3 structure matching query intent');
-  }
-
-  if (mentioned.length > 0 && cited.length === 0) {
-    suggestions.push('Add structured data (FAQ schema) to improve citation chances');
-    suggestions.push('Include your domain URL naturally in authoritative content');
-  }
-
-  if (notMentioned.length > 0 && mentioned.length > 0) {
+    suggestions.push('Add a direct answer in the first paragraph of your page');
+    suggestions.push('Use clear H2/H3 headings that match the query intent');
+  } else if (mentioned.length < valid.length) {
     const names = notMentioned.map((p) => {
       const display = PLATFORM_DISPLAY.find((d) => d.platformId === p.platformId);
       return display ? display.name : p.platformId;
     });
-    suggestions.push(`Improve visibility on ${names.join(', ')} by diversifying content format`);
+    suggestions.push(`Improve visibility on ${names.join(', ')} with platform-specific content`);
   }
 
-  suggestions.push('Strengthen E-E-A-T signals (author bio, date, citations)');
-  suggestions.push('Add authoritative external citations and sources');
-  suggestions.push('Keyword in title and first 100 words');
-  suggestions.push('Include FAQ section with exact-match questions');
+  // ── Lost mention detection ──
+  if (prevResult && prevMentioned.length > mentioned.length) {
+    const lostPlatforms = prevMentioned
+      .filter((pm) => !mentioned.some((m) => m.platformId === pm.platformId))
+      .map((p) => {
+        const display = PLATFORM_DISPLAY.find((d) => d.platformId === p.platformId);
+        return display ? display.name : p.platformId;
+      });
+    if (lostPlatforms.length > 0) {
+      suggestions.push(`Lost mentions on ${lostPlatforms.join(', ')} — refresh and expand your content`);
+    }
+  }
+
+  // ── Citation suggestions ──
+  if (mentioned.length > 0 && cited.length === 0) {
+    suggestions.push('Add structured data (FAQ schema) to boost citation chances');
+    suggestions.push('Include your domain URL naturally in authoritative content');
+  } else if (cited.length > 0 && cited.length < mentioned.length) {
+    const uncitedNames = mentioned
+      .filter((m) => !m.cited)
+      .map((p) => {
+        const display = PLATFORM_DISPLAY.find((d) => d.platformId === p.platformId);
+        return display ? display.name : p.platformId;
+      });
+    suggestions.push(`Not cited on ${uncitedNames.join(', ')} despite mention — add structured data and source links`);
+  }
+
+  // ── Citation gained/lost ──
+  if (prevResult && cited.length > prevCited.length) {
+    suggestions.push('Citations growing — keep content fresh and add more authoritative sources');
+  } else if (prevResult && prevCited.length > 0 && cited.length < prevCited.length) {
+    suggestions.push('Lost citations since last scan — update content with recent data and statistics');
+  }
+
+  // ── Sentiment-based suggestions ──
+  const sentimentScores = valid
+    .filter((p) => p.mentioned && p.sentimentScore != null)
+    .map((p) => p.sentimentScore);
+  if (sentimentScores.length > 0) {
+    const avgSentiment = sentimentScores.reduce((s, v) => s + v, 0) / sentimentScores.length;
+    if (avgSentiment < 40) {
+      suggestions.push('Negative sentiment detected — address common complaints and highlight positive outcomes');
+    } else if (avgSentiment < 60) {
+      suggestions.push('Neutral sentiment — add case studies and testimonials to improve brand perception');
+    }
+  }
+
+  // ── Position-based suggestions ──
+  const positions = valid
+    .filter((p) => p.mentioned && p.normalizedPosition != null)
+    .map((p) => p.normalizedPosition);
+  if (positions.length > 0) {
+    const avgPos = positions.reduce((s, v) => s + v, 0) / positions.length;
+    if (avgPos < 0.3) {
+      suggestions.push('Low ranking position — create more comprehensive, authoritative content on this topic');
+    }
+  }
+
+  // ── Filler: only add generic suggestions to reach 6 if needed ──
+  const fillers = [
+    'Strengthen E-E-A-T signals (author bio, date, citations)',
+    'Add authoritative external citations and sources',
+    'Keyword in title and first 100 words',
+    'Include FAQ section with exact-match questions',
+  ];
+  for (const f of fillers) {
+    if (suggestions.length >= 6) break;
+    if (!suggestions.includes(f)) suggestions.push(f);
+  }
 
   return suggestions.slice(0, 6);
 }
 
-function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
+function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, domain) {
+  // Pre-build lookup: for each scan, promptId → result (avoids O(prompts × scans × results) find)
+  const scanResultMaps = (recentScans || []).map((scan) => {
+    const m = new Map();
+    for (const r of scan.results) {
+      if (r.promptId) m.set(r.promptId.toString(), r);
+    }
+    return m;
+  });
+
   if (!latestScan) {
     return prompts.map((p) => ({
       id: p._id.toString(),
@@ -151,33 +322,103 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
       frequency: p.frequency,
       active: p.active,
       locked: p.locked || false,
-      suggestions: generatePromptSuggestions(null),
+      suggestions: generatePromptSuggestions(null, null),
       trendHistory: [],
+      competitors: [],
     }));
   }
 
-  return prompts.map((p) => {
-    const scanResult = latestScan.results.find((r) => r.promptId.equals(p._id));
-    const prevResult = previousScan
-      ? previousScan.results.find((r) => r.promptId.equals(p._id))
-      : null;
+  // Pre-build competitor list for per-prompt attribution
+  // Filter own brand + deduplicate aliases (e.g. "OpenAI" + "ChatGPT" → "ChatGPT")
+  const ownBrand = domain ? domain.replace(/^(https?:\/\/)?(www\.)?/, '').split('.')[0].toLowerCase() : null;
+  const allCR = (latestScan.competitorResults || []).filter((cr) => !cr.isOwn && !(ownBrand && isSameBrand(cr.name, ownBrand)));
+  // Deduplicate: merge alias brands (keeps longest name as display)
+  const dedupedCR = [];
+  for (const cr of allCR) {
+    const existing = dedupedCR.find((d) => isSameBrand(d.name, cr.name));
+    if (existing) {
+      existing.mentions += cr.mentions;
+      if (cr.name.length > existing.name.length) existing.name = cr.name;
+    } else {
+      dedupedCR.push({ ...cr });
+    }
+  }
+  // Generic words that shouldn't match on their own (too common in AI responses)
+  const STOP_WORDS = new Set(['search', 'engine', 'tools', 'tool', 'assistant', 'chat', 'studio', 'labs', 'platform', 'suite', 'cloud', 'machine', 'learning', 'intelligence']);
+  const competitorMatchers = dedupedCR.map((cr) => {
+    const escaped = cr.name.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Build patterns: full name + individual significant words (4+ chars, not generic)
+    const patterns = [new RegExp(`\\b${escaped}\\b`, 'i')];
+    const words = cr.name.toLowerCase().split(/[\s-]+/);
+    if (words.length > 1) {
+      for (const w of words) {
+        if (w.length >= 4 && !STOP_WORDS.has(w)) {
+          const wEsc = w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          patterns.push(new RegExp(`\\b${wEsc}\\b`, 'i'));
+        }
+      }
+    }
+    return {
+      name: cr.name,
+      patterns,
+      slug: cr.name.toLowerCase().replace(/\s+/g, ''),
+    };
+  });
 
-    const currentMentioned = scanResult
-      ? scanResult.platforms.filter((pl) => pl.mentioned).length
+  // Build carry-forward maps: latest/prev known result per prompt across ALL recent scans.
+  // Prompts on different frequencies (e.g. monthly) won't appear in every scan, but we
+  // still want to show their last known value rather than falling back to 0.
+  // recentScans is sorted newest-first, so first occurrence = most recent result.
+  const seenCount = new Map();
+  const latestMap = new Map();
+  const prevMap = new Map();
+  for (const scan of (recentScans || [])) {
+    for (const r of (scan.results || [])) {
+      const pid = r.promptId?.toString();
+      if (!pid) continue;
+      const n = (seenCount.get(pid) || 0) + 1;
+      seenCount.set(pid, n);
+      if (n === 1) latestMap.set(pid, r);
+      else if (n === 2) prevMap.set(pid, r);
+    }
+  }
+
+  return prompts.map((p) => {
+    const pid = p._id.toString();
+    const scanResult = latestMap.get(pid) || null;
+    const prevResult = prevMap.get(pid) || null;
+
+    // Weighted visibility for current and previous scans
+    const currentVisibility = scanResult
+      ? computeWeightedVisibility(scanResult.platforms)
       : 0;
-    const prevMentioned = prevResult
-      ? prevResult.platforms.filter((pl) => pl.mentioned).length
+    const prevVisibility = prevResult
+      ? computeWeightedVisibility(prevResult.platforms)
       : 0;
-    const delta = currentMentioned - prevMentioned;
 
     let trend = 'stable';
     if (!prevResult) trend = 'new';
-    else if (delta > 0) trend = 'up';
-    else if (delta < 0) trend = 'down';
+    else if (currentVisibility > prevVisibility) trend = 'up';
+    else if (currentVisibility < prevVisibility) trend = 'down';
 
-    // Normalize trendDelta to percentage (out of total platforms)
-    const platformCount = PLATFORMS.length;
-    const trendDelta = platformCount > 0 ? Math.round((delta / platformCount) * 100) : 0;
+    const trendDelta = currentVisibility - prevVisibility;
+
+    // Per-prompt competitor attribution: check which competitors appear in this prompt's responses
+    const promptCompetitors = [];
+    if (scanResult) {
+      for (const cm of competitorMatchers) {
+        let mentioned = false;
+        let cited = false;
+        for (const pl of scanResult.platforms) {
+          if (!mentioned && pl.aiResponse && cm.patterns.some((r) => r.test(pl.aiResponse))) mentioned = true;
+          if (!cited && pl.citedFrom && pl.citedFrom.toLowerCase().includes(cm.slug)) cited = true;
+          if (mentioned && cited) break;
+        }
+        if (mentioned || cited) {
+          promptCompetitors.push({ name: cm.name, mentioned, cited });
+        }
+      }
+    }
 
     return {
       id: p._id.toString(),
@@ -188,7 +429,14 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
         tier: pl.tier,
         cited: pl.cited,
         citedFrom: pl.citedFrom || null,
+        normalizedPosition: pl.normalizedPosition ?? null,
+        aiResponse: pl.aiResponse || null,
+        sentiment: pl.sentiment || null,
+        sentimentScore: pl.sentimentScore ?? null,
+        error: pl.error || false,
+        fanoutQueries: pl.fanoutQueries || [],
       })),
+      competitors: promptCompetitors,
       lastChecked: latestScan.completedAt
         ? formatRelativeDate(latestScan.completedAt)
         : 'Pending',
@@ -199,46 +447,77 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans) {
       frequency: p.frequency,
       active: p.active,
       locked: p.locked || false,
-      suggestions: generatePromptSuggestions(scanResult),
-      trendHistory: (recentScans || []).map((scan) => {
-        const result = scan.results.find((r) => r.promptId.equals(p._id));
+      suggestions: generatePromptSuggestions(scanResult, prevResult),
+      trendHistory: scanResultMaps.map((m) => {
+        const result = m.get(p._id.toString());
         if (!result) return 0;
+        return computeWeightedVisibility(result.platforms);
+      }).reverse(),
+      citationHistory: scanResultMaps.map((m) => {
+        const result = m.get(p._id.toString());
+        if (!result) return 0;
+        const citedCount = result.platforms.filter((pl) => pl.cited).length;
         const mentionedCount = result.platforms.filter((pl) => pl.mentioned).length;
-        const totalCount = result.platforms.length || PLATFORMS.length;
-        return Math.round((mentionedCount / totalCount) * 100);
+        return mentionedCount > 0 ? Math.round((citedCount / mentionedCount) * 100) : 0;
+      }).reverse(),
+      mentionRateHistory: scanResultMaps.map((m) => {
+        const result = m.get(p._id.toString());
+        if (!result) return 0;
+        const valid = result.platforms.filter((pl) => !pl.error);
+        if (valid.length === 0) return 0;
+        return Math.round((valid.filter((pl) => pl.mentioned).length / valid.length) * 100);
+      }).reverse(),
+      positionHistory: scanResultMaps.map((m) => {
+        const result = m.get(p._id.toString());
+        if (!result) return null;
+        const mentioned = result.platforms.filter((pl) => pl.mentioned && !pl.error && pl.normalizedPosition != null);
+        if (mentioned.length === 0) return null;
+        const avg = mentioned.reduce((s, pl) => s + pl.normalizedPosition, 0) / mentioned.length;
+        return Math.round(avg * 100);
+      }).reverse(),
+      sentimentHistory: scanResultMaps.map((m) => {
+        const result = m.get(p._id.toString());
+        if (!result) return null;
+        const scores = result.platforms.filter((pl) => pl.mentioned && !pl.error && pl.sentimentScore != null).map((pl) => pl.sentimentScore);
+        if (scores.length === 0) return null;
+        return Math.round(scores.reduce((s, v) => s + v, 0) / scores.length);
+      }).reverse(),
+      trendDates: (recentScans || []).map((scan) => {
+        const d = scan.completedAt || scan.startedAt;
+        return d ? d.toISOString() : null;
       }).reverse(),
     };
   });
 }
 
-function formatCompetitors(competitors, latestScan, previousScan) {
-  return competitors.map((c) => {
-    const current = latestScan
-      ? (latestScan.competitorResults || []).find((cr) => cr.competitorId.equals(c._id))
-      : null;
-    const prev = previousScan
-      ? (previousScan.competitorResults || []).find((cr) => cr.competitorId.equals(c._id))
-      : null;
+function formatCompetitors(latestScan, previousScan, domain) {
+  const currentResults = latestScan?.competitorResults || [];
+  const prevResults = previousScan?.competitorResults || [];
 
-    const visibility = current ? current.visibility : 0;
+  if (currentResults.length === 0) return [];
+
+  // Extract brand from domain for filtering (e.g. "google.com" → "google")
+  const ownBrand = domain ? domain.replace(/^(https?:\/\/)?(www\.)?/, '').split('.')[0].toLowerCase() : null;
+
+  const allMentions = currentResults.reduce((sum, cr) => sum + cr.mentions, 0);
+
+  return currentResults.map((cr, idx) => {
+    // Match previous scan by brand similarity (handles "GPT" ↔ "ChatGPT", "Anthropic Claude" ↔ "Claude", etc.)
+    const prev = prevResults.find((pr) => isSameBrand(cr.name, pr.name));
     const prevVisibility = prev ? prev.visibility : 0;
+    const shareOfVoice = allMentions > 0 ? Math.round((cr.mentions / allMentions) * 100) : 0;
 
-    // Compute share of voice for this competitor
-    const allCompMentions = latestScan
-      ? (latestScan.competitorResults || []).reduce((sum, cr) => sum + cr.mentions, 0)
-      : 0;
-    const shareOfVoice = allCompMentions > 0 && current
-      ? Math.round((current.mentions / allCompMentions) * 100)
-      : 0;
+    // Mark as own if flagged OR if brand name matches the monitored domain
+    const isOwn = cr.isOwn || (ownBrand ? isSameBrand(cr.name, ownBrand) : false);
 
     return {
-      id: c._id.toString(),
-      name: c.name,
-      isOwn: c.isOwn,
-      visibility,
-      visibilityDelta: visibility - prevVisibility,
-      mentions: current ? current.mentions : 0,
-      citations: current ? current.citations : 0,
+      id: `auto-${idx}`,
+      name: cr.name,
+      isOwn,
+      visibility: cr.visibility,
+      visibilityDelta: cr.visibility - prevVisibility,
+      mentions: cr.mentions,
+      citations: cr.citations,
       shareOfVoice,
     };
   });
@@ -247,75 +526,150 @@ function formatCompetitors(competitors, latestScan, previousScan) {
 function computeChanges(latestScan, previousScan) {
   if (!latestScan || !previousScan) return [];
 
+  // Pre-build Map for O(1) lookup
+  const prevMap = new Map();
+  for (const r of previousScan.results) {
+    if (r.promptId) prevMap.set(r.promptId.toString(), r);
+  }
+
   const changes = [];
   let changeId = 0;
 
+  // Helper to build platform metadata fields
+  const platMeta = (plat) => {
+    const meta = PLATFORM_DISPLAY.find((p) => p.platformId === plat.platformId);
+    return {
+      platform: meta ? meta.name : plat.platformId,
+      platformLetter: meta ? meta.letter : plat.platformId[0].toUpperCase(),
+      platformColor: meta ? meta.color : 'text-gray-600',
+      platformBg: meta ? meta.bgColor : 'bg-gray-50',
+    };
+  };
+
   for (const result of latestScan.results) {
-    const prevResult = previousScan.results.find((r) => r.promptId.equals(result.promptId));
+    if (!result.promptId) continue;
+    const prevResult = prevMap.get(result.promptId.toString());
     if (!prevResult) continue;
 
     for (const plat of result.platforms) {
       const prevPlat = prevResult.platforms.find((pp) => pp.platformId === plat.platformId);
-      if (!prevPlat) continue;
+      const m = platMeta(plat);
 
-      const meta = PLATFORM_DISPLAY.find((p) => p.platformId === plat.platformId);
+      // ── New platform (not scanned previously) ──
+      if (!prevPlat) {
+        if (plat.mentioned) {
+          changes.push({
+            id: `ch_${changeId++}`, type: 'gained', prompt: result.prompt, ...m,
+            detail: `Now mentioned on ${m.platform} (newly tracked)`,
+          });
+          if (plat.cited) {
+            changes.push({
+              id: `ch_${changeId++}`, type: 'new_citation', prompt: result.prompt, ...m,
+              detail: `Cited on ${m.platform} (newly tracked)`,
+            });
+          }
+        }
+        continue;
+      }
 
+      // ── Mention gained / lost ──
       if (!prevPlat.mentioned && plat.mentioned) {
         changes.push({
-          id: `ch_${changeId++}`,
-          type: 'gained',
-          prompt: result.prompt,
-          platform: meta ? meta.name : plat.platformId,
-          platformLetter: meta ? meta.letter : plat.platformId[0].toUpperCase(),
-          platformColor: meta ? meta.color : 'text-gray-600',
-          platformBg: meta ? meta.bgColor : 'bg-gray-50',
-          detail: `Now mentioned on ${meta ? meta.name : plat.platformId}`,
+          id: `ch_${changeId++}`, type: 'gained', prompt: result.prompt, ...m,
+          detail: `Now mentioned on ${m.platform}`,
         });
       } else if (prevPlat.mentioned && !plat.mentioned) {
         changes.push({
-          id: `ch_${changeId++}`,
-          type: 'lost',
-          prompt: result.prompt,
-          platform: meta ? meta.name : plat.platformId,
-          platformLetter: meta ? meta.letter : plat.platformId[0].toUpperCase(),
-          platformColor: meta ? meta.color : 'text-gray-600',
-          platformBg: meta ? meta.bgColor : 'bg-gray-50',
-          detail: `Lost mention on ${meta ? meta.name : plat.platformId}`,
+          id: `ch_${changeId++}`, type: 'lost', prompt: result.prompt, ...m,
+          detail: `Lost mention on ${m.platform}`,
         });
       } else if (prevPlat.tier === 'mentioned' && plat.tier === 'top') {
+        // ── Tier upgrade ──
         changes.push({
-          id: `ch_${changeId++}`,
-          type: 'improved',
-          prompt: result.prompt,
-          platform: meta ? meta.name : plat.platformId,
-          platformLetter: meta ? meta.letter : plat.platformId[0].toUpperCase(),
-          platformColor: meta ? meta.color : 'text-gray-600',
-          platformBg: meta ? meta.bgColor : 'bg-gray-50',
-          detail: `Upgraded to top mention on ${meta ? meta.name : plat.platformId}`,
+          id: `ch_${changeId++}`, type: 'improved', prompt: result.prompt, ...m,
+          detail: `Upgraded to top mention on ${m.platform}`,
         });
       } else if (prevPlat.tier === 'top' && plat.tier === 'mentioned') {
+        // ── Tier downgrade ──
         changes.push({
-          id: `ch_${changeId++}`,
-          type: 'declined',
-          prompt: result.prompt,
-          platform: meta ? meta.name : plat.platformId,
-          platformLetter: meta ? meta.letter : plat.platformId[0].toUpperCase(),
-          platformColor: meta ? meta.color : 'text-gray-600',
-          platformBg: meta ? meta.bgColor : 'bg-gray-50',
-          detail: `Dropped from top to mentioned on ${meta ? meta.name : plat.platformId}`,
+          id: `ch_${changeId++}`, type: 'declined', prompt: result.prompt, ...m,
+          detail: `Dropped from top to mentioned on ${m.platform}`,
         });
       }
 
+      // ── Citation gained ──
       if (!prevPlat.cited && plat.cited) {
         changes.push({
-          id: `ch_${changeId++}`,
-          type: 'new_citation',
-          prompt: result.prompt,
-          platform: meta ? meta.name : plat.platformId,
-          platformLetter: meta ? meta.letter : plat.platformId[0].toUpperCase(),
-          platformColor: meta ? meta.color : 'text-gray-600',
-          platformBg: meta ? meta.bgColor : 'bg-gray-50',
-          detail: `New citation from ${plat.citedFrom || (meta ? meta.name : plat.platformId)}`,
+          id: `ch_${changeId++}`, type: 'new_citation', prompt: result.prompt, ...m,
+          detail: `New citation from ${plat.citedFrom || m.platform}`,
+        });
+      }
+
+      // ── Citation lost ──
+      if (prevPlat.cited && !plat.cited) {
+        changes.push({
+          id: `ch_${changeId++}`, type: 'declined', prompt: result.prompt, ...m,
+          detail: `Lost citation on ${m.platform}`,
+        });
+      }
+
+      // ── Position change (both mentioned — allow prev unknown → known) ──
+      if (plat.mentioned && prevPlat.mentioned && plat.tier === prevPlat.tier) {
+        const prevPos = prevPlat.normalizedPosition ?? null;
+        const currPos = plat.normalizedPosition ?? null;
+        if (prevPos == null && currPos != null) {
+          // Position data now available (wasn't tracked before)
+          if (currPos <= 0.3) {
+            changes.push({
+              id: `ch_${changeId++}`, type: 'improved', prompt: result.prompt, ...m,
+              detail: `Position now tracked on ${m.platform} — ranked high`,
+            });
+          }
+        } else if (prevPos != null && currPos != null) {
+          // normalizedPosition: 0 = top (best), 1 = bottom (worst)
+          // positive posDelta = moved down = declined
+          // negative posDelta = moved up = improved
+          const posDelta = currPos - prevPos;
+          if (posDelta <= -0.2) {
+            changes.push({
+              id: `ch_${changeId++}`, type: 'improved', prompt: result.prompt, ...m,
+              detail: `Position improved on ${m.platform}`,
+            });
+          } else if (posDelta >= 0.2) {
+            changes.push({
+              id: `ch_${changeId++}`, type: 'declined', prompt: result.prompt, ...m,
+              detail: `Position dropped on ${m.platform}`,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // ── Competitor changes ──
+  if (latestScan.competitorResults && previousScan.competitorResults) {
+    const prevCompList = previousScan.competitorResults;
+
+    for (const comp of latestScan.competitorResults) {
+      const prevComp = prevCompList.find((c) => isSameBrand(c.name, comp.name));
+      if (!prevComp) continue;
+
+      const mentionDelta = comp.mentions - prevComp.mentions;
+      const citationDelta = comp.citations - prevComp.citations;
+
+      if (mentionDelta > 0) {
+        changes.push({
+          id: `ch_${changeId++}`, type: 'competitor',
+          prompt: comp.name,
+          detail: `${comp.name} gained ${mentionDelta} new mention${mentionDelta > 1 ? 's' : ''}`,
+        });
+      }
+
+      if (citationDelta > 0) {
+        changes.push({
+          id: `ch_${changeId++}`, type: 'competitor',
+          prompt: comp.name,
+          detail: `${comp.name} gained ${citationDelta} new citation${citationDelta > 1 ? 's' : ''}`,
         });
       }
     }
@@ -325,19 +679,20 @@ function computeChanges(latestScan, previousScan) {
 }
 
 function computeTrendData(scans) {
-  return scans.map((scan) => {
-    const totalPossible = scan.results.length * PLATFORMS.length;
-    let totalMentions = 0;
-    for (const r of scan.results) {
-      for (const p of r.platforms) {
-        if (p.mentioned) totalMentions++;
-      }
-    }
-    const value = totalPossible > 0 ? Math.round((totalMentions / totalPossible) * 100) : 0;
+  // scans are sorted newest-first from the DB query
+  return scans.map((scan, idx) => {
+    // Weighted visibility across all platform results in this scan
+    const allPlatforms = scan.results.flatMap((r) => r.platforms);
+    const value = allPlatforms.length > 0 ? computeWeightedVisibility(allPlatforms) : 0;
     const d = scan.completedAt || scan.startedAt;
     const month = d.toLocaleString('en-US', { month: 'short' });
     const day = d.getDate();
-    return { week: `${month} ${day}`, value };
+
+    // Compute changes between this scan and the next older one
+    const olderScan = scans[idx + 1] || null;
+    const changes = computeChanges(scan, olderScan);
+
+    return { week: `${month} ${day}`, value, date: d.toISOString(), changes };
   }).reverse(); // oldest first
 }
 
@@ -346,11 +701,13 @@ function computePlatformStats(latestScan) {
     let mentionCount = 0;
     let citationCount = 0;
     let totalPrompts = 0;
+    let errorCount = 0;
 
     if (latestScan) {
       for (const r of latestScan.results) {
         const plat = r.platforms.find((pl) => pl.platformId === p.platformId);
         if (plat) {
+          if (plat.error) { errorCount++; continue; }
           totalPrompts++;
           if (plat.mentioned) mentionCount++;
           if (plat.cited) citationCount++;
@@ -368,6 +725,7 @@ function computePlatformStats(latestScan) {
       visibility: totalPrompts > 0 ? Math.round((mentionCount / totalPrompts) * 100) : 0,
       mentionCount,
       citationCount,
+      errorCount,
     };
   });
 }
@@ -378,10 +736,11 @@ function generateActionItems(latestScan) {
   const items = [];
   let id = 0;
 
-  // Prompts not mentioned on any platform
-  const missingAll = latestScan.results.filter((r) =>
-    r.platforms.every((p) => !p.mentioned)
-  );
+  // Prompts not mentioned on any platform (exclude all-errored prompts)
+  const missingAll = latestScan.results.filter((r) => {
+    const valid = r.platforms.filter((p) => !p.error);
+    return valid.length > 0 && valid.every((p) => !p.mentioned);
+  });
   if (missingAll.length > 0) {
     items.push({
       id: `ai_${id++}`,
@@ -390,13 +749,13 @@ function generateActionItems(latestScan) {
       description: `Your brand is not mentioned in any AI platform for ${missingAll.length} tracked prompts. Creating comprehensive content targeting these queries can improve visibility.`,
       impact: `+${Math.min(missingAll.length * 10, 40)}% visibility`,
       type: 'content',
-      linkedPrompts: missingAll.map((r) => r.promptId.toString()),
+      linkedPrompts: missingAll.filter((r) => r.promptId).map((r) => r.promptId.toString()),
     });
   }
 
-  // Mentioned but not cited
+  // Mentioned but not cited (exclude errored platforms)
   const mentionedNotCited = latestScan.results.filter((r) =>
-    r.platforms.some((p) => p.mentioned && !p.cited)
+    r.platforms.some((p) => !p.error && p.mentioned && !p.cited)
   );
   if (mentionedNotCited.length > 0) {
     items.push({
@@ -409,15 +768,16 @@ function generateActionItems(latestScan) {
     });
   }
 
-  // Platform gaps: mentioned on some but not all
+  // Platform gaps: mentioned on some but not all (exclude errored platforms)
   const platformGaps = latestScan.results.filter((r) => {
-    const mentioned = r.platforms.filter((p) => p.mentioned);
-    return mentioned.length > 0 && mentioned.length < PLATFORMS.length;
+    const valid = r.platforms.filter((p) => !p.error);
+    const mentioned = valid.filter((p) => p.mentioned);
+    return mentioned.length > 0 && mentioned.length < valid.length;
   });
   if (platformGaps.length > 0) {
     const gapPlatformIds = [...new Set(
       platformGaps.flatMap((r) =>
-        r.platforms.filter((p) => !p.mentioned).map((p) => p.platformId)
+        r.platforms.filter((p) => !p.mentioned && !p.error).map((p) => p.platformId)
       )
     )];
     const gapNames = gapPlatformIds
@@ -453,10 +813,30 @@ function formatRelativeDate(date) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// STUCK SCAN RECOVERY
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Reset scans stuck in 'scanning' or 'pending' for more than 30 minutes
+async function recoverStuckScans(workspaceId) {
+  const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000);
+  const result = await AiTracker.updateMany(
+    {
+      workspaceId,
+      scanStatus: { $in: ['scanning', 'pending'] },
+      updatedAt: { $lt: thirtyMinAgo },
+    },
+    { $set: { scanStatus: 'failed', scanError: 'Scan timed out and was automatically recovered' } }
+  );
+  if (result.modifiedCount > 0) {
+    console.log(`[ai-tracker-scan] Recovered ${result.modifiedCount} stuck scan(s) in workspace ${workspaceId}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // BACKGROUND SCAN EXECUTION (fire-and-forget)
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function executeScan(trackerId, userId = null) {
+async function executeScan(trackerId, userId = null, { force = false } = {}) {
   let creditTxId = null;
   let orgId = null;
 
@@ -475,12 +855,55 @@ async function executeScan(trackerId, userId = null) {
     const ws = await Workspace.findById(tracker.workspaceId);
     orgId = ws?.organizationId?.toString() || null;
 
-    // ── 3. Load prompts & platforms to estimate credit cost
-    const prompts = await AiTrackerPrompt.find({ trackerId });
-    const competitors = await AiTrackerCompetitor.find({ trackerId });
+    // ── 3. Load prompts & platforms to estimate credit cost (skip inactive + locked prompts)
+    const allActivePrompts = await AiTrackerPrompt.find({ trackerId, active: { $ne: false }, locked: { $ne: true } }).limit(500);
+
+    // ── 3b. Filter prompts by frequency — only scan prompts that are due
+    //        Manual scans (force=true) scan all prompts but only reset timers for due ones
+    const scanStart = new Date();
+    const FREQ_DAYS = { 'Daily': 1, 'Weekly': 7, 'Bi-weekly': 14, 'Monthly': 30 };
+    const timeScale = _devTimeScale; // >1 in dev accelerated mode, 1 = real time
+    // Tolerance absorbs cron's 1-minute real-time granularity so prompts with harmonically
+    // related frequencies (weekly + bi-weekly) always land in the same scan.
+    // Capped at 10% of the shortest interval to prevent high time scales from making
+    // everything appear due (e.g. at 10000x, Daily=8.6s, old 2-min tolerance > interval).
+    const shortestIntervalMs = Math.min(...allActivePrompts.map(p =>
+      ((FREQ_DAYS[p.frequency] || 7) / timeScale) * 24 * 60 * 60 * 1000
+    ));
+    const CRON_TOLERANCE_MS = Math.min(2 * 60 * 1000, shortestIntervalMs * 0.1);
+    const isDuePrompt = (p) => {
+      if (!p.lastScannedAt) return true; // never scanned → always due
+      const freqDays = (FREQ_DAYS[p.frequency] || 7) / timeScale;
+      const dueAt = new Date(p.lastScannedAt.getTime() + freqDays * 24 * 60 * 60 * 1000);
+      return scanStart.getTime() + CRON_TOLERANCE_MS >= dueAt.getTime();
+    };
+    // Manual scans scan all prompts (user gets fresh data) but track which were due
+    // so we only reset lastScannedAt on due ones (preserving cooldown timers)
+    const duePromptIds = new Set(allActivePrompts.filter(isDuePrompt).map((p) => p._id.toString()));
+    const prompts = force ? allActivePrompts : allActivePrompts.filter(isDuePrompt);
 
     const platformCount = tracker.defaultModels?.length || 0;
     const promptCount = prompts.length;
+
+    // ── 3c. Skip scan entirely if no prompts are due — but advance nextScanAt
+    //        so the cron doesn't keep re-picking this tracker every cycle
+    if (promptCount === 0) {
+      console.log(`[ai-tracker-scan] No prompts due for ${trackerId}, skipping scan`);
+      // Find the earliest next-due prompt to set nextScanAt precisely
+      let nextDueAt = null;
+      for (const p of allActivePrompts) {
+        if (!p.lastScannedAt) { nextDueAt = scanStart; break; } // should not happen (would have been included)
+        const freqDays = (FREQ_DAYS[p.frequency] || 7) / timeScale;
+        const due = new Date(p.lastScannedAt.getTime() + freqDays * 24 * 60 * 60 * 1000);
+        if (!nextDueAt || due < nextDueAt) nextDueAt = due;
+      }
+      // Fallback: if no active prompts at all, schedule 1 day out (scaled)
+      if (!nextDueAt) nextDueAt = new Date(scanStart.getTime() + (24 * 60 * 60 * 1000) / timeScale);
+      await AiTracker.findByIdAndUpdate(trackerId, {
+        $set: { scanStatus: 'ready', scanProgress: 0, nextScanAt: nextDueAt },
+      });
+      return;
+    }
 
     // ── 4. Pre-deduct estimated credits (1 credit per 50 words, ~200 words per answer)
     //       Estimate = prompts × platforms × 4 credits, minimum 1
@@ -493,10 +916,11 @@ async function executeScan(trackerId, userId = null) {
         );
         creditTxId = transactionId;
       } catch (creditErr) {
-        // Insufficient credits — abort scan, reset status
+        // Insufficient credits — push nextScanAt forward so cron doesn't retry every minute
         console.log(`[ai-tracker-scan] skipping scan for tracker ${trackerId}: ${creditErr.message}`);
+        const retryDelay = (60 * 60 * 1000) / (_devTimeScale || 1); // 1 hour, scaled in dev
         await AiTracker.findByIdAndUpdate(trackerId, {
-          $set: { scanStatus: 'ready', scanProgress: 0, scanError: 'Insufficient credits' },
+          $set: { scanStatus: 'ready', scanProgress: 0, scanError: 'Insufficient credits', nextScanAt: new Date(Date.now() + retryDelay) },
         });
         return;
       }
@@ -507,10 +931,10 @@ async function executeScan(trackerId, userId = null) {
     await AiTracker.findByIdAndUpdate(trackerId, { $set: { currentScanId: scan._id } });
 
     // ── 6. Run the scan engine
-    const { results, competitorResults, totalAnswerWords } = await runScan(
+    const { results, competitorResults, detectedBrands, totalAnswerWords } = await runScan(
       tracker,
       prompts,
-      competitors,
+      [], // competitors auto-detected by scan engine
       async (progress, platformStatuses) => {
         await AiTracker.findByIdAndUpdate(trackerId, {
           $set: { scanProgress: progress, platformStatuses },
@@ -520,23 +944,75 @@ async function executeScan(trackerId, userId = null) {
 
     // ── 7. Settle credits with actual word count
     if (creditTxId) {
-      const actualCredits = Math.max(1, creditService.wordsToCredits(totalAnswerWords));
-      await creditService.settle(creditTxId, actualCredits);
-      console.log(`[ai-tracker-scan] settled credits for tracker ${trackerId}: estimated ${promptCount * platformCount * 4}, actual ${actualCredits} (${totalAnswerWords} words)`);
+      try {
+        const actualCredits = Math.max(1, creditService.wordsToCredits(totalAnswerWords));
+        await creditService.settle(creditTxId, actualCredits);
+        console.log(`[ai-tracker-scan] settled credits for tracker ${trackerId}: estimated ${promptCount * platformCount * 4}, actual ${actualCredits} (${totalAnswerWords} words)`);
+        creditTxId = null; // Mark as settled so outer catch doesn't double-refund
+      } catch (settleErr) {
+        console.error(`[ai-tracker-scan] settle failed for tracker ${trackerId}, refunding:`, settleErr.message);
+        await creditService.refund(creditTxId).catch((refundErr) => {
+          console.error(`[ai-tracker-scan] refund also failed for tracker ${trackerId}:`, refundErr.message);
+        });
+        creditTxId = null;
+
+        // S74: Don't save results if credits couldn't be settled — mark scan as failed
+        await AiTrackerScan.findByIdAndUpdate(scan._id, {
+          $set: { status: 'failed', completedAt: new Date() },
+        });
+        await AiTracker.findByIdAndUpdate(trackerId, {
+          $set: { scanStatus: 'failed', scanError: 'Credit settlement failed', currentScanId: null },
+        });
+        return;
+      }
     }
 
     // ── 8. Save scan results
     const now = new Date();
     await AiTrackerScan.findByIdAndUpdate(scan._id, {
-      $set: { status: 'ready', completedAt: now, results, competitorResults },
+      $set: { status: 'ready', completedAt: now, results, competitorResults, detectedBrands: detectedBrands || [] },
     });
 
-    // ── 9. Determine refresh interval from tier config
+    // ── 8b. Fixed-rate scheduling: advance lastScannedAt by exactly one frequency
+    //        interval instead of setting it to "now". This prevents scan execution
+    //        time from causing drift (e.g. Weekly firing after 6 Daily scans instead of 7).
+    //        Manual scans only reset timers on prompts that were actually due.
+    const promptsToResetTimer = prompts.filter((p) => duePromptIds.has(p._id.toString()));
+    let earliestNextDue = null;
+    for (const p of promptsToResetTimer) {
+      const freqMs = ((FREQ_DAYS[p.frequency] || 7) / timeScale) * 24 * 60 * 60 * 1000;
+      let newLastScannedAt;
+      if (p.lastScannedAt) {
+        // Fixed-rate: jump to the most recent interval boundary before scanStart.
+        // This prevents drift AND handles catch-up when multiple intervals have passed
+        // (e.g. after switching time scales or server downtime).
+        const elapsed = scanStart.getTime() - p.lastScannedAt.getTime();
+        const intervals = Math.max(1, Math.floor(elapsed / freqMs));
+        newLastScannedAt = new Date(p.lastScannedAt.getTime() + intervals * freqMs);
+      } else {
+        newLastScannedAt = now;
+      }
+      await AiTrackerPrompt.findByIdAndUpdate(p._id, { $set: { lastScannedAt: newLastScannedAt } });
+      // Track earliest next-due prompt to set tracker nextScanAt precisely
+      const nextDue = new Date(newLastScannedAt.getTime() + freqMs);
+      if (!earliestNextDue || nextDue < earliestNextDue) earliestNextDue = nextDue;
+    }
+    // Also check non-scanned prompts for earliest next-due
+    for (const p of allActivePrompts) {
+      if (duePromptIds.has(p._id.toString())) continue; // already handled above
+      if (!p.lastScannedAt) continue;
+      const freqMs = ((FREQ_DAYS[p.frequency] || 7) / timeScale) * 24 * 60 * 60 * 1000;
+      const nextDue = new Date(p.lastScannedAt.getTime() + freqMs);
+      if (!earliestNextDue || nextDue < earliestNextDue) earliestNextDue = nextDue;
+    }
+
+    // ── 9. Determine refresh interval from tier config (fallback for nextScanAt)
     let intervalDays = 7;
     if (orgId) {
       const { config } = await tierService.getOrgTierConfig(orgId);
       intervalDays = config?.aiTrackerRefreshInterval === 'daily' ? 1 : 7;
     }
+    const fallbackNextScan = new Date(now.getTime() + (intervalDays / timeScale) * 24 * 60 * 60 * 1000);
 
     // ── 10. Update tracker to ready
     const scannedPlatforms = tracker.defaultModels && tracker.defaultModels.length > 0
@@ -547,7 +1023,7 @@ async function executeScan(trackerId, userId = null) {
         scanStatus: 'ready',
         scanProgress: 100,
         lastScanAt: now,
-        nextScanAt: new Date(now.getTime() + intervalDays * 24 * 60 * 60 * 1000),
+        nextScanAt: earliestNextDue || fallbackNextScan,
         currentScanId: null,
         platformStatuses: scannedPlatforms.map((pid) => ({
           platformId: pid,
@@ -555,6 +1031,153 @@ async function executeScan(trackerId, userId = null) {
         })),
       },
     });
+
+    // ── 11. Send scan summary email to workspace owner
+    try {
+      const ownerId = userId || ws?.userId;
+      if (!ownerId) {
+        console.log(`[ai-tracker-scan] skipping email for tracker ${trackerId}: no ownerId (userId=${userId}, ws.userId=${ws?.userId})`);
+      } else {
+        const owner = await User.findById(ownerId).select('email profile preferences').lean();
+        if (!owner) {
+          console.log(`[ai-tracker-scan] skipping email for tracker ${trackerId}: user ${ownerId} not found`);
+        } else if (!owner.email) {
+          console.log(`[ai-tracker-scan] skipping email for tracker ${trackerId}: user ${ownerId} has no email`);
+        } else if (owner.preferences?.emailNotifications === false) {
+          console.log(`[ai-tracker-scan] skipping email for tracker ${trackerId}: emailNotifications disabled for ${owner.email}`);
+        } else {
+          // Build carry-forward results for prompts not scanned this run
+          const scannedIds = new Set(results.map((r) => r.promptId?.toString()).filter(Boolean));
+          const notScannedPrompts = allActivePrompts.filter((p) => !scannedIds.has(p._id.toString()));
+          let carryForwardResults = [];
+          if (notScannedPrompts.length > 0) {
+            // Anchor on the oldest lastScannedAt among not-scanned prompts so we always
+            // reach back far enough — no fixed limit that could drop monthly/slow prompts
+            const notScannedWithHistory = notScannedPrompts.filter((p) => p.lastScannedAt);
+            const oldestNeeded = notScannedWithHistory.reduce((min, p) =>
+              p.lastScannedAt < min ? p.lastScannedAt : min,
+              notScannedWithHistory[0]?.lastScannedAt || new Date()
+            );
+            const prevScans = await AiTrackerScan.find({
+              trackerId,
+              status: 'ready',
+              _id: { $ne: scan._id },
+              completedAt: { $gte: oldestNeeded },
+            }).sort({ completedAt: -1 }).lean();
+            const notScannedIds = new Set(notScannedPrompts.map((p) => p._id.toString()));
+            const carryMap = new Map();
+            for (const prevScan of prevScans) {
+              for (const r of (prevScan.results || [])) {
+                const pid = r.promptId?.toString();
+                if (pid && notScannedIds.has(pid) && !carryMap.has(pid)) {
+                  carryMap.set(pid, { ...r, _isCarryForward: true, _carryDate: prevScan.completedAt });
+                }
+              }
+            }
+            carryForwardResults = [...carryMap.values()];
+          }
+
+          // Combined: newly scanned (fresh) + carry-forward (historical, last known)
+          const allEmailResults = [
+            ...results.map((r) => ({ ...r, _isCarryForward: false })),
+            ...carryForwardResults,
+          ];
+
+          const fakeScan = { results: allEmailResults, competitorResults: competitorResults || [] };
+          const metrics = computeMetrics(fakeScan, allActivePrompts.length) || {};
+          // Platform stats reflect only current scan (represents actual API calls made this run)
+          const platStats = computePlatformStats({ results, competitorResults: competitorResults || [] });
+          const actionItems = generateActionItems(fakeScan);
+          const sortedCompetitors = [...(competitorResults || [])].sort((a, b) => b.visibility - a.visibility);
+
+          // Sentiment label
+          const avgSentimentLabel = metrics.avgSentiment == null ? '—'
+            : metrics.avgSentiment >= 60 ? `Positive (${metrics.avgSentiment})`
+            : metrics.avgSentiment >= 40 ? `Neutral (${metrics.avgSentiment})`
+            : `Negative (${metrics.avgSentiment})`;
+
+          // Per-platform rows (current scan only)
+          const platformRows = platStats.map((p) => {
+            const total = results.length - p.errorCount;
+            const errorCell = p.errorCount > 0
+              ? `<td style="padding:10px 16px;color:#ef4444;font-size:12px;">${p.errorCount} error${p.errorCount > 1 ? 's' : ''}</td>`
+              : '<td></td>';
+            return `<tr style="border-bottom:1px solid #f1f5f9;"><td style="padding:10px 16px;font-weight:600;color:#111;font-size:13px;">${p.name}</td><td style="padding:10px 16px;color:#555;font-size:13px;">${p.visibility}%</td><td style="padding:10px 16px;color:#555;font-size:13px;">${p.mentionCount} / ${total}</td><td style="padding:10px 16px;color:#555;font-size:13px;">${p.citationCount}</td>${errorCell}</tr>`;
+          }).join('');
+
+          // Per-prompt rows: scanned-this-run first (green badge), then carry-forward (gray date)
+          const promptRows = allEmailResults
+            .map((r) => {
+              const valid = r.platforms.filter((p) => !p.error);
+              const mentioned = valid.filter((p) => p.mentioned).length;
+              const cited = valid.filter((p) => p.cited).length;
+              const mRate = valid.length > 0 ? Math.round((mentioned / valid.length) * 100) : 0;
+              const cRate = valid.length > 0 ? Math.round((cited / valid.length) * 100) : 0;
+              return { prompt: r.prompt, mentioned, total: valid.length, mRate, cRate, isCarryForward: r._isCarryForward, carryDate: r._carryDate };
+            })
+            .sort((a, b) => {
+              if (a.isCarryForward !== b.isCarryForward) return a.isCarryForward ? 1 : -1;
+              return b.mRate - a.mRate;
+            })
+            .map((r, i) => {
+              const short = r.prompt.length > 70 ? r.prompt.slice(0, 70) + '\u2026' : r.prompt;
+              const statusCell = r.isCarryForward
+                ? `<td style="padding:9px 14px;white-space:nowrap;"><span style="display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:600;background:#f1f5f9;color:#64748b;">${r.carryDate ? new Date(r.carryDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : 'prev'}</span></td>`
+                : `<td style="padding:9px 14px;white-space:nowrap;"><span style="display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700;background:#dcfce7;color:#15803d;">&#10003; New</span></td>`;
+              return `<tr style="border-bottom:1px solid #f1f5f9;">${statusCell}<td style="padding:9px 14px;color:#94a3b8;font-size:12px;">${i + 1}</td><td style="padding:9px 14px;color:#111;font-size:13px;">${short}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.mentioned}/${r.total}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.mRate}%</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.cRate}%</td></tr>`;
+            })
+            .join('');
+
+          // Competitor rows (top 10)
+          const competitorRows = sortedCompetitors.slice(0, 10).map((c, i) =>
+            `<tr style="border-bottom:1px solid #f1f5f9;"><td style="padding:9px 14px;color:#94a3b8;font-size:12px;">${i + 1}</td><td style="padding:9px 14px;color:#111;font-weight:600;font-size:13px;">${c.name}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${c.mentions}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${c.citations}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${c.visibility}%</td></tr>`
+          ).join('');
+
+          // Action item rows (high priority first, max 5)
+          const priOrder = { high: 0, medium: 1, low: 2 };
+          const actionRows = actionItems
+            .sort((a, b) => (priOrder[a.priority] || 0) - (priOrder[b.priority] || 0))
+            .slice(0, 5)
+            .map((item) => {
+              const bg = item.priority === 'high' ? '#ef4444' : item.priority === 'medium' ? '#f59e0b' : '#22c55e';
+              return `<tr style="border-bottom:1px solid #f1f5f9;"><td style="padding:10px 14px;white-space:nowrap;"><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;text-transform:uppercase;color:#fff;background:${bg};">${item.priority}</span></td><td style="padding:10px 14px;"><div style="color:#111;font-size:13px;font-weight:600;margin-bottom:2px;">${item.title}</div><div style="color:#64748b;font-size:12px;">${item.description}</div></td><td style="padding:10px 14px;color:#4f46e5;font-size:12px;font-weight:600;white-space:nowrap;">${item.impact}</td></tr>`;
+            })
+            .join('');
+
+          const appUrl = process.env.FRONTEND_URL || 'https://app.suparank.ai';
+          const dashboardUrl = `${appUrl}/workspace/${ws?.workspaceNumber || 1}/ai-tracker`;
+
+          const emailOptions = {
+            to: owner.email,
+            fromName: 'SupaRank',
+            data: {
+              userName: owner.profile?.name || owner.email.split('@')[0],
+              trackerName: tracker.name || tracker.domain,
+              domain: tracker.domain,
+              scanDate: now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+              promptsScanned: results.length === allActivePrompts.length
+                ? `${results.length} scanned`
+                : `${results.length} scanned, ${carryForwardResults.length} from history`,
+              visibility: metrics.visibility || 0,
+              mentionRate: metrics.mentionRate || 0,
+              shareOfVoice: metrics.shareOfVoice || 0,
+              citationRate: metrics.citationRate || 0,
+              avgSentiment: avgSentimentLabel,
+              platformRows,
+              promptRows,
+              competitorRows: competitorRows || '<tr><td colspan="5" style="padding:12px 14px;color:#94a3b8;font-size:13px;">No competitors detected</td></tr>',
+              actionRows: actionRows || '<tr><td colspan="3" style="padding:12px 14px;color:#94a3b8;font-size:13px;">No actions at this time</td></tr>',
+              dashboardUrl,
+            },
+          };
+          await applyCustomTemplate('scan_completed', emailOptions);
+          await sendEmail(emailOptions);
+          console.log(`[ai-tracker-scan] sent scan summary email to ${owner.email} for tracker ${trackerId}`);
+        }
+      }
+    } catch (emailErr) {
+      console.error(`[ai-tracker-scan] failed to send scan summary email for tracker ${trackerId}:`, emailErr.message);
+    }
   } catch (err) {
     console.error('[ai-tracker-scan] error:', err.message);
 
@@ -565,9 +1188,11 @@ async function executeScan(trackerId, userId = null) {
       });
     }
 
+    // Schedule retry in 1 hour so the cron auto-recovers transient failures
+    const retryAt = new Date(Date.now() + 60 * 60 * 1000);
     await AiTracker.findByIdAndUpdate(trackerId, {
-      $set: { scanStatus: 'failed', scanError: err.message, currentScanId: null },
-    }).catch(() => {});
+      $set: { scanStatus: 'failed', scanError: (err.message || 'Scan failed').slice(0, 500), currentScanId: null, nextScanAt: retryAt },
+    }).catch((e) => console.error(`[ai-tracker-scan] failed to update scan failure status for tracker ${trackerId}:`, e.message));
   }
 }
 
@@ -576,9 +1201,11 @@ async function executeScan(trackerId, userId = null) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function buildDashboardResponse(tracker) {
-  const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id });
-  const competitors = await AiTrackerCompetitor.find({ trackerId: tracker._id });
+  // Fetch all non-locked prompts (including inactive) so ManagePromptsView can show them
+  const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id, locked: { $ne: true } }).limit(500);
+  const activePromptCount = prompts.filter(p => p.active !== false).length;
 
+  // recentScans (limit 12): used for trend chart and latestScan/previousScan references
   const recentScans = await AiTrackerScan.find({
     trackerId: tracker._id,
     status: 'ready',
@@ -587,12 +1214,26 @@ async function buildDashboardResponse(tracker) {
     .limit(12)
     .lean();
 
+  // carryScans: anchored on oldest lastScannedAt so carry-forward never loses slow-frequency prompts
+  // A monthly prompt last scanned 30 days ago will always be found, regardless of scan volume since then
+  const activePrompts = prompts.filter(p => p.active !== false && p.lastScannedAt);
+  const oldestNeeded = activePrompts.length > 0
+    ? activePrompts.reduce((min, p) => p.lastScannedAt < min ? p.lastScannedAt : min, activePrompts[0].lastScannedAt)
+    : null;
+  const carryScans = oldestNeeded
+    ? await AiTrackerScan.find({
+        trackerId: tracker._id,
+        status: 'ready',
+        completedAt: { $gte: oldestNeeded },
+      }).sort({ completedAt: -1 }).lean()
+    : recentScans;
+
   const latestScan = recentScans[0] || null;
   const previousScan = recentScans[1] || null;
 
-  const metrics = computeMetrics(latestScan, prompts.length, competitors);
-  const trackedPrompts = formatTrackedPrompts(prompts, latestScan, previousScan, recentScans);
-  const formattedCompetitors = formatCompetitors(competitors, latestScan, previousScan);
+  const metrics = computeMetrics(latestScan, activePromptCount, carryScans);
+  const trackedPrompts = formatTrackedPrompts(prompts, latestScan, previousScan, carryScans, tracker.domain);
+  const formattedCompetitors = formatCompetitors(latestScan, previousScan, tracker.domain);
   const changes = computeChanges(latestScan, previousScan);
   const trendData = computeTrendData(recentScans);
   const actionItems = generateActionItems(latestScan);
@@ -678,34 +1319,65 @@ const updateTracker = async (req, res) => {
 
 // ─── POST /:workspaceNumber/ai-tracker/suggest-prompts ────────────────────
 
-const DEFAULT_SUGGESTIONS = [
-  { prompt: 'best tools in your industry', category: 'brand', reason: 'High-volume query where your brand could be recommended' },
-  { prompt: 'how to solve problems your product addresses', category: 'feature', reason: 'Directly related to your core value proposition' },
-  { prompt: 'your brand vs competitors comparison', category: 'comparison', reason: 'Users actively compare products in your space' },
-  { prompt: 'best free alternatives in your category', category: 'brand', reason: 'Captures price-sensitive users searching for options' },
-  { prompt: 'how to get started with your type of product', category: 'feature', reason: 'High intent query matching onboarding use cases' },
-  { prompt: 'industry trends and tools for your market', category: 'industry', reason: 'Broad industry query where your brand could appear' },
-  { prompt: 'reviews and recommendations for your product type', category: 'brand', reason: 'Users seeking social proof before purchasing' },
-  { prompt: 'tips and best practices in your domain', category: 'industry', reason: 'Educational content where your brand adds authority' },
-];
+function buildDefaultSuggestions(domain) {
+  const brand = domain ? domain.replace(/^(https?:\/\/)?(www\.)?/, '').split('.')[0] : 'your brand';
+  return [
+    { prompt: `best ${brand} alternatives`, category: 'brand', reason: `Users comparing ${brand} to competitors` },
+    { prompt: `${brand} review`, category: 'brand', reason: `Users researching ${brand} before purchasing` },
+    { prompt: `what is ${brand} and how does it work`, category: 'feature', reason: `High-intent informational query about ${brand}` },
+    { prompt: `${brand} vs competitors`, category: 'comparison', reason: 'Users actively comparing products in your space' },
+    { prompt: `is ${brand} worth it`, category: 'brand', reason: 'Purchase-intent query seeking recommendations' },
+    { prompt: `best tools like ${brand}`, category: 'brand', reason: `Users exploring options similar to ${brand}` },
+    { prompt: `${brand} pricing and plans`, category: 'feature', reason: 'Commercial query from potential customers' },
+    { prompt: `how to get started with ${brand}`, category: 'feature', reason: 'Onboarding query from high-intent users' },
+  ];
+}
+
+// Simple in-memory rate limiter for suggestPrompts (max 5 calls per 60s per workspace)
+const _suggestRateMap = new Map();
+const SUGGEST_RATE_LIMIT = 5;
+const SUGGEST_RATE_WINDOW = 60000;
+// Prune stale entries every 5 minutes to prevent unbounded memory growth
+setInterval(() => {
+  try {
+    const now = Date.now();
+    for (const [key, entry] of _suggestRateMap) {
+      entry.timestamps = entry.timestamps.filter((t) => now - t < SUGGEST_RATE_WINDOW);
+      if (entry.timestamps.length === 0) _suggestRateMap.delete(key);
+    }
+  } catch (err) {
+    console.error('[ai-tracker] rate limiter cleanup failed:', err.message);
+  }
+}, 5 * 60 * 1000).unref();
 
 const suggestPrompts = async (req, res) => {
-  console.log('[suggest-prompts] route hit, body:', JSON.stringify(req.body));
   try {
     const workspace = req.workspace;
-    console.log('[suggest-prompts] workspace resolved:', workspace.workspaceNumber);
+
+    // Rate limit: max 5 requests per 60s per workspace
+    const rateKey = workspace._id.toString();
+    const now = Date.now();
+    const entry = _suggestRateMap.get(rateKey) || { timestamps: [] };
+    entry.timestamps = entry.timestamps.filter((t) => now - t < SUGGEST_RATE_WINDOW);
+    if (entry.timestamps.length >= SUGGEST_RATE_LIMIT) {
+      return res.status(429).json({ error: 'Too many suggestion requests. Please wait a minute.' });
+    }
+    entry.timestamps.push(now);
+    _suggestRateMap.set(rateKey, entry);
 
     const { domain } = req.body;
     if (!domain || typeof domain !== 'string' || !domain.trim()) {
-      console.log('[suggest-prompts] missing domain');
       return res.status(400).json({ error: 'Domain is required' });
     }
 
+    const domainTrimmed = domain.trim();
+    if (domainTrimmed.length > 253 || domainTrimmed.includes(' ') || !/^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$/.test(domainTrimmed)) {
+      return res.status(400).json({ error: 'Invalid domain format' });
+    }
+
     const apiKey = process.env.CHATGPT_API_KEY;
-    console.log('[suggest-prompts] CHATGPT_API_KEY present:', !!apiKey);
     if (!apiKey) {
-      console.log('[suggest-prompts] no API key, returning default suggestions');
-      return res.json({ suggestions: DEFAULT_SUGGESTIONS });
+      return res.json({ suggestions: buildDefaultSuggestions(domainTrimmed) });
     }
 
     const controller = new AbortController();
@@ -734,9 +1406,14 @@ Categories: brand, feature, comparison, industry.
 - comparison: queries comparing the brand to competitors
 - industry: broader industry queries where the brand could appear
 
-Make prompts realistic — what real users would ask AI assistants.`,
+CRITICAL RULES:
+- Every prompt MUST include the actual brand name or specific product/industry terms. AI assistants will receive these prompts as-is.
+- NEVER use placeholder phrases like "your industry", "your product", "your brand", "your category", "your domain". These will be sent directly to AI models and will fail.
+- Good: "best Suparank alternatives for SEO", "is HubSpot worth it for small businesses"
+- Bad: "best tools in your industry", "how to solve problems your product addresses"
+- Prompts must be self-contained and specific enough that an AI assistant can give a concrete answer.`,
             },
-            { role: 'user', content: `Domain: ${domain.trim()}` },
+            { role: 'user', content: `Domain: ${domainTrimmed}` },
           ],
           response_format: { type: 'json_object' },
         }),
@@ -745,17 +1422,22 @@ Make prompts realistic — what real users would ask AI assistants.`,
 
       if (!response.ok) {
         console.error('[suggest-prompts] OpenAI error:', response.status);
-        return res.json({ suggestions: DEFAULT_SUGGESTIONS });
+        return res.json({ suggestions: buildDefaultSuggestions(domainTrimmed) });
       }
 
       const data = await response.json();
       const content = data.choices?.[0]?.message?.content;
       if (!content) {
-        return res.json({ suggestions: DEFAULT_SUGGESTIONS });
+        return res.json({ suggestions: buildDefaultSuggestions(domainTrimmed) });
       }
 
-      const parsed = JSON.parse(content);
-      const suggestions = Array.isArray(parsed.suggestions) ? parsed.suggestions : Array.isArray(parsed) ? parsed : DEFAULT_SUGGESTIONS;
+      let parsed;
+      try {
+        parsed = JSON.parse(content);
+      } catch {
+        return res.json({ suggestions: buildDefaultSuggestions(domainTrimmed) });
+      }
+      const suggestions = Array.isArray(parsed.suggestions) ? parsed.suggestions : Array.isArray(parsed) ? parsed : buildDefaultSuggestions(domainTrimmed);
 
       // Validate shape
       const valid = suggestions
@@ -764,16 +1446,17 @@ Make prompts realistic — what real users would ask AI assistants.`,
         .map((s) => ({
           prompt: s.prompt.trim(),
           category: ['brand', 'feature', 'comparison', 'industry'].includes(s.category) ? s.category : 'industry',
-          reason: typeof s.reason === 'string' ? s.reason : 'Relevant to your brand visibility',
+          reason: typeof s.reason === 'string' ? s.reason.slice(0, 200) : 'Relevant to your brand visibility',
         }));
 
-      res.json({ suggestions: valid.length > 0 ? valid : DEFAULT_SUGGESTIONS });
+      res.json({ suggestions: valid.length > 0 ? valid : buildDefaultSuggestions(domainTrimmed) });
     } finally {
       clearTimeout(timeout);
     }
   } catch (err) {
     console.error('suggestPrompts error:', err.message);
-    res.json({ suggestions: DEFAULT_SUGGESTIONS });
+    const fallbackDomain = req.body?.domain?.trim() || null;
+    res.json({ suggestions: buildDefaultSuggestions(fallbackDomain) });
   }
 };
 
@@ -783,10 +1466,14 @@ const setup = async (req, res) => {
   try {
     const workspace = req.workspace;
 
-    const { domain, name, prompts, competitors, platforms } = req.body;
+    const { domain, name, prompts, platforms } = req.body;
 
     if (!domain || typeof domain !== 'string' || !domain.trim()) {
       return res.status(400).json({ error: 'Domain is required' });
+    }
+    const domainTrimmed = domain.trim();
+    if (domainTrimmed.length > 253 || domainTrimmed.includes(' ') || !/^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$/.test(domainTrimmed)) {
+      return res.status(400).json({ error: 'Please enter a valid domain (e.g. example.com)' });
     }
     if (!Array.isArray(prompts) || prompts.length === 0) {
       return res.status(400).json({ error: 'At least one prompt is required' });
@@ -815,18 +1502,28 @@ const setup = async (req, res) => {
         }
       }
 
-      // Check prompt quota
+      // Check prompt quota (atomic: increment first, rollback if over)
       const promptCount = prompts.filter((p) => typeof p === 'string' && p.trim()).length;
       if (config?.maxAiTrackerPromptsPerMonth != null && promptCount > 0) {
         const limitType = config.aiTrackerPromptLimitType || 'monthly';
-        let used;
+        let newTotal;
         if (limitType === 'lifetime' && req.user?.userId) {
-          used = await UserUsageTracker.getCount(req.user.userId, 'aiTrackerPromptsCreated');
+          const doc = await UserUsageTracker.increment(req.user.userId, 'aiTrackerPromptsCreated', promptCount);
+          newTotal = doc?.aiTrackerPromptsCreated ?? promptCount;
         } else {
           const period = tierService.getPeriod(limitType);
-          used = await UsageTracker.getCount(orgId, 'aiTrackerPromptsCreated', period);
+          const doc = await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, promptCount);
+          newTotal = doc?.aiTrackerPromptsCreated ?? promptCount;
         }
-        if (used + promptCount > config.maxAiTrackerPromptsPerMonth) {
+        if (newTotal > config.maxAiTrackerPromptsPerMonth) {
+          // Rollback the increment
+          if (limitType === 'lifetime' && req.user?.userId) {
+            await UserUsageTracker.increment(req.user.userId, 'aiTrackerPromptsCreated', -promptCount);
+          } else {
+            const period = tierService.getPeriod(limitType);
+            await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, -promptCount);
+          }
+          const used = newTotal - promptCount;
           return res.status(429).json({
             error: `Your ${tier} plan allows ${config.maxAiTrackerPromptsPerMonth} AI Tracker prompts (${used} used, ${promptCount} requested)`,
             code: 'QUOTA_EXCEEDED',
@@ -887,38 +1584,12 @@ const setup = async (req, res) => {
       });
     }
 
-    // Increment prompt usage counter for the bulk insert
-    if (orgId && promptDocs.length > 0) {
-      const limitType = tierConfig?.aiTrackerPromptLimitType || 'monthly';
-      if (limitType === 'lifetime' && req.user?.userId) {
-        await UserUsageTracker.increment(req.user.userId, 'aiTrackerPromptsCreated', promptDocs.length);
-      } else {
-        const period = tierService.getPeriod(limitType);
-        await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, promptDocs.length);
-      }
-    }
+    // Usage already incremented atomically above (no separate increment needed)
 
-    // Create own-brand competitor
-    const brandName = domain.trim().replace(/^(https?:\/\/)?(www\.)?/, '').split('.')[0];
-    const capitalizedBrand = brandName.charAt(0).toUpperCase() + brandName.slice(1);
-    await AiTrackerCompetitor.create({
-      trackerId: tracker._id,
-      name: capitalizedBrand,
-      isOwn: true,
-    });
-
-    // Create additional competitors
-    if (Array.isArray(competitors)) {
-      const compDocs = competitors
-        .filter((c) => typeof c === 'string' && c.trim())
-        .map((c) => ({ trackerId: tracker._id, name: c.trim(), isOwn: false }));
-      if (compDocs.length > 0) {
-        await AiTrackerCompetitor.insertMany(compDocs);
-      }
-    }
+    // Competitors are now fully auto-detected by the scan engine from AI responses
 
     // Fire-and-forget: start first scan (pass userId so user free credits can be used)
-    executeScan(tracker._id, req.user?.userId).catch((err) => {
+    executeScan(tracker._id, req.user?.userId, { force: true }).catch((err) => {
       console.error('[ai-tracker-setup] scan failed:', err.message);
     });
 
@@ -962,13 +1633,26 @@ const triggerScan = async (req, res) => {
     const tracker = await resolveTracker(workspace, res);
     if (!tracker) return;
 
-    // Check if scan is already in progress
+    // Recover any scans stuck for 30+ minutes before checking limits
+    await recoverStuckScans(tracker.workspaceId);
+
+    // Check if scan is already in progress on this tracker
     if (tracker.scanStatus === 'pending' || tracker.scanStatus === 'scanning') {
       return res.status(409).json({ error: 'A scan is already in progress' });
     }
 
-    // Rate limit: at least 1 hour between scans
-    if (tracker.lastScanAt) {
+    // S81: Workspace-level concurrent scan limit (max 2 simultaneous scans)
+    const activeScans = await AiTracker.countDocuments({
+      workspaceId: tracker.workspaceId,
+      scanStatus: { $in: ['pending', 'scanning'] },
+    });
+    if (activeScans >= 2) {
+      return res.status(429).json({ error: 'Too many scans running in this workspace. Please wait for a scan to finish.' });
+    }
+
+    // Rate limit: at least 1 hour between scans (skip in development)
+    const isDev = process.env.NODE_ENV === 'development';
+    if (!isDev && tracker.lastScanAt) {
       const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
       if (tracker.lastScanAt > hourAgo) {
         return res.status(429).json({ error: 'Please wait at least 1 hour between scans' });
@@ -978,7 +1662,7 @@ const triggerScan = async (req, res) => {
     // Pre-check credit affordability so we can return 402 immediately.
     // Actual deduction happens inside executeScan (shared with cron path).
     if (req.creditContext?.deductionEnabled) {
-      const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id }).countDocuments();
+      const prompts = await AiTrackerPrompt.countDocuments({ trackerId: tracker._id });
       const platforms = tracker.defaultModels?.length || 0;
       const estimatedCredits = Math.max(1, prompts * platforms * 4);
       const canPay = await creditService.canAfford(req.creditContext.orgId, estimatedCredits, req.user?.userId);
@@ -996,7 +1680,7 @@ const triggerScan = async (req, res) => {
       $set: { scanStatus: 'pending', scanProgress: 0, scanError: null },
     });
 
-    executeScan(tracker._id, req.user?.userId).catch((err) => {
+    executeScan(tracker._id, req.user?.userId, { force: true }).catch((err) => {
       console.error('[ai-tracker-scan] manual scan failed:', err.message);
     });
 
@@ -1020,8 +1704,24 @@ const addPrompt = async (req, res) => {
     if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
       return res.status(400).json({ error: 'Prompt is required' });
     }
+    if (prompt.trim().length > 500) {
+      return res.status(400).json({ error: 'Prompt must be 500 characters or fewer' });
+    }
 
-    // Check duplicate
+    // Sanitize models to only valid platform IDs
+    const VALID_PLATFORMS = ['chatgpt', 'gemini', 'claude', 'perplexity'];
+    const sanitizedModels = Array.isArray(models) && models.length > 0
+      ? models.filter((m) => VALID_PLATFORMS.includes(m))
+      : undefined;
+
+    if (frequency && !VALID_FREQUENCIES.includes(frequency)) {
+      return res.status(400).json({ error: `Invalid frequency. Must be one of: ${VALID_FREQUENCIES.join(', ')}` });
+    }
+    if (frequency === 'Daily' && !(await isDailyFrequencyAllowed(workspace))) {
+      return res.status(403).json({ error: 'Daily frequency requires a Professional or Agency plan' });
+    }
+
+    // Check duplicate — block if prompt already exists (active or inactive)
     const existing = await AiTrackerPrompt.findOne({
       trackerId: tracker._id,
       prompt: prompt.trim(),
@@ -1042,7 +1742,7 @@ const addPrompt = async (req, res) => {
     const doc = await AiTrackerPrompt.create({
       trackerId: tracker._id,
       prompt: prompt.trim(),
-      ...(Array.isArray(models) && models.length > 0 ? { models } : {}),
+      ...(sanitizedModels && sanitizedModels.length > 0 ? { models: sanitizedModels } : {}),
       ...(frequency ? { frequency } : {}),
       createdOnPlan,
     });
@@ -1069,6 +1769,8 @@ const removePrompt = async (req, res) => {
     if (!tracker) return;
 
     const { promptId } = req.params;
+    if (!isValidObjectId(promptId)) return res.status(400).json({ error: 'Invalid prompt ID' });
+
     const deleted = await AiTrackerPrompt.findOneAndDelete({
       _id: promptId,
       trackerId: tracker._id,
@@ -1095,11 +1797,22 @@ const updatePrompt = async (req, res) => {
     if (!tracker) return;
 
     const { promptId } = req.params;
+    if (!isValidObjectId(promptId)) return res.status(400).json({ error: 'Invalid prompt ID' });
+
     const { models, frequency, active } = req.body;
 
+    const VALID_PLATFORMS = ['chatgpt', 'gemini', 'claude', 'perplexity'];
     const update = {};
-    if (Array.isArray(models)) update.models = models;
-    if (frequency !== undefined) update.frequency = frequency;
+    if (Array.isArray(models)) update.models = models.filter((m) => VALID_PLATFORMS.includes(m));
+    if (frequency !== undefined) {
+      if (!VALID_FREQUENCIES.includes(frequency)) {
+        return res.status(400).json({ error: `Invalid frequency. Must be one of: ${VALID_FREQUENCIES.join(', ')}` });
+      }
+      if (frequency === 'Daily' && !(await isDailyFrequencyAllowed(workspace))) {
+        return res.status(403).json({ error: 'Daily frequency requires a Professional or Agency plan' });
+      }
+      update.frequency = frequency;
+    }
     if (active !== undefined) update.active = active;
 
     if (Object.keys(update).length === 0) {
@@ -1114,6 +1827,18 @@ const updatePrompt = async (req, res) => {
 
     if (!doc) {
       return res.status(404).json({ error: 'Prompt not found' });
+    }
+
+    // If frequency changed to a shorter interval, pull nextScanAt forward on the tracker
+    if (frequency !== undefined) {
+      const FREQ_DAYS = { 'Daily': 1, 'Weekly': 7, 'Bi-weekly': 14, 'Monthly': 30 };
+      const freqDays = FREQ_DAYS[frequency] || 7;
+      const baseTime = doc.lastScannedAt ? doc.lastScannedAt.getTime() : Date.now();
+      const promptNextDue = new Date(baseTime + freqDays * 24 * 60 * 60 * 1000);
+      const currentNextScan = tracker.nextScanAt ? tracker.nextScanAt.getTime() : Infinity;
+      if (promptNextDue.getTime() < currentNextScan) {
+        await AiTracker.findByIdAndUpdate(tracker._id, { $set: { nextScanAt: promptNextDue } });
+      }
     }
 
     res.json({
@@ -1142,6 +1867,12 @@ const bulkDeletePrompts = async (req, res) => {
     if (!Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ error: 'ids array is required' });
     }
+    if (ids.length > 500) {
+      return res.status(400).json({ error: 'Cannot delete more than 500 prompts at once' });
+    }
+    if (!ids.every(isValidObjectId)) {
+      return res.status(400).json({ error: 'All ids must be valid ObjectIds' });
+    }
 
     const result = await AiTrackerPrompt.deleteMany({
       _id: { $in: ids },
@@ -1168,6 +1899,9 @@ const addCompetitor = async (req, res) => {
     if (!name || typeof name !== 'string' || !name.trim()) {
       return res.status(400).json({ error: 'Competitor name is required' });
     }
+    if (name.trim().length > 100) {
+      return res.status(400).json({ error: 'Competitor name must be 100 characters or fewer' });
+    }
 
     const doc = await AiTrackerCompetitor.create({
       trackerId: tracker._id,
@@ -1177,6 +1911,9 @@ const addCompetitor = async (req, res) => {
 
     res.status(201).json({ id: doc._id.toString(), name: doc.name });
   } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ error: 'This competitor is already being tracked' });
+    }
     console.error('addCompetitor error:', err.message);
     res.status(500).json({ error: 'Failed to add competitor' });
   }
@@ -1192,6 +1929,8 @@ const removeCompetitor = async (req, res) => {
     if (!tracker) return;
 
     const { competitorId } = req.params;
+    if (!isValidObjectId(competitorId)) return res.status(400).json({ error: 'Invalid competitor ID' });
+
     const deleted = await AiTrackerCompetitor.findOneAndDelete({
       _id: competitorId,
       trackerId: tracker._id,
@@ -1208,6 +1947,35 @@ const removeCompetitor = async (req, res) => {
   }
 };
 
+// ─── POST /:workspaceNumber/ai-tracker/competitors/dismiss ───────────────
+
+const dismissSuggestedCompetitor = async (req, res) => {
+  try {
+    const workspace = req.workspace;
+
+    const tracker = await resolveTracker(workspace, res);
+    if (!tracker) return;
+
+    const { name } = req.body;
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ error: 'Competitor name is required' });
+    }
+
+    const trimmed = name.trim();
+    // Add to dismissedCompetitors if not already there
+    if (!tracker.dismissedCompetitors.includes(trimmed)) {
+      await AiTracker.findByIdAndUpdate(tracker._id, {
+        $addToSet: { dismissedCompetitors: trimmed },
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('dismissSuggestedCompetitor error:', err.message);
+    res.status(500).json({ error: 'Failed to dismiss competitor' });
+  }
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // MULTI-MONITOR ENDPOINT HANDLERS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1220,19 +1988,24 @@ const listMonitors = async (req, res) => {
 
     const trackers = await AiTracker.find({ workspaceId: workspace._id })
       .sort({ createdAt: 1 })
+      .limit(100)
       .lean();
 
-    const monitors = await Promise.all(trackers.map(async (t) => {
-      const promptCount = await AiTrackerPrompt.countDocuments({ trackerId: t._id });
-      return {
-        id: t._id.toString(),
-        name: t.name || t.domain,
-        domain: t.domain,
-        scanStatus: t.scanStatus,
-        lastScanAt: t.lastScanAt ? t.lastScanAt.toISOString() : null,
-        createdAt: t.createdAt.toISOString(),
-        promptCount,
-      };
+    // Single aggregation query instead of N+1 countDocuments
+    const promptCounts = await AiTrackerPrompt.aggregate([
+      { $match: { trackerId: { $in: trackers.map((t) => t._id) } } },
+      { $group: { _id: '$trackerId', count: { $sum: 1 } } },
+    ]);
+    const countMap = Object.fromEntries(promptCounts.map((p) => [p._id.toString(), p.count]));
+
+    const monitors = trackers.map((t) => ({
+      id: t._id.toString(),
+      name: t.name || t.domain,
+      domain: t.domain,
+      scanStatus: t.scanStatus,
+      lastScanAt: t.lastScanAt ? t.lastScanAt.toISOString() : null,
+      createdAt: t.createdAt.toISOString(),
+      promptCount: countMap[t._id.toString()] || 0,
     }));
 
     res.json({ monitors });
@@ -1248,10 +2021,14 @@ const createMonitor = async (req, res) => {
   try {
     const workspace = req.workspace;
 
-    const { domain, name, prompts, competitors, platforms } = req.body;
+    const { domain, name, prompts, platforms } = req.body;
 
     if (!domain || typeof domain !== 'string' || !domain.trim()) {
       return res.status(400).json({ error: 'Domain is required' });
+    }
+    const domainTrimmed = domain.trim();
+    if (domainTrimmed.length > 253 || domainTrimmed.includes(' ') || !/^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$/.test(domainTrimmed)) {
+      return res.status(400).json({ error: 'Please enter a valid domain (e.g. example.com)' });
     }
     if (!Array.isArray(prompts) || prompts.length === 0) {
       return res.status(400).json({ error: 'At least one prompt is required' });
@@ -1280,18 +2057,28 @@ const createMonitor = async (req, res) => {
         }
       }
 
-      // Check prompt quota
+      // Check prompt quota (atomic: increment first, rollback if over)
       const promptCount = prompts.filter((p) => typeof p === 'string' && p.trim()).length;
       if (config?.maxAiTrackerPromptsPerMonth != null && promptCount > 0) {
         const limitType = config.aiTrackerPromptLimitType || 'monthly';
-        let used;
+        let newTotal;
         if (limitType === 'lifetime' && req.user?.userId) {
-          used = await UserUsageTracker.getCount(req.user.userId, 'aiTrackerPromptsCreated');
+          const doc = await UserUsageTracker.increment(req.user.userId, 'aiTrackerPromptsCreated', promptCount);
+          newTotal = doc?.aiTrackerPromptsCreated ?? promptCount;
         } else {
           const period = tierService.getPeriod(limitType);
-          used = await UsageTracker.getCount(orgId, 'aiTrackerPromptsCreated', period);
+          const doc = await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, promptCount);
+          newTotal = doc?.aiTrackerPromptsCreated ?? promptCount;
         }
-        if (used + promptCount > config.maxAiTrackerPromptsPerMonth) {
+        if (newTotal > config.maxAiTrackerPromptsPerMonth) {
+          // Rollback the increment
+          if (limitType === 'lifetime' && req.user?.userId) {
+            await UserUsageTracker.increment(req.user.userId, 'aiTrackerPromptsCreated', -promptCount);
+          } else {
+            const period = tierService.getPeriod(limitType);
+            await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, -promptCount);
+          }
+          const used = newTotal - promptCount;
           return res.status(429).json({
             error: `Your ${tier} plan allows ${config.maxAiTrackerPromptsPerMonth} AI Tracker prompts (${used} used, ${promptCount} requested)`,
             code: 'QUOTA_EXCEEDED',
@@ -1351,38 +2138,12 @@ const createMonitor = async (req, res) => {
       });
     }
 
-    // Increment prompt usage counter for the bulk insert
-    if (orgId && promptDocs.length > 0) {
-      const limitType = tierConfig?.aiTrackerPromptLimitType || 'monthly';
-      if (limitType === 'lifetime' && req.user?.userId) {
-        await UserUsageTracker.increment(req.user.userId, 'aiTrackerPromptsCreated', promptDocs.length);
-      } else {
-        const period = tierService.getPeriod(limitType);
-        await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, promptDocs.length);
-      }
-    }
+    // Usage already incremented atomically above (no separate increment needed)
 
-    // Create own-brand competitor
-    const brandName = domain.trim().replace(/^(https?:\/\/)?(www\.)?/, '').split('.')[0];
-    const capitalizedBrand = brandName.charAt(0).toUpperCase() + brandName.slice(1);
-    await AiTrackerCompetitor.create({
-      trackerId: tracker._id,
-      name: capitalizedBrand,
-      isOwn: true,
-    });
-
-    // Create additional competitors
-    if (Array.isArray(competitors)) {
-      const compDocs = competitors
-        .filter((c) => typeof c === 'string' && c.trim())
-        .map((c) => ({ trackerId: tracker._id, name: c.trim(), isOwn: false }));
-      if (compDocs.length > 0) {
-        await AiTrackerCompetitor.insertMany(compDocs);
-      }
-    }
+    // Competitors are now fully auto-detected by the scan engine from AI responses
 
     // Fire-and-forget: start first scan (pass userId so user free credits can be used)
-    executeScan(tracker._id, req.user?.userId).catch((err) => {
+    executeScan(tracker._id, req.user?.userId, { force: true }).catch((err) => {
       console.error('[ai-tracker-monitor] scan failed:', err.message);
     });
 
@@ -1406,10 +2167,12 @@ const deleteMonitor = async (req, res) => {
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 
-    // Cascade delete all associated data
-    await AiTrackerScan.deleteMany({ trackerId: tracker._id });
-    await AiTrackerPrompt.deleteMany({ trackerId: tracker._id });
-    await AiTrackerCompetitor.deleteMany({ trackerId: tracker._id });
+    // Cascade delete all associated data (delete tracker last to avoid orphans)
+    await Promise.all([
+      AiTrackerScan.deleteMany({ trackerId: tracker._id }),
+      AiTrackerPrompt.deleteMany({ trackerId: tracker._id }),
+      AiTrackerCompetitor.deleteMany({ trackerId: tracker._id }),
+    ]);
     await AiTracker.findByIdAndDelete(tracker._id);
 
     res.json({ success: true });
@@ -1464,7 +2227,12 @@ const updateMonitor = async (req, res) => {
       }
       update.defaultModels = filtered;
     }
-    if (name && typeof name === 'string' && name.trim()) update.name = name.trim();
+    if (name && typeof name === 'string' && name.trim()) {
+      if (name.trim().length > 253) {
+        return res.status(400).json({ error: 'Monitor name must be 253 characters or fewer' });
+      }
+      update.name = name.trim();
+    }
 
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ error: 'No fields to update' });
@@ -1512,10 +2280,24 @@ const triggerMonitorScan = async (req, res) => {
     const tracker = await resolveMonitor(req, workspace, res);
     if (!tracker) return;
 
+    // Recover any scans stuck for 30+ minutes before checking limits
+    await recoverStuckScans(tracker.workspaceId);
+
     if (tracker.scanStatus === 'pending' || tracker.scanStatus === 'scanning') {
       return res.status(409).json({ error: 'A scan is already in progress' });
     }
-    if (tracker.lastScanAt) {
+
+    // Workspace-level concurrent scan limit (max 2 simultaneous scans)
+    const activeScans = await AiTracker.countDocuments({
+      workspaceId: tracker.workspaceId,
+      scanStatus: { $in: ['pending', 'scanning'] },
+    });
+    if (activeScans >= 2) {
+      return res.status(429).json({ error: 'Too many scans running in this workspace. Please wait for a scan to finish.' });
+    }
+
+    const isDev = process.env.NODE_ENV === 'development';
+    if (!isDev && tracker.lastScanAt) {
       const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
       if (tracker.lastScanAt > hourAgo) {
         return res.status(429).json({ error: 'Please wait at least 1 hour between scans' });
@@ -1525,7 +2307,7 @@ const triggerMonitorScan = async (req, res) => {
     // Pre-check credit affordability so we can return 402 immediately.
     // Actual deduction happens inside executeScan (shared with cron path).
     if (req.creditContext?.deductionEnabled) {
-      const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id }).countDocuments();
+      const prompts = await AiTrackerPrompt.countDocuments({ trackerId: tracker._id });
       const platforms = tracker.defaultModels?.length || 0;
       const estimatedCredits = Math.max(1, prompts * platforms * 4);
       const canPay = await creditService.canAfford(req.creditContext.orgId, estimatedCredits, req.user?.userId);
@@ -1542,7 +2324,7 @@ const triggerMonitorScan = async (req, res) => {
     await AiTracker.findByIdAndUpdate(tracker._id, {
       $set: { scanStatus: 'pending', scanProgress: 0, scanError: null },
     });
-    executeScan(tracker._id, req.user?.userId).catch((err) => {
+    executeScan(tracker._id, req.user?.userId, { force: true }).catch((err) => {
       console.error('[ai-tracker-scan] manual scan failed:', err.message);
     });
 
@@ -1563,6 +2345,22 @@ const addMonitorPrompt = async (req, res) => {
     if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
       return res.status(400).json({ error: 'Prompt is required' });
     }
+    if (prompt.trim().length > 500) {
+      return res.status(400).json({ error: 'Prompt must be 500 characters or fewer' });
+    }
+
+    // Sanitize models to only valid platform IDs
+    const VALID_PLATFORMS = ['chatgpt', 'gemini', 'claude', 'perplexity'];
+    const sanitizedModels = Array.isArray(models) && models.length > 0
+      ? models.filter((m) => VALID_PLATFORMS.includes(m))
+      : undefined;
+
+    if (frequency && !VALID_FREQUENCIES.includes(frequency)) {
+      return res.status(400).json({ error: `Invalid frequency. Must be one of: ${VALID_FREQUENCIES.join(', ')}` });
+    }
+    if (frequency === 'Daily' && !(await isDailyFrequencyAllowed(workspace))) {
+      return res.status(403).json({ error: 'Daily frequency requires a Professional or Agency plan' });
+    }
 
     const existing = await AiTrackerPrompt.findOne({ trackerId: tracker._id, prompt: prompt.trim() });
     if (existing) {
@@ -1581,7 +2379,7 @@ const addMonitorPrompt = async (req, res) => {
     const doc = await AiTrackerPrompt.create({
       trackerId: tracker._id,
       prompt: prompt.trim(),
-      ...(Array.isArray(models) && models.length > 0 ? { models } : {}),
+      ...(sanitizedModels && sanitizedModels.length > 0 ? { models: sanitizedModels } : {}),
       ...(frequency ? { frequency } : {}),
       createdOnPlan,
     });
@@ -1605,11 +2403,22 @@ const updateMonitorPrompt = async (req, res) => {
     if (!tracker) return;
 
     const { promptId } = req.params;
+    if (!isValidObjectId(promptId)) return res.status(400).json({ error: 'Invalid prompt ID' });
+
     const { models, frequency, active } = req.body;
 
+    const VALID_PLATFORMS = ['chatgpt', 'gemini', 'claude', 'perplexity'];
     const update = {};
-    if (Array.isArray(models)) update.models = models;
-    if (frequency !== undefined) update.frequency = frequency;
+    if (Array.isArray(models)) update.models = models.filter((m) => VALID_PLATFORMS.includes(m));
+    if (frequency !== undefined) {
+      if (!VALID_FREQUENCIES.includes(frequency)) {
+        return res.status(400).json({ error: `Invalid frequency. Must be one of: ${VALID_FREQUENCIES.join(', ')}` });
+      }
+      if (frequency === 'Daily' && !(await isDailyFrequencyAllowed(workspace))) {
+        return res.status(403).json({ error: 'Daily frequency requires a Professional or Agency plan' });
+      }
+      update.frequency = frequency;
+    }
     if (active !== undefined) update.active = active;
 
     if (Object.keys(update).length === 0) {
@@ -1626,6 +2435,18 @@ const updateMonitorPrompt = async (req, res) => {
       return res.status(404).json({ error: 'Prompt not found' });
     }
 
+    // If frequency changed to a shorter interval, pull nextScanAt forward on the tracker
+    if (frequency !== undefined) {
+      const FREQ_DAYS = { 'Daily': 1, 'Weekly': 7, 'Bi-weekly': 14, 'Monthly': 30 };
+      const freqDays = FREQ_DAYS[frequency] || 7;
+      const baseTime = doc.lastScannedAt ? doc.lastScannedAt.getTime() : Date.now();
+      const promptNextDue = new Date(baseTime + freqDays * 24 * 60 * 60 * 1000);
+      const currentNextScan = tracker.nextScanAt ? tracker.nextScanAt.getTime() : Infinity;
+      if (promptNextDue.getTime() < currentNextScan) {
+        await AiTracker.findByIdAndUpdate(tracker._id, { $set: { nextScanAt: promptNextDue } });
+      }
+    }
+
     res.json({ id: doc._id.toString(), prompt: doc.prompt, models: doc.models, frequency: doc.frequency, active: doc.active });
   } catch (err) {
     console.error('updateMonitorPrompt error:', err.message);
@@ -1640,6 +2461,8 @@ const removeMonitorPrompt = async (req, res) => {
     if (!tracker) return;
 
     const { promptId } = req.params;
+    if (!isValidObjectId(promptId)) return res.status(400).json({ error: 'Invalid prompt ID' });
+
     const deleted = await AiTrackerPrompt.findOneAndDelete({ _id: promptId, trackerId: tracker._id });
     if (!deleted) {
       return res.status(404).json({ error: 'Prompt not found' });
@@ -1662,6 +2485,12 @@ const bulkDeleteMonitorPrompts = async (req, res) => {
     if (!Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ error: 'ids array is required' });
     }
+    if (ids.length > 500) {
+      return res.status(400).json({ error: 'Cannot delete more than 500 prompts at once' });
+    }
+    if (!ids.every(isValidObjectId)) {
+      return res.status(400).json({ error: 'All ids must be valid ObjectIds' });
+    }
 
     const result = await AiTrackerPrompt.deleteMany({ _id: { $in: ids }, trackerId: tracker._id });
     res.json({ deleted: result.deletedCount });
@@ -1681,10 +2510,16 @@ const addMonitorCompetitor = async (req, res) => {
     if (!name || typeof name !== 'string' || !name.trim()) {
       return res.status(400).json({ error: 'Competitor name is required' });
     }
+    if (name.trim().length > 100) {
+      return res.status(400).json({ error: 'Competitor name must be 100 characters or fewer' });
+    }
 
     const doc = await AiTrackerCompetitor.create({ trackerId: tracker._id, name: name.trim(), isOwn: false });
     res.status(201).json({ id: doc._id.toString(), name: doc.name });
   } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ error: 'This competitor is already being tracked' });
+    }
     console.error('addMonitorCompetitor error:', err.message);
     res.status(500).json({ error: 'Failed to add competitor' });
   }
@@ -1697,6 +2532,8 @@ const removeMonitorCompetitor = async (req, res) => {
     if (!tracker) return;
 
     const { competitorId } = req.params;
+    if (!isValidObjectId(competitorId)) return res.status(400).json({ error: 'Invalid competitor ID' });
+
     const deleted = await AiTrackerCompetitor.findOneAndDelete({ _id: competitorId, trackerId: tracker._id });
     if (!deleted) {
       return res.status(404).json({ error: 'Competitor not found' });
@@ -1706,6 +2543,31 @@ const removeMonitorCompetitor = async (req, res) => {
   } catch (err) {
     console.error('removeMonitorCompetitor error:', err.message);
     res.status(500).json({ error: 'Failed to remove competitor' });
+  }
+};
+
+const dismissMonitorSuggestedCompetitor = async (req, res) => {
+  try {
+    const workspace = req.workspace;
+    const tracker = await resolveMonitor(req, workspace, res);
+    if (!tracker) return;
+
+    const { name } = req.body;
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ error: 'Competitor name is required' });
+    }
+
+    const trimmed = name.trim();
+    if (!tracker.dismissedCompetitors.includes(trimmed)) {
+      await AiTracker.findByIdAndUpdate(tracker._id, {
+        $addToSet: { dismissedCompetitors: trimmed },
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('dismissMonitorSuggestedCompetitor error:', err.message);
+    res.status(500).json({ error: 'Failed to dismiss competitor' });
   }
 };
 
@@ -1723,6 +2585,7 @@ module.exports = {
   bulkDeletePrompts,
   addCompetitor,
   removeCompetitor,
+  dismissSuggestedCompetitor,
   executeScan,
   // Multi-monitor
   listMonitors,
@@ -1738,4 +2601,8 @@ module.exports = {
   bulkDeleteMonitorPrompts,
   addMonitorCompetitor,
   removeMonitorCompetitor,
+  dismissMonitorSuggestedCompetitor,
+  // Dev helpers (no-op in production since _devTimeScale defaults to 1)
+  setDevTimeScale,
+  getDevTimeScale,
 };

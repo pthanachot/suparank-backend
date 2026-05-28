@@ -9,8 +9,13 @@ const platformResultSchema = new mongoose.Schema({
     default: 'not_mentioned',
   },
   cited: { type: Boolean, default: false },
-  citedFrom: { type: String, default: null },
+  citedFrom: { type: String, default: null, maxlength: 2048 },
+  normalizedPosition: { type: Number, default: null },
   aiResponse: { type: String, default: '' },
+  sentiment: { type: String, enum: ['positive', 'neutral', 'negative', null], default: null },
+  sentimentScore: { type: Number, default: null },
+  error: { type: Boolean, default: false },
+  fanoutQueries: { type: [String], default: [] },
 }, { _id: false });
 
 const promptResultSchema = new mongoose.Schema({
@@ -25,6 +30,11 @@ const competitorResultSchema = new mongoose.Schema({
   mentions: { type: Number, default: 0 },
   citations: { type: Number, default: 0 },
   visibility: { type: Number, default: 0 },
+}, { _id: false });
+
+const detectedBrandSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  mentionCount: { type: Number, default: 1 },
 }, { _id: false });
 
 const aiTrackerScanSchema = new mongoose.Schema({
@@ -42,8 +52,10 @@ const aiTrackerScanSchema = new mongoose.Schema({
   },
   results: { type: [promptResultSchema], default: [] },
   competitorResults: { type: [competitorResultSchema], default: [] },
+  detectedBrands: { type: [detectedBrandSchema], default: [] },
 }, { timestamps: true });
 
 aiTrackerScanSchema.index({ trackerId: 1, completedAt: -1 });
+aiTrackerScanSchema.index({ trackerId: 1, status: 1, completedAt: -1 });
 
 module.exports = mongoose.model('AiTrackerScan', aiTrackerScanSchema);

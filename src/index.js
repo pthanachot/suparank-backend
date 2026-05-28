@@ -16,8 +16,30 @@ const app = express();
 // Trust proxy for production
 app.set('trust proxy', 1);
 
-// Connect to MongoDB, then sync config from seed files
+// Connect to MongoDB, recover dead scans, then sync config from seed files
 connectDB()
+  .then(async () => {
+    // On startup, any scan stuck in 'scanning'/'pending' is dead (server was restarted).
+    // Run BEFORE cron fires to prevent race condition.
+    const AiTrackerStartup = require('./models/AiTracker');
+    const recovered = await AiTrackerStartup.updateMany(
+      { scanStatus: { $in: ['scanning', 'pending'] } },
+      { $set: { scanStatus: 'failed', scanError: 'Scan interrupted by server restart' } }
+    );
+    if (recovered.modifiedCount > 0) {
+      console.log(`[startup] recovered ${recovered.modifiedCount} interrupted scan(s)`);
+    }
+
+    // Recover stuck sitemap crawls on startup
+    const SitemapStartup = require('./models/Sitemap');
+    const recoveredCrawls = await SitemapStartup.updateMany(
+      { crawlStatus: 'crawling' },
+      { $set: { crawlStatus: 'error', crawlError: 'Crawl interrupted by server restart' } }
+    );
+    if (recoveredCrawls.modifiedCount > 0) {
+      console.log(`[startup] recovered ${recoveredCrawls.modifiedCount} interrupted sitemap crawl(s)`);
+    }
+  })
   .then(() => syncConfig())
   .then(() => console.log('Database ready'))
   .catch((error) => {
@@ -74,6 +96,8 @@ const aiTrackerRoutes = require('./routes/aiTrackerRoutes');
 const keywordRoutes = require('./routes/keywordRoutes');
 const imageRoutes = require('./routes/imageRoutes');
 const brandVoiceRoutes = require('./routes/brandVoiceRoutes');
+const sitesRoutes = require('./routes/sitesRoutes');
+const sitemapRoutes = require('./routes/sitemapRoutes');
 const orgRoutes = require('./routes/orgRoutes');
 const organizationRoutes = require('./routes/organizationRoutes');
 const adminRoutes = require('./routes/adminRoutes');
@@ -87,6 +111,12 @@ app.use('/api/b2-image', imageRoutes);
 app.use('/api/workspace', aiTrackerRoutes);
 app.use('/api/workspace', keywordRoutes);
 app.use('/api/workspace', brandVoiceRoutes);
+app.use('/api/workspace', sitesRoutes);
+app.use('/api/workspace', sitemapRoutes);
+// Static GSC OAuth callback (Google redirects here — workspace number is in the state param)
+const { authenticateToken: authForGsc } = require('./middleware/auth');
+const sitesController = require('./controllers/sitesController');
+app.get('/api/gsc/callback', authForGsc, sitesController.handleGscCallback);
 app.use('/api/workspace', workspaceRoutes);
 app.use('/api/workspaces', workspaceCrudRoutes);
 app.use('/api/org', orgRoutes);
@@ -105,28 +135,104 @@ if (process.env.NODE_ENV !== 'production') {
   try { app.use(require('./routes/devRoutes')); } catch {}
 }
 
-// Scheduled scan: check daily at 3:00 AM for trackers due for weekly scan
+// Scheduled scan: check daily at 3:00 AM for trackers due for scan
+// In development, run every minute so frequency logic can be tested without waiting overnight
 const cron = require('node-cron');
 const AiTracker = require('./models/AiTracker');
+const SitemapModel = require('./models/Sitemap');
+const Workspace = require('./models/Workspace');
 const { executeScan } = require('./controllers/aiTrackerController');
+const { crawlSite: crawlSitemapSite } = require('./services/sitemapCrawlerService');
+const tierServiceForCron = require('./services/tierService');
 
-cron.schedule('0 3 * * *', async () => {
+const cronSchedule = '0 3 * * *'; // Daily at 3 AM
+console.log(`[cron] scheduled tasks: daily at 3 AM`);
+
+let cronConsecutiveFailures = 0;
+
+cron.schedule(cronSchedule, async () => {
+  // Circuit breaker: skip ticks with exponential backoff when DB is unreachable
+  if (cronConsecutiveFailures > 0) {
+    const skipTicks = Math.min(Math.pow(2, cronConsecutiveFailures - 1), 30); // max ~30 min pause in dev
+    const shouldSkip = cronConsecutiveFailures > 1 && Math.random() > (1 / skipTicks);
+    if (shouldSkip) return; // silently skip to avoid log flood
+  }
+
   try {
+    // Recover scans stuck in 'scanning' for 30+ min (e.g. after internet drop)
+    const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000);
+    const recovered = await AiTracker.updateMany(
+      { scanStatus: { $in: ['scanning', 'pending'] }, updatedAt: { $lt: thirtyMinAgo } },
+      { $set: { scanStatus: 'failed', scanError: 'Scan timed out (recovered by cron)' } }
+    );
+    if (recovered.modifiedCount > 0) {
+      console.log(`[cron] recovered ${recovered.modifiedCount} stuck scan(s)`);
+    }
+
     const dueTrackers = await AiTracker.find({
-      scanStatus: 'ready',
+      scanStatus: { $in: ['ready', 'failed'] },
       nextScanAt: { $lte: new Date() },
     });
 
+    // DB query succeeded — reset circuit breaker
+    if (cronConsecutiveFailures > 0) {
+      console.log(`[cron] DB connection recovered after ${cronConsecutiveFailures} failure(s)`);
+      cronConsecutiveFailures = 0;
+    }
+
+    console.log(`[cron] tick — ${dueTrackers.length} tracker(s) due`);
     if (dueTrackers.length === 0) return;
     console.log(`[cron] Found ${dueTrackers.length} tracker(s) due for scan`);
 
-    for (const tracker of dueTrackers) {
-      executeScan(tracker._id).catch((err) => {
+    await Promise.allSettled(dueTrackers.map(async (tracker) => {
+      const ws = await Workspace.findById(tracker.workspaceId);
+      const userId = ws?.userId?.toString() || null;
+      try {
+        await executeScan(tracker._id, userId);
+      } catch (err) {
         console.error(`[cron] scan failed for tracker ${tracker._id}:`, err.message);
-      });
-    }
+      }
+    }));
   } catch (err) {
-    console.error('[cron] scheduled scan check failed:', err.message);
+    cronConsecutiveFailures++;
+    if (cronConsecutiveFailures <= 3) {
+      console.error('[cron] scheduled scan check failed:', err.message);
+    } else if (cronConsecutiveFailures === 4) {
+      console.error(`[cron] DB unreachable (${cronConsecutiveFailures} consecutive failures), suppressing further logs until recovery`);
+    }
+    // After 4+ failures, logs are silenced until recovery
+  }
+});
+
+// ─── Sitemap crawl scheduler (weekly, checked every cron tick) ──────────────
+cron.schedule(cronSchedule, async () => {
+  try {
+    // Recover stuck crawls (30+ min)
+    const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000);
+    await SitemapModel.updateMany(
+      { crawlStatus: 'crawling', updatedAt: { $lt: thirtyMinAgo } },
+      { $set: { crawlStatus: 'error', crawlError: 'Crawl timed out (recovered by cron)' } }
+    );
+
+    const dueSitemaps = await SitemapModel.find({
+      crawlStatus: { $in: ['idle', 'completed', 'error'] },
+      nextCrawlAt: { $lte: new Date() },
+    });
+
+    if (dueSitemaps.length === 0) return;
+    console.log(`[cron] ${dueSitemaps.length} sitemap(s) due for crawl`);
+
+    await Promise.allSettled(dueSitemaps.map(async (s) => {
+      try {
+        const { config } = await tierServiceForCron.getOrgTierConfig(s.organizationId);
+        const maxPages = config.maxCrawlPages ?? 500;
+        await crawlSitemapSite(s._id, { maxPages });
+      } catch (err) {
+        console.error(`[cron] sitemap crawl failed for ${s._id}:`, err.message);
+      }
+    }));
+  } catch (err) {
+    console.error('[cron] sitemap scheduler error:', err.message);
   }
 });
 

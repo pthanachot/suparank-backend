@@ -74,6 +74,15 @@ const tierConfigSchema = new mongoose.Schema(
 
     // ── Sites / GSC ──
     maxSites: { type: Number, default: null }, // null = unlimited
+    sitesSyncFrequency: {
+      type: String,
+      enum: ['daily', 'weekly'],
+      default: 'weekly',
+    },
+
+    // ── Sitemap Crawler ──
+    maxSitemaps: { type: Number, default: 3 },
+    maxCrawlPages: { type: Number, default: 500 },
 
     // ── Seats (organization members) ──
     maxSeats: { type: Number, default: 1 },

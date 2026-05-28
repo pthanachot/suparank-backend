@@ -34,12 +34,14 @@ const updateProfile = async (req, res) => {
     if (timezone !== undefined) {
       user.preferences = user.preferences || {};
       user.preferences.timezone = timezone;
+      user.markModified('preferences');
     }
 
     // Update email notifications preference
     if (emailNotifications !== undefined) {
       user.preferences = user.preferences || {};
       user.preferences.emailNotifications = !!emailNotifications;
+      user.markModified('preferences');
     }
 
     // Handle email change (requires re-verification)

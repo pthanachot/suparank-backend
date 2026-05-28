@@ -48,6 +48,11 @@ const MATRIX = [
   // Sites / GSC
   ['sites', 'read', true, true, true, true],
   ['sites', 'manage', true, true, false, false],
+
+  // Sitemap Crawler
+  ['sitemap', 'read', true, true, true, true],
+  ['sitemap', 'manage', true, true, false, false],
+  ['sitemap', 'use', true, true, true, false],
 ];
 
 const ROLE_NAMES = ['owner', 'admin', 'editor', 'viewer'];

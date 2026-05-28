@@ -80,6 +80,10 @@ const tierConfigSchema = new mongoose.Schema(
       default: 'weekly',
     },
 
+    // ── Sitemap Crawler ──
+    maxSitemaps: { type: Number, default: 3 },
+    maxCrawlPages: { type: Number, default: 500 },
+
     // ── Seats (organization members) ──
     maxSeats: { type: Number, default: 1 },
     extraSeatPrice: { type: Number, default: 0 }, // USD per extra seat per month

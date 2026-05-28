@@ -142,6 +142,16 @@ const FLAGS = [
     },
   },
   {
+    key: 'sitemap',
+    displayName: 'Sitemap Crawler',
+    description: 'Crawl your website to discover pages and generate sitemap.xml.',
+    enabled: true,
+    implemented: true,
+    conditions: {
+      custom: { tierLimitKey: 'maxSitemaps' },
+    },
+  },
+  {
     key: 'performanceCards',
     displayName: 'Performance Cards',
     description: 'View and export content performance reports.',

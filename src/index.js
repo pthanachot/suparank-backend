@@ -29,6 +29,16 @@ connectDB()
     if (recovered.modifiedCount > 0) {
       console.log(`[startup] recovered ${recovered.modifiedCount} interrupted scan(s)`);
     }
+
+    // Recover stuck sitemap crawls on startup
+    const SitemapStartup = require('./models/Sitemap');
+    const recoveredCrawls = await SitemapStartup.updateMany(
+      { crawlStatus: 'crawling' },
+      { $set: { crawlStatus: 'error', crawlError: 'Crawl interrupted by server restart' } }
+    );
+    if (recoveredCrawls.modifiedCount > 0) {
+      console.log(`[startup] recovered ${recoveredCrawls.modifiedCount} interrupted sitemap crawl(s)`);
+    }
   })
   .then(() => syncConfig())
   .then(() => console.log('Database ready'))
@@ -87,6 +97,7 @@ const keywordRoutes = require('./routes/keywordRoutes');
 const imageRoutes = require('./routes/imageRoutes');
 const brandVoiceRoutes = require('./routes/brandVoiceRoutes');
 const sitesRoutes = require('./routes/sitesRoutes');
+const sitemapRoutes = require('./routes/sitemapRoutes');
 const orgRoutes = require('./routes/orgRoutes');
 const organizationRoutes = require('./routes/organizationRoutes');
 const adminRoutes = require('./routes/adminRoutes');
@@ -101,6 +112,7 @@ app.use('/api/workspace', aiTrackerRoutes);
 app.use('/api/workspace', keywordRoutes);
 app.use('/api/workspace', brandVoiceRoutes);
 app.use('/api/workspace', sitesRoutes);
+app.use('/api/workspace', sitemapRoutes);
 // Static GSC OAuth callback (Google redirects here — workspace number is in the state param)
 const { authenticateToken: authForGsc } = require('./middleware/auth');
 const sitesController = require('./controllers/sitesController');
@@ -127,11 +139,14 @@ if (process.env.NODE_ENV !== 'production') {
 // In development, run every minute so frequency logic can be tested without waiting overnight
 const cron = require('node-cron');
 const AiTracker = require('./models/AiTracker');
+const SitemapModel = require('./models/Sitemap');
 const Workspace = require('./models/Workspace');
 const { executeScan } = require('./controllers/aiTrackerController');
+const { crawlSite: crawlSitemapSite } = require('./services/sitemapCrawlerService');
+const tierServiceForCron = require('./services/tierService');
 
-const cronSchedule = process.env.NODE_ENV !== 'production' ? '* * * * *' : '0 3 * * *';
-console.log(`[cron] AI scan scheduler: ${process.env.NODE_ENV !== 'production' ? 'every minute (dev)' : '3 AM daily (prod)'}`);
+const cronSchedule = '0 3 * * *'; // Daily at 3 AM
+console.log(`[cron] scheduled tasks: daily at 3 AM`);
 
 let cronConsecutiveFailures = 0;
 
@@ -186,6 +201,38 @@ cron.schedule(cronSchedule, async () => {
       console.error(`[cron] DB unreachable (${cronConsecutiveFailures} consecutive failures), suppressing further logs until recovery`);
     }
     // After 4+ failures, logs are silenced until recovery
+  }
+});
+
+// ─── Sitemap crawl scheduler (weekly, checked every cron tick) ──────────────
+cron.schedule(cronSchedule, async () => {
+  try {
+    // Recover stuck crawls (30+ min)
+    const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000);
+    await SitemapModel.updateMany(
+      { crawlStatus: 'crawling', updatedAt: { $lt: thirtyMinAgo } },
+      { $set: { crawlStatus: 'error', crawlError: 'Crawl timed out (recovered by cron)' } }
+    );
+
+    const dueSitemaps = await SitemapModel.find({
+      crawlStatus: { $in: ['idle', 'completed', 'error'] },
+      nextCrawlAt: { $lte: new Date() },
+    });
+
+    if (dueSitemaps.length === 0) return;
+    console.log(`[cron] ${dueSitemaps.length} sitemap(s) due for crawl`);
+
+    await Promise.allSettled(dueSitemaps.map(async (s) => {
+      try {
+        const { config } = await tierServiceForCron.getOrgTierConfig(s.organizationId);
+        const maxPages = config.maxCrawlPages ?? 500;
+        await crawlSitemapSite(s._id, { maxPages });
+      } catch (err) {
+        console.error(`[cron] sitemap crawl failed for ${s._id}:`, err.message);
+      }
+    }));
+  } catch (err) {
+    console.error('[cron] sitemap scheduler error:', err.message);
   }
 });
 

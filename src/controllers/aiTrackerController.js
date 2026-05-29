@@ -1628,12 +1628,22 @@ const setup = async (req, res) => {
       }
     }
 
-    const monitorName = (name && typeof name === 'string' && name.trim()) ? name.trim() : domain.trim();
+    let monitorName = (name && typeof name === 'string' && name.trim()) ? name.trim() : domain.trim();
 
-    // Check if monitor with same name already exists
+    // Check if monitor with same name already exists — auto-suffix if needed
     const existing = await AiTracker.findOne({ workspaceId: workspace._id, name: monitorName });
     if (existing) {
-      return res.status(409).json({ error: 'A monitor with this name already exists' });
+      // Try appending a number suffix to make it unique
+      let suffix = 2;
+      let candidate = `${monitorName} (${suffix})`;
+      while (await AiTracker.findOne({ workspaceId: workspace._id, name: candidate })) {
+        suffix++;
+        candidate = `${monitorName} (${suffix})`;
+        if (suffix > 20) {
+          return res.status(409).json({ error: 'A monitor with this name already exists. Please choose a different name.' });
+        }
+      }
+      monitorName = candidate;
     }
 
     // Create tracker
@@ -1648,7 +1658,7 @@ const setup = async (req, res) => {
       });
     } catch (createErr) {
       if (createErr.code === 11000) {
-        return res.status(409).json({ error: 'A monitor with this name already exists' });
+        return res.status(409).json({ error: 'A monitor with this name already exists. Please choose a different name.' });
       }
       throw createErr;
     }
@@ -2183,17 +2193,30 @@ const createMonitor = async (req, res) => {
       }
     }
 
-    const monitorName = (name && typeof name === 'string' && name.trim()) ? name.trim() : domain.trim();
+    let monitorName = (name && typeof name === 'string' && name.trim()) ? name.trim() : domain.trim();
 
-    // Check duplicate name
+    // Check duplicate name — auto-suffix if needed
+    console.log(`[createMonitor] workspaceId=${workspace._id}, monitorName="${monitorName}"`);
     const existing = await AiTracker.findOne({ workspaceId: workspace._id, name: monitorName });
+    console.log(`[createMonitor] existing check result:`, existing ? `found _id=${existing._id} name="${existing.name}"` : 'null (no match)');
     if (existing) {
-      return res.status(409).json({ error: 'A monitor with this name already exists' });
+      let suffix = 2;
+      let candidate = `${monitorName} (${suffix})`;
+      while (await AiTracker.findOne({ workspaceId: workspace._id, name: candidate })) {
+        suffix++;
+        candidate = `${monitorName} (${suffix})`;
+        if (suffix > 20) {
+          return res.status(409).json({ error: 'A monitor with this name already exists. Please choose a different name.' });
+        }
+      }
+      monitorName = candidate;
+      console.log(`[createMonitor] auto-suffixed to "${monitorName}"`);
     }
 
     // Create tracker
     let tracker;
     try {
+      console.log(`[createMonitor] creating tracker: workspace=${workspace._id}, name="${monitorName}", domain="${domain.trim()}"`);
       tracker = await AiTracker.create({
         workspaceId: workspace._id,
         name: monitorName,
@@ -2201,9 +2224,13 @@ const createMonitor = async (req, res) => {
         defaultModels: selectedPlatforms,
         scanStatus: 'pending',
       });
+      console.log(`[createMonitor] created successfully: _id=${tracker._id}`);
     } catch (createErr) {
+      console.error(`[createMonitor] create error: code=${createErr.code}, message=${createErr.message}`);
       if (createErr.code === 11000) {
-        return res.status(409).json({ error: 'A monitor with this name already exists' });
+        // Log indexes to diagnose stale unique constraints
+        try { const idxs = await AiTracker.collection.indexes(); console.error('[createMonitor] collection indexes:', JSON.stringify(idxs)); } catch {}
+        return res.status(409).json({ error: 'A monitor with this name already exists. Please choose a different name.' });
       }
       throw createErr;
     }

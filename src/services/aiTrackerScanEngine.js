@@ -46,32 +46,48 @@ async function searchChatGPT(query) {
   const apiKey = process.env.CHATGPT_API_KEY;
   if (!apiKey) throw new Error('CHATGPT_API_KEY not configured');
 
+  const systemPrompt = 'You MUST search the web for current information before answering. For EVERY claim or fact, cite the source immediately after it using markdown link format: [domain.com](full_url). Example: "Google holds 90% market share [mangools.com](https://mangools.com/blog/search-engines/)." NEVER list sources at the end. NEVER use numbered references like [1] or [2]. Always inline the citation right after the statement it supports. Answer directly and comprehensively. NEVER ask clarifying questions, follow-up questions, or ask what the user means. If the query is ambiguous, interpret it broadly and answer all reasonable interpretations. Do not answer from memory alone.';
+
+  // Try Responses API first (returns real fanout queries), fall back to Chat Completions
+  try {
+    const result = await _searchChatGPTResponses(query, apiKey, systemPrompt);
+    return result;
+  } catch (responsesErr) {
+    console.warn(`[chatgpt] Responses API failed, falling back to Chat Completions: ${responsesErr.message}`);
+    return _searchChatGPTCompletions(query, apiKey, systemPrompt);
+  }
+}
+
+/** ChatGPT via Responses API — returns real web_search_call fanout queries */
+async function _searchChatGPTResponses(query, apiKey, systemPrompt) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 90000);
 
   try {
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    const res = await fetch('https://api.openai.com/v1/responses', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'gpt-5-search-api',
-        messages: [
-          { role: 'system', content: 'You MUST search the web for current information before answering. For EVERY claim or fact, cite the source immediately after it using markdown link format: [domain.com](full_url). Example: "Google holds 90% market share [mangools.com](https://mangools.com/blog/search-engines/)." NEVER list sources at the end. NEVER use numbered references like [1] or [2]. Always inline the citation right after the statement it supports. Answer directly and comprehensively. NEVER ask clarifying questions, follow-up questions, or ask what the user means. If the query is ambiguous, interpret it broadly and answer all reasonable interpretations. Do not answer from memory alone.' },
-          { role: 'user', content: query },
+        model: 'gpt-5-mini',
+        instructions: systemPrompt,
+        input: query,
+        tools: [
+          {
+            type: 'web_search',
+            search_context_size: 'medium',
+          },
         ],
-        web_search_options: {
-          search_context_size: 'medium',
-        },
+        store: false,
       }),
       signal: controller.signal,
     });
 
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(`OpenAI returned status ${res.status}: ${text.slice(0, 200)}`);
+      throw new Error(`OpenAI Responses API returned status ${res.status}: ${text.slice(0, 200)}`);
     }
 
     const data = await res.json();
@@ -79,17 +95,34 @@ async function searchChatGPT(query) {
     const citations = [];
     const seen = new Set();
     let annotations = [];
+    const fanoutQueries = [];
 
-    if (data.choices && data.choices.length > 0) {
-      const choice = data.choices[0];
-      answer = choice.message?.content || '';
+    // Parse output items from Responses API
+    for (const item of (data.output || [])) {
+      // Extract real search queries from web_search_call items
+      if (item.type === 'web_search_call' && item.action?.type === 'search') {
+        if (Array.isArray(item.action.queries)) {
+          for (const q of item.action.queries) {
+            if (q && !fanoutQueries.includes(q)) fanoutQueries.push(q);
+          }
+        } else if (item.action.query) {
+          if (!fanoutQueries.includes(item.action.query)) fanoutQueries.push(item.action.query);
+        }
+      }
 
-      // Extract citations from structured annotations (keep full objects for position info)
-      annotations = choice.message?.annotations || [];
-      for (const ann of annotations) {
-        if (ann.type === 'url_citation' && ann.url_citation?.url && !seen.has(ann.url_citation.url)) {
-          seen.add(ann.url_citation.url);
-          citations.push(ann.url_citation.url);
+      // Extract answer text and citation annotations from message items
+      if (item.type === 'message' && item.role === 'assistant') {
+        for (const block of (item.content || [])) {
+          if (block.type === 'output_text') {
+            answer += block.text || '';
+            annotations = block.annotations || [];
+            for (const ann of annotations) {
+              if (ann.type === 'url_citation' && ann.url && !seen.has(ann.url)) {
+                seen.add(ann.url);
+                citations.push(ann.url);
+              }
+            }
+          }
         }
       }
     }
@@ -106,19 +139,78 @@ async function searchChatGPT(query) {
     }
 
     if (!answer || answer.trim().length === 0) {
-      throw new Error('ChatGPT returned empty response');
+      throw new Error('ChatGPT Responses API returned empty response');
     }
 
-    // ChatGPT doesn't expose internal search queries — ask it explicitly
-    const fanoutQueries = await generateSubQueries(
-      query,
-      'https://api.openai.com/v1/chat/completions',
-      apiKey,
-      'gpt-4o-mini',
-    );
-
-    console.log(`[chatgpt] query_len=${query.length} answer_len=${answer.length} citations=${citations.length} fanout=${fanoutQueries.length}`);
+    console.log(`[chatgpt-responses] query_len=${query.length} answer_len=${answer.length} citations=${citations.length} fanout=${fanoutQueries.length}`);
     return { answer, citations, fanoutQueries, annotations };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** ChatGPT via Chat Completions API — fallback when Responses API fails (no fanout queries) */
+async function _searchChatGPTCompletions(query, apiKey, systemPrompt) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 90000);
+
+  try {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-search-preview',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: query },
+        ],
+        web_search_options: { search_context_size: 'medium' },
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`OpenAI Chat Completions returned status ${res.status}: ${text.slice(0, 200)}`);
+    }
+
+    const data = await res.json();
+    let answer = '';
+    const citations = [];
+    const seen = new Set();
+    let annotations = [];
+
+    if (data.choices && data.choices.length > 0) {
+      const choice = data.choices[0];
+      answer = choice.message?.content || '';
+      annotations = choice.message?.annotations || [];
+      for (const ann of annotations) {
+        if (ann.type === 'url_citation' && ann.url_citation?.url && !seen.has(ann.url_citation.url)) {
+          seen.add(ann.url_citation.url);
+          citations.push(ann.url_citation.url);
+        }
+      }
+    }
+
+    if (citations.length === 0 && answer) {
+      const fallback = extractCitationsFromText(answer);
+      for (const url of fallback) {
+        if (!seen.has(url)) {
+          seen.add(url);
+          citations.push(url);
+        }
+      }
+    }
+
+    if (!answer || answer.trim().length === 0) {
+      throw new Error('ChatGPT Chat Completions returned empty response');
+    }
+
+    console.log(`[chatgpt-completions-fallback] query_len=${query.length} answer_len=${answer.length} citations=${citations.length}`);
+    return { answer, citations, fanoutQueries: [], annotations };
   } finally {
     clearTimeout(timeout);
   }
@@ -145,7 +237,7 @@ async function searchGemini(query) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: 'You MUST search the web for current information before answering. For EVERY claim or fact, cite the source immediately after it using markdown link format: [domain.com](full_url). Example: "Google holds 90% market share [mangools.com](https://mangools.com/blog/search-engines/)." NEVER list sources at the end. NEVER use numbered references like [1] or [2]. Always inline the citation right after the statement it supports. Answer directly and comprehensively. NEVER ask clarifying questions, follow-up questions, or ask what the user means. If the query is ambiguous, interpret it broadly and answer all reasonable interpretations. Do not answer from memory alone.\n\n' + query }] }],
+        contents: [{ parts: [{ text: 'You MUST search the web thoroughly for current information before answering. Search for MULTIPLE aspects of the question — specific brands, products, comparisons, rankings, and recent developments separately. For EVERY claim or fact, cite the source immediately after it using markdown link format: [domain.com](full_url). Example: "Google holds 90% market share [mangools.com](https://mangools.com/blog/search-engines/)." NEVER list sources at the end. NEVER use numbered references like [1] or [2]. Always inline the citation right after the statement it supports. Answer directly and comprehensively. NEVER ask clarifying questions, follow-up questions, or ask what the user means. If the query is ambiguous, interpret it broadly and answer all reasonable interpretations. Do not answer from memory alone — always search first.\n\n' + query }] }],
         tools: [{ google_search: {} }],
       }),
       signal: controller.signal,
@@ -239,6 +331,7 @@ async function searchPerplexity(query) {
           { role: 'system', content: 'You MUST search the web for current information before answering. For EVERY claim or fact, cite the source immediately after it using markdown link format: [domain.com](full_url). Example: "Google holds 90% market share [mangools.com](https://mangools.com/blog/search-engines/)." NEVER list sources at the end. NEVER use numbered references like [1] or [2]. Always inline the citation right after the statement it supports. Answer directly and comprehensively. NEVER ask clarifying questions, follow-up questions, or ask what the user means. If the query is ambiguous, interpret it broadly and answer all reasonable interpretations. Do not answer from memory alone.' },
           { role: 'user', content: query },
         ],
+        return_related_questions: true,
       }),
       signal: controller.signal,
     });
@@ -271,13 +364,8 @@ async function searchPerplexity(query) {
       throw new Error('Perplexity returned empty response');
     }
 
-    // Perplexity doesn't expose internal search queries — ask it explicitly
-    const fanoutQueries = await generateSubQueries(
-      query,
-      'https://api.perplexity.ai/chat/completions',
-      apiKey,
-      'sonar',
-    );
+    // Use related_questions as fanout queries — real queries generated by Perplexity
+    const fanoutQueries = Array.isArray(data.related_questions) ? data.related_questions.filter(q => typeof q === 'string' && q.trim()) : [];
 
     console.log(`[perplexity] query_len=${query.length} answer_len=${answer.length} citations=${citations.length} fanout=${fanoutQueries.length}`);
     return { answer, citations, fanoutQueries };
@@ -311,9 +399,9 @@ async function searchClaude(query) {
       body: JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 2048,
-        system: 'You MUST search the web for current information before answering. For EVERY claim or fact, cite the source immediately after it using markdown link format: [domain.com](full_url). Example: "Google holds 90% market share [mangools.com](https://mangools.com/blog/search-engines/)." NEVER list sources at the end. NEVER use numbered references like [1] or [2]. Always inline the citation right after the statement it supports. Answer directly and comprehensively. NEVER ask clarifying questions, follow-up questions, or ask what the user means. If the query is ambiguous, interpret it broadly and answer all reasonable interpretations. Do not answer from memory alone.',
+        system: 'You MUST search the web thoroughly for current information before answering. Perform MULTIPLE web searches covering different aspects of the question — search for specific brands, products, comparisons, rankings, and recent news separately. For EVERY claim or fact, cite the source immediately after it using markdown link format: [domain.com](full_url). Example: "Google holds 90% market share [mangools.com](https://mangools.com/blog/search-engines/)." NEVER list sources at the end. NEVER use numbered references like [1] or [2]. Always inline the citation right after the statement it supports. Answer directly and comprehensively. NEVER ask clarifying questions, follow-up questions, or ask what the user means. If the query is ambiguous, interpret it broadly and answer all reasonable interpretations. Do not answer from memory alone — always search first.',
         messages: [{ role: 'user', content: query }],
-        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 5 }],
+        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 10 }],
       }),
       signal: controller.signal,
     });
@@ -917,51 +1005,6 @@ function getAvailablePlatforms() {
 }
 
 /**
- * Ask a platform to generate search sub-queries for a given prompt.
- * Used for ChatGPT and Perplexity which don't expose their internal queries.
- * Returns [] on any error — never throws.
- *
- * @param {string} query - The main prompt
- * @param {string} endpoint - API endpoint URL
- * @param {string} apiKey - API key
- * @param {string} model - Model ID to use
- * @returns {Promise<string[]>}
- */
-async function generateSubQueries(query, endpoint, apiKey, model) {
-  if (!apiKey) return [];
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
-  try {
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model,
-        max_tokens: 200,
-        messages: [{
-          role: 'user',
-          content: `For this question: "${query}"\n\nList up to 5 specific search queries you would use internally to research this comprehensively.\n\nRespond ONLY with a valid JSON array of strings. No extra text. Example: ["query one","query two","query three"]`,
-        }],
-      }),
-      signal: controller.signal,
-    });
-    if (!res.ok) return [];
-    const data = await res.json();
-    const content = (data.choices?.[0]?.message?.content || '').trim();
-    // Extract JSON array even if model adds surrounding text
-    const match = content.match(/\[[\s\S]*\]/);
-    if (!match) return [];
-    const parsed = JSON.parse(match[0]);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter((q) => typeof q === 'string' && q.trim()).slice(0, 5);
-  } catch {
-    return [];
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
  * Call the appropriate platform's search function.
  */
 async function searchPlatform(platformId, query) {
@@ -1066,13 +1109,21 @@ async function runScan(tracker, prompts, competitors, onProgress) {
           });
         }
 
-        // Count words
+        // Count words from platform search response
         if (answer) {
           totalAnswerWords += answer.trim().split(/\s+/).filter(Boolean).length;
         }
 
         // Step 3: Unified analysis — single Claude Haiku call
         const analysis = await analyzeResponse(answer, prompt.prompt, brandName, tracker.domain);
+
+        // Count words from extractor response (AI API call #3)
+        const extractorWords = [
+          ...(analysis.brandRanking || []).map(b => b.brandName),
+          ...(analysis.citedUrls || []),
+          analysis.sentiment || '',
+        ].join(' ').split(/\s+/).filter(Boolean).length;
+        totalAnswerWords += Math.max(extractorWords, 10); // minimum 10 words per extraction call
 
         platformResult = {
           platformId: platform.id,

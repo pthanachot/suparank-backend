@@ -117,22 +117,40 @@ function computeWeightedVisibility(platforms) {
   const cited = valid.filter((p) => p.cited);
 
   const mentionRate = (mentioned.length / total) * 100;
-  const citationRate = (cited.length / total) * 100;
+  const citationRate = mentioned.length > 0 ? (cited.length / mentioned.length) * 100 : 0;
 
-  // Position score: average of (1 - normalizedPosition) for mentioned platforms
-  // Higher = mentioned earlier = better. Falls back to 50 if no position data.
+  // Position score: use position (1-10), fall back to brandRanking, then normalizedPosition
   let positionScore = 0;
   if (mentioned.length > 0) {
-    const positionValues = mentioned.map((p) =>
-      p.normalizedPosition != null ? (1 - p.normalizedPosition) * 100 : 50
-    );
+    const positionValues = mentioned.map((p) => {
+      // New field: position (1-10 scale, 1=best)
+      if (p.position != null) {
+        return (10 - p.position) / 9 * 100; // position 1 → 100, position 10 → 0
+      }
+      // Backward compat: brandRanking
+      if (p.brandRanking && p.brandRanking.length > 0) {
+        const targetIdx = p.brandRanking.findIndex(b => b.isTargetBrand);
+        if (targetIdx >= 0) {
+          return p.brandRanking.length > 1
+            ? (1 - targetIdx / (p.brandRanking.length - 1)) * 100
+            : 100;
+        }
+      }
+      // Backward compat: normalizedPosition
+      return p.normalizedPosition != null ? (1 - p.normalizedPosition) * 100 : 50;
+    });
     positionScore = positionValues.reduce((sum, v) => sum + v, 0) / mentioned.length;
   }
 
   return Math.round(mentionRate * W_MENTION + positionScore * W_POSITION + citationRate * W_CITATION);
 }
 
-function computeMetrics(latestScan, promptCount, recentScans) {
+function cleanDomainForMatch(domain) {
+  if (!domain) return '';
+  return domain.replace(/^(https?:\/\/)?(www\.)?/, '').split('/')[0].toLowerCase();
+}
+
+function computeMetrics(latestScan, promptCount, recentScans, domain) {
   if (!latestScan) return null;
 
   // Build carry-forward results: latest known result per prompt across all recent scans
@@ -149,22 +167,21 @@ function computeMetrics(latestScan, promptCount, recentScans) {
   } else {
     results = latestScan.results || [];
   }
-  // Use actual platform count from scan results instead of global PLATFORMS.length
-  const platformCount = (results.length > 0 && results[0].platforms?.length > 0) ? results[0].platforms.length : PLATFORMS.length;
+  // Count actual valid results (not errored) instead of using fixed platformCount
   let totalMentions = 0;
   let totalCitations = 0;
-  let errorCount = 0;
+  let totalValid = 0;
 
   for (const r of results) {
     for (const p of r.platforms) {
-      if (p.error) { errorCount++; continue; }
+      if (p.error) continue;
+      totalValid++;
       if (p.mentioned) totalMentions++;
       if (p.cited) totalCitations++;
     }
   }
 
-  // Exclude errored platforms from totalPossible so API failures don't lower scores
-  const totalPossible = results.length * platformCount - errorCount;
+  const totalPossible = totalValid;
 
   const mentionRate = totalPossible > 0 ? Math.round((totalMentions / totalPossible) * 100) : 0;
   const citationRate = totalMentions > 0 ? Math.round((totalCitations / totalMentions) * 100) : 0;
@@ -188,7 +205,39 @@ function computeMetrics(latestScan, promptCount, recentScans) {
     ? Math.round(sentimentScores.reduce((sum, s) => sum + s, 0) / sentimentScores.length)
     : null;
 
-  return { visibility, mentionRate, shareOfVoice, citationRate, promptCount, avgSentiment };
+  // Average position: use position (1-10), fall back to brandRanking index, then normalizedPosition
+  const positionRanks = [];
+  for (const r of results) {
+    for (const p of r.platforms) {
+      if (p.error || !p.mentioned) continue;
+      if (p.position != null) {
+        positionRanks.push(p.position); // already 1-10 scale
+      } else if (p.brandRanking && p.brandRanking.length > 0) {
+        const targetIdx = p.brandRanking.findIndex(b => b.isTargetBrand);
+        if (targetIdx >= 0) positionRanks.push(targetIdx + 1);
+      } else if (p.normalizedPosition != null) {
+        positionRanks.push(Math.round(p.normalizedPosition * 10) + 1);
+      }
+    }
+  }
+  const averagePosition = positionRanks.length > 0
+    ? Math.round((positionRanks.reduce((s, v) => s + v, 0) / positionRanks.length) * 10) / 10
+    : null;
+
+  // Total citation count: count unique domain-matching URLs (consistent with "Cited In" metric)
+  const domainClean = cleanDomainForMatch(domain);
+  let totalCitationCount = 0;
+  for (const r of results) {
+    for (const p of r.platforms) {
+      if (p.error) continue;
+      if (p.citedUrls && p.citedUrls.length > 0 && domainClean) {
+        const matching = p.citedUrls.filter(u => u.toLowerCase().includes(domainClean));
+        totalCitationCount += new Set(matching).size;
+      }
+    }
+  }
+
+  return { visibility, mentionRate, shareOfVoice, citationRate, promptCount, avgSentiment, averagePosition, totalCitationCount };
 }
 
 function generatePromptSuggestions(scanResult, prevResult) {
@@ -276,11 +325,11 @@ function generatePromptSuggestions(scanResult, prevResult) {
 
   // ── Position-based suggestions ──
   const positions = valid
-    .filter((p) => p.mentioned && p.normalizedPosition != null)
-    .map((p) => p.normalizedPosition);
+    .filter((p) => p.mentioned && (p.position != null || p.normalizedPosition != null))
+    .map((p) => p.position != null ? p.position : Math.round(p.normalizedPosition * 10) + 1);
   if (positions.length > 0) {
     const avgPos = positions.reduce((s, v) => s + v, 0) / positions.length;
-    if (avgPos < 0.3) {
+    if (avgPos > 6) {
       suggestions.push('Low ranking position — create more comprehensive, authoritative content on this topic');
     }
   }
@@ -411,7 +460,7 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
         let cited = false;
         for (const pl of scanResult.platforms) {
           if (!mentioned && pl.aiResponse && cm.patterns.some((r) => r.test(pl.aiResponse))) mentioned = true;
-          if (!cited && pl.citedFrom && pl.citedFrom.toLowerCase().includes(cm.slug)) cited = true;
+          if (!cited && pl.citedUrls && pl.citedUrls.some(u => u.toLowerCase().includes(cm.slug))) cited = true;
           if (mentioned && cited) break;
         }
         if (mentioned || cited) {
@@ -426,15 +475,24 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
       platforms: (scanResult ? scanResult.platforms : []).map((pl) => ({
         platformId: pl.platformId,
         mentioned: pl.mentioned,
-        tier: pl.tier,
+        position: pl.position ?? null,
         cited: pl.cited,
-        citedFrom: pl.citedFrom || null,
-        normalizedPosition: pl.normalizedPosition ?? null,
+        citationCount: pl.citationCount ?? 0,
+        citedUrls: pl.citedUrls || [],
+        brandRanking: (pl.brandRanking || []).map(b => ({
+          brandName: b.brandName,
+          isTargetBrand: b.isTargetBrand,
+          mentionCount: b.mentionCount ?? 1,
+        })),
         aiResponse: pl.aiResponse || null,
         sentiment: pl.sentiment || null,
         sentimentScore: pl.sentimentScore ?? null,
         error: pl.error || false,
         fanoutQueries: pl.fanoutQueries || [],
+        // Backward compat for old scans
+        ...(pl.tier ? { tier: pl.tier } : {}),
+        ...(pl.citedFrom ? { citedFrom: pl.citedFrom } : {}),
+        ...(pl.normalizedPosition != null ? { normalizedPosition: pl.normalizedPosition } : {}),
       })),
       competitors: promptCompetitors,
       lastChecked: latestScan.completedAt
@@ -456,8 +514,9 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
       citationHistory: scanResultMaps.map((m) => {
         const result = m.get(p._id.toString());
         if (!result) return 0;
-        const citedCount = result.platforms.filter((pl) => pl.cited).length;
-        const mentionedCount = result.platforms.filter((pl) => pl.mentioned).length;
+        const valid = result.platforms.filter((pl) => !pl.error);
+        const citedCount = valid.filter((pl) => pl.cited).length;
+        const mentionedCount = valid.filter((pl) => pl.mentioned).length;
         return mentionedCount > 0 ? Math.round((citedCount / mentionedCount) * 100) : 0;
       }).reverse(),
       mentionRateHistory: scanResultMaps.map((m) => {
@@ -470,10 +529,20 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
       positionHistory: scanResultMaps.map((m) => {
         const result = m.get(p._id.toString());
         if (!result) return null;
-        const mentioned = result.platforms.filter((pl) => pl.mentioned && !pl.error && pl.normalizedPosition != null);
-        if (mentioned.length === 0) return null;
-        const avg = mentioned.reduce((s, pl) => s + pl.normalizedPosition, 0) / mentioned.length;
-        return Math.round(avg * 100);
+        const ranks = [];
+        for (const pl of result.platforms) {
+          if (pl.error || !pl.mentioned) continue;
+          if (pl.position != null) {
+            ranks.push(pl.position);
+          } else if (pl.brandRanking && pl.brandRanking.length > 0) {
+            const idx = pl.brandRanking.findIndex((b) => b.isTargetBrand);
+            if (idx >= 0) ranks.push(idx + 1);
+          } else if (pl.normalizedPosition != null) {
+            ranks.push(Math.round(pl.normalizedPosition * 10) + 1);
+          }
+        }
+        if (ranks.length === 0) return null;
+        return Math.round((ranks.reduce((s, v) => s + v, 0) / ranks.length) * 10) / 10;
       }).reverse(),
       sentimentHistory: scanResultMaps.map((m) => {
         const result = m.get(p._id.toString());
@@ -583,25 +652,14 @@ function computeChanges(latestScan, previousScan) {
           id: `ch_${changeId++}`, type: 'lost', prompt: result.prompt, ...m,
           detail: `Lost mention on ${m.platform}`,
         });
-      } else if (prevPlat.tier === 'mentioned' && plat.tier === 'top') {
-        // ── Tier upgrade ──
-        changes.push({
-          id: `ch_${changeId++}`, type: 'improved', prompt: result.prompt, ...m,
-          detail: `Upgraded to top mention on ${m.platform}`,
-        });
-      } else if (prevPlat.tier === 'top' && plat.tier === 'mentioned') {
-        // ── Tier downgrade ──
-        changes.push({
-          id: `ch_${changeId++}`, type: 'declined', prompt: result.prompt, ...m,
-          detail: `Dropped from top to mentioned on ${m.platform}`,
-        });
       }
 
       // ── Citation gained ──
       if (!prevPlat.cited && plat.cited) {
+        const citUrl = (plat.citedUrls && plat.citedUrls[0]) || plat.citedFrom || m.platform;
         changes.push({
           id: `ch_${changeId++}`, type: 'new_citation', prompt: result.prompt, ...m,
-          detail: `New citation from ${plat.citedFrom || m.platform}`,
+          detail: `New citation from ${citUrl}`,
         });
       }
 
@@ -613,32 +671,32 @@ function computeChanges(latestScan, previousScan) {
         });
       }
 
-      // ── Position change (both mentioned — allow prev unknown → known) ──
-      if (plat.mentioned && prevPlat.mentioned && plat.tier === prevPlat.tier) {
-        const prevPos = prevPlat.normalizedPosition ?? null;
-        const currPos = plat.normalizedPosition ?? null;
-        if (prevPos == null && currPos != null) {
-          // Position data now available (wasn't tracked before)
-          if (currPos <= 0.3) {
-            changes.push({
-              id: `ch_${changeId++}`, type: 'improved', prompt: result.prompt, ...m,
-              detail: `Position now tracked on ${m.platform} — ranked high`,
-            });
+      // ── Position change (both mentioned) ──
+      if (plat.mentioned && prevPlat.mentioned) {
+        // Derive position: prefer new `position` field, fall back to brandRanking, then normalizedPosition
+        const getPos = (p) => {
+          if (p.position != null) return p.position;
+          if (p.brandRanking && p.brandRanking.length > 0) {
+            const idx = p.brandRanking.findIndex(b => b.isTargetBrand);
+            if (idx >= 0) return idx + 1;
           }
-        } else if (prevPos != null && currPos != null) {
-          // normalizedPosition: 0 = top (best), 1 = bottom (worst)
-          // positive posDelta = moved down = declined
-          // negative posDelta = moved up = improved
+          if (p.normalizedPosition != null) return Math.round(p.normalizedPosition * 10) + 1;
+          return null;
+        };
+        const prevPos = getPos(prevPlat);
+        const currPos = getPos(plat);
+        if (prevPos != null && currPos != null) {
+          // Lower position = better. Improved if position decreased by >= 2
           const posDelta = currPos - prevPos;
-          if (posDelta <= -0.2) {
+          if (posDelta <= -2) {
             changes.push({
               id: `ch_${changeId++}`, type: 'improved', prompt: result.prompt, ...m,
-              detail: `Position improved on ${m.platform}`,
+              detail: `Position improved on ${m.platform} (#${prevPos} → #${currPos})`,
             });
-          } else if (posDelta >= 0.2) {
+          } else if (posDelta >= 2) {
             changes.push({
               id: `ch_${changeId++}`, type: 'declined', prompt: result.prompt, ...m,
-              detail: `Position dropped on ${m.platform}`,
+              detail: `Position dropped on ${m.platform} (#${prevPos} → #${currPos})`,
             });
           }
         }
@@ -696,10 +754,13 @@ function computeTrendData(scans) {
   }).reverse(); // oldest first
 }
 
-function computePlatformStats(latestScan) {
+function computePlatformStats(latestScan, domain) {
+  const domainClean = cleanDomainForMatch(domain);
   return PLATFORM_DISPLAY.map((p) => {
+    const platformResults = [];
     let mentionCount = 0;
     let citationCount = 0;
+    let totalCitationUrls = 0;
     let totalPrompts = 0;
     let errorCount = 0;
 
@@ -707,10 +768,16 @@ function computePlatformStats(latestScan) {
       for (const r of latestScan.results) {
         const plat = r.platforms.find((pl) => pl.platformId === p.platformId);
         if (plat) {
+          platformResults.push(plat);
           if (plat.error) { errorCount++; continue; }
           totalPrompts++;
           if (plat.mentioned) mentionCount++;
           if (plat.cited) citationCount++;
+          if (plat.citationCount != null) {
+            totalCitationUrls += plat.citationCount;
+          } else if (plat.citedUrls && plat.citedUrls.length > 0) {
+            totalCitationUrls += new Set(plat.citedUrls).size;
+          }
         }
       }
     }
@@ -722,9 +789,10 @@ function computePlatformStats(latestScan) {
       color: p.color,
       bgColor: p.bgColor,
       borderColor: p.borderColor,
-      visibility: totalPrompts > 0 ? Math.round((mentionCount / totalPrompts) * 100) : 0,
+      visibility: computeWeightedVisibility(platformResults),
       mentionCount,
       citationCount,
+      totalCitationUrls,
       errorCount,
     };
   });
@@ -1084,9 +1152,9 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
           ];
 
           const fakeScan = { results: allEmailResults, competitorResults: competitorResults || [] };
-          const metrics = computeMetrics(fakeScan, allActivePrompts.length) || {};
+          const metrics = computeMetrics(fakeScan, allActivePrompts.length, undefined, tracker.domain) || {};
           // Platform stats reflect only current scan (represents actual API calls made this run)
-          const platStats = computePlatformStats({ results, competitorResults: competitorResults || [] });
+          const platStats = computePlatformStats({ results, competitorResults: competitorResults || [] }, tracker.domain);
           const actionItems = generateActionItems(fakeScan);
           const sortedCompetitors = [...(competitorResults || [])].sort((a, b) => b.visibility - a.visibility);
 
@@ -1231,13 +1299,13 @@ async function buildDashboardResponse(tracker) {
   const latestScan = recentScans[0] || null;
   const previousScan = recentScans[1] || null;
 
-  const metrics = computeMetrics(latestScan, activePromptCount, carryScans);
+  const metrics = computeMetrics(latestScan, activePromptCount, carryScans, tracker.domain);
   const trackedPrompts = formatTrackedPrompts(prompts, latestScan, previousScan, carryScans, tracker.domain);
   const formattedCompetitors = formatCompetitors(latestScan, previousScan, tracker.domain);
   const changes = computeChanges(latestScan, previousScan);
   const trendData = computeTrendData(recentScans);
   const actionItems = generateActionItems(latestScan);
-  const platformStats = computePlatformStats(latestScan);
+  const platformStats = computePlatformStats(latestScan, tracker.domain);
 
   return {
     tracker: tracker.toTrackerState(),

@@ -1391,13 +1391,13 @@ function buildDefaultSuggestions(domain) {
   const brand = domain ? domain.replace(/^(https?:\/\/)?(www\.)?/, '').split('.')[0] : 'your brand';
   return [
     { prompt: `best ${brand} alternatives`, category: 'brand', reason: `Users comparing ${brand} to competitors` },
-    { prompt: `${brand} review`, category: 'brand', reason: `Users researching ${brand} before purchasing` },
-    { prompt: `what is ${brand} and how does it work`, category: 'feature', reason: `High-intent informational query about ${brand}` },
+    { prompt: `what is ${brand} and how does it work`, category: 'brand', reason: `High-intent informational query about ${brand}` },
     { prompt: `${brand} vs competitors`, category: 'comparison', reason: 'Users actively comparing products in your space' },
-    { prompt: `is ${brand} worth it`, category: 'brand', reason: 'Purchase-intent query seeking recommendations' },
-    { prompt: `best tools like ${brand}`, category: 'brand', reason: `Users exploring options similar to ${brand}` },
-    { prompt: `${brand} pricing and plans`, category: 'feature', reason: 'Commercial query from potential customers' },
-    { prompt: `how to get started with ${brand}`, category: 'feature', reason: 'Onboarding query from high-intent users' },
+    { prompt: 'best tools for small businesses in this space', category: 'industry', reason: 'Category-level query where your brand could be recommended' },
+    { prompt: 'how to choose the right solution for my needs', category: 'industry', reason: 'Buyers researching options in your category' },
+    { prompt: 'top rated platforms compared', category: 'comparison', reason: 'Users evaluating multiple options in your market' },
+    { prompt: 'common problems and how to solve them', category: 'feature', reason: 'Problem-oriented query where your product could appear as a solution' },
+    { prompt: 'getting started guide for beginners', category: 'feature', reason: 'Educational query from potential new users' },
   ];
 }
 
@@ -1463,23 +1463,31 @@ const suggestPrompts = async (req, res) => {
           messages: [
             {
               role: 'system',
-              content: `You are an AI visibility analyst. Given a website domain, suggest 8 search prompts that users would type into AI assistants (ChatGPT, Gemini, Claude, Perplexity) where this brand could potentially be mentioned or recommended.
+              content: `You are an AI visibility analyst. Given a website domain, first identify the brand name and the industry/category it belongs to. Then suggest 8 search prompts that users would type into AI assistants (ChatGPT, Gemini, Claude, Perplexity) where this brand could potentially be mentioned or recommended.
 
 Return a JSON object with a "suggestions" key containing an array of exactly 8 items:
 {"suggestions": [{"prompt": "the search prompt", "category": "brand", "reason": "why this prompt matters"}]}
 
 Categories: brand, feature, comparison, industry.
-- brand: queries where the brand should be directly mentioned
-- feature: queries about features/capabilities the brand offers
-- comparison: queries comparing the brand to competitors
-- industry: broader industry queries where the brand could appear
+- brand: queries that mention the brand name directly (MAX 2 of these)
+- feature: queries about capabilities/problems the brand solves, without naming the brand
+- comparison: queries comparing options in the category, without naming the brand
+- industry: broader category/industry queries where the brand could naturally appear
 
-CRITICAL RULES:
-- Every prompt MUST include the actual brand name or specific product/industry terms. AI assistants will receive these prompts as-is.
-- NEVER use placeholder phrases like "your industry", "your product", "your brand", "your category", "your domain". These will be sent directly to AI models and will fail.
-- Good: "best Suparank alternatives for SEO", "is HubSpot worth it for small businesses"
-- Bad: "best tools in your industry", "how to solve problems your product addresses"
-- Prompts must be self-contained and specific enough that an AI assistant can give a concrete answer.`,
+PROMPT MIX RULES:
+- Only 2-3 prompts should mention the brand name directly (brand/comparison category)
+- The remaining 5-6 prompts should be CATEGORY-LEVEL queries that do NOT mention the brand name
+- Category-level prompts should use the actual industry/category terms (e.g. "SEO tools", "project management software", "cloud hosting")
+- NEVER use placeholder phrases like "your industry", "your product", "your brand". Use the actual category name instead.
+- Prompts must be self-contained and specific enough that an AI assistant can give a concrete answer.
+
+Examples for suparank.com (SEO tool):
+- Good brand prompt: "best Suparank alternatives" (2 of these max)
+- Good category prompt: "best SEO tools for small businesses" (most prompts should be like this)
+- Good category prompt: "how to track AI search visibility"
+- Good category prompt: "SEO vs AEO what's the difference"
+- Bad: "best tools in your industry" (placeholder)
+- Bad: "Suparank review", "Suparank pricing", "is Suparank worth it" (too many brand mentions)`,
             },
             { role: 'user', content: `Domain: ${domainTrimmed}` },
           ],

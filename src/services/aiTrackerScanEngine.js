@@ -71,13 +71,13 @@ async function _searchChatGPTResponses(query, apiKey, systemPrompt) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'gpt-5-mini',
+        model: 'gpt-4o-mini',
         instructions: systemPrompt,
         input: query,
         tools: [
           {
             type: 'web_search',
-            search_context_size: 'medium',
+            search_context_size: 'low',
           },
         ],
         store: false,
@@ -162,12 +162,12 @@ async function _searchChatGPTCompletions(query, apiKey, systemPrompt) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'gpt-4o-search-preview',
+        model: 'gpt-4o-mini-search-preview',
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: query },
         ],
-        web_search_options: { search_context_size: 'medium' },
+        web_search_options: { search_context_size: 'low' },
       }),
       signal: controller.signal,
     });
@@ -405,6 +405,15 @@ async function searchClaude(query) {
       }),
       signal: controller.signal,
     });
+
+    if (res.status === 429) {
+      const retryAfter = parseInt(res.headers.get('retry-after') || '0', 10);
+      const delay = Math.max(retryAfter * 1000, 5000);
+      console.warn(`[ai-tracker] searchClaude rate limited (429), waiting ${delay}ms before retry...`);
+      clearTimeout(timeout);
+      await new Promise((r) => setTimeout(r, delay));
+      throw new Error(`Claude returned status 429 (rate limited)`);
+    }
 
     if (!res.ok) {
       const text = await res.text();
@@ -771,30 +780,59 @@ Return a JSON object with:
 Return ONLY valid JSON, no other text. Example:
 {"brands":["BrandA","BrandB","BrandA"],"citationUrls":["https://example.com"],"sentiment":{"label":"positive","score":85}}`;
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
-  try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 1024,
-        messages: [{ role: 'user', content: userPrompt }],
-      }),
-      signal: controller.signal,
-    });
+  // Retry loop for rate limit (429) errors — up to 3 attempts with backoff
+  let data;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    try {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 1024,
+          messages: [{ role: 'user', content: userPrompt }],
+        }),
+        signal: controller.signal,
+      });
 
-    if (!res.ok) {
-      console.warn(`[ai-tracker] analyzeResponse failed: ${res.status}`);
+      if (res.status === 429) {
+        const retryAfter = parseInt(res.headers.get('retry-after') || '0', 10);
+        const delay = Math.max(retryAfter * 1000, 2000 * Math.pow(2, attempt)); // 2s, 4s, 8s minimum
+        console.warn(`[ai-tracker] analyzeResponse rate limited (429), retry ${attempt + 1}/3 after ${delay}ms`);
+        clearTimeout(timeout);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+
+      if (!res.ok) {
+        console.warn(`[ai-tracker] analyzeResponse failed: ${res.status}`);
+        clearTimeout(timeout);
+        return _fallbackAnalysis(aiResponse, targetBrand, domain);
+      }
+
+      data = await res.json();
+      clearTimeout(timeout);
+      break; // success
+    } catch (err) {
+      clearTimeout(timeout);
+      if (attempt < 2) {
+        console.warn(`[ai-tracker] analyzeResponse error (attempt ${attempt + 1}): ${err?.message}`);
+        await new Promise((r) => setTimeout(r, 2000 * Math.pow(2, attempt)));
+        continue;
+      }
+      console.warn('[ai-tracker] analyzeResponse error (final):', err?.message || err);
       return _fallbackAnalysis(aiResponse, targetBrand, domain);
     }
+  }
+  if (!data) return _fallbackAnalysis(aiResponse, targetBrand, domain);
 
-    const data = await res.json();
+  try {
     const rawText = data.content?.[0]?.text?.trim();
     if (!rawText) return _fallbackAnalysis(aiResponse, targetBrand, domain);
 
@@ -870,10 +908,8 @@ Return ONLY valid JSON, no other text. Example:
 
     return { mentioned, position, cited, citedUrls, citationCount, brandRanking, sentiment, sentimentScore };
   } catch (err) {
-    console.warn('[ai-tracker] analyzeResponse error:', err?.message || err);
+    console.warn('[ai-tracker] analyzeResponse parse error:', err?.message || err);
     return _fallbackAnalysis(aiResponse, targetBrand, domain);
-  } finally {
-    clearTimeout(timeout);
   }
 }
 

@@ -152,6 +152,16 @@ const FLAGS = [
     },
   },
   {
+    key: 'statFormulaBreakdown',
+    displayName: 'Stat Formula Breakdown',
+    description: 'Show calculation formulas and breakdowns when clicking stat card info icons.',
+    enabled: true,
+    implemented: true,
+    conditions: {
+      custom: {},
+    },
+  },
+  {
     key: 'performanceCards',
     displayName: 'Performance Cards',
     description: 'View and export content performance reports.',

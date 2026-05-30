@@ -26,6 +26,9 @@ router.post('/:workspaceNumber/ai-tracker/suggest-prompts', ...rwrAiTracker, rp(
 // Setup (onboarding)
 router.post('/:workspaceNumber/ai-tracker/setup', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.setup);
 
+// Historical scan details (shared handler — resolves legacy vs multi-monitor via req.params.monitorId)
+router.get('/:workspaceNumber/ai-tracker/scan-details', ...rwrAiTracker, rp('aiTracker', 'read'), aiTrackerController.getScanDetails);
+
 // Scan status & trigger
 router.get('/:workspaceNumber/ai-tracker/scan', ...rwrAiTracker, rp('aiTracker', 'read'), aiTrackerController.getScanStatus);
 router.post('/:workspaceNumber/ai-tracker/scan', ...rwrAiTracker, rp('aiTracker', 'use'), rc('aiTrackerScan', 5), aiTrackerController.triggerScan);
@@ -53,6 +56,9 @@ router.post('/:workspaceNumber/ai-tracker/monitors', ...rwrAiTracker, rp('aiTrac
 router.get('/:workspaceNumber/ai-tracker/monitors/:monitorId', ...rwrAiTracker, rp('aiTracker', 'read'), aiTrackerController.getMonitor);
 router.put('/:workspaceNumber/ai-tracker/monitors/:monitorId', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.updateMonitor);
 router.delete('/:workspaceNumber/ai-tracker/monitors/:monitorId', ...rwrAiTracker, rp('aiTracker', 'manage'), aiTrackerController.deleteMonitor);
+
+// Monitor-scoped historical scan details
+router.get('/:workspaceNumber/ai-tracker/monitors/:monitorId/scan-details', ...rwrAiTracker, rp('aiTracker', 'read'), aiTrackerController.getScanDetails);
 
 // Monitor-scoped scan
 router.get('/:workspaceNumber/ai-tracker/monitors/:monitorId/scan', ...rwrAiTracker, rp('aiTracker', 'read'), aiTrackerController.getMonitorScanStatus);

@@ -351,10 +351,19 @@ function generatePromptSuggestions(scanResult, prevResult) {
 
 function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, domain) {
   // Pre-build lookup: for each scan, promptId → result (avoids O(prompts × scans × results) find)
+  // Also build text-based fallback maps for when promptIds don't match (e.g. prompts regenerated)
   const scanResultMaps = (recentScans || []).map((scan) => {
     const m = new Map();
     for (const r of scan.results) {
       if (r.promptId) m.set(r.promptId.toString(), r);
+    }
+    return m;
+  });
+  const scanResultMapsByText = (recentScans || []).map((scan) => {
+    const m = new Map();
+    for (const r of scan.results) {
+      const key = (r.prompt || '').trim().toLowerCase();
+      if (key) m.set(key, r);
     }
     return m;
   });
@@ -421,21 +430,37 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
   const seenCount = new Map();
   const latestMap = new Map();
   const prevMap = new Map();
+  // Text-based fallback maps: when promptIds don't match (e.g. prompts were regenerated
+  // after a scan), fall back to matching by normalized prompt text
+  const seenCountByText = new Map();
+  const latestMapByText = new Map();
+  const prevMapByText = new Map();
   for (const scan of (recentScans || [])) {
     for (const r of (scan.results || [])) {
       const pid = r.promptId?.toString();
-      if (!pid) continue;
-      const n = (seenCount.get(pid) || 0) + 1;
-      seenCount.set(pid, n);
-      if (n === 1) latestMap.set(pid, r);
-      else if (n === 2) prevMap.set(pid, r);
+      if (pid) {
+        const n = (seenCount.get(pid) || 0) + 1;
+        seenCount.set(pid, n);
+        if (n === 1) latestMap.set(pid, r);
+        else if (n === 2) prevMap.set(pid, r);
+      }
+      // Always build text-based fallback
+      const textKey = (r.prompt || '').trim().toLowerCase();
+      if (textKey) {
+        const nt = (seenCountByText.get(textKey) || 0) + 1;
+        seenCountByText.set(textKey, nt);
+        if (nt === 1) latestMapByText.set(textKey, r);
+        else if (nt === 2) prevMapByText.set(textKey, r);
+      }
     }
   }
 
   return prompts.map((p) => {
     const pid = p._id.toString();
-    const scanResult = latestMap.get(pid) || null;
-    const prevResult = prevMap.get(pid) || null;
+    const textKey = (p.prompt || '').trim().toLowerCase();
+    // Primary: match by promptId. Fallback: match by prompt text (handles regenerated prompts)
+    const scanResult = latestMap.get(pid) || latestMapByText.get(textKey) || null;
+    const prevResult = prevMap.get(pid) || prevMapByText.get(textKey) || null;
 
     // Weighted visibility for current and previous scans
     const currentVisibility = scanResult
@@ -506,28 +531,28 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
       active: p.active,
       locked: p.locked || false,
       suggestions: generatePromptSuggestions(scanResult, prevResult),
-      trendHistory: scanResultMaps.map((m) => {
-        const result = m.get(p._id.toString());
+      trendHistory: scanResultMaps.map((m, idx) => {
+        const result = m.get(pid) || scanResultMapsByText[idx]?.get(textKey);
         if (!result) return 0;
         return computeWeightedVisibility(result.platforms);
       }).reverse(),
-      citationHistory: scanResultMaps.map((m) => {
-        const result = m.get(p._id.toString());
+      citationHistory: scanResultMaps.map((m, idx) => {
+        const result = m.get(pid) || scanResultMapsByText[idx]?.get(textKey);
         if (!result) return 0;
         const valid = result.platforms.filter((pl) => !pl.error);
         const citedCount = valid.filter((pl) => pl.cited).length;
         const mentionedCount = valid.filter((pl) => pl.mentioned).length;
         return mentionedCount > 0 ? Math.round((citedCount / mentionedCount) * 100) : 0;
       }).reverse(),
-      mentionRateHistory: scanResultMaps.map((m) => {
-        const result = m.get(p._id.toString());
+      mentionRateHistory: scanResultMaps.map((m, idx) => {
+        const result = m.get(pid) || scanResultMapsByText[idx]?.get(textKey);
         if (!result) return 0;
         const valid = result.platforms.filter((pl) => !pl.error);
         if (valid.length === 0) return 0;
         return Math.round((valid.filter((pl) => pl.mentioned).length / valid.length) * 100);
       }).reverse(),
-      positionHistory: scanResultMaps.map((m) => {
-        const result = m.get(p._id.toString());
+      positionHistory: scanResultMaps.map((m, si) => {
+        const result = m.get(pid) || scanResultMapsByText[si]?.get(textKey);
         if (!result) return null;
         const ranks = [];
         for (const pl of result.platforms) {
@@ -544,8 +569,8 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
         if (ranks.length === 0) return null;
         return Math.round((ranks.reduce((s, v) => s + v, 0) / ranks.length) * 10) / 10;
       }).reverse(),
-      sentimentHistory: scanResultMaps.map((m) => {
-        const result = m.get(p._id.toString());
+      sentimentHistory: scanResultMaps.map((m, idx) => {
+        const result = m.get(pid) || scanResultMapsByText[idx]?.get(textKey);
         if (!result) return null;
         const scores = result.platforms.filter((pl) => pl.mentioned && !pl.error && pl.sentimentScore != null).map((pl) => pl.sentimentScore);
         if (scores.length === 0) return null;
@@ -738,6 +763,14 @@ function computeChanges(latestScan, previousScan) {
 
 function computeTrendData(scans) {
   // scans are sorted newest-first from the DB query
+  // Detect which calendar dates have multiple scans so we can add time
+  const dateCounts = {};
+  for (const scan of scans) {
+    const d = scan.completedAt || scan.startedAt;
+    const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+    dateCounts[key] = (dateCounts[key] || 0) + 1;
+  }
+
   return scans.map((scan, idx) => {
     // Weighted visibility across all platform results in this scan
     const allPlatforms = scan.results.flatMap((r) => r.platforms);
@@ -746,11 +779,17 @@ function computeTrendData(scans) {
     const month = d.toLocaleString('en-US', { month: 'short' });
     const day = d.getDate();
 
+    // Add time when multiple scans share the same calendar date
+    const dateKey = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+    const time = dateCounts[dateKey] > 1
+      ? ' ' + d.toLocaleString('en-US', { hour: 'numeric', minute: '2-digit' })
+      : '';
+
     // Compute changes between this scan and the next older one
     const olderScan = scans[idx + 1] || null;
     const changes = computeChanges(scan, olderScan);
 
-    return { week: `${month} ${day}`, value, date: d.toISOString(), changes };
+    return { week: `${month} ${day}${time}`, value, date: d.toISOString(), changes };
   }).reverse(); // oldest first
 }
 
@@ -1288,13 +1327,19 @@ async function buildDashboardResponse(tracker) {
   const oldestNeeded = activePrompts.length > 0
     ? activePrompts.reduce((min, p) => p.lastScannedAt < min ? p.lastScannedAt : min, activePrompts[0].lastScannedAt)
     : null;
-  const carryScans = oldestNeeded
+  let carryScans = oldestNeeded
     ? await AiTrackerScan.find({
         trackerId: tracker._id,
         status: 'ready',
         completedAt: { $gte: oldestNeeded },
       }).sort({ completedAt: -1 }).lean()
     : recentScans;
+
+  // Fallback: if carryScans query returned nothing (e.g. prompts' lastScannedAt is newer
+  // than any scan's completedAt due to data cleanup), use recentScans instead
+  if (carryScans.length === 0 && recentScans.length > 0) {
+    carryScans = recentScans;
+  }
 
   const latestScan = recentScans[0] || null;
   const previousScan = recentScans[1] || null;
@@ -1388,16 +1433,16 @@ const updateTracker = async (req, res) => {
 // ─── POST /:workspaceNumber/ai-tracker/suggest-prompts ────────────────────
 
 function buildDefaultSuggestions(domain) {
-  const brand = domain ? domain.replace(/^(https?:\/\/)?(www\.)?/, '').split('.')[0] : 'your brand';
+  const brand = domain ? domain.replace(/^(https?:\/\/)?(www\.)?/, '').split('.')[0] : 'brand';
   return [
-    { prompt: `what is ${brand}`, category: 'brand', reason: `Baseline: checks if AI knows about ${brand} at all` },
-    { prompt: 'best tools for small businesses in this space', category: 'industry', reason: 'Category-level query where your brand could be recommended' },
-    { prompt: 'how to choose the right solution for my needs', category: 'industry', reason: 'Buyers researching options in your category' },
-    { prompt: 'top rated platforms compared', category: 'comparison', reason: 'Users evaluating multiple options in your market' },
-    { prompt: 'common problems and how to solve them', category: 'feature', reason: 'Problem-oriented query where your product could appear as a solution' },
-    { prompt: 'best free and paid options available', category: 'comparison', reason: 'Price-sensitive users exploring the category' },
-    { prompt: 'beginner guide to getting started', category: 'feature', reason: 'Educational query from potential new users' },
-    { prompt: 'latest trends and innovations', category: 'industry', reason: 'Users exploring what is new in the space' },
+    { prompt: `what is ${brand}`, category: 'brand', reason: `Baseline: checks if AI knows about ${brand}` },
+    { prompt: `best ${brand} alternatives`, category: 'comparison', reason: 'Users comparing options in your category' },
+    { prompt: `${brand} vs competitors`, category: 'comparison', reason: 'Direct comparison queries' },
+    { prompt: `is ${brand} worth it`, category: 'brand', reason: 'Purchase-intent query about your brand' },
+    { prompt: `top tools like ${brand}`, category: 'industry', reason: 'Category-level discovery query' },
+    { prompt: `${brand} reviews and pricing`, category: 'feature', reason: 'Users evaluating your product' },
+    { prompt: `best free alternatives to ${brand}`, category: 'comparison', reason: 'Price-sensitive users exploring options' },
+    { prompt: `how does ${brand} work`, category: 'feature', reason: 'Users researching your product functionality' },
   ];
 }
 
@@ -1448,22 +1493,7 @@ const suggestPrompts = async (req, res) => {
       return res.json({ suggestions: buildDefaultSuggestions(domainTrimmed) });
     }
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000);
-
-    try {
-      const response = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'gpt-4o-mini',
-          messages: [
-            {
-              role: 'system',
-              content: `You are an AI visibility analyst. Given a website domain, first identify the brand name and the industry/category it belongs to. Then suggest 8 search prompts that real users would type into AI assistants (ChatGPT, Gemini, Claude, Perplexity).
+    const suggestSystemPrompt = `You are an AI visibility analyst. Given a website domain, use web search to look up the domain and identify the brand name and the industry/category it belongs to. Then suggest 8 search prompts that real users would type into AI assistants (ChatGPT, Gemini, Claude, Perplexity).
 
 The goal is to measure ORGANIC visibility — whether AI naturally recommends this brand when users ask about the category, NOT whether AI mentions the brand when users ask about the brand directly.
 
@@ -1491,36 +1521,12 @@ Examples for suparank.com (SEO/AI visibility tool):
 - Category: "best tools to monitor brand mentions in AI responses"
 - BAD: "best Suparank alternatives" (brand-biased — AI will always mention it)
 - BAD: "Suparank review" (brand-biased)
-- BAD: "best tools in your industry" (placeholder)`,
-            },
-            { role: 'user', content: `Domain: ${domainTrimmed}` },
-          ],
-          response_format: { type: 'json_object' },
-        }),
-        signal: controller.signal,
-      });
+- BAD: "best tools in your industry" (placeholder)`;
 
-      if (!response.ok) {
-        console.error('[suggest-prompts] OpenAI error:', response.status);
-        return res.json({ suggestions: buildDefaultSuggestions(domainTrimmed) });
-      }
-
-      const data = await response.json();
-      const content = data.choices?.[0]?.message?.content;
-      if (!content) {
-        return res.json({ suggestions: buildDefaultSuggestions(domainTrimmed) });
-      }
-
-      let parsed;
-      try {
-        parsed = JSON.parse(content);
-      } catch {
-        return res.json({ suggestions: buildDefaultSuggestions(domainTrimmed) });
-      }
-      const suggestions = Array.isArray(parsed.suggestions) ? parsed.suggestions : Array.isArray(parsed) ? parsed : buildDefaultSuggestions(domainTrimmed);
-
-      // Validate shape
-      const valid = suggestions
+    // Helper: validate and extract suggestions from raw parsed JSON
+    const validateSuggestions = (parsed) => {
+      const suggestions = Array.isArray(parsed?.suggestions) ? parsed.suggestions : Array.isArray(parsed) ? parsed : [];
+      return suggestions
         .filter((s) => s && typeof s.prompt === 'string' && s.prompt.trim())
         .slice(0, 8)
         .map((s) => ({
@@ -1528,11 +1534,96 @@ Examples for suparank.com (SEO/AI visibility tool):
           category: ['brand', 'feature', 'comparison', 'industry'].includes(s.category) ? s.category : 'industry',
           reason: typeof s.reason === 'string' ? s.reason.slice(0, 200) : 'Relevant to your brand visibility',
         }));
+    };
 
-      res.json({ suggestions: valid.length > 0 ? valid : buildDefaultSuggestions(domainTrimmed) });
+    // Primary: Responses API with web_search (can look up unknown domains)
+    let valid = [];
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 45000);
+    try {
+      const response = await fetch('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          instructions: suggestSystemPrompt,
+          input: `Domain: ${domainTrimmed}`,
+          tools: [{ type: 'web_search', search_context_size: 'low' }],
+          text: { format: { type: 'json_object' } },
+          store: false,
+        }),
+        signal: controller.signal,
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        // Extract text content from Responses API output
+        let content = '';
+        for (const item of (data.output || [])) {
+          if (item.type === 'message' && item.content) {
+            for (const part of item.content) {
+              if (part.type === 'output_text') content += part.text;
+            }
+          }
+        }
+        if (content) {
+          try {
+            valid = validateSuggestions(JSON.parse(content));
+          } catch { /* parse failed, will try fallback */ }
+        }
+      } else {
+        console.warn('[suggest-prompts] Responses API error:', response.status);
+      }
+    } catch (err) {
+      console.warn('[suggest-prompts] Responses API failed:', err.message);
     } finally {
       clearTimeout(timeout);
     }
+
+    // Fallback: Chat Completions (no web search, works for well-known domains)
+    if (valid.length === 0) {
+      const controller2 = new AbortController();
+      const timeout2 = setTimeout(() => controller2.abort(), 30000);
+      try {
+        const response = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: 'gpt-4o-mini',
+            messages: [
+              { role: 'system', content: suggestSystemPrompt },
+              { role: 'user', content: `Domain: ${domainTrimmed}` },
+            ],
+            response_format: { type: 'json_object' },
+          }),
+          signal: controller2.signal,
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const content = data.choices?.[0]?.message?.content;
+          if (content) {
+            try {
+              valid = validateSuggestions(JSON.parse(content));
+            } catch { /* parse failed */ }
+          }
+        } else {
+          console.warn('[suggest-prompts] Chat Completions error:', response.status);
+        }
+      } catch (err) {
+        console.warn('[suggest-prompts] Chat Completions failed:', err.message);
+      } finally {
+        clearTimeout(timeout2);
+      }
+    }
+
+    res.json({ suggestions: valid.length > 0 ? valid : buildDefaultSuggestions(domainTrimmed) });
   } catch (err) {
     console.error('suggestPrompts error:', err.message);
     const fallbackDomain = req.body?.domain?.trim() || null;
@@ -2678,6 +2769,93 @@ const dismissMonitorSuggestedCompetitor = async (req, res) => {
   }
 };
 
+// ─── GET /:wn/ai-tracker/scan-details?date=ISO ─────────────────────────
+// Returns platform-level data (aiResponse, fanoutQueries, brandRanking,
+// citedUrls) for the scan closest to the requested date.  Used by the
+// frontend when viewing a historical date range so detail tabs show the
+// correct scan's data instead of always showing the latest scan.
+
+const getScanDetails = async (req, res) => {
+  try {
+    const workspace = req.workspace;
+    const { date } = req.query;
+
+    if (!date) {
+      return res.status(400).json({ error: 'date query parameter is required' });
+    }
+
+    const targetDate = new Date(date);
+    if (isNaN(targetDate.getTime())) {
+      return res.status(400).json({ error: 'Invalid date format' });
+    }
+
+    // Resolve tracker — legacy single-monitor or multi-monitor
+    const tracker = req.params.monitorId
+      ? await resolveMonitor(req, workspace, res)
+      : await resolveTracker(workspace, res);
+    if (!tracker) return; // resolveTracker/resolveMonitor already sent the response
+
+    // Find the scan closest to the target date.
+    // Two queries hitting the existing { trackerId, completedAt } index.
+    const [scanBefore, scanAfter] = await Promise.all([
+      AiTrackerScan.findOne({
+        trackerId: tracker._id,
+        status: 'ready',
+        completedAt: { $lte: targetDate },
+      }).sort({ completedAt: -1 }).limit(1).lean(),
+      AiTrackerScan.findOne({
+        trackerId: tracker._id,
+        status: 'ready',
+        completedAt: { $gt: targetDate },
+      }).sort({ completedAt: 1 }).limit(1).lean(),
+    ]);
+
+    let scan = null;
+    if (scanBefore && scanAfter) {
+      const diffBefore = targetDate - scanBefore.completedAt;
+      const diffAfter = scanAfter.completedAt - targetDate;
+      scan = diffBefore <= diffAfter ? scanBefore : scanAfter;
+    } else {
+      scan = scanBefore || scanAfter;
+    }
+
+    if (!scan) {
+      return res.status(404).json({ error: 'No scan found near the specified date' });
+    }
+
+    // Build promptPlatforms map: { promptId → platforms[] }
+    const promptPlatforms = {};
+    for (const result of scan.results || []) {
+      const promptId = result.promptId?.toString();
+      if (!promptId) continue;
+      promptPlatforms[promptId] = (result.platforms || []).map((pl) => ({
+        platformId: pl.platformId,
+        mentioned: pl.mentioned,
+        position: pl.position ?? null,
+        cited: pl.cited,
+        citationCount: pl.citationCount || 0,
+        citedUrls: pl.citedUrls || [],
+        brandRanking: pl.brandRanking || [],
+        aiResponse: pl.aiResponse || '',
+        sentiment: pl.sentiment || null,
+        sentimentScore: pl.sentimentScore ?? null,
+        error: pl.error || false,
+        fanoutQueries: pl.fanoutQueries || [],
+      }));
+    }
+
+    res.json({
+      scanDate: scan.completedAt.toISOString(),
+      scanId: scan._id.toString(),
+      promptPlatforms,
+      competitorResults: scan.competitorResults || [],
+    });
+  } catch (err) {
+    console.error('getScanDetails error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch scan details' });
+  }
+};
+
 module.exports = {
   // Legacy single-monitor
   getTracker,
@@ -2709,6 +2887,8 @@ module.exports = {
   addMonitorCompetitor,
   removeMonitorCompetitor,
   dismissMonitorSuggestedCompetitor,
+  // Shared (works for both legacy and multi-monitor via req.params.monitorId)
+  getScanDetails,
   // Dev helpers (no-op in production since _devTimeScale defaults to 1)
   setDevTimeScale,
   getDevTimeScale,

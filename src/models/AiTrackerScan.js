@@ -3,14 +3,18 @@ const mongoose = require('mongoose');
 const platformResultSchema = new mongoose.Schema({
   platformId: { type: String, required: true },
   mentioned: { type: Boolean, default: false },
-  tier: {
-    type: String,
-    enum: ['top', 'mentioned', 'not_mentioned'],
-    default: 'not_mentioned',
-  },
+  position: { type: Number, default: null },        // 1-10 scale (1=best), replaces normalizedPosition
   cited: { type: Boolean, default: false },
-  citedFrom: { type: String, default: null, maxlength: 2048 },
-  normalizedPosition: { type: Number, default: null },
+  citationCount: { type: Number, default: 0 },      // unique citation URL count
+  citedUrls: { type: [String], default: [] },
+  brandRanking: {
+    type: [{
+      brandName: { type: String, required: true },
+      isTargetBrand: { type: Boolean, default: false },
+      mentionCount: { type: Number, default: 1 },
+    }],
+    default: [],
+  },
   aiResponse: { type: String, default: '' },
   sentiment: { type: String, enum: ['positive', 'neutral', 'negative', null], default: null },
   sentimentScore: { type: Number, default: null },

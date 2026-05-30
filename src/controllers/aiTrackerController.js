@@ -117,22 +117,40 @@ function computeWeightedVisibility(platforms) {
   const cited = valid.filter((p) => p.cited);
 
   const mentionRate = (mentioned.length / total) * 100;
-  const citationRate = (cited.length / total) * 100;
+  const citationRate = mentioned.length > 0 ? (cited.length / mentioned.length) * 100 : 0;
 
-  // Position score: average of (1 - normalizedPosition) for mentioned platforms
-  // Higher = mentioned earlier = better. Falls back to 50 if no position data.
+  // Position score: use position (1-10), fall back to brandRanking, then normalizedPosition
   let positionScore = 0;
   if (mentioned.length > 0) {
-    const positionValues = mentioned.map((p) =>
-      p.normalizedPosition != null ? (1 - p.normalizedPosition) * 100 : 50
-    );
+    const positionValues = mentioned.map((p) => {
+      // New field: position (1-10 scale, 1=best)
+      if (p.position != null) {
+        return (10 - p.position) / 9 * 100; // position 1 → 100, position 10 → 0
+      }
+      // Backward compat: brandRanking
+      if (p.brandRanking && p.brandRanking.length > 0) {
+        const targetIdx = p.brandRanking.findIndex(b => b.isTargetBrand);
+        if (targetIdx >= 0) {
+          return p.brandRanking.length > 1
+            ? (1 - targetIdx / (p.brandRanking.length - 1)) * 100
+            : 100;
+        }
+      }
+      // Backward compat: normalizedPosition
+      return p.normalizedPosition != null ? (1 - p.normalizedPosition) * 100 : 50;
+    });
     positionScore = positionValues.reduce((sum, v) => sum + v, 0) / mentioned.length;
   }
 
   return Math.round(mentionRate * W_MENTION + positionScore * W_POSITION + citationRate * W_CITATION);
 }
 
-function computeMetrics(latestScan, promptCount, recentScans) {
+function cleanDomainForMatch(domain) {
+  if (!domain) return '';
+  return domain.replace(/^(https?:\/\/)?(www\.)?/, '').split('/')[0].toLowerCase();
+}
+
+function computeMetrics(latestScan, promptCount, recentScans, domain) {
   if (!latestScan) return null;
 
   // Build carry-forward results: latest known result per prompt across all recent scans
@@ -149,22 +167,21 @@ function computeMetrics(latestScan, promptCount, recentScans) {
   } else {
     results = latestScan.results || [];
   }
-  // Use actual platform count from scan results instead of global PLATFORMS.length
-  const platformCount = (results.length > 0 && results[0].platforms?.length > 0) ? results[0].platforms.length : PLATFORMS.length;
+  // Count actual valid results (not errored) instead of using fixed platformCount
   let totalMentions = 0;
   let totalCitations = 0;
-  let errorCount = 0;
+  let totalValid = 0;
 
   for (const r of results) {
     for (const p of r.platforms) {
-      if (p.error) { errorCount++; continue; }
+      if (p.error) continue;
+      totalValid++;
       if (p.mentioned) totalMentions++;
       if (p.cited) totalCitations++;
     }
   }
 
-  // Exclude errored platforms from totalPossible so API failures don't lower scores
-  const totalPossible = results.length * platformCount - errorCount;
+  const totalPossible = totalValid;
 
   const mentionRate = totalPossible > 0 ? Math.round((totalMentions / totalPossible) * 100) : 0;
   const citationRate = totalMentions > 0 ? Math.round((totalCitations / totalMentions) * 100) : 0;
@@ -188,7 +205,39 @@ function computeMetrics(latestScan, promptCount, recentScans) {
     ? Math.round(sentimentScores.reduce((sum, s) => sum + s, 0) / sentimentScores.length)
     : null;
 
-  return { visibility, mentionRate, shareOfVoice, citationRate, promptCount, avgSentiment };
+  // Average position: use position (1-10), fall back to brandRanking index, then normalizedPosition
+  const positionRanks = [];
+  for (const r of results) {
+    for (const p of r.platforms) {
+      if (p.error || !p.mentioned) continue;
+      if (p.position != null) {
+        positionRanks.push(p.position); // already 1-10 scale
+      } else if (p.brandRanking && p.brandRanking.length > 0) {
+        const targetIdx = p.brandRanking.findIndex(b => b.isTargetBrand);
+        if (targetIdx >= 0) positionRanks.push(targetIdx + 1);
+      } else if (p.normalizedPosition != null) {
+        positionRanks.push(Math.round(p.normalizedPosition * 10) + 1);
+      }
+    }
+  }
+  const averagePosition = positionRanks.length > 0
+    ? Math.round((positionRanks.reduce((s, v) => s + v, 0) / positionRanks.length) * 10) / 10
+    : null;
+
+  // Total citation count: count unique domain-matching URLs (consistent with "Cited In" metric)
+  const domainClean = cleanDomainForMatch(domain);
+  let totalCitationCount = 0;
+  for (const r of results) {
+    for (const p of r.platforms) {
+      if (p.error) continue;
+      if (p.citedUrls && p.citedUrls.length > 0 && domainClean) {
+        const matching = p.citedUrls.filter(u => u.toLowerCase().includes(domainClean));
+        totalCitationCount += new Set(matching).size;
+      }
+    }
+  }
+
+  return { visibility, mentionRate, shareOfVoice, citationRate, promptCount, avgSentiment, averagePosition, totalCitationCount };
 }
 
 function generatePromptSuggestions(scanResult, prevResult) {
@@ -276,11 +325,11 @@ function generatePromptSuggestions(scanResult, prevResult) {
 
   // ── Position-based suggestions ──
   const positions = valid
-    .filter((p) => p.mentioned && p.normalizedPosition != null)
-    .map((p) => p.normalizedPosition);
+    .filter((p) => p.mentioned && (p.position != null || p.normalizedPosition != null))
+    .map((p) => p.position != null ? p.position : Math.round(p.normalizedPosition * 10) + 1);
   if (positions.length > 0) {
     const avgPos = positions.reduce((s, v) => s + v, 0) / positions.length;
-    if (avgPos < 0.3) {
+    if (avgPos > 6) {
       suggestions.push('Low ranking position — create more comprehensive, authoritative content on this topic');
     }
   }
@@ -302,10 +351,19 @@ function generatePromptSuggestions(scanResult, prevResult) {
 
 function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, domain) {
   // Pre-build lookup: for each scan, promptId → result (avoids O(prompts × scans × results) find)
+  // Also build text-based fallback maps for when promptIds don't match (e.g. prompts regenerated)
   const scanResultMaps = (recentScans || []).map((scan) => {
     const m = new Map();
     for (const r of scan.results) {
       if (r.promptId) m.set(r.promptId.toString(), r);
+    }
+    return m;
+  });
+  const scanResultMapsByText = (recentScans || []).map((scan) => {
+    const m = new Map();
+    for (const r of scan.results) {
+      const key = (r.prompt || '').trim().toLowerCase();
+      if (key) m.set(key, r);
     }
     return m;
   });
@@ -372,21 +430,37 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
   const seenCount = new Map();
   const latestMap = new Map();
   const prevMap = new Map();
+  // Text-based fallback maps: when promptIds don't match (e.g. prompts were regenerated
+  // after a scan), fall back to matching by normalized prompt text
+  const seenCountByText = new Map();
+  const latestMapByText = new Map();
+  const prevMapByText = new Map();
   for (const scan of (recentScans || [])) {
     for (const r of (scan.results || [])) {
       const pid = r.promptId?.toString();
-      if (!pid) continue;
-      const n = (seenCount.get(pid) || 0) + 1;
-      seenCount.set(pid, n);
-      if (n === 1) latestMap.set(pid, r);
-      else if (n === 2) prevMap.set(pid, r);
+      if (pid) {
+        const n = (seenCount.get(pid) || 0) + 1;
+        seenCount.set(pid, n);
+        if (n === 1) latestMap.set(pid, r);
+        else if (n === 2) prevMap.set(pid, r);
+      }
+      // Always build text-based fallback
+      const textKey = (r.prompt || '').trim().toLowerCase();
+      if (textKey) {
+        const nt = (seenCountByText.get(textKey) || 0) + 1;
+        seenCountByText.set(textKey, nt);
+        if (nt === 1) latestMapByText.set(textKey, r);
+        else if (nt === 2) prevMapByText.set(textKey, r);
+      }
     }
   }
 
   return prompts.map((p) => {
     const pid = p._id.toString();
-    const scanResult = latestMap.get(pid) || null;
-    const prevResult = prevMap.get(pid) || null;
+    const textKey = (p.prompt || '').trim().toLowerCase();
+    // Primary: match by promptId. Fallback: match by prompt text (handles regenerated prompts)
+    const scanResult = latestMap.get(pid) || latestMapByText.get(textKey) || null;
+    const prevResult = prevMap.get(pid) || prevMapByText.get(textKey) || null;
 
     // Weighted visibility for current and previous scans
     const currentVisibility = scanResult
@@ -411,7 +485,7 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
         let cited = false;
         for (const pl of scanResult.platforms) {
           if (!mentioned && pl.aiResponse && cm.patterns.some((r) => r.test(pl.aiResponse))) mentioned = true;
-          if (!cited && pl.citedFrom && pl.citedFrom.toLowerCase().includes(cm.slug)) cited = true;
+          if (!cited && pl.citedUrls && pl.citedUrls.some(u => u.toLowerCase().includes(cm.slug))) cited = true;
           if (mentioned && cited) break;
         }
         if (mentioned || cited) {
@@ -426,15 +500,24 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
       platforms: (scanResult ? scanResult.platforms : []).map((pl) => ({
         platformId: pl.platformId,
         mentioned: pl.mentioned,
-        tier: pl.tier,
+        position: pl.position ?? null,
         cited: pl.cited,
-        citedFrom: pl.citedFrom || null,
-        normalizedPosition: pl.normalizedPosition ?? null,
+        citationCount: pl.citationCount ?? 0,
+        citedUrls: pl.citedUrls || [],
+        brandRanking: (pl.brandRanking || []).map(b => ({
+          brandName: b.brandName,
+          isTargetBrand: b.isTargetBrand,
+          mentionCount: b.mentionCount ?? 1,
+        })),
         aiResponse: pl.aiResponse || null,
         sentiment: pl.sentiment || null,
         sentimentScore: pl.sentimentScore ?? null,
         error: pl.error || false,
         fanoutQueries: pl.fanoutQueries || [],
+        // Backward compat for old scans
+        ...(pl.tier ? { tier: pl.tier } : {}),
+        ...(pl.citedFrom ? { citedFrom: pl.citedFrom } : {}),
+        ...(pl.normalizedPosition != null ? { normalizedPosition: pl.normalizedPosition } : {}),
       })),
       competitors: promptCompetitors,
       lastChecked: latestScan.completedAt
@@ -448,35 +531,46 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
       active: p.active,
       locked: p.locked || false,
       suggestions: generatePromptSuggestions(scanResult, prevResult),
-      trendHistory: scanResultMaps.map((m) => {
-        const result = m.get(p._id.toString());
+      trendHistory: scanResultMaps.map((m, idx) => {
+        const result = m.get(pid) || scanResultMapsByText[idx]?.get(textKey);
         if (!result) return 0;
         return computeWeightedVisibility(result.platforms);
       }).reverse(),
-      citationHistory: scanResultMaps.map((m) => {
-        const result = m.get(p._id.toString());
+      citationHistory: scanResultMaps.map((m, idx) => {
+        const result = m.get(pid) || scanResultMapsByText[idx]?.get(textKey);
         if (!result) return 0;
-        const citedCount = result.platforms.filter((pl) => pl.cited).length;
-        const mentionedCount = result.platforms.filter((pl) => pl.mentioned).length;
+        const valid = result.platforms.filter((pl) => !pl.error);
+        const citedCount = valid.filter((pl) => pl.cited).length;
+        const mentionedCount = valid.filter((pl) => pl.mentioned).length;
         return mentionedCount > 0 ? Math.round((citedCount / mentionedCount) * 100) : 0;
       }).reverse(),
-      mentionRateHistory: scanResultMaps.map((m) => {
-        const result = m.get(p._id.toString());
+      mentionRateHistory: scanResultMaps.map((m, idx) => {
+        const result = m.get(pid) || scanResultMapsByText[idx]?.get(textKey);
         if (!result) return 0;
         const valid = result.platforms.filter((pl) => !pl.error);
         if (valid.length === 0) return 0;
         return Math.round((valid.filter((pl) => pl.mentioned).length / valid.length) * 100);
       }).reverse(),
-      positionHistory: scanResultMaps.map((m) => {
-        const result = m.get(p._id.toString());
+      positionHistory: scanResultMaps.map((m, si) => {
+        const result = m.get(pid) || scanResultMapsByText[si]?.get(textKey);
         if (!result) return null;
-        const mentioned = result.platforms.filter((pl) => pl.mentioned && !pl.error && pl.normalizedPosition != null);
-        if (mentioned.length === 0) return null;
-        const avg = mentioned.reduce((s, pl) => s + pl.normalizedPosition, 0) / mentioned.length;
-        return Math.round(avg * 100);
+        const ranks = [];
+        for (const pl of result.platforms) {
+          if (pl.error || !pl.mentioned) continue;
+          if (pl.position != null) {
+            ranks.push(pl.position);
+          } else if (pl.brandRanking && pl.brandRanking.length > 0) {
+            const idx = pl.brandRanking.findIndex((b) => b.isTargetBrand);
+            if (idx >= 0) ranks.push(idx + 1);
+          } else if (pl.normalizedPosition != null) {
+            ranks.push(Math.round(pl.normalizedPosition * 10) + 1);
+          }
+        }
+        if (ranks.length === 0) return null;
+        return Math.round((ranks.reduce((s, v) => s + v, 0) / ranks.length) * 10) / 10;
       }).reverse(),
-      sentimentHistory: scanResultMaps.map((m) => {
-        const result = m.get(p._id.toString());
+      sentimentHistory: scanResultMaps.map((m, idx) => {
+        const result = m.get(pid) || scanResultMapsByText[idx]?.get(textKey);
         if (!result) return null;
         const scores = result.platforms.filter((pl) => pl.mentioned && !pl.error && pl.sentimentScore != null).map((pl) => pl.sentimentScore);
         if (scores.length === 0) return null;
@@ -583,25 +677,14 @@ function computeChanges(latestScan, previousScan) {
           id: `ch_${changeId++}`, type: 'lost', prompt: result.prompt, ...m,
           detail: `Lost mention on ${m.platform}`,
         });
-      } else if (prevPlat.tier === 'mentioned' && plat.tier === 'top') {
-        // ── Tier upgrade ──
-        changes.push({
-          id: `ch_${changeId++}`, type: 'improved', prompt: result.prompt, ...m,
-          detail: `Upgraded to top mention on ${m.platform}`,
-        });
-      } else if (prevPlat.tier === 'top' && plat.tier === 'mentioned') {
-        // ── Tier downgrade ──
-        changes.push({
-          id: `ch_${changeId++}`, type: 'declined', prompt: result.prompt, ...m,
-          detail: `Dropped from top to mentioned on ${m.platform}`,
-        });
       }
 
       // ── Citation gained ──
       if (!prevPlat.cited && plat.cited) {
+        const citUrl = (plat.citedUrls && plat.citedUrls[0]) || plat.citedFrom || m.platform;
         changes.push({
           id: `ch_${changeId++}`, type: 'new_citation', prompt: result.prompt, ...m,
-          detail: `New citation from ${plat.citedFrom || m.platform}`,
+          detail: `New citation from ${citUrl}`,
         });
       }
 
@@ -613,32 +696,32 @@ function computeChanges(latestScan, previousScan) {
         });
       }
 
-      // ── Position change (both mentioned — allow prev unknown → known) ──
-      if (plat.mentioned && prevPlat.mentioned && plat.tier === prevPlat.tier) {
-        const prevPos = prevPlat.normalizedPosition ?? null;
-        const currPos = plat.normalizedPosition ?? null;
-        if (prevPos == null && currPos != null) {
-          // Position data now available (wasn't tracked before)
-          if (currPos <= 0.3) {
-            changes.push({
-              id: `ch_${changeId++}`, type: 'improved', prompt: result.prompt, ...m,
-              detail: `Position now tracked on ${m.platform} — ranked high`,
-            });
+      // ── Position change (both mentioned) ──
+      if (plat.mentioned && prevPlat.mentioned) {
+        // Derive position: prefer new `position` field, fall back to brandRanking, then normalizedPosition
+        const getPos = (p) => {
+          if (p.position != null) return p.position;
+          if (p.brandRanking && p.brandRanking.length > 0) {
+            const idx = p.brandRanking.findIndex(b => b.isTargetBrand);
+            if (idx >= 0) return idx + 1;
           }
-        } else if (prevPos != null && currPos != null) {
-          // normalizedPosition: 0 = top (best), 1 = bottom (worst)
-          // positive posDelta = moved down = declined
-          // negative posDelta = moved up = improved
+          if (p.normalizedPosition != null) return Math.round(p.normalizedPosition * 10) + 1;
+          return null;
+        };
+        const prevPos = getPos(prevPlat);
+        const currPos = getPos(plat);
+        if (prevPos != null && currPos != null) {
+          // Lower position = better. Improved if position decreased by >= 2
           const posDelta = currPos - prevPos;
-          if (posDelta <= -0.2) {
+          if (posDelta <= -2) {
             changes.push({
               id: `ch_${changeId++}`, type: 'improved', prompt: result.prompt, ...m,
-              detail: `Position improved on ${m.platform}`,
+              detail: `Position improved on ${m.platform} (#${prevPos} → #${currPos})`,
             });
-          } else if (posDelta >= 0.2) {
+          } else if (posDelta >= 2) {
             changes.push({
               id: `ch_${changeId++}`, type: 'declined', prompt: result.prompt, ...m,
-              detail: `Position dropped on ${m.platform}`,
+              detail: `Position dropped on ${m.platform} (#${prevPos} → #${currPos})`,
             });
           }
         }
@@ -680,6 +763,14 @@ function computeChanges(latestScan, previousScan) {
 
 function computeTrendData(scans) {
   // scans are sorted newest-first from the DB query
+  // Detect which calendar dates have multiple scans so we can add time
+  const dateCounts = {};
+  for (const scan of scans) {
+    const d = scan.completedAt || scan.startedAt;
+    const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+    dateCounts[key] = (dateCounts[key] || 0) + 1;
+  }
+
   return scans.map((scan, idx) => {
     // Weighted visibility across all platform results in this scan
     const allPlatforms = scan.results.flatMap((r) => r.platforms);
@@ -688,18 +779,27 @@ function computeTrendData(scans) {
     const month = d.toLocaleString('en-US', { month: 'short' });
     const day = d.getDate();
 
+    // Add time when multiple scans share the same calendar date
+    const dateKey = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+    const time = dateCounts[dateKey] > 1
+      ? ' ' + d.toLocaleString('en-US', { hour: 'numeric', minute: '2-digit' })
+      : '';
+
     // Compute changes between this scan and the next older one
     const olderScan = scans[idx + 1] || null;
     const changes = computeChanges(scan, olderScan);
 
-    return { week: `${month} ${day}`, value, date: d.toISOString(), changes };
+    return { week: `${month} ${day}${time}`, value, date: d.toISOString(), changes };
   }).reverse(); // oldest first
 }
 
-function computePlatformStats(latestScan) {
+function computePlatformStats(latestScan, domain) {
+  const domainClean = cleanDomainForMatch(domain);
   return PLATFORM_DISPLAY.map((p) => {
+    const platformResults = [];
     let mentionCount = 0;
     let citationCount = 0;
+    let totalCitationUrls = 0;
     let totalPrompts = 0;
     let errorCount = 0;
 
@@ -707,10 +807,16 @@ function computePlatformStats(latestScan) {
       for (const r of latestScan.results) {
         const plat = r.platforms.find((pl) => pl.platformId === p.platformId);
         if (plat) {
+          platformResults.push(plat);
           if (plat.error) { errorCount++; continue; }
           totalPrompts++;
           if (plat.mentioned) mentionCount++;
           if (plat.cited) citationCount++;
+          if (plat.citationCount != null) {
+            totalCitationUrls += plat.citationCount;
+          } else if (plat.citedUrls && plat.citedUrls.length > 0) {
+            totalCitationUrls += new Set(plat.citedUrls).size;
+          }
         }
       }
     }
@@ -722,9 +828,10 @@ function computePlatformStats(latestScan) {
       color: p.color,
       bgColor: p.bgColor,
       borderColor: p.borderColor,
-      visibility: totalPrompts > 0 ? Math.round((mentionCount / totalPrompts) * 100) : 0,
+      visibility: computeWeightedVisibility(platformResults),
       mentionCount,
       citationCount,
+      totalCitationUrls,
       errorCount,
     };
   });
@@ -1084,9 +1191,9 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
           ];
 
           const fakeScan = { results: allEmailResults, competitorResults: competitorResults || [] };
-          const metrics = computeMetrics(fakeScan, allActivePrompts.length) || {};
+          const metrics = computeMetrics(fakeScan, allActivePrompts.length, undefined, tracker.domain) || {};
           // Platform stats reflect only current scan (represents actual API calls made this run)
-          const platStats = computePlatformStats({ results, competitorResults: competitorResults || [] });
+          const platStats = computePlatformStats({ results, competitorResults: competitorResults || [] }, tracker.domain);
           const actionItems = generateActionItems(fakeScan);
           const sortedCompetitors = [...(competitorResults || [])].sort((a, b) => b.visibility - a.visibility);
 
@@ -1220,7 +1327,7 @@ async function buildDashboardResponse(tracker) {
   const oldestNeeded = activePrompts.length > 0
     ? activePrompts.reduce((min, p) => p.lastScannedAt < min ? p.lastScannedAt : min, activePrompts[0].lastScannedAt)
     : null;
-  const carryScans = oldestNeeded
+  let carryScans = oldestNeeded
     ? await AiTrackerScan.find({
         trackerId: tracker._id,
         status: 'ready',
@@ -1228,16 +1335,22 @@ async function buildDashboardResponse(tracker) {
       }).sort({ completedAt: -1 }).lean()
     : recentScans;
 
+  // Fallback: if carryScans query returned nothing (e.g. prompts' lastScannedAt is newer
+  // than any scan's completedAt due to data cleanup), use recentScans instead
+  if (carryScans.length === 0 && recentScans.length > 0) {
+    carryScans = recentScans;
+  }
+
   const latestScan = recentScans[0] || null;
   const previousScan = recentScans[1] || null;
 
-  const metrics = computeMetrics(latestScan, activePromptCount, carryScans);
+  const metrics = computeMetrics(latestScan, activePromptCount, carryScans, tracker.domain);
   const trackedPrompts = formatTrackedPrompts(prompts, latestScan, previousScan, carryScans, tracker.domain);
   const formattedCompetitors = formatCompetitors(latestScan, previousScan, tracker.domain);
   const changes = computeChanges(latestScan, previousScan);
   const trendData = computeTrendData(recentScans);
   const actionItems = generateActionItems(latestScan);
-  const platformStats = computePlatformStats(latestScan);
+  const platformStats = computePlatformStats(latestScan, tracker.domain);
 
   return {
     tracker: tracker.toTrackerState(),
@@ -1320,16 +1433,16 @@ const updateTracker = async (req, res) => {
 // ─── POST /:workspaceNumber/ai-tracker/suggest-prompts ────────────────────
 
 function buildDefaultSuggestions(domain) {
-  const brand = domain ? domain.replace(/^(https?:\/\/)?(www\.)?/, '').split('.')[0] : 'your brand';
+  const brand = domain ? domain.replace(/^(https?:\/\/)?(www\.)?/, '').split('.')[0] : 'brand';
   return [
-    { prompt: `best ${brand} alternatives`, category: 'brand', reason: `Users comparing ${brand} to competitors` },
-    { prompt: `${brand} review`, category: 'brand', reason: `Users researching ${brand} before purchasing` },
-    { prompt: `what is ${brand} and how does it work`, category: 'feature', reason: `High-intent informational query about ${brand}` },
-    { prompt: `${brand} vs competitors`, category: 'comparison', reason: 'Users actively comparing products in your space' },
-    { prompt: `is ${brand} worth it`, category: 'brand', reason: 'Purchase-intent query seeking recommendations' },
-    { prompt: `best tools like ${brand}`, category: 'brand', reason: `Users exploring options similar to ${brand}` },
-    { prompt: `${brand} pricing and plans`, category: 'feature', reason: 'Commercial query from potential customers' },
-    { prompt: `how to get started with ${brand}`, category: 'feature', reason: 'Onboarding query from high-intent users' },
+    { prompt: `what is ${brand}`, category: 'brand', reason: `Baseline: checks if AI knows about ${brand}` },
+    { prompt: `best ${brand} alternatives`, category: 'comparison', reason: 'Users comparing options in your category' },
+    { prompt: `${brand} vs competitors`, category: 'comparison', reason: 'Direct comparison queries' },
+    { prompt: `is ${brand} worth it`, category: 'brand', reason: 'Purchase-intent query about your brand' },
+    { prompt: `top tools like ${brand}`, category: 'industry', reason: 'Category-level discovery query' },
+    { prompt: `${brand} reviews and pricing`, category: 'feature', reason: 'Users evaluating your product' },
+    { prompt: `best free alternatives to ${brand}`, category: 'comparison', reason: 'Price-sensitive users exploring options' },
+    { prompt: `how does ${brand} work`, category: 'feature', reason: 'Users researching your product functionality' },
   ];
 }
 
@@ -1380,67 +1493,40 @@ const suggestPrompts = async (req, res) => {
       return res.json({ suggestions: buildDefaultSuggestions(domainTrimmed) });
     }
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000);
+    const suggestSystemPrompt = `You are an AI visibility analyst. Given a website domain, use web search to look up the domain and identify the brand name and the industry/category it belongs to. Then suggest 8 search prompts that real users would type into AI assistants (ChatGPT, Gemini, Claude, Perplexity).
 
-    try {
-      const response = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'gpt-4o-mini',
-          messages: [
-            {
-              role: 'system',
-              content: `You are an AI visibility analyst. Given a website domain, suggest 8 search prompts that users would type into AI assistants (ChatGPT, Gemini, Claude, Perplexity) where this brand could potentially be mentioned or recommended.
+The goal is to measure ORGANIC visibility — whether AI naturally recommends this brand when users ask about the category, NOT whether AI mentions the brand when users ask about the brand directly.
 
 Return a JSON object with a "suggestions" key containing an array of exactly 8 items:
 {"suggestions": [{"prompt": "the search prompt", "category": "brand", "reason": "why this prompt matters"}]}
 
 Categories: brand, feature, comparison, industry.
-- brand: queries where the brand should be directly mentioned
-- feature: queries about features/capabilities the brand offers
-- comparison: queries comparing the brand to competitors
-- industry: broader industry queries where the brand could appear
+- brand: ONE baseline query that mentions the brand name (e.g. "what is [brand]") — to check if AI knows about it at all
+- feature: queries about problems/needs the brand solves, WITHOUT naming the brand
+- comparison: queries comparing options in the category, WITHOUT naming the brand
+- industry: broader category/industry queries where the brand could naturally appear
 
-CRITICAL RULES:
-- Every prompt MUST include the actual brand name or specific product/industry terms. AI assistants will receive these prompts as-is.
-- NEVER use placeholder phrases like "your industry", "your product", "your brand", "your category", "your domain". These will be sent directly to AI models and will fail.
-- Good: "best Suparank alternatives for SEO", "is HubSpot worth it for small businesses"
-- Bad: "best tools in your industry", "how to solve problems your product addresses"
-- Prompts must be self-contained and specific enough that an AI assistant can give a concrete answer.`,
-            },
-            { role: 'user', content: `Domain: ${domainTrimmed}` },
-          ],
-          response_format: { type: 'json_object' },
-        }),
-        signal: controller.signal,
-      });
+PROMPT MIX RULES:
+- EXACTLY 1 prompt should mention the brand name (the "brand" category baseline)
+- The other 7 prompts must be CATEGORY-LEVEL queries that do NOT mention the brand name
+- Category-level prompts must use specific industry/category terms (e.g. "best SEO tools", "project management software for remote teams", "cloud hosting providers")
+- NEVER use generic placeholders like "your industry", "your product", "your brand", "this space"
+- Prompts must be self-contained and specific enough that an AI assistant can give a concrete answer
 
-      if (!response.ok) {
-        console.error('[suggest-prompts] OpenAI error:', response.status);
-        return res.json({ suggestions: buildDefaultSuggestions(domainTrimmed) });
-      }
+Examples for suparank.com (SEO/AI visibility tool):
+- Brand (1 only): "what is Suparank"
+- Category: "best SEO tools for small businesses"
+- Category: "how to track AI search visibility"
+- Category: "SEO vs AEO what's the difference"
+- Category: "best tools to monitor brand mentions in AI responses"
+- BAD: "best Suparank alternatives" (brand-biased — AI will always mention it)
+- BAD: "Suparank review" (brand-biased)
+- BAD: "best tools in your industry" (placeholder)`;
 
-      const data = await response.json();
-      const content = data.choices?.[0]?.message?.content;
-      if (!content) {
-        return res.json({ suggestions: buildDefaultSuggestions(domainTrimmed) });
-      }
-
-      let parsed;
-      try {
-        parsed = JSON.parse(content);
-      } catch {
-        return res.json({ suggestions: buildDefaultSuggestions(domainTrimmed) });
-      }
-      const suggestions = Array.isArray(parsed.suggestions) ? parsed.suggestions : Array.isArray(parsed) ? parsed : buildDefaultSuggestions(domainTrimmed);
-
-      // Validate shape
-      const valid = suggestions
+    // Helper: validate and extract suggestions from raw parsed JSON
+    const validateSuggestions = (parsed) => {
+      const suggestions = Array.isArray(parsed?.suggestions) ? parsed.suggestions : Array.isArray(parsed) ? parsed : [];
+      return suggestions
         .filter((s) => s && typeof s.prompt === 'string' && s.prompt.trim())
         .slice(0, 8)
         .map((s) => ({
@@ -1448,11 +1534,96 @@ CRITICAL RULES:
           category: ['brand', 'feature', 'comparison', 'industry'].includes(s.category) ? s.category : 'industry',
           reason: typeof s.reason === 'string' ? s.reason.slice(0, 200) : 'Relevant to your brand visibility',
         }));
+    };
 
-      res.json({ suggestions: valid.length > 0 ? valid : buildDefaultSuggestions(domainTrimmed) });
+    // Primary: Responses API with web_search (can look up unknown domains)
+    let valid = [];
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 45000);
+    try {
+      const response = await fetch('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          instructions: suggestSystemPrompt,
+          input: `Domain: ${domainTrimmed}`,
+          tools: [{ type: 'web_search', search_context_size: 'low' }],
+          text: { format: { type: 'json_object' } },
+          store: false,
+        }),
+        signal: controller.signal,
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        // Extract text content from Responses API output
+        let content = '';
+        for (const item of (data.output || [])) {
+          if (item.type === 'message' && item.content) {
+            for (const part of item.content) {
+              if (part.type === 'output_text') content += part.text;
+            }
+          }
+        }
+        if (content) {
+          try {
+            valid = validateSuggestions(JSON.parse(content));
+          } catch { /* parse failed, will try fallback */ }
+        }
+      } else {
+        console.warn('[suggest-prompts] Responses API error:', response.status);
+      }
+    } catch (err) {
+      console.warn('[suggest-prompts] Responses API failed:', err.message);
     } finally {
       clearTimeout(timeout);
     }
+
+    // Fallback: Chat Completions (no web search, works for well-known domains)
+    if (valid.length === 0) {
+      const controller2 = new AbortController();
+      const timeout2 = setTimeout(() => controller2.abort(), 30000);
+      try {
+        const response = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: 'gpt-4o-mini',
+            messages: [
+              { role: 'system', content: suggestSystemPrompt },
+              { role: 'user', content: `Domain: ${domainTrimmed}` },
+            ],
+            response_format: { type: 'json_object' },
+          }),
+          signal: controller2.signal,
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const content = data.choices?.[0]?.message?.content;
+          if (content) {
+            try {
+              valid = validateSuggestions(JSON.parse(content));
+            } catch { /* parse failed */ }
+          }
+        } else {
+          console.warn('[suggest-prompts] Chat Completions error:', response.status);
+        }
+      } catch (err) {
+        console.warn('[suggest-prompts] Chat Completions failed:', err.message);
+      } finally {
+        clearTimeout(timeout2);
+      }
+    }
+
+    res.json({ suggestions: valid.length > 0 ? valid : buildDefaultSuggestions(domainTrimmed) });
   } catch (err) {
     console.error('suggestPrompts error:', err.message);
     const fallbackDomain = req.body?.domain?.trim() || null;
@@ -1548,12 +1719,22 @@ const setup = async (req, res) => {
       }
     }
 
-    const monitorName = (name && typeof name === 'string' && name.trim()) ? name.trim() : domain.trim();
+    let monitorName = (name && typeof name === 'string' && name.trim()) ? name.trim() : domain.trim();
 
-    // Check if monitor with same name already exists
+    // Check if monitor with same name already exists — auto-suffix if needed
     const existing = await AiTracker.findOne({ workspaceId: workspace._id, name: monitorName });
     if (existing) {
-      return res.status(409).json({ error: 'A monitor with this name already exists' });
+      // Try appending a number suffix to make it unique
+      let suffix = 2;
+      let candidate = `${monitorName} (${suffix})`;
+      while (await AiTracker.findOne({ workspaceId: workspace._id, name: candidate })) {
+        suffix++;
+        candidate = `${monitorName} (${suffix})`;
+        if (suffix > 20) {
+          return res.status(409).json({ error: 'A monitor with this name already exists. Please choose a different name.' });
+        }
+      }
+      monitorName = candidate;
     }
 
     // Create tracker
@@ -1568,7 +1749,7 @@ const setup = async (req, res) => {
       });
     } catch (createErr) {
       if (createErr.code === 11000) {
-        return res.status(409).json({ error: 'A monitor with this name already exists' });
+        return res.status(409).json({ error: 'A monitor with this name already exists. Please choose a different name.' });
       }
       throw createErr;
     }
@@ -2103,17 +2284,30 @@ const createMonitor = async (req, res) => {
       }
     }
 
-    const monitorName = (name && typeof name === 'string' && name.trim()) ? name.trim() : domain.trim();
+    let monitorName = (name && typeof name === 'string' && name.trim()) ? name.trim() : domain.trim();
 
-    // Check duplicate name
+    // Check duplicate name — auto-suffix if needed
+    console.log(`[createMonitor] workspaceId=${workspace._id}, monitorName="${monitorName}"`);
     const existing = await AiTracker.findOne({ workspaceId: workspace._id, name: monitorName });
+    console.log(`[createMonitor] existing check result:`, existing ? `found _id=${existing._id} name="${existing.name}"` : 'null (no match)');
     if (existing) {
-      return res.status(409).json({ error: 'A monitor with this name already exists' });
+      let suffix = 2;
+      let candidate = `${monitorName} (${suffix})`;
+      while (await AiTracker.findOne({ workspaceId: workspace._id, name: candidate })) {
+        suffix++;
+        candidate = `${monitorName} (${suffix})`;
+        if (suffix > 20) {
+          return res.status(409).json({ error: 'A monitor with this name already exists. Please choose a different name.' });
+        }
+      }
+      monitorName = candidate;
+      console.log(`[createMonitor] auto-suffixed to "${monitorName}"`);
     }
 
     // Create tracker
     let tracker;
     try {
+      console.log(`[createMonitor] creating tracker: workspace=${workspace._id}, name="${monitorName}", domain="${domain.trim()}"`);
       tracker = await AiTracker.create({
         workspaceId: workspace._id,
         name: monitorName,
@@ -2121,9 +2315,13 @@ const createMonitor = async (req, res) => {
         defaultModels: selectedPlatforms,
         scanStatus: 'pending',
       });
+      console.log(`[createMonitor] created successfully: _id=${tracker._id}`);
     } catch (createErr) {
+      console.error(`[createMonitor] create error: code=${createErr.code}, message=${createErr.message}`);
       if (createErr.code === 11000) {
-        return res.status(409).json({ error: 'A monitor with this name already exists' });
+        // Log indexes to diagnose stale unique constraints
+        try { const idxs = await AiTracker.collection.indexes(); console.error('[createMonitor] collection indexes:', JSON.stringify(idxs)); } catch {}
+        return res.status(409).json({ error: 'A monitor with this name already exists. Please choose a different name.' });
       }
       throw createErr;
     }
@@ -2571,6 +2769,93 @@ const dismissMonitorSuggestedCompetitor = async (req, res) => {
   }
 };
 
+// ─── GET /:wn/ai-tracker/scan-details?date=ISO ─────────────────────────
+// Returns platform-level data (aiResponse, fanoutQueries, brandRanking,
+// citedUrls) for the scan closest to the requested date.  Used by the
+// frontend when viewing a historical date range so detail tabs show the
+// correct scan's data instead of always showing the latest scan.
+
+const getScanDetails = async (req, res) => {
+  try {
+    const workspace = req.workspace;
+    const { date } = req.query;
+
+    if (!date) {
+      return res.status(400).json({ error: 'date query parameter is required' });
+    }
+
+    const targetDate = new Date(date);
+    if (isNaN(targetDate.getTime())) {
+      return res.status(400).json({ error: 'Invalid date format' });
+    }
+
+    // Resolve tracker — legacy single-monitor or multi-monitor
+    const tracker = req.params.monitorId
+      ? await resolveMonitor(req, workspace, res)
+      : await resolveTracker(workspace, res);
+    if (!tracker) return; // resolveTracker/resolveMonitor already sent the response
+
+    // Find the scan closest to the target date.
+    // Two queries hitting the existing { trackerId, completedAt } index.
+    const [scanBefore, scanAfter] = await Promise.all([
+      AiTrackerScan.findOne({
+        trackerId: tracker._id,
+        status: 'ready',
+        completedAt: { $lte: targetDate },
+      }).sort({ completedAt: -1 }).limit(1).lean(),
+      AiTrackerScan.findOne({
+        trackerId: tracker._id,
+        status: 'ready',
+        completedAt: { $gt: targetDate },
+      }).sort({ completedAt: 1 }).limit(1).lean(),
+    ]);
+
+    let scan = null;
+    if (scanBefore && scanAfter) {
+      const diffBefore = targetDate - scanBefore.completedAt;
+      const diffAfter = scanAfter.completedAt - targetDate;
+      scan = diffBefore <= diffAfter ? scanBefore : scanAfter;
+    } else {
+      scan = scanBefore || scanAfter;
+    }
+
+    if (!scan) {
+      return res.status(404).json({ error: 'No scan found near the specified date' });
+    }
+
+    // Build promptPlatforms map: { promptId → platforms[] }
+    const promptPlatforms = {};
+    for (const result of scan.results || []) {
+      const promptId = result.promptId?.toString();
+      if (!promptId) continue;
+      promptPlatforms[promptId] = (result.platforms || []).map((pl) => ({
+        platformId: pl.platformId,
+        mentioned: pl.mentioned,
+        position: pl.position ?? null,
+        cited: pl.cited,
+        citationCount: pl.citationCount || 0,
+        citedUrls: pl.citedUrls || [],
+        brandRanking: pl.brandRanking || [],
+        aiResponse: pl.aiResponse || '',
+        sentiment: pl.sentiment || null,
+        sentimentScore: pl.sentimentScore ?? null,
+        error: pl.error || false,
+        fanoutQueries: pl.fanoutQueries || [],
+      }));
+    }
+
+    res.json({
+      scanDate: scan.completedAt.toISOString(),
+      scanId: scan._id.toString(),
+      promptPlatforms,
+      competitorResults: scan.competitorResults || [],
+    });
+  } catch (err) {
+    console.error('getScanDetails error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch scan details' });
+  }
+};
+
 module.exports = {
   // Legacy single-monitor
   getTracker,
@@ -2602,6 +2887,8 @@ module.exports = {
   addMonitorCompetitor,
   removeMonitorCompetitor,
   dismissMonitorSuggestedCompetitor,
+  // Shared (works for both legacy and multi-monitor via req.params.monitorId)
+  getScanDetails,
   // Dev helpers (no-op in production since _devTimeScale defaults to 1)
   setDevTimeScale,
   getDevTimeScale,

@@ -82,7 +82,7 @@ const tierConfigSchema = new mongoose.Schema(
 
     // ── Sitemap Crawler ──
     maxSitemaps: { type: Number, default: 3 },
-    maxCrawlPages: { type: Number, default: 500 },
+    maxCrawlPages: { type: Number, default: 100 },
 
     // ── Seats (organization members) ──
     maxSeats: { type: Number, default: 1 },

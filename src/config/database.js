@@ -23,6 +23,9 @@ const connectDB = async () => {
     // Sync indexes to drop stale unique constraints
     const Avatar = require('../models/Avatar');
     await Avatar.syncIndexes();
+    const AiTracker = require('../models/AiTracker');
+    await AiTracker.syncIndexes();
+    console.log('[db] AiTracker indexes synced');
 
     return conn;
   } catch (error) {

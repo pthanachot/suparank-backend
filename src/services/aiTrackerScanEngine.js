@@ -46,44 +46,83 @@ async function searchChatGPT(query) {
   const apiKey = process.env.CHATGPT_API_KEY;
   if (!apiKey) throw new Error('CHATGPT_API_KEY not configured');
 
+  const systemPrompt = 'You MUST search the web for current information before answering. For EVERY claim or fact, cite the source immediately after it using markdown link format: [domain.com](full_url). Example: "Google holds 90% market share [mangools.com](https://mangools.com/blog/search-engines/)." NEVER list sources at the end. NEVER use numbered references like [1] or [2]. Always inline the citation right after the statement it supports. Answer directly and comprehensively. NEVER ask clarifying questions, follow-up questions, or ask what the user means. If the query is ambiguous, interpret it broadly and answer all reasonable interpretations. Do not answer from memory alone.';
+
+  // Try Responses API first (returns real fanout queries), fall back to Chat Completions
+  try {
+    const result = await _searchChatGPTResponses(query, apiKey, systemPrompt);
+    return result;
+  } catch (responsesErr) {
+    console.warn(`[chatgpt] Responses API failed, falling back to Chat Completions: ${responsesErr.message}`);
+    return _searchChatGPTCompletions(query, apiKey, systemPrompt);
+  }
+}
+
+/** ChatGPT via Responses API — returns real web_search_call fanout queries */
+async function _searchChatGPTResponses(query, apiKey, systemPrompt) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 90000);
 
   try {
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    const res = await fetch('https://api.openai.com/v1/responses', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'gpt-5-search-api',
-        messages: [{ role: 'user', content: query }],
-        web_search_options: {},
+        model: 'gpt-4o-mini',
+        instructions: systemPrompt,
+        input: query,
+        tools: [
+          {
+            type: 'web_search',
+            search_context_size: 'low',
+          },
+        ],
+        store: false,
       }),
       signal: controller.signal,
     });
 
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(`OpenAI returned status ${res.status}: ${text.slice(0, 200)}`);
+      throw new Error(`OpenAI Responses API returned status ${res.status}: ${text.slice(0, 200)}`);
     }
 
     const data = await res.json();
     let answer = '';
     const citations = [];
     const seen = new Set();
+    let annotations = [];
+    const fanoutQueries = [];
 
-    if (data.choices && data.choices.length > 0) {
-      const choice = data.choices[0];
-      answer = choice.message?.content || '';
+    // Parse output items from Responses API
+    for (const item of (data.output || [])) {
+      // Extract real search queries from web_search_call items
+      if (item.type === 'web_search_call' && item.action?.type === 'search') {
+        if (Array.isArray(item.action.queries)) {
+          for (const q of item.action.queries) {
+            if (q && !fanoutQueries.includes(q)) fanoutQueries.push(q);
+          }
+        } else if (item.action.query) {
+          if (!fanoutQueries.includes(item.action.query)) fanoutQueries.push(item.action.query);
+        }
+      }
 
-      // Extract citations from structured annotations
-      const annotations = choice.message?.annotations || [];
-      for (const ann of annotations) {
-        if (ann.type === 'url_citation' && ann.url_citation?.url && !seen.has(ann.url_citation.url)) {
-          seen.add(ann.url_citation.url);
-          citations.push(ann.url_citation.url);
+      // Extract answer text and citation annotations from message items
+      if (item.type === 'message' && item.role === 'assistant') {
+        for (const block of (item.content || [])) {
+          if (block.type === 'output_text') {
+            answer += block.text || '';
+            annotations = block.annotations || [];
+            for (const ann of annotations) {
+              if (ann.type === 'url_citation' && ann.url && !seen.has(ann.url)) {
+                seen.add(ann.url);
+                citations.push(ann.url);
+              }
+            }
+          }
         }
       }
     }
@@ -100,19 +139,78 @@ async function searchChatGPT(query) {
     }
 
     if (!answer || answer.trim().length === 0) {
-      throw new Error('ChatGPT returned empty response');
+      throw new Error('ChatGPT Responses API returned empty response');
     }
 
-    // ChatGPT doesn't expose internal search queries — ask it explicitly
-    const fanoutQueries = await generateSubQueries(
-      query,
-      'https://api.openai.com/v1/chat/completions',
-      apiKey,
-      'gpt-4o-mini',
-    );
+    console.log(`[chatgpt-responses] query_len=${query.length} answer_len=${answer.length} citations=${citations.length} fanout=${fanoutQueries.length}`);
+    return { answer, citations, fanoutQueries, annotations };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
-    console.log(`[chatgpt] query_len=${query.length} answer_len=${answer.length} citations=${citations.length} fanout=${fanoutQueries.length}`);
-    return { answer, citations, fanoutQueries };
+/** ChatGPT via Chat Completions API — fallback when Responses API fails (no fanout queries) */
+async function _searchChatGPTCompletions(query, apiKey, systemPrompt) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 90000);
+
+  try {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini-search-preview',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: query },
+        ],
+        web_search_options: { search_context_size: 'low' },
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`OpenAI Chat Completions returned status ${res.status}: ${text.slice(0, 200)}`);
+    }
+
+    const data = await res.json();
+    let answer = '';
+    const citations = [];
+    const seen = new Set();
+    let annotations = [];
+
+    if (data.choices && data.choices.length > 0) {
+      const choice = data.choices[0];
+      answer = choice.message?.content || '';
+      annotations = choice.message?.annotations || [];
+      for (const ann of annotations) {
+        if (ann.type === 'url_citation' && ann.url_citation?.url && !seen.has(ann.url_citation.url)) {
+          seen.add(ann.url_citation.url);
+          citations.push(ann.url_citation.url);
+        }
+      }
+    }
+
+    if (citations.length === 0 && answer) {
+      const fallback = extractCitationsFromText(answer);
+      for (const url of fallback) {
+        if (!seen.has(url)) {
+          seen.add(url);
+          citations.push(url);
+        }
+      }
+    }
+
+    if (!answer || answer.trim().length === 0) {
+      throw new Error('ChatGPT Chat Completions returned empty response');
+    }
+
+    console.log(`[chatgpt-completions-fallback] query_len=${query.length} answer_len=${answer.length} citations=${citations.length}`);
+    return { answer, citations, fanoutQueries: [], annotations };
   } finally {
     clearTimeout(timeout);
   }
@@ -139,7 +237,7 @@ async function searchGemini(query) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: query }] }],
+        contents: [{ parts: [{ text: 'You MUST search the web thoroughly for current information before answering. Search for MULTIPLE aspects of the question — specific brands, products, comparisons, rankings, and recent developments separately. For EVERY claim or fact, cite the source immediately after it using markdown link format: [domain.com](full_url). Example: "Google holds 90% market share [mangools.com](https://mangools.com/blog/search-engines/)." NEVER list sources at the end. NEVER use numbered references like [1] or [2]. Always inline the citation right after the statement it supports. Answer directly and comprehensively. NEVER ask clarifying questions, follow-up questions, or ask what the user means. If the query is ambiguous, interpret it broadly and answer all reasonable interpretations. Do not answer from memory alone — always search first.\n\n' + query }] }],
         tools: [{ google_search: {} }],
       }),
       signal: controller.signal,
@@ -156,6 +254,8 @@ async function searchGemini(query) {
     const seen = new Set();
 
     let fanoutQueries = [];
+    let groundingChunks = [];
+    let groundingSupports = [];
 
     if (data.candidates && data.candidates.length > 0) {
       const candidate = data.candidates[0];
@@ -169,6 +269,7 @@ async function searchGemini(query) {
 
       // Extract citations from grounding metadata
       const chunks = candidate.groundingMetadata?.groundingChunks || [];
+      groundingChunks = chunks;
       for (const chunk of chunks) {
         let uri = chunk.web?.uri || '';
         if (!uri) continue;
@@ -187,6 +288,9 @@ async function searchGemini(query) {
 
       // Extract the actual search queries Gemini used (free, already in response)
       fanoutQueries = candidate.groundingMetadata?.webSearchQueries || [];
+
+      // Extract grounding supports for inline citation positioning
+      groundingSupports = candidate.groundingMetadata?.groundingSupports || [];
     }
 
     if (!answer || answer.trim().length === 0) {
@@ -194,7 +298,7 @@ async function searchGemini(query) {
     }
 
     console.log(`[gemini] query_len=${query.length} answer_len=${answer.length} citations=${citations.length} fanout=${fanoutQueries.length}`);
-    return { answer, citations, fanoutQueries };
+    return { answer, citations, fanoutQueries, groundingSupports, groundingChunks };
   } finally {
     clearTimeout(timeout);
   }
@@ -223,7 +327,11 @@ async function searchPerplexity(query) {
       },
       body: JSON.stringify({
         model: 'sonar',
-        messages: [{ role: 'user', content: query }],
+        messages: [
+          { role: 'system', content: 'You MUST search the web for current information before answering. For EVERY claim or fact, cite the source immediately after it using markdown link format: [domain.com](full_url). Example: "Google holds 90% market share [mangools.com](https://mangools.com/blog/search-engines/)." NEVER list sources at the end. NEVER use numbered references like [1] or [2]. Always inline the citation right after the statement it supports. Answer directly and comprehensively. NEVER ask clarifying questions, follow-up questions, or ask what the user means. If the query is ambiguous, interpret it broadly and answer all reasonable interpretations. Do not answer from memory alone.' },
+          { role: 'user', content: query },
+        ],
+        return_related_questions: true,
       }),
       signal: controller.signal,
     });
@@ -256,13 +364,8 @@ async function searchPerplexity(query) {
       throw new Error('Perplexity returned empty response');
     }
 
-    // Perplexity doesn't expose internal search queries — ask it explicitly
-    const fanoutQueries = await generateSubQueries(
-      query,
-      'https://api.perplexity.ai/chat/completions',
-      apiKey,
-      'sonar',
-    );
+    // Use related_questions as fanout queries — real queries generated by Perplexity
+    const fanoutQueries = Array.isArray(data.related_questions) ? data.related_questions.filter(q => typeof q === 'string' && q.trim()) : [];
 
     console.log(`[perplexity] query_len=${query.length} answer_len=${answer.length} citations=${citations.length} fanout=${fanoutQueries.length}`);
     return { answer, citations, fanoutQueries };
@@ -296,11 +399,21 @@ async function searchClaude(query) {
       body: JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 2048,
+        system: 'You MUST search the web thoroughly for current information before answering. Perform MULTIPLE web searches covering different aspects of the question — search for specific brands, products, comparisons, rankings, and recent news separately. For EVERY claim or fact, cite the source immediately after it using markdown link format: [domain.com](full_url). Example: "Google holds 90% market share [mangools.com](https://mangools.com/blog/search-engines/)." NEVER list sources at the end. NEVER use numbered references like [1] or [2]. Always inline the citation right after the statement it supports. Answer directly and comprehensively. NEVER ask clarifying questions, follow-up questions, or ask what the user means. If the query is ambiguous, interpret it broadly and answer all reasonable interpretations. Do not answer from memory alone — always search first.',
         messages: [{ role: 'user', content: query }],
-        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }],
+        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 10 }],
       }),
       signal: controller.signal,
     });
+
+    if (res.status === 429) {
+      const retryAfter = parseInt(res.headers.get('retry-after') || '0', 10);
+      const delay = Math.max(retryAfter * 1000, 5000);
+      console.warn(`[ai-tracker] searchClaude rate limited (429), waiting ${delay}ms before retry...`);
+      clearTimeout(timeout);
+      await new Promise((r) => setTimeout(r, delay));
+      throw new Error(`Claude returned status 429 (rate limited)`);
+    }
 
     if (!res.ok) {
       const text = await res.text();
@@ -315,15 +428,26 @@ async function searchClaude(query) {
     // Claude web search response: content blocks include text (with citations),
     // server_tool_use (web search calls), and web_search_tool_result
     const fanoutQueries = [];
+    const textBlocks = []; // Keep full blocks for citation position embedding
     if (Array.isArray(data.content)) {
       for (const block of data.content) {
         // Extract the actual search queries Claude sent to its web search tool
         if (block.type === 'server_tool_use' && block.name === 'web_search' && block.input?.query) {
           fanoutQueries.push(block.input.query);
         }
+        // Extract source URLs from web_search_tool_result blocks (fallback citation source)
+        if (block.type === 'web_search_tool_result' && Array.isArray(block.content)) {
+          for (const sr of block.content) {
+            if (sr.type === 'web_search_result' && sr.url && !seen.has(sr.url)) {
+              seen.add(sr.url);
+              citations.push(sr.url);
+            }
+          }
+        }
         if (block.type === 'text' && block.text) {
+          textBlocks.push(block); // Keep full block including citations array
           answer += block.text;
-          // Extract citation URLs from inline citations
+          // Extract citation URLs from text block citations (web_search_result_location)
           if (Array.isArray(block.citations)) {
             for (const cite of block.citations) {
               if (cite.url && !seen.has(cite.url)) {
@@ -351,8 +475,9 @@ async function searchClaude(query) {
       throw new Error('Claude returned empty response');
     }
 
-    console.log(`[claude] query_len=${query.length} answer_len=${answer.length} citations=${citations.length} fanout=${fanoutQueries.length}`);
-    return { answer, citations, fanoutQueries };
+    const blockCiteCount = textBlocks.reduce((n, b) => n + (Array.isArray(b.citations) ? b.citations.length : 0), 0);
+    console.log(`[claude] query_len=${query.length} answer_len=${answer.length} citations=${citations.length} blockCitations=${blockCiteCount} blocks=${textBlocks.length} fanout=${fanoutQueries.length}`);
+    return { answer, citations, fanoutQueries, blocks: textBlocks };
   } finally {
     clearTimeout(timeout);
   }
@@ -427,7 +552,178 @@ function extractCitationsFromText(text) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// BRAND & COMPETITOR DETECTION
+// CITATION EMBEDDING
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Extract a display-friendly domain from a URL.
+ * e.g., "https://www.example.com/page" → "example.com"
+ */
+function extractDomainFromURL(url) {
+  try {
+    const u = new URL(url);
+    return u.hostname.replace(/^www\./, '');
+  } catch {
+    const match = url.match(/https?:\/\/(?:www\.)?([^/]+)/);
+    return match ? match[1] : url.slice(0, 30);
+  }
+}
+
+/**
+ * Claude web search: citations are { type: "web_search_result_location", url, title, cited_text, encrypted_index }.
+ * There are NO char position indices (end_char_index/start_char_index), and cited_text is from the
+ * SOURCE page (not Claude's response), so we append citation links after each text block.
+ */
+function embedClaudeCitations(answer, citations, blocks) {
+  if (!blocks || blocks.length === 0) {
+    // No blocks available — append citation URLs at the end if we have them
+    if (citations && citations.length > 0) {
+      const seen = new Set();
+      const links = [];
+      for (const url of citations) {
+        if (seen.has(url)) continue;
+        seen.add(url);
+        links.push(`[${extractDomainFromURL(url)}](${url})`);
+      }
+      if (links.length > 0) {
+        return answer.trimEnd() + '\n\nSources: ' + links.join(' ');
+      }
+    }
+    return answer;
+  }
+
+  let result = '';
+  let anyInserted = false;
+
+  for (const block of blocks) {
+    if (block.type !== 'text' || !block.text) continue;
+
+    let blockText = block.text;
+    if (Array.isArray(block.citations) && block.citations.length > 0) {
+      // Deduplicate and append citation links after this text block
+      const seen = new Set();
+      const links = [];
+      for (const cite of block.citations) {
+        const url = cite.url;
+        if (!url || seen.has(url)) continue;
+        seen.add(url);
+        links.push(`[${extractDomainFromURL(url)}](${url})`);
+      }
+      if (links.length > 0) {
+        blockText = blockText.trimEnd() + ' ' + links.join(' ');
+        anyInserted = true;
+      }
+    }
+    result += blockText;
+  }
+
+  // Fallback: if no block-level citations were inserted, append all citation URLs
+  if (!anyInserted && citations && citations.length > 0) {
+    const seen = new Set();
+    const links = [];
+    for (const url of citations) {
+      if (seen.has(url)) continue;
+      seen.add(url);
+      links.push(`[${extractDomainFromURL(url)}](${url})`);
+    }
+    if (links.length > 0) {
+      result = (result || answer).trimEnd() + '\n\nSources: ' + links.join(' ');
+    }
+  }
+
+  console.log(`[claude-citations] blocks=${blocks.length} anyInserted=${anyInserted} citationUrls=${citations?.length || 0}`);
+  return result || answer;
+}
+
+/**
+ * Gemini: use groundingSupports for inline citation positioning.
+ * Each support has segment.endIndex and groundingChunkIndices pointing to URLs.
+ */
+function embedGeminiCitations(answer, citations, groundingSupports, groundingChunks) {
+  if (!groundingSupports || groundingSupports.length === 0) return answer;
+
+  // Build chunk index → resolved URL mapping
+  const chunkUrls = {};
+  if (Array.isArray(groundingChunks)) {
+    for (let i = 0; i < groundingChunks.length; i++) {
+      const uri = groundingChunks[i].web?.uri;
+      if (uri) {
+        // Find the resolved URL in citations (redirect URLs were already resolved)
+        chunkUrls[i] = citations[i] || uri;
+      }
+    }
+  }
+
+  // Collect insertion points from grounding supports
+  const insertions = []; // { pos, links }
+  const inserted = new Set();
+  for (const support of groundingSupports) {
+    const seg = support.segment;
+    if (!seg || typeof seg.endIndex !== 'number') continue;
+    const indices = support.groundingChunkIndices || [];
+    if (indices.length === 0) continue;
+
+    // Collect unique URLs for this support segment
+    const links = [];
+    for (const idx of indices) {
+      const url = chunkUrls[idx];
+      if (!url) continue;
+      const key = `${url}:${seg.endIndex}`;
+      if (inserted.has(key)) continue;
+      inserted.add(key);
+      const domain = extractDomainFromURL(url);
+      links.push(`[${domain}](${url})`);
+    }
+    if (links.length > 0) {
+      insertions.push({ pos: seg.endIndex, link: ' ' + links.join(' ') });
+    }
+  }
+
+  if (insertions.length === 0) return answer;
+
+  // Sort by position descending and insert
+  let result = answer;
+  insertions.sort((a, b) => b.pos - a.pos);
+  for (const ins of insertions) {
+    result = result.slice(0, ins.pos) + ins.link + result.slice(ins.pos);
+  }
+  return result;
+}
+
+/**
+ * Embed structured citation metadata inline for platforms that return
+ * citations separately from text (Gemini and Claude only).
+ */
+function embedCitationsInAnswer(answer, citations, platformId, extra = {}) {
+  if (!answer || !citations || citations.length === 0) return answer;
+
+  if (platformId === 'claude') {
+    return embedClaudeCitations(answer, citations, extra.blocks || []);
+  }
+  if (platformId === 'gemini') {
+    return embedGeminiCitations(answer, citations, extra.groundingSupports || [], extra.groundingChunks || []);
+  }
+  return answer;
+}
+
+/**
+ * Truncate text without cutting markdown links in half.
+ */
+function safeSlice(text, maxLen) {
+  if (text.length <= maxLen) return text;
+  let sliced = text.slice(0, maxLen);
+  const lastOpen = sliced.lastIndexOf('[');
+  if (lastOpen > 0) {
+    const afterBracket = sliced.slice(lastOpen);
+    if (!/\[[^\]]*\]\([^)]*\)/.test(afterBracket)) {
+      sliced = sliced.slice(0, lastOpen);
+    }
+  }
+  return sliced;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BRAND & ANALYSIS
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
@@ -447,70 +743,48 @@ function cleanDomain(domain) {
 }
 
 /**
- * Analyze sentiment of brand mention in an AI response using gpt-4o-mini.
- * Returns { sentiment, sentimentScore } or null if analysis fails.
+ * Unified response analysis — single Claude Haiku call that extracts:
+ *   - Ordered brand list (with duplicates for mention counting)
+ *   - Citation URLs from the text
+ *   - Sentiment toward target brand
+ *
+ * Replaces: detectBrand(), extractBrandRanking(), analyzeSentiment()
+ *
+ * @param {string} aiResponse - The AI response text (with inline citations)
+ * @param {string} query - The original prompt query
+ * @param {string} targetBrand - The user's brand name (e.g. "suparank")
+ * @param {string} domain - The user's domain (e.g. "suparank.com")
+ * @returns {Promise<Object>} Analysis results
  */
-async function analyzeSentiment(aiResponse, brandName) {
-  if (!aiResponse || !brandName) return null;
-
-  const prompt = `You analyze brand sentiment in AI responses. Respond ONLY with valid JSON: {"sentiment":"positive"|"neutral"|"negative","score":0-100} where 100=most positive. No other text.\n\nBrand: "${brandName}"\nAI Response (excerpt):\n${aiResponse.slice(0, 1000)}`;
-
-  // Try Claude first (reliable), fall back to OpenAI
-  const claudeResult = await _sentimentViaClaude(prompt);
-  if (claudeResult) return claudeResult;
-
-  const openaiResult = await _sentimentViaOpenAI(prompt);
-  return openaiResult;
-}
-
-async function _sentimentViaOpenAI(prompt) {
-  const apiKey = process.env.CHATGPT_API_KEY;
-  if (!apiKey) return null;
-
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 60000);
-    try {
-      const res = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'gpt-4o-mini',
-          messages: [
-            { role: 'system', content: 'Respond ONLY with valid JSON. No other text.' },
-            { role: 'user', content: prompt },
-          ],
-          max_tokens: 30,
-          temperature: 0,
-        }),
-        signal: controller.signal,
-      });
-      if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        console.warn(`[ai-tracker] OpenAI sentiment failed: ${res.status} ${res.statusText}`, body.slice(0, 200));
-        return null;
-      }
-      const data = await res.json();
-      return _parseSentimentResponse(data.choices?.[0]?.message?.content?.trim());
-    } finally {
-      clearTimeout(timeout);
-    }
-  } catch (err) {
-    console.warn('[ai-tracker] OpenAI sentiment error:', err?.message || err);
-    return null;
-  }
-}
-
-async function _sentimentViaClaude(prompt) {
+async function analyzeResponse(aiResponse, query, targetBrand, domain) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    console.warn('[ai-tracker] Claude sentiment skipped: no ANTHROPIC_API_KEY');
-    return null;
+  if (!apiKey || !aiResponse) {
+    return _fallbackAnalysis(aiResponse, targetBrand, domain);
   }
 
-  try {
+  const domainClean = cleanDomain(domain);
+
+  const userPrompt = `Analyze this AI response about "${query}".
+Target brand: "${targetBrand}" (domain: ${domain})
+
+AI Response:
+"""
+${aiResponse.slice(0, 4000)}
+"""
+
+Return a JSON object with:
+1. "brands": An ordered array of brand/company/product names mentioned in the response, ranked by prominence (most prominent first). Include ONLY brands relevant to the topic. If a brand is mentioned multiple times in different contexts, include it multiple times. Use canonical product names (e.g. "Ahrefs" not "ahrefs.com"). Merge parent company + product into one entry (e.g. "Google" + "Gemini" → "Gemini"). Include the target brand "${targetBrand}" if mentioned.
+2. "citationUrls": An array of ALL URLs found in the text (from markdown links like [text](url) or bare URLs). Include each URL every time it appears.
+3. "sentiment": If the target brand "${targetBrand}" is mentioned, return {"label":"positive"|"neutral"|"negative","score":0-100} where 100=most positive. If not mentioned, return null.
+
+Return ONLY valid JSON, no other text. Example:
+{"brands":["BrandA","BrandB","BrandA"],"citationUrls":["https://example.com"],"sentiment":{"label":"positive","score":85}}`;
+
+  // Retry loop for rate limit (429) errors — up to 3 attempts with backoff
+  let data;
+  for (let attempt = 0; attempt < 3; attempt++) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 60000);
+    const timeout = setTimeout(() => controller.abort(), 30000);
     try {
       const res = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -521,42 +795,161 @@ async function _sentimentViaClaude(prompt) {
         },
         body: JSON.stringify({
           model: 'claude-haiku-4-5-20251001',
-          max_tokens: 60,
-          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 1024,
+          messages: [{ role: 'user', content: userPrompt }],
         }),
         signal: controller.signal,
       });
-      if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        console.warn(`[ai-tracker] Claude sentiment failed: ${res.status} ${res.statusText}`, body.slice(0, 200));
-        return null;
+
+      if (res.status === 429) {
+        const retryAfter = parseInt(res.headers.get('retry-after') || '0', 10);
+        const delay = Math.max(retryAfter * 1000, 2000 * Math.pow(2, attempt)); // 2s, 4s, 8s minimum
+        console.warn(`[ai-tracker] analyzeResponse rate limited (429), retry ${attempt + 1}/3 after ${delay}ms`);
+        clearTimeout(timeout);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
       }
-      const data = await res.json();
-      const rawText = data.content?.[0]?.text?.trim();
-      console.log('[ai-tracker] Claude sentiment raw response:', rawText);
-      return _parseSentimentResponse(rawText);
-    } finally {
+
+      if (!res.ok) {
+        console.warn(`[ai-tracker] analyzeResponse failed: ${res.status}`);
+        clearTimeout(timeout);
+        return _fallbackAnalysis(aiResponse, targetBrand, domain);
+      }
+
+      data = await res.json();
       clearTimeout(timeout);
+      break; // success
+    } catch (err) {
+      clearTimeout(timeout);
+      if (attempt < 2) {
+        console.warn(`[ai-tracker] analyzeResponse error (attempt ${attempt + 1}): ${err?.message}`);
+        await new Promise((r) => setTimeout(r, 2000 * Math.pow(2, attempt)));
+        continue;
+      }
+      console.warn('[ai-tracker] analyzeResponse error (final):', err?.message || err);
+      return _fallbackAnalysis(aiResponse, targetBrand, domain);
     }
+  }
+  if (!data) return _fallbackAnalysis(aiResponse, targetBrand, domain);
+
+  try {
+    const rawText = data.content?.[0]?.text?.trim();
+    if (!rawText) return _fallbackAnalysis(aiResponse, targetBrand, domain);
+
+    // Parse — strip markdown code fences if present
+    let cleaned;
+    const fenceMatch = rawText.match(/```(?:json)?\s*\n([\s\S]*?)\n```/i);
+    if (fenceMatch) {
+      cleaned = fenceMatch[1].trim();
+    } else {
+      cleaned = rawText.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```[\s\S]*/i, '').trim();
+    }
+    const parsed = JSON.parse(cleaned);
+
+    // Process brands
+    const rawBrands = Array.isArray(parsed.brands) ? parsed.brands.filter(b => typeof b === 'string' && b.trim()) : [];
+
+    // Build deduplicated brand ranking with mention counts (order of first occurrence)
+    const brandRanking = [];
+    for (const name of rawBrands) {
+      const trimmed = name.trim();
+      if (!trimmed) continue;
+      const existing = brandRanking.find(b => isSameBrand(b.brandName, trimmed));
+      if (existing) {
+        existing.mentionCount++;
+        // Prefer longer (more specific) name
+        if (trimmed.length > existing.brandName.length) existing.brandName = trimmed;
+      } else {
+        brandRanking.push({
+          brandName: trimmed,
+          isTargetBrand: isSameBrand(trimmed, targetBrand) || trimmed.toLowerCase().includes(domainClean),
+          mentionCount: 1,
+        });
+      }
+    }
+
+    // Determine if target brand mentioned
+    const targetEntry = brandRanking.find(b => b.isTargetBrand);
+    const mentioned = !!targetEntry;
+
+    // Compute position (1-10 scale)
+    let position = null;
+    if (mentioned) {
+      const rank = brandRanking.indexOf(targetEntry) + 1; // 1-indexed
+      const total = brandRanking.length;
+      position = total <= 1 ? 1 : Math.round(1 + (rank - 1) / (total - 1) * 9);
+    }
+
+    // Process citation URLs
+    const rawCitationUrls = Array.isArray(parsed.citationUrls) ? parsed.citationUrls.filter(u => typeof u === 'string' && u.startsWith('http')) : [];
+    const seenUrls = new Set();
+    const citedUrls = [];
+    for (const url of rawCitationUrls) {
+      if (!seenUrls.has(url)) {
+        seenUrls.add(url);
+        citedUrls.push(url);
+      }
+    }
+    const citationCount = citedUrls.length;
+    const cited = citedUrls.some(url => url.toLowerCase().includes(domainClean));
+
+    // Process sentiment
+    let sentiment = null;
+    let sentimentScore = null;
+    if (parsed.sentiment && typeof parsed.sentiment === 'object') {
+      const validSentiments = ['positive', 'neutral', 'negative'];
+      if (validSentiments.includes(parsed.sentiment.label)) {
+        sentiment = parsed.sentiment.label;
+        sentimentScore = Math.max(0, Math.min(100, Math.round(Number(parsed.sentiment.score) || 50)));
+      }
+    }
+
+    console.log(`[ai-tracker] analyzeResponse: brands=${brandRanking.length} position=${position} cited=${cited} citations=${citationCount} sentiment=${sentiment}`);
+
+    return { mentioned, position, cited, citedUrls, citationCount, brandRanking, sentiment, sentimentScore };
   } catch (err) {
-    console.warn('[ai-tracker] Claude sentiment error:', err?.message || err);
-    return null;
+    console.warn('[ai-tracker] analyzeResponse parse error:', err?.message || err);
+    return _fallbackAnalysis(aiResponse, targetBrand, domain);
   }
 }
 
-function _parseSentimentResponse(content) {
-  if (!content) return null;
-  try {
-    // Strip markdown code fences (e.g. ```json ... ```) that Claude may wrap around responses
-    const cleaned = content.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
-    const parsed = JSON.parse(cleaned);
-    const validSentiments = ['positive', 'neutral', 'negative'];
-    if (!validSentiments.includes(parsed.sentiment)) return null;
-    const score = Math.max(0, Math.min(100, Math.round(Number(parsed.score) || 50)));
-    return { sentiment: parsed.sentiment, sentimentScore: score };
-  } catch {
-    return null;
+/**
+ * Fallback analysis when Claude Haiku is unavailable — uses regex detection.
+ */
+function _fallbackAnalysis(aiResponse, targetBrand, domain) {
+  if (!aiResponse) {
+    return { mentioned: false, position: null, cited: false, citedUrls: [], citationCount: 0, brandRanking: [], sentiment: null, sentimentScore: null };
   }
+
+  const domainClean = cleanDomain(domain);
+  const brandRegex = new RegExp(`\\b${targetBrand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+  const domainRegex = new RegExp(`\\b${domainClean.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+  const mentioned = brandRegex.test(aiResponse) || domainRegex.test(aiResponse);
+
+  // Extract URLs from markdown links
+  const citedUrls = [];
+  const seenUrls = new Set();
+  const urlRegex = /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g;
+  let match;
+  while ((match = urlRegex.exec(aiResponse)) !== null) {
+    if (!seenUrls.has(match[2])) {
+      seenUrls.add(match[2]);
+      citedUrls.push(match[2]);
+    }
+  }
+
+  const cited = citedUrls.some(url => url.toLowerCase().includes(domainClean));
+
+  return {
+    mentioned,
+    position: mentioned ? 5 : null, // default mid-range
+    cited,
+    citedUrls,
+    citationCount: citedUrls.length,
+    brandRanking: mentioned ? [{ brandName: targetBrand, isTargetBrand: true, mentionCount: 1 }] : [],
+    sentiment: null,
+    sentimentScore: null,
+  };
 }
 
 /**
@@ -609,16 +1002,13 @@ function isSameBrand(nameA, nameB) {
 /**
  * Merge brands that refer to the same entity.
  * Keeps the longest name as the canonical display name (more specific).
- * Works for any brand — no hardcoded alias table needed.
  */
 function deduplicateBrands(brands) {
-  const groups = []; // Array of { name, mentionCount }
+  const groups = [];
   for (const brand of brands) {
-    // Find an existing group this brand belongs to
     const match = groups.find((g) => isSameBrand(g.name, brand.name));
     if (match) {
       match.mentionCount += brand.mentionCount;
-      // Prefer the longer (more specific) name as display name
       if (brand.name.length > match.name.length) {
         match.name = brand.name;
       }
@@ -627,210 +1017,6 @@ function deduplicateBrands(brands) {
     }
   }
   return groups;
-}
-
-/**
- * Extract brand/company names mentioned across all AI responses.
- * Uses Claude Haiku to identify brands, excluding the user's own brand
- * and already-tracked competitors.
- *
- * @param {Array<{platformId: string, answer: string}>} allAnswers
- * @param {string} ownBrand - The user's brand name (extracted from domain)
- * @returns {Promise<Array<{name: string, mentionCount: number}>>}
- */
-async function extractBrandsFromResponses(allAnswers, ownBrand, domain) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    console.warn('[ai-tracker] brand extraction skipped: no ANTHROPIC_API_KEY');
-    return [];
-  }
-
-  // Build a combined text from all answers (cap at ~8000 chars to stay within token limits)
-  const combinedParts = [];
-  let totalLen = 0;
-  for (const { answer } of allAnswers) {
-    if (!answer) continue;
-    const chunk = answer.slice(0, 1500);
-    if (totalLen + chunk.length > 8000) break;
-    combinedParts.push(chunk);
-    totalLen += chunk.length;
-  }
-
-  if (combinedParts.length === 0) return [];
-
-  const userPrompt = `You are a brand-name extraction expert. The user's website is ${domain || ownBrand}. Extract all competitor brands mentioned in the following AI responses.
-
-RULES:
-1. Use the official, canonical PRODUCT name (e.g. "Ahrefs" not "ahrefs.com", "SEMrush" not "Semrush tool", "HubSpot" not "Hubspot").
-2. CRITICAL — each company = ONE entry. Merge the parent company, its products, AND product versions into a single entry. Use the most recognizable product name. For example:
-   - "OpenAI" + "ChatGPT" + "GPT-4" + "GPT-4o" → output only "ChatGPT"
-   - "Google" + "Gemini" + "Gemini Pro" + "Gemini 1.5" → output only "Gemini"
-   - "Anthropic" + "Claude" + "Claude 3.5" → output only "Claude"
-   - "Microsoft" + "Copilot" + "Azure OpenAI" → output only "Copilot"
-   - "Meta" + "Llama" + "Llama 3" → output only "Llama"
-   This applies to ALL companies, not just these examples. Never list a parent company, its product, or version variants as separate entries.
-3. Also merge spelling/casing variations into one entry (e.g. "ChatGPT" and "chat gpt" → "ChatGPT").
-4. Only include real businesses, products, or services — not generic terms (e.g. skip "SEO", "machine learning", "content marketing").
-5. Exclude the user's own brand: ${ownBrand} (and any product made by ${ownBrand}).
-6. Count each distinct AI response that mentions the brand (not word occurrences within one response). If a company and its product both appear in one response, that still counts as 1.
-7. Only include brands that are relevant competitors or alternatives in the same industry as ${domain || ownBrand}. Skip brands mentioned in passing that operate in a completely different field.
-
-Return ONLY a JSON array of objects with "name" (string, canonical product name) and "count" (number of responses mentioning it). Example: [{"name":"Ahrefs","count":3},{"name":"Moz","count":1}]
-
-If no brands are found, return an empty array: []
-
-AI Responses:
-${combinedParts.join('\n---\n')}`;
-
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000);
-    try {
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 1024,
-          messages: [{ role: 'user', content: userPrompt }],
-        }),
-        signal: controller.signal,
-      });
-
-      if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        console.warn(`[ai-tracker] brand extraction failed: ${res.status} ${res.statusText}`, body.slice(0, 200));
-        return [];
-      }
-
-      const data = await res.json();
-      const rawText = data.content?.[0]?.text?.trim();
-      console.log('[ai-tracker] brand extraction raw:', rawText?.slice(0, 200));
-
-      if (!rawText) return [];
-
-      // Parse — extract JSON from markdown code fences if present
-      let cleaned;
-      const fenceMatch = rawText.match(/```(?:json)?\s*\n([\s\S]*?)\n```/i);
-      if (fenceMatch) {
-        cleaned = fenceMatch[1].trim();
-      } else {
-        cleaned = rawText.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```[\s\S]*/i, '').trim();
-      }
-      const parsed = JSON.parse(cleaned);
-
-      if (!Array.isArray(parsed)) return [];
-
-      // Deduplicate and filter out excluded names
-      const brandMap = new Map();
-      for (const item of parsed) {
-        if (!item.name || typeof item.name !== 'string') continue;
-        const name = item.name.trim();
-        if (!name || name.length > 100) continue;
-        if (isSameBrand(name, ownBrand)) continue;
-        const count = Math.max(1, Math.round(Number(item.count) || 1));
-        const existing = brandMap.get(name.toLowerCase());
-        if (existing) {
-          existing.mentionCount += count;
-        } else {
-          brandMap.set(name.toLowerCase(), { name, mentionCount: count });
-        }
-      }
-
-      // Deduplicate aliases (e.g. "GPT" + "ChatGPT" → "ChatGPT"), then sort and cap
-      const deduplicated = deduplicateBrands(Array.from(brandMap.values()));
-      // Re-check after dedup: merged brands may now match ownBrand (e.g. "Google Gemini" + "Google" → "Google Gemini")
-      const brands = deduplicated
-        .filter((b) => !isSameBrand(b.name, ownBrand))
-        .sort((a, b) => b.mentionCount - a.mentionCount)
-        .slice(0, 20);
-
-      console.log(`[ai-tracker] brand extraction found ${brands.length} brands (after dedup)`);
-      return brands;
-    } finally {
-      clearTimeout(timeout);
-    }
-  } catch (err) {
-    console.warn('[ai-tracker] brand extraction error:', err?.message || err);
-    return [];
-  }
-}
-
-/**
- * Detect if the user's brand/domain appears in an AI response.
- *
- * @param {string} answer - AI response text
- * @param {string[]} citations - URLs cited by the AI
- * @param {string} domain - User's domain (e.g., "suparank.com")
- * @returns {{ mentioned: boolean, tier: string, cited: boolean, citedFrom: string|null }}
- */
-function detectBrand(answer, citations, domain) {
-  const brand = extractBrand(domain);
-  const domainClean = cleanDomain(domain);
-  const answerLower = answer.toLowerCase();
-
-  // Check if brand or domain mentioned in answer text (word boundary to avoid false positives)
-  const brandRegex = new RegExp(`\\b${brand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-  const domainRegex = new RegExp(`\\b${domainClean.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-  const mentioned = brandRegex.test(answer) || domainRegex.test(answer);
-
-  // Determine tier based on position in answer
-  let tier = 'not_mentioned';
-  if (mentioned) {
-    const brandMatch = answer.search(brandRegex);
-    const domainMatch = answer.search(domainRegex);
-    const positions = [brandMatch, domainMatch].filter((i) => i >= 0);
-    const earliest = Math.min(...positions);
-    // "top" if mentioned in the first 20% of the answer
-    tier = earliest < answer.length * 0.2 ? 'top' : 'mentioned';
-  }
-
-  // Check if domain appears in any citation URL
-  let cited = false;
-  let citedFrom = null;
-  for (const url of citations) {
-    if (typeof url === 'string' && url.length <= 2048 && url.toLowerCase().includes(domainClean)) {
-      cited = true;
-      citedFrom = url;
-      break;
-    }
-  }
-
-  // Normalized position: 0 = mentioned at very start, 1 = at the end, null = not mentioned
-  const normalizedPosition = mentioned && answer.length > 0
-    ? (() => {
-        const brandMatch = answer.search(brandRegex);
-        const domainMatch = answer.search(domainRegex);
-        const positions = [brandMatch, domainMatch].filter((i) => i >= 0);
-        return Math.min(...positions) / answer.length;
-      })()
-    : null;
-
-  return { mentioned, tier, cited, citedFrom, normalizedPosition };
-}
-
-/**
- * Detect if a competitor is mentioned in an AI response.
- *
- * @param {string} answer - AI response text
- * @param {string[]} citations - URLs cited by the AI
- * @param {string} competitorName - e.g., "Surfer SEO"
- * @returns {{ mentioned: boolean, cited: boolean }}
- */
-function detectCompetitorInAnswer(answer, citations, competitorName) {
-  const nameLower = competitorName.toLowerCase();
-  const answerLower = answer.toLowerCase();
-  // S75: Use word-boundary regex (consistent with detectBrand)
-  const escaped = nameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const mentioned = new RegExp(`\\b${escaped}\\b`, 'i').test(answerLower);
-  // Check citations: strip spaces from name for domain-style matching
-  const nameSlug = nameLower.replace(/\s+/g, '');
-  const cited = citations.some((url) => url.toLowerCase().includes(nameSlug));
-  return { mentioned, cited };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -852,51 +1038,6 @@ function getAvailablePlatforms() {
     console.warn('[ai-tracker] No AI API keys configured. Scan will produce empty results.');
   }
   return available;
-}
-
-/**
- * Ask a platform to generate search sub-queries for a given prompt.
- * Used for ChatGPT and Perplexity which don't expose their internal queries.
- * Returns [] on any error — never throws.
- *
- * @param {string} query - The main prompt
- * @param {string} endpoint - API endpoint URL
- * @param {string} apiKey - API key
- * @param {string} model - Model ID to use
- * @returns {Promise<string[]>}
- */
-async function generateSubQueries(query, endpoint, apiKey, model) {
-  if (!apiKey) return [];
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
-  try {
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model,
-        max_tokens: 200,
-        messages: [{
-          role: 'user',
-          content: `For this question: "${query}"\n\nList up to 5 specific search queries you would use internally to research this comprehensively.\n\nRespond ONLY with a valid JSON array of strings. No extra text. Example: ["query one","query two","query three"]`,
-        }],
-      }),
-      signal: controller.signal,
-    });
-    if (!res.ok) return [];
-    const data = await res.json();
-    const content = (data.choices?.[0]?.message?.content || '').trim();
-    // Extract JSON array even if model adds surrounding text
-    const match = content.match(/\[[\s\S]*\]/);
-    if (!match) return [];
-    const parsed = JSON.parse(match[0]);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter((q) => typeof q === 'string' && q.trim()).slice(0, 5);
-  } catch {
-    return [];
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 /**
@@ -950,16 +1091,14 @@ async function runScan(tracker, prompts, competitors, onProgress) {
     });
   }
 
-  // Collect all answers for competitor detection later
-  // Key: `${platformId}:${promptId}` → { answer, citations }
-  const allAnswers = [];
+  const brandName = extractBrand(tracker.domain);
   let totalAnswerWords = 0;
 
   // Process each available platform sequentially
   for (let pi = 0; pi < availablePlatforms.length; pi++) {
     const platform = availablePlatforms[pi];
 
-    // Build platform statuses for progress reporting (only selected platforms)
+    // Build platform statuses for progress reporting
     const platformStatuses = availablePlatforms.map((p, idx) => {
       if (idx < pi) return { platformId: p.id, status: 'completed' };
       if (idx === pi) return { platformId: p.id, status: 'scanning' };
@@ -976,72 +1115,74 @@ async function runScan(tracker, prompts, competitors, onProgress) {
         continue;
       }
 
-      let answer = '';
-      let citations = [];
-      let fanoutQueries = [];
-      let mentioned = false;
-      let tier = 'not_mentioned';
-      let cited = false;
-      let citedFrom = null;
-      let normalizedPosition = null;
-      let error = false;
+      let platformResult = {
+        platformId: platform.id,
+        mentioned: false,
+        position: null,
+        cited: false,
+        citationCount: 0,
+        citedUrls: [],
+        brandRanking: [],
+        fanoutQueries: [],
+        aiResponse: '',
+        sentiment: null,
+        sentimentScore: null,
+        error: false,
+      };
 
       try {
+        // Step 1: Search platform
         const result = await withRetry(() => searchPlatform(platform.id, prompt.prompt));
-        answer = result.answer;
-        citations = result.citations;
-        fanoutQueries = result.fanoutQueries || [];
+        let answer = result.answer;
+        const fanoutQueries = result.fanoutQueries || [];
 
-        // Detect brand in this response
-        const detection = detectBrand(answer, citations, tracker.domain);
-        mentioned = detection.mentioned;
-        tier = detection.tier;
-        cited = detection.cited;
-        citedFrom = detection.citedFrom;
-        normalizedPosition = detection.normalizedPosition;
+        // Step 2: Embed structured citations for Gemini/Claude
+        if (platform.id === 'gemini' || platform.id === 'claude') {
+          answer = embedCitationsInAnswer(answer, result.citations, platform.id, {
+            blocks: result.blocks || [],
+            groundingSupports: result.groundingSupports || [],
+            groundingChunks: result.groundingChunks || [],
+          });
+        }
 
-        // Count words from full answer (before truncation)
+        // Count words from platform search response
         if (answer) {
           totalAnswerWords += answer.trim().split(/\s+/).filter(Boolean).length;
         }
 
-        // Save for competitor analysis
-        allAnswers.push({ platformId: platform.id, answer, citations });
-      } catch (err) {
-        // Log and continue — don't fail the whole scan
-        console.error(`[ai-tracker] ${platform.id} failed for "${prompt.prompt.slice(0, 40)}": ${err.message}`);
-        error = true;
-      }
+        // Step 3: Unified analysis — single Claude Haiku call
+        const analysis = await analyzeResponse(answer, prompt.prompt, brandName, tracker.domain);
 
-      // Sentiment analysis — only for mentioned, non-errored results with an answer
-      let sentiment = null;
-      let sentimentScore = null;
-      if (mentioned && !error && answer) {
-        const brandName = extractBrand(tracker.domain);
-        console.log(`[ai-tracker] sentiment: calling for brand="${brandName}", platform=${platform.id}, answerLen=${answer.length}`);
-        const sentimentResult = await analyzeSentiment(answer, brandName);
-        console.log(`[ai-tracker] sentiment result:`, sentimentResult);
-        if (sentimentResult) {
-          sentiment = sentimentResult.sentiment;
-          sentimentScore = sentimentResult.sentimentScore;
-        }
+        // Count words from extractor response (AI API call #3)
+        const extractorWords = [
+          ...(analysis.brandRanking || []).map(b => b.brandName),
+          ...(analysis.citedUrls || []),
+          analysis.sentiment || '',
+        ].join(' ').split(/\s+/).filter(Boolean).length;
+        totalAnswerWords += Math.max(extractorWords, 10); // minimum 10 words per extraction call
+
+        platformResult = {
+          platformId: platform.id,
+          mentioned: analysis.mentioned,
+          position: analysis.position,
+          cited: analysis.cited,
+          citationCount: analysis.citationCount,
+          citedUrls: analysis.citedUrls,
+          brandRanking: analysis.brandRanking,
+          fanoutQueries,
+          aiResponse: answer,
+          sentiment: analysis.sentiment,
+          sentimentScore: analysis.sentimentScore,
+          error: false,
+        };
+      } catch (err) {
+        console.error(`[ai-tracker] ${platform.id} failed for "${prompt.prompt.slice(0, 40)}": ${err.message}`);
+        platformResult.error = true;
       }
 
       // Add platform result to this prompt's results
-      const promptResult = promptResultMap.get(prompt._id.toString());
-      promptResult.platforms.push({
-        platformId: platform.id,
-        mentioned,
-        tier,
-        cited,
-        citedFrom,
-        normalizedPosition,
-        fanoutQueries,
-        aiResponse: answer.slice(0, 2000),
-        sentiment,
-        sentimentScore,
-        error,
-      });
+      const promptBucket = promptResultMap.get(prompt._id.toString());
+      promptBucket.platforms.push(platformResult);
 
       completedSteps++;
       const progress = totalSteps > 0 ? Math.round((completedSteps / totalSteps) * 100) : 100;
@@ -1050,59 +1191,91 @@ async function runScan(tracker, prompts, competitors, onProgress) {
   }
 
   // Collect all prompt results
-  const results = [];
-  for (const result of promptResultMap.values()) {
-    results.push(result);
-  }
+  const results = Array.from(promptResultMap.values());
 
-  // Own brand: aggregate from scan results (already computed via detectBrand)
+  // ── Post-scan: Aggregate competitors from per-prompt brand rankings ──
+
+  const ownBrand = brandName;
   let ownMentions = 0;
   let ownCitations = 0;
+  const competitorMap = new Map(); // normalized key → { name, mentions, citations, appearances }
+
   for (const r of results) {
     for (const p of r.platforms) {
+      if (p.error) continue;
       if (p.mentioned) ownMentions++;
       if (p.cited) ownCitations++;
+
+      // Aggregate competitor brands from this result's brandRanking
+      for (const brand of p.brandRanking) {
+        if (brand.isTargetBrand) continue;
+        if (isSameBrand(brand.brandName, ownBrand)) continue;
+
+        const key = normalizeBrandKey(brand.brandName);
+        const existing = competitorMap.get(key);
+        if (existing) {
+          existing.mentions += brand.mentionCount;
+          existing.appearances++;
+          // Prefer longer name
+          if (brand.brandName.length > existing.name.length) {
+            existing.name = brand.brandName;
+          }
+        } else {
+          competitorMap.set(key, {
+            name: brand.brandName,
+            mentions: brand.mentionCount,
+            appearances: 1,
+            citations: 0,
+          });
+        }
+      }
+
+      // Check if any competitor's slug appears in citation URLs
+      for (const [key, comp] of competitorMap) {
+        const slug = comp.name.toLowerCase().replace(/\s+/g, '');
+        if (p.citedUrls.some(url => url.toLowerCase().includes(slug))) {
+          comp.citations++;
+        }
+      }
     }
   }
-  const ownTotalPossible = results.length * availablePlatforms.length;
-  const ownBrand = extractBrand(tracker.domain);
 
+  // Deduplicate competitors using isSameBrand
+  const rawCompetitors = Array.from(competitorMap.values());
+  const dedupedCompetitors = deduplicateBrands(rawCompetitors.map(c => ({ name: c.name, mentionCount: c.mentions })));
+
+  // Build competitor results
+  const totalResults = results.reduce((sum, r) => sum + r.platforms.filter(p => !p.error).length, 0);
   const ownBrandResult = {
     competitorId: null,
     name: ownBrand,
     isOwn: true,
     mentions: ownMentions,
     citations: ownCitations,
-    visibility: ownTotalPossible > 0 ? Math.round((ownMentions / ownTotalPossible) * 100) : 0,
+    visibility: totalResults > 0 ? Math.round((ownMentions / totalResults) * 100) : 0,
   };
 
-  // Auto-detect competitor brands mentioned in AI responses
-  const detectedBrands = await extractBrandsFromResponses(allAnswers, ownBrand, tracker.domain);
+  const detectedCompetitorResults = dedupedCompetitors
+    .filter(b => !isSameBrand(b.name, ownBrand))
+    .sort((a, b) => b.mentionCount - a.mentionCount)
+    .slice(0, 20)
+    .map(brand => {
+      // Re-lookup from competitorMap for citations count
+      const comp = rawCompetitors.find(c => isSameBrand(c.name, brand.name));
+      return {
+        competitorId: null,
+        name: brand.name,
+        isOwn: false,
+        mentions: brand.mentionCount,
+        citations: comp?.citations || 0,
+        visibility: totalResults > 0 ? Math.round(((comp?.appearances || 0) / totalResults) * 100) : 0,
+      };
+    });
 
-  // For each detected brand, compute full visibility/mentions/citations stats
-  // Defense-in-depth: filter out any brand that matches ownBrand (e.g. "Google Search" when monitoring google.com)
-  const filteredBrands = detectedBrands.filter((brand) => !isSameBrand(brand.name, ownBrand));
-  const detectedCompetitorResults = filteredBrands.map((brand) => {
-    let mentions = 0;
-    let citationCount = 0;
-    for (const { answer, citations } of allAnswers) {
-      const detection = detectCompetitorInAnswer(answer, citations, brand.name);
-      if (detection.mentioned) mentions++;
-      if (detection.cited) citationCount++;
-    }
-    const totalPossible = allAnswers.length;
-    return {
-      competitorId: null,
-      name: brand.name,
-      isOwn: false,
-      mentions,
-      citations: citationCount,
-      visibility: totalPossible > 0 ? Math.round((mentions / totalPossible) * 100) : 0,
-    };
-  });
-
-  // Combine own brand + auto-detected competitors
   const competitorResults = [ownBrandResult, ...detectedCompetitorResults];
+  const detectedBrands = dedupedCompetitors
+    .filter(b => !isSameBrand(b.name, ownBrand))
+    .map(b => ({ name: b.name, mentionCount: b.mentionCount }));
 
   return { results, competitorResults, detectedBrands, totalAnswerWords };
 }

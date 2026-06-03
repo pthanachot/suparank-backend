@@ -9,3 +9,4 @@ yarn-error.log
 # dev-only (local tools, not deployed)
 src/routes/devRoutes.js
 /scripts/
+.env.bak

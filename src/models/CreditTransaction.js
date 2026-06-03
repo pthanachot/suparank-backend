@@ -54,12 +54,14 @@ const creditTransactionSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ['confirmed', 'pending', 'settled', 'refunded'],
+      enum: ['confirmed', 'pending', 'settling', 'refunding', 'settled', 'refunded'],
       default: 'confirmed',
-      // 'pending' = pre-deduction waiting for settle
-      // 'settled' = pre-deduction confirmed with actual amount
-      // 'refunded' = pre-deduction was fully refunded
-      // 'confirmed' = immediate deduction (no reserve phase)
+      // 'pending'    = pre-deduction waiting for settle
+      // 'settling'   = atomic claim by settle() in progress (F10-02)
+      // 'refunding'  = atomic claim by refund() in progress (F10-02)
+      // 'settled'    = pre-deduction confirmed with actual amount
+      // 'refunded'   = pre-deduction was fully refunded
+      // 'confirmed'  = immediate deduction (no reserve phase)
     },
     relatedTransactionId: {
       type: mongoose.Schema.Types.ObjectId,

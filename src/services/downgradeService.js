@@ -222,32 +222,104 @@ async function lockPaidCreatedResources(orgId) {
   // Resolve AI Tracker IDs for prompt locking
   const trackerIds = await AiTracker.find({ workspaceId: { $in: wsIds } }).distinct('_id');
 
-  await Promise.all([
-    Content.updateMany(
-      { workspaceId: { $in: wsIds }, createdOnPlan: 'paid' },
-      { $set: { locked: true } }
-    ),
-    BrandVoice.updateMany(
-      { workspace: { $in: wsIds }, createdOnPlan: 'paid' },
-      { $set: { locked: true } }
-    ),
-    Avatar.updateMany(
-      { workspace: { $in: wsIds }, createdOnPlan: 'paid' },
-      { $set: { locked: true } }
-    ),
-    KeywordResearchHistory.updateMany(
-      { workspaceId: { $in: wsIds }, createdOnPlan: 'paid' },
-      { $set: { locked: true } }
-    ),
-    ...(trackerIds.length > 0 ? [
-      AiTrackerPrompt.updateMany(
-        { trackerId: { $in: trackerIds }, createdOnPlan: 'paid' },
-        { $set: { locked: true } }
-      ),
-    ] : []),
-  ]);
+  // F20-06: when locking AI Tracker prompts, preserve the N most-recent
+  // paid-created per tracker (where N = free tier's per-monitor cap). Pre-fix
+  // ALL paid-created prompts were locked uniformly — a Pro user with 50
+  // hand-crafted prompts lost access to all of them on downgrade, with no
+  // way to keep their most recent work. Other resources (workspaces,
+  // brand voices) already do this kind of sort-then-slice preservation.
+  // The unlock-list filter below also applies — only paid-created within
+  // the preserve window stay unlocked.
+  let preserveCount = 0;
+  try {
+    const freeConfig = await tierService.getTierConfig('free');
+    if (freeConfig?.maxAiTrackerPromptsPerMonitor != null) {
+      preserveCount = freeConfig.maxAiTrackerPromptsPerMonitor;
+    }
+  } catch (e) {
+    console.warn(`[downgradeService] lockPaid: could not load free tier config (${e.message}); falling back to all-lock for AI Tracker prompts`);
+  }
 
-  console.log(`[downgradeService] Locked paid-created resources for org ${orgId}`);
+  // Build the AiTrackerPrompt ops. When preserveCount > 0 we go per-tracker;
+  // otherwise we fall back to the original uniform-lock for back-compat.
+  let aiTrackerPromptOps = [];
+  if (trackerIds.length > 0) {
+    if (preserveCount > 0) {
+      // Per-tracker: find paid-created prompts, sort newest-first, keep
+      // first `preserveCount` unlocked, lock the rest.
+      for (const tid of trackerIds) {
+        const all = await AiTrackerPrompt.find({ trackerId: tid, createdOnPlan: 'paid' })
+          .sort({ createdAt: -1 })
+          .select('_id')
+          .lean();
+        if (all.length === 0) continue;
+        const keepIds = all.slice(0, preserveCount).map((p) => p._id);
+        const lockIds = all.slice(preserveCount).map((p) => p._id);
+        // Unlock the keep set (reverses any previous lock from a prior downgrade
+        // cycle so the user gets their preserve back).
+        if (keepIds.length > 0) {
+          aiTrackerPromptOps.push({
+            name: `AiTrackerPrompt-keep-${tid}`,
+            op: AiTrackerPrompt.updateMany({ _id: { $in: keepIds } }, { $set: { locked: false } }),
+          });
+        }
+        if (lockIds.length > 0) {
+          aiTrackerPromptOps.push({
+            name: `AiTrackerPrompt-lock-${tid}`,
+            op: AiTrackerPrompt.updateMany({ _id: { $in: lockIds } }, { $set: { locked: true } }),
+          });
+        }
+      }
+    } else {
+      // Fallback: lock all paid-created (legacy behavior).
+      aiTrackerPromptOps.push({
+        name: 'AiTrackerPrompt-all',
+        op: AiTrackerPrompt.updateMany(
+          { trackerId: { $in: trackerIds }, createdOnPlan: 'paid' },
+          { $set: { locked: true } }
+        ),
+      });
+    }
+  }
+
+  // F20-02: Promise.allSettled instead of Promise.all so a transient DB
+  // failure on one resource type doesn't abort the others. Pre-fix
+  // Promise.all rejected on first failure leaving the org in a half-locked
+  // state (Content+BrandVoice locked, Avatar+Tracker not). With allSettled,
+  // all writes attempt; failures are logged and re-thrown as a composite
+  // so the caller can retry or alert. Each updateMany is itself idempotent.
+  const ops = [
+    { name: 'Content', op: Content.updateMany(
+      { workspaceId: { $in: wsIds }, createdOnPlan: 'paid' },
+      { $set: { locked: true } }
+    ) },
+    { name: 'BrandVoice', op: BrandVoice.updateMany(
+      { workspace: { $in: wsIds }, createdOnPlan: 'paid' },
+      { $set: { locked: true } }
+    ) },
+    { name: 'Avatar', op: Avatar.updateMany(
+      { workspace: { $in: wsIds }, createdOnPlan: 'paid' },
+      { $set: { locked: true } }
+    ) },
+    { name: 'KeywordResearchHistory', op: KeywordResearchHistory.updateMany(
+      { workspaceId: { $in: wsIds }, createdOnPlan: 'paid' },
+      { $set: { locked: true } }
+    ) },
+    ...aiTrackerPromptOps,
+  ];
+  const results = await Promise.allSettled(ops.map((o) => o.op));
+  const failures = [];
+  results.forEach((r, i) => {
+    if (r.status === 'rejected') {
+      console.error(`[downgradeService] lockPaid: ${ops[i].name} failed:`, r.reason?.message || r.reason);
+      failures.push(ops[i].name);
+    }
+  });
+  if (failures.length > 0) {
+    throw new Error(`lockPaidCreatedResources partial failure for org ${orgId}: ${failures.join(', ')}`);
+  }
+
+  console.log(`[downgradeService] Locked paid-created resources for org ${orgId} (preserved ${preserveCount}/tracker)`);
 }
 
 async function unlockPaidCreatedResources(orgId) {
@@ -256,30 +328,40 @@ async function unlockPaidCreatedResources(orgId) {
 
   const trackerIds = await AiTracker.find({ workspaceId: { $in: wsIds } }).distinct('_id');
 
-  await Promise.all([
-    Content.updateMany(
+  // F20-02: Promise.allSettled — same rationale as lockPaidCreatedResources.
+  const ops = [
+    { name: 'Content', op: Content.updateMany(
       { workspaceId: { $in: wsIds }, createdOnPlan: 'paid', locked: true },
       { $set: { locked: false } }
-    ),
-    BrandVoice.updateMany(
+    ) },
+    { name: 'BrandVoice', op: BrandVoice.updateMany(
       { workspace: { $in: wsIds }, createdOnPlan: 'paid', locked: true },
       { $set: { locked: false } }
-    ),
-    Avatar.updateMany(
+    ) },
+    { name: 'Avatar', op: Avatar.updateMany(
       { workspace: { $in: wsIds }, createdOnPlan: 'paid', locked: true },
       { $set: { locked: false } }
-    ),
-    KeywordResearchHistory.updateMany(
+    ) },
+    { name: 'KeywordResearchHistory', op: KeywordResearchHistory.updateMany(
       { workspaceId: { $in: wsIds }, createdOnPlan: 'paid', locked: true },
       { $set: { locked: false } }
-    ),
-    ...(trackerIds.length > 0 ? [
-      AiTrackerPrompt.updateMany(
-        { trackerId: { $in: trackerIds }, createdOnPlan: 'paid', locked: true },
-        { $set: { locked: false } }
-      ),
-    ] : []),
-  ]);
+    ) },
+    ...(trackerIds.length > 0 ? [{ name: 'AiTrackerPrompt', op: AiTrackerPrompt.updateMany(
+      { trackerId: { $in: trackerIds }, createdOnPlan: 'paid', locked: true },
+      { $set: { locked: false } }
+    ) }] : []),
+  ];
+  const results = await Promise.allSettled(ops.map((o) => o.op));
+  const failures = [];
+  results.forEach((r, i) => {
+    if (r.status === 'rejected') {
+      console.error(`[downgradeService] unlockPaid: ${ops[i].name} failed:`, r.reason?.message || r.reason);
+      failures.push(ops[i].name);
+    }
+  });
+  if (failures.length > 0) {
+    throw new Error(`unlockPaidCreatedResources partial failure for org ${orgId}: ${failures.join(', ')}`);
+  }
 }
 
 // ─── Main orchestrator ──────────────────────────────────────────
@@ -306,11 +388,33 @@ async function applyLocksForOrg(orgId) {
   }).lean();
   const extraSeats = sub?.purchasedExtraSeats || 0;
 
-  // Free tier: lock all paid-created resources; Paid tier: unlock them
-  if (tier === 'free') {
-    await lockPaidCreatedResources(orgId);
-  } else {
-    await unlockPaidCreatedResources(orgId);
+  // F20-03: retry the plan-origin lock with exponential backoff. The Stripe
+  // webhook caller is fire-and-forget, so once Stripe gets 200 it never
+  // retries — without this internal retry, a transient DB blip on the
+  // first attempt left the org's tier updated but locks unapplied
+  // permanently. lockPaidCreatedResources is idempotent (updateMany with
+  // explicit $set), so retrying is safe.
+  const planOriginOp = tier === 'free' ? lockPaidCreatedResources : unlockPaidCreatedResources;
+  const MAX_ATTEMPTS = 3;
+  let lastErr = null;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    try {
+      await planOriginOp(orgId);
+      lastErr = null;
+      break;
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[downgradeService] plan-origin lock attempt ${attempt + 1}/${MAX_ATTEMPTS} failed for org ${orgId}: ${e.message}`);
+      if (attempt < MAX_ATTEMPTS - 1) {
+        await new Promise((r) => setTimeout(r, 500 * Math.pow(2, attempt)));
+      }
+    }
+  }
+  if (lastErr) {
+    console.error(`[downgradeService] plan-origin lock EXHAUSTED retries for org ${orgId}:`, lastErr.message);
+    // Re-throw so the caller (webhook) can log/alert and so any operational
+    // reconciliation tooling can detect the inconsistency.
+    throw lastErr;
   }
 
   await Promise.all([

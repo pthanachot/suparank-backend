@@ -39,6 +39,34 @@ connectDB()
     if (recoveredCrawls.modifiedCount > 0) {
       console.log(`[startup] recovered ${recoveredCrawls.modifiedCount} interrupted sitemap crawl(s)`);
     }
+
+    // F4-13: refund orphaned pending CreditTransactions. When a scan crashes
+    // between preDeduct and settle (process kill, OOM, server restart), the
+    // pre-deducted credits stay locked in `pending` state forever. This sweep
+    // refunds any pending tx older than 30 min, releasing the debit.
+    try {
+      const CreditTransactionStartup = require('./models/CreditTransaction');
+      const creditServiceStartup = require('./services/creditService');
+      const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000);
+      const orphans = await CreditTransactionStartup.find({
+        status: 'pending',
+        createdAt: { $lt: thirtyMinAgo },
+      }).select('_id').lean();
+      let refundedGroups = 0;
+      for (const orphan of orphans) {
+        try {
+          const result = await creditServiceStartup.refund(orphan._id.toString());
+          if (result.refunded > 0) refundedGroups++;
+        } catch (e) {
+          console.error(`[startup] refund failed for tx ${orphan._id}:`, e.message);
+        }
+      }
+      if (refundedGroups > 0) {
+        console.log(`[startup] refunded ${refundedGroups} orphaned credit transaction group(s)`);
+      }
+    } catch (e) {
+      console.error('[startup] orphan credit sweep failed:', e.message);
+    }
   })
   .then(() => syncConfig())
   .then(() => console.log('Database ready'))
@@ -135,8 +163,11 @@ if (process.env.NODE_ENV !== 'production') {
   try { app.use(require('./routes/devRoutes')); } catch {}
 }
 
-// Scheduled scan: check daily at 3:00 AM for trackers due for scan
-// In development, run every minute so frequency logic can be tested without waiting overnight
+// Scheduled scan: check daily at 3:00 AM for trackers due for scan.
+// NOTE: the schedule is daily in both dev and prod. _devTimeScale (see
+// aiTrackerController.js) only accelerates per-prompt frequency math —
+// it does NOT change how often this cron fires. To test the scan loop
+// in dev, manually invoke executeScan or change cronSchedule below.
 const cron = require('node-cron');
 const AiTracker = require('./models/AiTracker');
 const SitemapModel = require('./models/Sitemap');
@@ -148,14 +179,19 @@ const tierServiceForCron = require('./services/tierService');
 const cronSchedule = '0 3 * * *'; // Daily at 3 AM
 console.log(`[cron] scheduled tasks: daily at 3 AM`);
 
-let cronConsecutiveFailures = 0;
+// F4-26: separate "DB unreachable" from "handler bug". The prior single
+// counter incremented on ANY thrown error and muted logs after 4 — masking
+// real handler bugs for days. Now:
+//  - cronDbFailures: only DB-query failures (drives circuit-breaker)
+//  - handler errors are surfaced unconditionally (loud, not muted)
+let cronDbFailures = 0;
+let cronNextRetryAt = 0; // ms timestamp; deterministic backoff, not Math.random
 
 cron.schedule(cronSchedule, async () => {
-  // Circuit breaker: skip ticks with exponential backoff when DB is unreachable
-  if (cronConsecutiveFailures > 0) {
-    const skipTicks = Math.min(Math.pow(2, cronConsecutiveFailures - 1), 30); // max ~30 min pause in dev
-    const shouldSkip = cronConsecutiveFailures > 1 && Math.random() > (1 / skipTicks);
-    if (shouldSkip) return; // silently skip to avoid log flood
+  // Circuit breaker: skip ticks deterministically when DB has been failing.
+  // Backoff: 2^N minutes, capped at 30. Reset on first successful query.
+  if (cronDbFailures > 0 && Date.now() < cronNextRetryAt) {
+    return; // not time to retry yet
   }
 
   try {
@@ -169,15 +205,65 @@ cron.schedule(cronSchedule, async () => {
       console.log(`[cron] recovered ${recovered.modifiedCount} stuck scan(s)`);
     }
 
-    const dueTrackers = await AiTracker.find({
-      scanStatus: { $in: ['ready', 'failed'] },
-      nextScanAt: { $lte: new Date() },
-    });
+    // F4-13: refund orphan pending CreditTransactions (>30 min old). Catches
+    // crashes that the startup sweep missed (e.g., scan completed but settle
+    // never marked the tx). Wrapped in its own try so cred-system issues
+    // don't break the tracker scheduler.
+    try {
+      const CreditTransactionCron = require('./models/CreditTransaction');
+      const creditServiceCron = require('./services/creditService');
+      const orphans = await CreditTransactionCron.find({
+        status: 'pending',
+        createdAt: { $lt: thirtyMinAgo },
+      }).select('_id').lean();
+      let refundedGroups = 0;
+      for (const orphan of orphans) {
+        try {
+          const result = await creditServiceCron.refund(orphan._id.toString());
+          if (result.refunded > 0) refundedGroups++;
+        } catch (e) {
+          console.error(`[cron] orphan refund failed for tx ${orphan._id}:`, e.message);
+        }
+      }
+      if (refundedGroups > 0) {
+        console.log(`[cron] refunded ${refundedGroups} orphaned credit transaction group(s)`);
+      }
+    } catch (e) {
+      console.error('[cron] orphan credit sweep failed:', e.message);
+    }
 
-    // DB query succeeded — reset circuit breaker
-    if (cronConsecutiveFailures > 0) {
-      console.log(`[cron] DB connection recovered after ${cronConsecutiveFailures} failure(s)`);
-      cronConsecutiveFailures = 0;
+    // The due-tracker query is the DB-health signal. Failures here drive the
+    // circuit breaker. Everything else (handler errors) is logged unconditionally.
+    let dueTrackers;
+    try {
+      dueTrackers = await AiTracker.find({
+        scanStatus: { $in: ['ready', 'failed'] },
+        nextScanAt: { $lte: new Date() },
+      });
+
+      // DB query succeeded — reset circuit breaker
+      if (cronDbFailures > 0) {
+        console.log(`[cron] DB connection recovered after ${cronDbFailures} failure(s)`);
+        cronDbFailures = 0;
+        cronNextRetryAt = 0;
+      }
+    } catch (dbErr) {
+      cronDbFailures++;
+      // Deterministic exponential backoff: next retry in 2^(N-1) minutes,
+      // capped at 30 min. (Was: Math.random() skip with no log after 4.)
+      const backoffMin = Math.min(Math.pow(2, cronDbFailures - 1), 30);
+      cronNextRetryAt = Date.now() + backoffMin * 60 * 1000;
+      // Log every DB failure but throttle the visible severity. Operators
+      // who care can grep '[cron] DB' for the full picture.
+      if (cronDbFailures <= 3) {
+        console.error(`[cron] DB query failed (${cronDbFailures}):`, dbErr.message);
+      } else if (cronDbFailures === 4) {
+        console.error(`[cron] DB sustained failure (${cronDbFailures}); next retry in ${backoffMin}min`);
+      } else if (cronDbFailures % 10 === 0) {
+        // Periodic reminder for prolonged outages
+        console.error(`[cron] DB still failing (${cronDbFailures}); next retry in ${backoffMin}min`);
+      }
+      return;
     }
 
     console.log(`[cron] tick — ${dueTrackers.length} tracker(s) due`);
@@ -190,17 +276,16 @@ cron.schedule(cronSchedule, async () => {
       try {
         await executeScan(tracker._id, userId);
       } catch (err) {
-        console.error(`[cron] scan failed for tracker ${tracker._id}:`, err.message);
+        // Per-tracker handler errors are NEVER muted — that's the F4-26 fix.
+        // A handler bug would have hidden for days under the old shared
+        // counter; now it's loud every tick.
+        console.error(`[cron] scan failed for tracker ${tracker._id}:`, err.message, err.stack);
       }
     }));
   } catch (err) {
-    cronConsecutiveFailures++;
-    if (cronConsecutiveFailures <= 3) {
-      console.error('[cron] scheduled scan check failed:', err.message);
-    } else if (cronConsecutiveFailures === 4) {
-      console.error(`[cron] DB unreachable (${cronConsecutiveFailures} consecutive failures), suppressing further logs until recovery`);
-    }
-    // After 4+ failures, logs are silenced until recovery
+    // Anything that escapes the inner try (e.g., a programmer bug in this
+    // file). Never mute these — operator needs to see them.
+    console.error('[cron] unexpected handler error:', err.message, err.stack);
   }
 });
 

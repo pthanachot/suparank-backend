@@ -17,6 +17,7 @@
  */
 
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 const Credit = require('../models/Credit');
 const UserCredit = require('../models/UserCredit');
 const CreditTransaction = require('../models/CreditTransaction');
@@ -183,6 +184,13 @@ async function preDeduct(orgId, userId, amount, feature, metadata = {}) {
     return { transactionId: null, deducted: 0, balanceAfter: { subscription: 0, general: 0, userFree: 0 } };
   }
 
+  // F10-01: stable group identifier so settle/refund can find ALL pending txs
+  // from this deduction across pools, regardless of their (slightly different)
+  // createdAt timestamps. Pre-fix the related-tx query used `createdAt: tx.createdAt`
+  // (exact equality), which only matched the queried tx because each sequential
+  // logTransaction call produced a different timestamp.
+  const groupId = crypto.randomUUID();
+
   for (let attempt = 0; attempt < MAX_TX_RETRIES; attempt++) {
     const session = await mongoose.startSession();
     try {
@@ -239,62 +247,83 @@ async function preDeduct(orgId, userId, amount, feature, metadata = {}) {
         );
       }
 
+      // F10-03: include UsageTracker.creditsUsed increment INSIDE the same
+      // transaction so a deduction and its usage entry commit-or-fail together.
+      // Pre-fix the increment ran AFTER session.commitTransaction(); a DB blip on
+      // the increment left credits deducted but usage counter never raised, and
+      // the eventual orphan refund (line 487) then DECREMENTED a never-raised
+      // counter, driving creditsUsed NEGATIVE and silently letting users
+      // exceed their monthly quota until the period rolled over.
+      const { config } = await tierService.getOrgTierConfig(orgId);
+      const limitType = config?.creditLimitType || 'monthly';
+      const period = tierService.getPeriod(limitType);
+      await UsageTracker.findOneAndUpdate(
+        { organizationId: orgId, period },
+        { $inc: { creditsUsed: totalDeducted } },
+        { upsert: true, new: true, setDefaultsOnInsert: true, session }
+      );
+
       await session.commitTransaction();
       session.endSession();
 
-      // Log transactions AFTER commit (one per pool touched)
+      // Log transactions AFTER commit (one per pool touched). Audit log
+      // failures here are informational only — the balance + usage commit is
+      // already durable. Wrap each in try/catch so a log hiccup doesn't
+      // propagate and confuse the caller about the deduction's success.
       const transactions = [];
+      const safeLog = async (params) => {
+        try {
+          return await CreditTransaction.logTransaction(params);
+        } catch (logErr) {
+          console.error('[creditService] preDeduct audit log failed:', logErr.message);
+          return null;
+        }
+      };
 
       if (fromSubscription > 0) {
-        const tx = await CreditTransaction.logTransaction({
+        const tx = await safeLog({
           orgId,
           userId,
           type: 'deduction',
           amount: -fromSubscription,
           pool: 'subscription',
           description: `${feature}: ${amount} credits`,
-          metadata: { ...metadata, feature, estimatedTotal: amount },
+          metadata: { ...metadata, feature, estimatedTotal: amount, groupId },
           balanceAfter: subEffective - fromSubscription,
           status: 'pending',
         });
-        transactions.push(tx);
+        if (tx) transactions.push(tx);
       }
 
       if (fromUserFree > 0) {
-        const tx = await CreditTransaction.logTransaction({
+        const tx = await safeLog({
           orgId,
           userId,
           type: 'deduction',
           amount: -fromUserFree,
           pool: 'user_free',
           description: `${feature}: ${amount} credits`,
-          metadata: { ...metadata, feature, estimatedTotal: amount },
+          metadata: { ...metadata, feature, estimatedTotal: amount, groupId },
           balanceAfter: userFreeAvail - fromUserFree,
           status: 'pending',
         });
-        transactions.push(tx);
+        if (tx) transactions.push(tx);
       }
 
       if (fromOrgGeneral > 0) {
-        const tx = await CreditTransaction.logTransaction({
+        const tx = await safeLog({
           orgId,
           userId,
           type: 'deduction',
           amount: -fromOrgGeneral,
           pool: 'general',
           description: `${feature}: ${amount} credits`,
-          metadata: { ...metadata, feature, estimatedTotal: amount },
+          metadata: { ...metadata, feature, estimatedTotal: amount, groupId },
           balanceAfter: orgGeneralAvail - fromOrgGeneral,
           status: 'pending',
         });
-        transactions.push(tx);
+        if (tx) transactions.push(tx);
       }
-
-      // Increment UsageTracker.creditsUsed (org-level)
-      const { config } = await tierService.getOrgTierConfig(orgId);
-      const limitType = config?.creditLimitType || 'monthly';
-      const period = tierService.getPeriod(limitType);
-      await UsageTracker.increment(orgId, 'creditsUsed', period, totalDeducted);
 
       return {
         transactionId: transactions[0]?._id?.toString() || null,
@@ -328,13 +357,25 @@ async function preDeduct(orgId, userId, amount, feature, metadata = {}) {
 async function _refundToPool(tx, refundAmount) {
   if (refundAmount <= 0) return;
 
+  // F10-04 + F10-05: single roundtrip for credit + balance read via `{ new: true }`,
+  // and wrap the audit log in try/catch so a log failure doesn't propagate (the
+  // balance is the source of truth; the log is informational, eventually
+  // reconstructable from balanceAfter snapshots).
+  const safeLog = async (params) => {
+    try {
+      await CreditTransaction.logTransaction(params);
+    } catch (logErr) {
+      console.error('[creditService] refund audit log failed:', logErr.message);
+    }
+  };
+
   if (tx.pool === 'user_free' && tx.userId) {
-    await UserCredit.findOneAndUpdate(
+    const updated = await UserCredit.findOneAndUpdate(
       { userId: tx.userId },
-      { $inc: { freeCredits: refundAmount } }
+      { $inc: { freeCredits: refundAmount } },
+      { new: true }
     );
-    const uc = await UserCredit.findOne({ userId: tx.userId }).lean();
-    await CreditTransaction.logTransaction({
+    await safeLog({
       orgId: tx.organizationId,
       userId: tx.userId,
       type: 'refund',
@@ -342,16 +383,16 @@ async function _refundToPool(tx, refundAmount) {
       pool: 'user_free',
       description: 'Refund to user free credits',
       metadata: { feature: tx.metadata?.feature },
-      balanceAfter: uc?.freeCredits || 0,
+      balanceAfter: updated?.freeCredits || 0,
       relatedTransactionId: tx._id,
     });
   } else if (tx.pool === 'subscription' && tx.organizationId) {
-    await Credit.findOneAndUpdate(
+    const updated = await Credit.findOneAndUpdate(
       { organizationId: tx.organizationId },
-      { $inc: { subscriptionCredits: refundAmount } }
+      { $inc: { subscriptionCredits: refundAmount } },
+      { new: true }
     );
-    const c = await Credit.findOne({ organizationId: tx.organizationId }).lean();
-    await CreditTransaction.logTransaction({
+    await safeLog({
       orgId: tx.organizationId,
       userId: tx.userId,
       type: 'refund',
@@ -359,17 +400,17 @@ async function _refundToPool(tx, refundAmount) {
       pool: 'subscription',
       description: 'Refund to subscription credits',
       metadata: { feature: tx.metadata?.feature },
-      balanceAfter: c?.subscriptionCredits || 0,
+      balanceAfter: updated?.subscriptionCredits || 0,
       relatedTransactionId: tx._id,
     });
   } else if (tx.organizationId) {
     // 'general' pool (org purchased credits)
-    await Credit.findOneAndUpdate(
+    const updated = await Credit.findOneAndUpdate(
       { organizationId: tx.organizationId },
-      { $inc: { generalCredits: refundAmount } }
+      { $inc: { generalCredits: refundAmount } },
+      { new: true }
     );
-    const c = await Credit.findOne({ organizationId: tx.organizationId }).lean();
-    await CreditTransaction.logTransaction({
+    await safeLog({
       orgId: tx.organizationId,
       userId: tx.userId,
       type: 'refund',
@@ -377,7 +418,7 @@ async function _refundToPool(tx, refundAmount) {
       pool: 'general',
       description: 'Refund to org purchased credits',
       metadata: { feature: tx.metadata?.feature },
-      balanceAfter: c?.generalCredits || 0,
+      balanceAfter: updated?.generalCredits || 0,
       relatedTransactionId: tx._id,
     });
   }
@@ -397,19 +438,41 @@ async function _refundToPool(tx, refundAmount) {
 async function settle(transactionId, actualAmount) {
   if (!transactionId) return { refunded: 0 };
 
-  const tx = await CreditTransaction.findById(transactionId);
-  if (!tx || tx.status !== 'pending') return { refunded: 0 };
+  // F10-02: atomic claim. Pre-fix `findById` + `if status !== 'pending' return`
+  // was a check-then-act race — a concurrent settle/orphan-refund could BOTH
+  // read 'pending', both call _refundToPool's unconditional $inc, and double-
+  // credit the user. Now we use findOneAndUpdate to atomically transition the
+  // primary tx into a temp 'settling' state; if someone else got there first
+  // the filter doesn't match and we return cleanly.
+  const tx = await CreditTransaction.findOneAndUpdate(
+    { _id: transactionId, status: 'pending' },
+    { $set: { status: 'settling' } },
+    { new: true }
+  );
+  if (!tx) return { refunded: 0 };
 
-  // Get all related pending transactions (subscription + user_free + general)
-  const relatedTxs = await CreditTransaction.find({
-    status: 'pending',
-    'metadata.estimatedTotal': tx.metadata?.estimatedTotal,
-    createdAt: tx.createdAt,
-    $or: [
-      { organizationId: tx.organizationId },
-      { userId: tx.userId, pool: 'user_free' },
-    ],
-  });
+  // F10-01: prefer the stable groupId from metadata; fall back to the legacy
+  // createdAt query for transactions that predate the groupId rollout.
+  const groupId = tx.metadata?.groupId;
+  const relatedFilter = groupId
+    ? { 'metadata.groupId': groupId }
+    : {
+        'metadata.estimatedTotal': tx.metadata?.estimatedTotal,
+        createdAt: tx.createdAt,
+        $or: [
+          { organizationId: tx.organizationId },
+          { userId: tx.userId, pool: 'user_free' },
+        ],
+      };
+
+  // F10-02: atomic claim of related txs too. updateMany returns modifiedCount;
+  // the primary tx is already 'settling' so it isn't re-claimed.
+  await CreditTransaction.updateMany(
+    { ...relatedFilter, _id: { $ne: tx._id }, status: 'pending' },
+    { $set: { status: 'settling' } }
+  );
+  // Fetch the full claimed set (primary + relatives) for processing.
+  const relatedTxs = await CreditTransaction.find({ ...relatedFilter, status: 'settling' });
 
   const totalDeducted = relatedTxs.reduce((sum, t) => sum + Math.abs(t.amount), 0);
   let refundRemaining = Math.max(0, totalDeducted - actualAmount);
@@ -438,7 +501,7 @@ async function settle(transactionId, actualAmount) {
     }
   }
 
-  // Mark all related pending transactions as settled
+  // Mark all claimed transactions as settled
   await CreditTransaction.updateMany(
     { _id: { $in: relatedTxs.map((t) => t._id) } },
     { $set: { status: 'settled' } }
@@ -458,19 +521,34 @@ async function settle(transactionId, actualAmount) {
 async function refund(transactionId) {
   if (!transactionId) return { refunded: 0 };
 
-  const tx = await CreditTransaction.findById(transactionId);
-  if (!tx || tx.status === 'refunded') return { refunded: 0 };
+  // F10-02: atomic claim — see settle() for full rationale. Note we only claim
+  // when status is 'pending'; an already-settled or already-refunded tx is
+  // not re-processed.
+  const tx = await CreditTransaction.findOneAndUpdate(
+    { _id: transactionId, status: 'pending' },
+    { $set: { status: 'refunding' } },
+    { new: true }
+  );
+  if (!tx) return { refunded: 0 };
 
-  // Get all related pending transactions
-  const relatedTxs = await CreditTransaction.find({
-    status: 'pending',
-    'metadata.estimatedTotal': tx.metadata?.estimatedTotal,
-    createdAt: tx.createdAt,
-    $or: [
-      { organizationId: tx.organizationId },
-      { userId: tx.userId, pool: 'user_free' },
-    ],
-  });
+  // F10-01: groupId-aware related-tx lookup with legacy fallback.
+  const groupId = tx.metadata?.groupId;
+  const relatedFilter = groupId
+    ? { 'metadata.groupId': groupId }
+    : {
+        'metadata.estimatedTotal': tx.metadata?.estimatedTotal,
+        createdAt: tx.createdAt,
+        $or: [
+          { organizationId: tx.organizationId },
+          { userId: tx.userId, pool: 'user_free' },
+        ],
+      };
+
+  await CreditTransaction.updateMany(
+    { ...relatedFilter, _id: { $ne: tx._id }, status: 'pending' },
+    { $set: { status: 'refunding' } }
+  );
+  const relatedTxs = await CreditTransaction.find({ ...relatedFilter, status: 'refunding' });
 
   let totalRefunded = 0;
   for (const rtx of relatedTxs) {
@@ -487,7 +565,7 @@ async function refund(transactionId) {
     await UsageTracker.increment(tx.organizationId, 'creditsUsed', period, -totalRefunded);
   }
 
-  // Mark all related transactions as refunded
+  // Mark all claimed transactions as refunded
   await CreditTransaction.updateMany(
     { _id: { $in: relatedTxs.map((t) => t._id) } },
     { $set: { status: 'refunded' } }

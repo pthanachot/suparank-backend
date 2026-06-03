@@ -20,6 +20,16 @@ const platformResultSchema = new mongoose.Schema({
   sentimentScore: { type: Number, default: null },
   error: { type: Boolean, default: false },
   fanoutQueries: { type: [String], default: [] },
+  // F11-02: when ChatGPT's Responses API fails and we fall back to Chat
+  // Completions (which doesn't expose web_search calls), fanoutQueries is
+  // necessarily empty. This flag lets the UI distinguish "no fanout
+  // captured because of fallback" from "no fanout because the LLM didn't
+  // search". Default false so existing scans don't display the warning.
+  fanoutUnavailable: { type: Boolean, default: false },
+  // F2-10: ChatGPT can fall back from Responses API to Chat Completions,
+  // which uses a different model. Tracking the variant lets the dashboard
+  // disclose model heterogeneity for honest cross-call comparisons.
+  modelVariant: { type: String, default: null },
 }, { _id: false });
 
 const promptResultSchema = new mongoose.Schema({

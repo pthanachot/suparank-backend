@@ -63,9 +63,11 @@ function requireCredits(featureKey, estimateCredits) {
         return next();
       }
 
-      // Calculate estimated credit cost
+      // Calculate estimated credit cost. Supports async functions so callers
+      // can look up live data (e.g., AI Tracker counts prompts × platforms
+      // from Mongo) instead of being stuck on a literal pre-flight estimate.
       const estimated = typeof estimateCredits === 'function'
-        ? estimateCredits(req)
+        ? await Promise.resolve(estimateCredits(req))
         : estimateCredits;
 
       // Check if org + user can afford it

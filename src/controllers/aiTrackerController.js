@@ -4,7 +4,7 @@ const AiTrackerCompetitor = require('../models/AiTrackerCompetitor');
 const AiTrackerScan = require('../models/AiTrackerScan');
 const Workspace = require('../models/Workspace');
 const User = require('../models/User');
-const { runScan, PLATFORMS, normalizeBrandKey, isSameBrand } = require('../services/aiTrackerScanEngine');
+const { runScan, PLATFORMS, normalizeBrandKey, isSameBrand, getAvailablePlatformIdsSilent, urlMatchesDomain, extractBrand } = require('../services/aiTrackerScanEngine');
 const UsageTracker = require('../models/UsageTracker');
 const UserUsageTracker = require('../models/UserUsageTracker');
 const tierService = require('../services/tierService');
@@ -47,6 +47,20 @@ const PLATFORM_DISPLAY = [
     color: 'text-cyan-600', bgColor: 'bg-cyan-50', borderColor: 'border-cyan-200',
   },
 ];
+
+// Escape user-controlled strings for embedding in HTML attribute or content
+// contexts in the scan-summary email. Prevents F4-23 — a malicious editor in
+// a multi-member workspace inserting <style>/<script> via a prompt or monitor
+// name. Used at every interpolation site that mixes user data into HTML.
+function htmlEscape(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 // Workspace resolved by permissions middleware (req.workspace).
 
@@ -145,19 +159,14 @@ function computeWeightedVisibility(platforms) {
   return Math.round(mentionRate * W_MENTION + positionScore * W_POSITION + citationRate * W_CITATION);
 }
 
-function cleanDomainForMatch(domain) {
-  if (!domain) return '';
-  return domain.replace(/^(https?:\/\/)?(www\.)?/, '').split('/')[0].toLowerCase();
-}
-
-function computeMetrics(latestScan, promptCount, recentScans, domain) {
+function computeMetrics(latestScan, promptCount, carryScans, domain) {
   if (!latestScan) return null;
 
-  // Build carry-forward results: latest known result per prompt across all recent scans
+  // Build carry-forward results: latest known result per prompt across all carryScans
   let results;
-  if (recentScans && recentScans.length > 0) {
+  if (carryScans && carryScans.length > 0) {
     const effectiveMap = new Map();
-    for (const scan of recentScans) {
+    for (const scan of carryScans) {
       for (const r of (scan.results || [])) {
         const pid = r.promptId?.toString();
         if (pid && !effectiveMap.has(pid)) effectiveMap.set(pid, r);
@@ -173,7 +182,7 @@ function computeMetrics(latestScan, promptCount, recentScans, domain) {
   let totalValid = 0;
 
   for (const r of results) {
-    for (const p of r.platforms) {
+    for (const p of (r.platforms || [])) {
       if (p.error) continue;
       totalValid++;
       if (p.mentioned) totalMentions++;
@@ -187,15 +196,37 @@ function computeMetrics(latestScan, promptCount, recentScans, domain) {
   const citationRate = totalMentions > 0 ? Math.round((totalCitations / totalMentions) * 100) : 0;
 
   // Weighted visibility across all prompts
-  const allPlatforms = results.flatMap((r) => r.platforms);
+  const allPlatforms = results.flatMap((r) => r.platforms || []);
   const visibility = allPlatforms.length > 0 ? computeWeightedVisibility(allPlatforms) : 0;
 
-  // Share of voice: own mentions vs total of all competitors + own
+  // Share of voice: own mentions vs total mentions across all competitors.
+  //
+  // F18-04 (documented residual): `totalMentions` reflects carry-forward
+  // (slow-frequency prompts contribute their last-known result), but
+  // `latestScan.competitorResults` is *only* from the latest scan. So the
+  // numerator can span a longer window than the denominator. F6-01's
+  // denom construction bounds the ratio in [0,1] mathematically, but the
+  // semantic mismatch remains. A full fix requires aggregating competitor
+  // data across carryScans — deferred (substantial refactor of the
+  // competitor pipeline).
+  //
+  // F6-01: two pre-fix failure modes:
+  //   1. ownCompResult missing (legacy scans pre-isOwn): denominator was just
+  //      allCompMentions (no own contribution), so own/comp could exceed 1.
+  //      Fix: when ownCompResult is absent, denom += ownMentions so the
+  //      ratio is mathematically bounded in [0,1].
+  //   2. Legacy entries lacking a `mentions` field would NaN-propagate
+  //      through reduce. `cr.mentions || 0` neutralizes that.
+  // Math: when ownCompResult exists, allCompMentions already includes own.
+  // When absent, denom = allCompMentions + ownMentions. In both cases
+  // ownMentions ≤ denom, so the ratio (and rounded percentage) is in [0,100]
+  // without needing an explicit clamp.
   const competitorResults = latestScan.competitorResults || [];
   const ownCompResult = competitorResults.find((cr) => cr.isOwn);
-  const ownMentions = ownCompResult ? ownCompResult.mentions : totalMentions;
-  const allCompMentions = competitorResults.reduce((sum, cr) => sum + cr.mentions, 0);
-  const shareOfVoice = allCompMentions > 0 ? Math.round((ownMentions / allCompMentions) * 100) : 0;
+  const ownMentions = ownCompResult ? (ownCompResult.mentions || 0) : totalMentions;
+  const allCompMentions = competitorResults.reduce((sum, cr) => sum + (cr.mentions || 0), 0);
+  const denom = ownCompResult ? allCompMentions : (allCompMentions + ownMentions);
+  const shareOfVoice = denom > 0 ? Math.round((ownMentions / denom) * 100) : 0;
 
   // Average sentiment score across all mentioned platforms with sentiment data
   const sentimentScores = allPlatforms
@@ -208,7 +239,7 @@ function computeMetrics(latestScan, promptCount, recentScans, domain) {
   // Average position: use position (1-10), fall back to brandRanking index, then normalizedPosition
   const positionRanks = [];
   for (const r of results) {
-    for (const p of r.platforms) {
+    for (const p of (r.platforms || [])) {
       if (p.error || !p.mentioned) continue;
       if (p.position != null) {
         positionRanks.push(p.position); // already 1-10 scale
@@ -224,14 +255,15 @@ function computeMetrics(latestScan, promptCount, recentScans, domain) {
     ? Math.round((positionRanks.reduce((s, v) => s + v, 0) / positionRanks.length) * 10) / 10
     : null;
 
-  // Total citation count: count unique domain-matching URLs (consistent with "Cited In" metric)
-  const domainClean = cleanDomainForMatch(domain);
+  // Total citation count: count unique domain-matching URLs (consistent with "Cited In" metric).
+  // F6-02: hostname-exact match via urlMatchesDomain (was substring `.includes()`,
+  // which let "realsuparank.com" match "suparank.com" — same class as F2-16).
   let totalCitationCount = 0;
   for (const r of results) {
-    for (const p of r.platforms) {
+    for (const p of (r.platforms || [])) {
       if (p.error) continue;
-      if (p.citedUrls && p.citedUrls.length > 0 && domainClean) {
-        const matching = p.citedUrls.filter(u => u.toLowerCase().includes(domainClean));
+      if (p.citedUrls && p.citedUrls.length > 0 && domain) {
+        const matching = p.citedUrls.filter(u => urlMatchesDomain(u, domain));
         totalCitationCount += new Set(matching).size;
       }
     }
@@ -352,16 +384,19 @@ function generatePromptSuggestions(scanResult, prevResult) {
 function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, domain) {
   // Pre-build lookup: for each scan, promptId → result (avoids O(prompts × scans × results) find)
   // Also build text-based fallback maps for when promptIds don't match (e.g. prompts regenerated)
-  const scanResultMaps = (recentScans || []).map((scan) => {
+  // Oldest-first so the per-prompt history pipeline can carry-forward
+  // left-to-right. (recentScans is sorted newest-first by the DB query.)
+  const scansOldestFirst = [...(recentScans || [])].reverse();
+  const scanResultMaps = scansOldestFirst.map((scan) => {
     const m = new Map();
-    for (const r of scan.results) {
+    for (const r of (scan.results || [])) {
       if (r.promptId) m.set(r.promptId.toString(), r);
     }
     return m;
   });
-  const scanResultMapsByText = (recentScans || []).map((scan) => {
+  const scanResultMapsByText = scansOldestFirst.map((scan) => {
     const m = new Map();
-    for (const r of scan.results) {
+    for (const r of (scan.results || [])) {
       const key = (r.prompt || '').trim().toLowerCase();
       if (key) m.set(key, r);
     }
@@ -388,7 +423,8 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
 
   // Pre-build competitor list for per-prompt attribution
   // Filter own brand + deduplicate aliases (e.g. "OpenAI" + "ChatGPT" → "ChatGPT")
-  const ownBrand = domain ? domain.replace(/^(https?:\/\/)?(www\.)?/, '').split('.')[0].toLowerCase() : null;
+  // F9-04: use engine's extractBrand (see formatCompetitors).
+  const ownBrand = domain ? extractBrand(domain) : null;
   const allCR = (latestScan.competitorResults || []).filter((cr) => !cr.isOwn && !(ownBrand && isSameBrand(cr.name, ownBrand)));
   // Deduplicate: merge alias brands (keeps longest name as display)
   const dedupedCR = [];
@@ -416,10 +452,18 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
         }
       }
     }
+    // F6-04: slugPattern uses word boundaries so cited URLs are matched on
+    // hostname/path labels rather than naked substring. Previously
+    // `url.includes('semrush')` matched `supersemrushy.com` → wrong cited
+    // attribution. `\b` treats `.`/`/`/`-` as word boundaries so
+    // `semrush.com` / `path/semrush/x` still match while
+    // `supersemrushy.com` does not.
+    const slug = cr.name.toLowerCase().replace(/\s+/g, '');
+    const slugEsc = slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     return {
       name: cr.name,
       patterns,
-      slug: cr.name.toLowerCase().replace(/\s+/g, ''),
+      slugPattern: new RegExp(`\\b${slugEsc}\\b`, 'i'),
     };
   });
 
@@ -444,7 +488,15 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
         if (n === 1) latestMap.set(pid, r);
         else if (n === 2) prevMap.set(pid, r);
       }
-      // Always build text-based fallback
+      // Always build text-based fallback for cases where promptIds don't
+      // match (prompts regenerated, monitor migrated, etc.).
+      //
+      // F18-06 (documented residual): two prompts sharing identical
+      // normalized text collide here — both resolve to the same historical
+      // result. `addPrompt` rejects same-text dupes at create time so
+      // this only fires under edge cases (cross-monitor import, after a
+      // rename race). Acceptable; the primary lookup is always promptId,
+      // so well-behaved data is unaffected.
       const textKey = (r.prompt || '').trim().toLowerCase();
       if (textKey) {
         const nt = (seenCountByText.get(textKey) || 0) + 1;
@@ -461,6 +513,18 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
     // Primary: match by promptId. Fallback: match by prompt text (handles regenerated prompts)
     const scanResult = latestMap.get(pid) || latestMapByText.get(textKey) || null;
     const prevResult = prevMap.get(pid) || prevMapByText.get(textKey) || null;
+
+    // Per-prompt carry-forward, indexed oldest→newest. At each scan position,
+    // use this prompt's own result if present, else the most recent prior
+    // result. Stays null until the prompt's first-ever scan. Prevents
+    // zero-spike valleys in detail-view charts for prompts on slower
+    // frequencies than the tracker's scan cadence.
+    let lastResult = null;
+    const effectiveResults = scanResultMaps.map((m, i) => {
+      const result = m.get(pid) || scanResultMapsByText[i]?.get(textKey);
+      if (result) lastResult = result;
+      return lastResult;
+    });
 
     // Weighted visibility for current and previous scans
     const currentVisibility = scanResult
@@ -483,9 +547,9 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
       for (const cm of competitorMatchers) {
         let mentioned = false;
         let cited = false;
-        for (const pl of scanResult.platforms) {
+        for (const pl of (scanResult.platforms || [])) {
           if (!mentioned && pl.aiResponse && cm.patterns.some((r) => r.test(pl.aiResponse))) mentioned = true;
-          if (!cited && pl.citedUrls && pl.citedUrls.some(u => u.toLowerCase().includes(cm.slug))) cited = true;
+          if (!cited && pl.citedUrls && pl.citedUrls.some(u => cm.slugPattern.test(u))) cited = true;
           if (mentioned && cited) break;
         }
         if (mentioned || cited) {
@@ -514,48 +578,51 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
         sentimentScore: pl.sentimentScore ?? null,
         error: pl.error || false,
         fanoutQueries: pl.fanoutQueries || [],
+        // F11-02: surface the fallback-mode signal so UI can disambiguate
+        // "no fanout because LLM didn't search" from "no fanout because we
+        // fell back to a non-fanout API".
+        ...(pl.fanoutUnavailable ? { fanoutUnavailable: true } : {}),
         // Backward compat for old scans
         ...(pl.tier ? { tier: pl.tier } : {}),
         ...(pl.citedFrom ? { citedFrom: pl.citedFrom } : {}),
         ...(pl.normalizedPosition != null ? { normalizedPosition: pl.normalizedPosition } : {}),
       })),
       competitors: promptCompetitors,
-      lastChecked: latestScan.completedAt
-        ? formatRelativeDate(latestScan.completedAt)
+      // F18-01: per-prompt last-scan time. Was `latestScan.completedAt` —
+      // every prompt showed the tracker's latest scan time even when the
+      // prompt itself was skipped (slower-frequency cadence). The prompt
+      // model's `lastScannedAt` is the actual per-prompt timestamp.
+      lastChecked: p.lastScannedAt
+        ? formatRelativeDate(p.lastScannedAt)
         : 'Pending',
       trend,
       trendDelta,
-      aiResponse: scanResult ? scanResult.platforms.find((pl) => pl.aiResponse)?.aiResponse : undefined,
+      aiResponse: scanResult ? (scanResult.platforms || []).find((pl) => pl.aiResponse)?.aiResponse : undefined,
       models: p.models,
       frequency: p.frequency,
       active: p.active,
       locked: p.locked || false,
       suggestions: generatePromptSuggestions(scanResult, prevResult),
-      trendHistory: scanResultMaps.map((m, idx) => {
-        const result = m.get(pid) || scanResultMapsByText[idx]?.get(textKey);
-        if (!result) return 0;
-        return computeWeightedVisibility(result.platforms);
-      }).reverse(),
-      citationHistory: scanResultMaps.map((m, idx) => {
-        const result = m.get(pid) || scanResultMapsByText[idx]?.get(textKey);
-        if (!result) return 0;
-        const valid = result.platforms.filter((pl) => !pl.error);
+      trendHistory: effectiveResults.map((r) =>
+        r ? computeWeightedVisibility(r.platforms) : 0
+      ),
+      citationHistory: effectiveResults.map((r) => {
+        if (!r) return 0;
+        const valid = (r.platforms || []).filter((pl) => !pl.error);
         const citedCount = valid.filter((pl) => pl.cited).length;
         const mentionedCount = valid.filter((pl) => pl.mentioned).length;
         return mentionedCount > 0 ? Math.round((citedCount / mentionedCount) * 100) : 0;
-      }).reverse(),
-      mentionRateHistory: scanResultMaps.map((m, idx) => {
-        const result = m.get(pid) || scanResultMapsByText[idx]?.get(textKey);
-        if (!result) return 0;
-        const valid = result.platforms.filter((pl) => !pl.error);
+      }),
+      mentionRateHistory: effectiveResults.map((r) => {
+        if (!r) return 0;
+        const valid = (r.platforms || []).filter((pl) => !pl.error);
         if (valid.length === 0) return 0;
         return Math.round((valid.filter((pl) => pl.mentioned).length / valid.length) * 100);
-      }).reverse(),
-      positionHistory: scanResultMaps.map((m, si) => {
-        const result = m.get(pid) || scanResultMapsByText[si]?.get(textKey);
-        if (!result) return null;
+      }),
+      positionHistory: effectiveResults.map((r) => {
+        if (!r) return null;
         const ranks = [];
-        for (const pl of result.platforms) {
+        for (const pl of (r.platforms || [])) {
           if (pl.error || !pl.mentioned) continue;
           if (pl.position != null) {
             ranks.push(pl.position);
@@ -568,18 +635,17 @@ function formatTrackedPrompts(prompts, latestScan, previousScan, recentScans, do
         }
         if (ranks.length === 0) return null;
         return Math.round((ranks.reduce((s, v) => s + v, 0) / ranks.length) * 10) / 10;
-      }).reverse(),
-      sentimentHistory: scanResultMaps.map((m, idx) => {
-        const result = m.get(pid) || scanResultMapsByText[idx]?.get(textKey);
-        if (!result) return null;
-        const scores = result.platforms.filter((pl) => pl.mentioned && !pl.error && pl.sentimentScore != null).map((pl) => pl.sentimentScore);
+      }),
+      sentimentHistory: effectiveResults.map((r) => {
+        if (!r) return null;
+        const scores = (r.platforms || []).filter((pl) => pl.mentioned && !pl.error && pl.sentimentScore != null).map((pl) => pl.sentimentScore);
         if (scores.length === 0) return null;
         return Math.round(scores.reduce((s, v) => s + v, 0) / scores.length);
-      }).reverse(),
-      trendDates: (recentScans || []).map((scan) => {
+      }),
+      trendDates: scansOldestFirst.map((scan) => {
         const d = scan.completedAt || scan.startedAt;
         return d ? d.toISOString() : null;
-      }).reverse(),
+      }),
     };
   });
 }
@@ -590,8 +656,13 @@ function formatCompetitors(latestScan, previousScan, domain) {
 
   if (currentResults.length === 0) return [];
 
-  // Extract brand from domain for filtering (e.g. "google.com" → "google")
-  const ownBrand = domain ? domain.replace(/^(https?:\/\/)?(www\.)?/, '').split('.')[0].toLowerCase() : null;
+  // F9-04: use engine's `extractBrand` instead of `domain.split('.')[0]`.
+  // Pre-fix `app.suparank.com` → `'app'` (wrong, should be `'suparank'`),
+  // and `analytics.google.com` → `'analytics'` which is in
+  // GENERIC_BRAND_WORDS so isSameBrand single-word checks rejected the
+  // own-brand match. `extractBrand` uses the public-suffix-aware logic
+  // from F2-15 that strips subdomains and multi-part TLDs properly.
+  const ownBrand = domain ? extractBrand(domain) : null;
 
   const allMentions = currentResults.reduce((sum, cr) => sum + cr.mentions, 0);
 
@@ -617,13 +688,33 @@ function formatCompetitors(latestScan, previousScan, domain) {
   });
 }
 
-function computeChanges(latestScan, previousScan) {
-  if (!latestScan || !previousScan) return [];
+function computeChanges(latestScan, previousScan, carryScans) {
+  if (!latestScan) return [];
 
-  // Pre-build Map for O(1) lookup
+  // F18-07: when carryScans is supplied, build the per-prompt previous
+  // result by walking carryScans newest-first and picking each prompt's
+  // most-recent result *strictly older* than the latest scan. This
+  // prevents the misclassification where a monthly prompt scanned today
+  // (but not yesterday) was reported as "newly mentioned" simply because
+  // the dashboard-level previousScan didn't include it.
+  //
+  // Legacy fallback: with no carryScans, compare against previousScan.
+  // Returns [] if neither comparison source is available.
   const prevMap = new Map();
-  for (const r of previousScan.results) {
-    if (r.promptId) prevMap.set(r.promptId.toString(), r);
+  if (Array.isArray(carryScans) && carryScans.length > 0) {
+    for (const scan of carryScans) {
+      if (!scan.completedAt || scan.completedAt >= latestScan.completedAt) continue;
+      for (const r of (scan.results || [])) {
+        const pid = r.promptId?.toString();
+        if (pid && !prevMap.has(pid)) prevMap.set(pid, r);
+      }
+    }
+  } else if (previousScan) {
+    for (const r of (previousScan.results || [])) {
+      if (r.promptId) prevMap.set(r.promptId.toString(), r);
+    }
+  } else {
+    return [];
   }
 
   const changes = [];
@@ -632,25 +723,32 @@ function computeChanges(latestScan, previousScan) {
   // Helper to build platform metadata fields
   const platMeta = (plat) => {
     const meta = PLATFORM_DISPLAY.find((p) => p.platformId === plat.platformId);
+    // Defensive fallback for missing/empty platformId — was `plat.platformId[0]`
+    // which threw on undefined. PLATFORM_DISPLAY covers the active platform
+    // set, so this only matters for legacy results with stripped fields.
+    const pid = plat.platformId || '?';
     return {
-      platform: meta ? meta.name : plat.platformId,
-      platformLetter: meta ? meta.letter : plat.platformId[0].toUpperCase(),
+      platform: meta ? meta.name : pid,
+      platformLetter: meta ? meta.letter : pid[0].toUpperCase(),
       platformColor: meta ? meta.color : 'text-gray-600',
       platformBg: meta ? meta.bgColor : 'bg-gray-50',
     };
   };
 
-  for (const result of latestScan.results) {
+  for (const result of (latestScan.results || [])) {
     if (!result.promptId) continue;
     const prevResult = prevMap.get(result.promptId.toString());
     if (!prevResult) continue;
 
-    for (const plat of result.platforms) {
-      const prevPlat = prevResult.platforms.find((pp) => pp.platformId === plat.platformId);
+    for (const plat of (result.platforms || [])) {
+      const prevPlat = (prevResult.platforms || []).find((pp) => pp.platformId === plat.platformId);
       const m = platMeta(plat);
 
       // ── New platform (not scanned previously) ──
       if (!prevPlat) {
+        // Don't report "newly tracked" for an errored platform — we don't
+        // actually know whether it was mentioned yet.
+        if (plat.error) continue;
         if (plat.mentioned) {
           changes.push({
             id: `ch_${changeId++}`, type: 'gained', prompt: result.prompt, ...m,
@@ -665,6 +763,13 @@ function computeChanges(latestScan, previousScan) {
         }
         continue;
       }
+
+      // F17-01 + F17-02: if either side errored, we have no reliable signal
+      // about the platform's mention/citation state. Skipping prevents
+      // ghost changes like "Lost mention on ChatGPT" when really the scan
+      // just failed. Errored ticks create gaps in the change log — a
+      // deliberate accuracy-over-completeness trade.
+      if (plat.error || prevPlat.error) continue;
 
       // ── Mention gained / lost ──
       if (!prevPlat.mentioned && plat.mentioned) {
@@ -711,18 +816,26 @@ function computeChanges(latestScan, previousScan) {
         const prevPos = getPos(prevPlat);
         const currPos = getPos(plat);
         if (prevPos != null && currPos != null) {
-          // Lower position = better. Improved if position decreased by >= 2
+          // Lower position = better.
+          //
+          // F17-04: report any movement that touches the top 3 (the change
+          // user cares about most — #2 → #1 is a more meaningful event than
+          // #8 → #6), and require ≥2 elsewhere to keep noise down.
           const posDelta = currPos - prevPos;
-          if (posDelta <= -2) {
-            changes.push({
-              id: `ch_${changeId++}`, type: 'improved', prompt: result.prompt, ...m,
-              detail: `Position improved on ${m.platform} (#${prevPos} → #${currPos})`,
-            });
-          } else if (posDelta >= 2) {
-            changes.push({
-              id: `ch_${changeId++}`, type: 'declined', prompt: result.prompt, ...m,
-              detail: `Position dropped on ${m.platform} (#${prevPos} → #${currPos})`,
-            });
+          const touchesTopTier = Math.min(prevPos, currPos) <= 3;
+          const isMeaningful = posDelta !== 0 && (touchesTopTier || Math.abs(posDelta) >= 2);
+          if (isMeaningful) {
+            if (posDelta < 0) {
+              changes.push({
+                id: `ch_${changeId++}`, type: 'improved', prompt: result.prompt, ...m,
+                detail: `Position improved on ${m.platform} (#${prevPos} → #${currPos})`,
+              });
+            } else {
+              changes.push({
+                id: `ch_${changeId++}`, type: 'declined', prompt: result.prompt, ...m,
+                detail: `Position dropped on ${m.platform} (#${prevPos} → #${currPos})`,
+              });
+            }
           }
         }
       }
@@ -730,10 +843,15 @@ function computeChanges(latestScan, previousScan) {
   }
 
   // ── Competitor changes ──
-  if (latestScan.competitorResults && previousScan.competitorResults) {
+  // F17-03: skip the own-brand entry. competitorResults always includes
+  // the user's own brand (set by the engine as `isOwn: true`). Without
+  // this filter, the user's own mention gains rendered as a RED
+  // "Competitor cited" warning — the exact opposite of the intent.
+  if (latestScan.competitorResults && previousScan && previousScan.competitorResults) {
     const prevCompList = previousScan.competitorResults;
 
     for (const comp of latestScan.competitorResults) {
+      if (comp.isOwn) continue;
       const prevComp = prevCompList.find((c) => isSameBrand(c.name, comp.name));
       if (!prevComp) continue;
 
@@ -761,7 +879,7 @@ function computeChanges(latestScan, previousScan) {
   return changes;
 }
 
-function computeTrendData(scans) {
+function computeTrendData(scans, carryScans) {
   // scans are sorted newest-first from the DB query
   // Detect which calendar dates have multiple scans so we can add time
   const dateCounts = {};
@@ -771,10 +889,41 @@ function computeTrendData(scans) {
     dateCounts[key] = (dateCounts[key] || 0) + 1;
   }
 
+  // F18-02: carry-forward visibility so the chart matches computeMetrics.
+  // Pre-fix: each point used only that scan's raw results — for a tick
+  // that ran only daily prompts (skipping the monthly), visibility dropped
+  // because the monthly result wasn't included, even though the *known
+  // state* of the monthly prompt hadn't changed. Now: for each scan
+  // point, build the effective state from all carryScans with completedAt
+  // <= that scan's completedAt, so slow-frequency prompts contribute
+  // their last-known result rather than vanishing.
+  //
+  // `carryScans` is optional — when omitted (legacy callers) or empty,
+  // falls back to raw per-scan visibility. (Treating empty-array same as
+  // missing prevents the misuse case where a caller passes `[]` and
+  // accidentally zeros out every point.)
+  const carryDesc = Array.isArray(carryScans) && carryScans.length > 0 ? carryScans : null;
+
   return scans.map((scan, idx) => {
-    // Weighted visibility across all platform results in this scan
-    const allPlatforms = scan.results.flatMap((r) => r.platforms);
-    const value = allPlatforms.length > 0 ? computeWeightedVisibility(allPlatforms) : 0;
+    let value;
+    if (carryDesc) {
+      const effectiveMap = new Map();
+      // carryDesc is sorted DESC; we want all scans completedAt <= this scan's
+      // completedAt, latest-first so "first seen" wins (carry-forward semantic).
+      for (const cs of carryDesc) {
+        if (!cs.completedAt || cs.completedAt > scan.completedAt) continue;
+        for (const r of (cs.results || [])) {
+          const pid = r.promptId?.toString();
+          if (pid && !effectiveMap.has(pid)) effectiveMap.set(pid, r);
+        }
+      }
+      const allPlatforms = [...effectiveMap.values()].flatMap((r) => r.platforms || []);
+      value = allPlatforms.length > 0 ? computeWeightedVisibility(allPlatforms) : 0;
+    } else {
+      const allPlatforms = (scan.results || []).flatMap((r) => r.platforms || []);
+      value = allPlatforms.length > 0 ? computeWeightedVisibility(allPlatforms) : 0;
+    }
+
     const d = scan.completedAt || scan.startedAt;
     const month = d.toLocaleString('en-US', { month: 'short' });
     const day = d.getDate();
@@ -793,8 +942,7 @@ function computeTrendData(scans) {
   }).reverse(); // oldest first
 }
 
-function computePlatformStats(latestScan, domain) {
-  const domainClean = cleanDomainForMatch(domain);
+function computePlatformStats(latestScan, _domain) {
   return PLATFORM_DISPLAY.map((p) => {
     const platformResults = [];
     let mentionCount = 0;
@@ -804,8 +952,8 @@ function computePlatformStats(latestScan, domain) {
     let errorCount = 0;
 
     if (latestScan) {
-      for (const r of latestScan.results) {
-        const plat = r.platforms.find((pl) => pl.platformId === p.platformId);
+      for (const r of (latestScan.results || [])) {
+        const plat = (r.platforms || []).find((pl) => pl.platformId === p.platformId);
         if (plat) {
           platformResults.push(plat);
           if (plat.error) { errorCount++; continue; }
@@ -840,12 +988,18 @@ function computePlatformStats(latestScan, domain) {
 function generateActionItems(latestScan) {
   if (!latestScan) return [];
 
+  // F6-03: alias guards `results`/`platforms` once so each filter below
+  // doesn't re-guard. Mongoose subdoc arrays default to [] but legacy or
+  // lean-projected docs may omit the field; this keeps the function pure
+  // and total against either shape.
+  const scanResults = latestScan.results || [];
+
   const items = [];
   let id = 0;
 
   // Prompts not mentioned on any platform (exclude all-errored prompts)
-  const missingAll = latestScan.results.filter((r) => {
-    const valid = r.platforms.filter((p) => !p.error);
+  const missingAll = scanResults.filter((r) => {
+    const valid = (r.platforms || []).filter((p) => !p.error);
     return valid.length > 0 && valid.every((p) => !p.mentioned);
   });
   if (missingAll.length > 0) {
@@ -860,44 +1014,82 @@ function generateActionItems(latestScan) {
     });
   }
 
-  // Mentioned but not cited (exclude errored platforms)
-  const mentionedNotCited = latestScan.results.filter((r) =>
-    r.platforms.some((p) => !p.error && p.mentioned && !p.cited)
+  // Mentioned but not cited (exclude errored platforms).
+  //
+  // F13-02: copy now says "on some platforms for N prompts" instead of the
+  // pre-fix "you are mentioned in N prompts but not cited" — which implied
+  // those prompts had ZERO citations even when they were cited on 2 of 3
+  // platforms. The more honest framing also counts the platform-level
+  // instances (a richer signal than per-prompt presence) for the impact
+  // estimate.
+  // F13-03: linkedPrompts added so UI can deep-link the recommendation to
+  // the affected prompts (parity with the missingAll action item).
+  const mentionedNotCited = scanResults.filter((r) =>
+    (r.platforms || []).some((p) => !p.error && p.mentioned && !p.cited)
   );
   if (mentionedNotCited.length > 0) {
+    let mncInstances = 0;
+    for (const r of mentionedNotCited) {
+      for (const p of (r.platforms || [])) {
+        if (!p.error && p.mentioned && !p.cited) mncInstances++;
+      }
+    }
     items.push({
       id: `ai_${id++}`,
       priority: 'medium',
       title: 'Add structured data and citations to boost citation rate',
-      description: `You are mentioned in ${mentionedNotCited.length} prompts but not cited with links. Adding FAQ schema, clear brand mentions, and authoritative content structure can improve citation rates.`,
-      impact: `+${Math.min(mentionedNotCited.length * 5, 25)}% citation rate`,
+      description: `On some platforms for ${mentionedNotCited.length} prompt${mentionedNotCited.length > 1 ? 's' : ''} (${mncInstances} platform mention${mncInstances > 1 ? 's' : ''} total), your brand is mentioned but no link back to your site is cited. Adding FAQ schema, clear brand mentions, and authoritative content structure can improve citation rates.`,
+      impact: `+${Math.min(mncInstances * 2, 25)}% citation rate`,
       type: 'technical',
+      linkedPrompts: mentionedNotCited.filter((r) => r.promptId).map((r) => r.promptId.toString()),
     });
   }
 
-  // Platform gaps: mentioned on some but not all (exclude errored platforms)
-  const platformGaps = latestScan.results.filter((r) => {
-    const valid = r.platforms.filter((p) => !p.error);
-    const mentioned = valid.filter((p) => p.mentioned);
-    return mentioned.length > 0 && mentioned.length < valid.length;
-  });
-  if (platformGaps.length > 0) {
-    const gapPlatformIds = [...new Set(
-      platformGaps.flatMap((r) =>
-        r.platforms.filter((p) => !p.mentioned && !p.error).map((p) => p.platformId)
-      )
-    )];
+  // Platform gaps: identify platforms with LOW mention rates across the
+  // tracker, not just any platform that's missing on a single prompt.
+  //
+  // F13-01: pre-fix the recommendation listed EVERY platform that had a gap
+  // on any single prompt — so a platform mentioning own brand 49 of 50 times
+  // (98% rate) was flagged as a "gap platform" the user should "close". Now
+  // we compute per-platform mention rates over the non-errored prompt set
+  // and only flag platforms whose rate is below `PLATFORM_GAP_THRESHOLD`.
+  const PLATFORM_GAP_THRESHOLD = 0.5;
+  const platformStatsMap = new Map(); // platformId → { mentioned, total, promptIds }
+  for (const r of scanResults) {
+    for (const p of (r.platforms || [])) {
+      if (p.error) continue;
+      const stat = platformStatsMap.get(p.platformId) || { mentioned: 0, total: 0, promptIds: [] };
+      stat.total++;
+      if (p.mentioned) stat.mentioned++;
+      else if (r.promptId) stat.promptIds.push(r.promptId.toString());
+      platformStatsMap.set(p.platformId, stat);
+    }
+  }
+  const lowRatePlatforms = [...platformStatsMap.entries()]
+    .filter(([_, s]) => s.total > 0 && (s.mentioned / s.total) < PLATFORM_GAP_THRESHOLD)
+    .map(([pid, s]) => ({ pid, rate: s.mentioned / s.total, promptIds: s.promptIds }));
+
+  if (lowRatePlatforms.length > 0) {
+    const gapPlatformIds = lowRatePlatforms.map((x) => x.pid);
     const gapNames = gapPlatformIds
       .map((pid) => PLATFORM_DISPLAY.find((pd) => pd.platformId === pid)?.name || pid)
       .join(', ');
+    // F13-03: linkedPrompts = union of un-mentioned prompts across the
+    // low-rate platforms (deduped).
+    const linkedPrompts = [...new Set(lowRatePlatforms.flatMap((x) => x.promptIds))];
+    // Worst rate determines impact estimate (more honest than the prior
+    // `gaps.length * 8` heuristic).
+    const worstGap = Math.min(...lowRatePlatforms.map((x) => x.rate));
+    const liftPct = Math.round((PLATFORM_GAP_THRESHOLD - worstGap) * 100);
     items.push({
       id: `ai_${id++}`,
       priority: 'medium',
       title: `Close platform gaps on ${gapNames}`,
-      description: `You're mentioned on some platforms but not others for ${platformGaps.length} prompts. Diversifying content format and structure can help reach all AI platforms.`,
-      impact: `+${Math.min(platformGaps.length * 8, 30)}% cross-platform visibility`,
+      description: `${gapNames} ${gapPlatformIds.length === 1 ? 'is' : 'are'} mentioning your brand on fewer than ${Math.round(PLATFORM_GAP_THRESHOLD * 100)}% of tracked prompts. Diversifying content format and structure can help reach those AI platforms.`,
+      impact: `+${Math.min(liftPct, 30)}% cross-platform visibility`,
       type: 'strategy',
       platformGap: gapPlatformIds,
+      linkedPrompts,
     });
   }
 
@@ -946,6 +1138,7 @@ async function recoverStuckScans(workspaceId) {
 async function executeScan(trackerId, userId = null, { force = false } = {}) {
   let creditTxId = null;
   let orgId = null;
+  let scanDocId = null; // hoisted so Phase H can mark the AiTrackerScan failed
 
   try {
     // ── 1. Atomic guard: claim the scan (prevents double-execution from race conditions)
@@ -958,12 +1151,32 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
 
     const tracker = claimed;
 
+    // ── 1b. Empty defaultModels guard — no platforms enabled (e.g. cleared
+    //        by downgrade). Bail out without creating a scan doc or
+    //        advancing per-prompt lastScannedAt. F19 reselection UI will
+    //        prompt the user to re-pick platforms.
+    if (!tracker.defaultModels || tracker.defaultModels.length === 0) {
+      const retryDelay = (24 * 60 * 60 * 1000) / (_devTimeScale || 1);
+      await AiTracker.findByIdAndUpdate(trackerId, {
+        $set: {
+          scanStatus: 'ready',
+          scanProgress: 0,
+          scanError: 'No platforms enabled',
+          nextScanAt: new Date(Date.now() + retryDelay),
+        },
+      });
+      return;
+    }
+
     // ── 2. Resolve org for credit operations
     const ws = await Workspace.findById(tracker.workspaceId);
     orgId = ws?.organizationId?.toString() || null;
 
     // ── 3. Load prompts & platforms to estimate credit cost (skip inactive + locked prompts)
-    const allActivePrompts = await AiTrackerPrompt.find({ trackerId, active: { $ne: false }, locked: { $ne: true } }).limit(500);
+    // F4-15: the prior `.limit(500)` was a silent truncation. Capped at tier
+    // level via maxAiTrackerPromptsPerMonitor at addPrompt time; bounded query
+    // here for defense (10× the typical tier ceiling).
+    const allActivePrompts = await AiTrackerPrompt.find({ trackerId, active: { $ne: false }, locked: { $ne: true } }).limit(5000);
 
     // ── 3b. Filter prompts by frequency — only scan prompts that are due
     //        Manual scans (force=true) scan all prompts but only reset timers for due ones
@@ -987,7 +1200,9 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
     // Manual scans scan all prompts (user gets fresh data) but track which were due
     // so we only reset lastScannedAt on due ones (preserving cooldown timers)
     const duePromptIds = new Set(allActivePrompts.filter(isDuePrompt).map((p) => p._id.toString()));
-    const prompts = force ? allActivePrompts : allActivePrompts.filter(isDuePrompt);
+    // F20-04: `let` because the re-fetch at step 6 may filter out prompts
+    // that became locked between the credit estimate and scan start.
+    let prompts = force ? allActivePrompts : allActivePrompts.filter(isDuePrompt);
 
     const platformCount = tracker.defaultModels?.length || 0;
     const promptCount = prompts.length;
@@ -1035,10 +1250,31 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
 
     // ── 5. Create scan document
     const scan = await AiTrackerScan.create({ trackerId, startedAt: new Date() });
+    scanDocId = scan._id;
     await AiTracker.findByIdAndUpdate(trackerId, { $set: { currentScanId: scan._id } });
 
+    // F20-04: re-check lock status immediately before runScan to narrow the
+    // race window with concurrent downgrades. Pre-fix `prompts` was captured
+    // at step 3 and could be minutes old by step 6 (credit estimate +
+    // pre-deduct between them). If a downgrade webhook fired in that window,
+    // the in-memory list still contained now-locked prompts and they got
+    // scanned + charged. This re-fetch shrinks the race to the gap between
+    // re-fetch and the first per-prompt API call (typically ms).
+    if (prompts.length > 0) {
+      const stillUnlocked = await AiTrackerPrompt
+        .find({ _id: { $in: prompts.map((p) => p._id) }, locked: { $ne: true } })
+        .select('_id')
+        .lean();
+      const unlockedSet = new Set(stillUnlocked.map((p) => p._id.toString()));
+      const filteredPrompts = prompts.filter((p) => unlockedSet.has(p._id.toString()));
+      if (filteredPrompts.length < prompts.length) {
+        console.log(`[ai-tracker-scan] F20-04: dropped ${prompts.length - filteredPrompts.length} prompts locked between estimate and scan start (tracker ${trackerId})`);
+      }
+      prompts = filteredPrompts;
+    }
+
     // ── 6. Run the scan engine
-    const { results, competitorResults, detectedBrands, totalAnswerWords } = await runScan(
+    const { results, competitorResults, detectedBrands, totalAnswerWords, availablePlatformIds } = await runScan(
       tracker,
       prompts,
       [], // competitors auto-detected by scan engine
@@ -1063,12 +1299,20 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
         });
         creditTxId = null;
 
-        // S74: Don't save results if credits couldn't be settled — mark scan as failed
+        // S74: Don't save results if credits couldn't be settled — mark scan as failed.
+        // Advance nextScanAt by 1h (dev-scaled) so cron doesn't immediately re-pick
+        // this tracker and re-charge credits on a likely-still-broken pool.
+        const settleRetryDelay = (60 * 60 * 1000) / (_devTimeScale || 1);
         await AiTrackerScan.findByIdAndUpdate(scan._id, {
           $set: { status: 'failed', completedAt: new Date() },
         });
         await AiTracker.findByIdAndUpdate(trackerId, {
-          $set: { scanStatus: 'failed', scanError: 'Credit settlement failed', currentScanId: null },
+          $set: {
+            scanStatus: 'failed',
+            scanError: 'Credit settlement failed',
+            currentScanId: null,
+            nextScanAt: new Date(Date.now() + settleRetryDelay),
+          },
         });
         return;
       }
@@ -1084,19 +1328,31 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
     //        interval instead of setting it to "now". This prevents scan execution
     //        time from causing drift (e.g. Weekly firing after 6 Daily scans instead of 7).
     //        Manual scans only reset timers on prompts that were actually due.
-    const promptsToResetTimer = prompts.filter((p) => duePromptIds.has(p._id.toString()));
+    //
+    //        Only advance prompts that produced platform results — prompts where every
+    //        platform was skipped by the per-prompt models filter never actually ran,
+    //        so their schedule shouldn't drift forward.
+    const scannedPromptIds = new Set(
+      results.filter((r) => r.platforms && r.platforms.length > 0).map((r) => r.promptId.toString())
+    );
+    const promptsToResetTimer = prompts.filter((p) =>
+      duePromptIds.has(p._id.toString()) && scannedPromptIds.has(p._id.toString())
+    );
     let earliestNextDue = null;
     for (const p of promptsToResetTimer) {
       const freqMs = ((FREQ_DAYS[p.frequency] || 7) / timeScale) * 24 * 60 * 60 * 1000;
       let newLastScannedAt;
-      if (p.lastScannedAt) {
+      if (p.lastScannedAt && p.lastScannedAt <= scanStart) {
         // Fixed-rate: jump to the most recent interval boundary before scanStart.
-        // This prevents drift AND handles catch-up when multiple intervals have passed
-        // (e.g. after switching time scales or server downtime).
+        // This prevents drift AND handles catch-up when multiple intervals have passed.
         const elapsed = scanStart.getTime() - p.lastScannedAt.getTime();
         const intervals = Math.max(1, Math.floor(elapsed / freqMs));
         newLastScannedAt = new Date(p.lastScannedAt.getTime() + intervals * freqMs);
       } else {
+        // No history OR future-dated lastScannedAt (clock skew / manual DB edit).
+        // Normalize to scanStart — refusing to honor anomalous future dates that
+        // would otherwise be pushed even further into the future by the Math.max(1, …)
+        // floor on intervals.
         newLastScannedAt = now;
       }
       await AiTrackerPrompt.findByIdAndUpdate(p._id, { $set: { lastScannedAt: newLastScannedAt } });
@@ -1104,10 +1360,25 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
       const nextDue = new Date(newLastScannedAt.getTime() + freqMs);
       if (!earliestNextDue || nextDue < earliestNextDue) earliestNextDue = nextDue;
     }
-    // Also check non-scanned prompts for earliest next-due
+    // Also factor in prompts that weren't advanced in the first loop:
+    //   - Not-due prompts (normal case)
+    //   - Due-but-not-scanned prompts whose per-prompt models[] didn't overlap
+    //     with available platforms (F4-19 case)
+    //
+    // Without including the second group, the tracker's nextScanAt could land
+    // a full refresh interval out while those prompts sit unscanned forever.
+    // Filtering by `advancedPromptIds` (rather than `duePromptIds` as before)
+    // ensures all unadvanced prompts contribute to the next-due calculation.
+    const advancedPromptIds = new Set(promptsToResetTimer.map((p) => p._id.toString()));
     for (const p of allActivePrompts) {
-      if (duePromptIds.has(p._id.toString())) continue; // already handled above
-      if (!p.lastScannedAt) continue;
+      if (advancedPromptIds.has(p._id.toString())) continue; // first loop already handled
+      if (!p.lastScannedAt) {
+        // No history and not advanced — still due now. Schedule cron to pick up
+        // soon (bounded to once-per-cron-tick by the daily cadence in prod, so
+        // no thrashing within a day).
+        if (!earliestNextDue || scanStart < earliestNextDue) earliestNextDue = scanStart;
+        continue;
+      }
       const freqMs = ((FREQ_DAYS[p.frequency] || 7) / timeScale) * 24 * 60 * 60 * 1000;
       const nextDue = new Date(p.lastScannedAt.getTime() + freqMs);
       if (!earliestNextDue || nextDue < earliestNextDue) earliestNextDue = nextDue;
@@ -1121,18 +1392,27 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
     }
     const fallbackNextScan = new Date(now.getTime() + (intervalDays / timeScale) * 24 * 60 * 60 * 1000);
 
-    // ── 10. Update tracker to ready
-    const scannedPlatforms = tracker.defaultModels && tracker.defaultModels.length > 0
-      ? tracker.defaultModels
-      : PLATFORM_DISPLAY.map((p) => p.platformId);
+    // ── 10. Update tracker to ready.
+    //        platformStatuses comes from the engine's actual availablePlatformIds —
+    //        not from tracker.defaultModels — so platforms silently dropped due to
+    //        missing API keys are not falsely reported as 'completed'.
+    //        An empty array means "no platform actually ran" — DO report that
+    //        accurately rather than falling back to defaultModels (which would
+    //        resurrect the F4-10 bug). Undefined only happens with a stale engine
+    //        build that predates the availablePlatformIds return; preserve compat
+    //        in that single case.
+    const completedPlatforms = Array.isArray(availablePlatformIds)
+      ? availablePlatformIds
+      : (tracker.defaultModels || []);
     await AiTracker.findByIdAndUpdate(trackerId, {
       $set: {
         scanStatus: 'ready',
         scanProgress: 100,
+        scanError: null,
         lastScanAt: now,
         nextScanAt: earliestNextDue || fallbackNextScan,
         currentScanId: null,
-        platformStatuses: scannedPlatforms.map((pid) => ({
+        platformStatuses: completedPlatforms.map((pid) => ({
           platformId: pid,
           status: 'completed',
         })),
@@ -1159,12 +1439,16 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
           let carryForwardResults = [];
           if (notScannedPrompts.length > 0) {
             // Anchor on the oldest lastScannedAt among not-scanned prompts so we always
-            // reach back far enough — no fixed limit that could drop monthly/slow prompts
+            // reach back far enough — no fixed limit that could drop monthly/slow prompts.
+            // F18-03: same 90-day clamp as buildDashboardResponse (a corrupted
+            // lastScannedAt would otherwise scan all-time tracker history).
             const notScannedWithHistory = notScannedPrompts.filter((p) => p.lastScannedAt);
-            const oldestNeeded = notScannedWithHistory.reduce((min, p) =>
+            const ninetyDaysAgoEmail = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+            let oldestNeeded = notScannedWithHistory.reduce((min, p) =>
               p.lastScannedAt < min ? p.lastScannedAt : min,
               notScannedWithHistory[0]?.lastScannedAt || new Date()
             );
+            if (oldestNeeded < ninetyDaysAgoEmail) oldestNeeded = ninetyDaysAgoEmail;
             const prevScans = await AiTrackerScan.find({
               trackerId,
               status: 'ready',
@@ -1203,13 +1487,16 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
             : metrics.avgSentiment >= 40 ? `Neutral (${metrics.avgSentiment})`
             : `Negative (${metrics.avgSentiment})`;
 
-          // Per-platform rows (current scan only)
+          // Per-platform rows (current scan only).
+          // platform names (p.name) come from PLATFORM_DISPLAY which is a
+          // server-controlled constant — safe — but escape anyway for
+          // defense-in-depth.
           const platformRows = platStats.map((p) => {
             const total = results.length - p.errorCount;
             const errorCell = p.errorCount > 0
               ? `<td style="padding:10px 16px;color:#ef4444;font-size:12px;">${p.errorCount} error${p.errorCount > 1 ? 's' : ''}</td>`
               : '<td></td>';
-            return `<tr style="border-bottom:1px solid #f1f5f9;"><td style="padding:10px 16px;font-weight:600;color:#111;font-size:13px;">${p.name}</td><td style="padding:10px 16px;color:#555;font-size:13px;">${p.visibility}%</td><td style="padding:10px 16px;color:#555;font-size:13px;">${p.mentionCount} / ${total}</td><td style="padding:10px 16px;color:#555;font-size:13px;">${p.citationCount}</td>${errorCell}</tr>`;
+            return `<tr style="border-bottom:1px solid #f1f5f9;"><td style="padding:10px 16px;font-weight:600;color:#111;font-size:13px;">${htmlEscape(p.name)}</td><td style="padding:10px 16px;color:#555;font-size:13px;">${p.visibility}%</td><td style="padding:10px 16px;color:#555;font-size:13px;">${p.mentionCount} / ${total}</td><td style="padding:10px 16px;color:#555;font-size:13px;">${p.citationCount}</td>${errorCell}</tr>`;
           }).join('');
 
           // Per-prompt rows: scanned-this-run first (green badge), then carry-forward (gray date)
@@ -1227,17 +1514,22 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
               return b.mRate - a.mRate;
             })
             .map((r, i) => {
-              const short = r.prompt.length > 70 ? r.prompt.slice(0, 70) + '\u2026' : r.prompt;
+              // r.prompt is user-controlled (set during prompt CRUD). Escape
+              // before embedding in <td> to prevent XSS via <style>, <img>,
+              // event-handler payloads, etc. (F4-23)
+              const truncated = r.prompt.length > 70 ? r.prompt.slice(0, 70) + '\u2026' : r.prompt;
+              const safeShort = htmlEscape(truncated);
               const statusCell = r.isCarryForward
                 ? `<td style="padding:9px 14px;white-space:nowrap;"><span style="display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:600;background:#f1f5f9;color:#64748b;">${r.carryDate ? new Date(r.carryDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : 'prev'}</span></td>`
                 : `<td style="padding:9px 14px;white-space:nowrap;"><span style="display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700;background:#dcfce7;color:#15803d;">&#10003; New</span></td>`;
-              return `<tr style="border-bottom:1px solid #f1f5f9;">${statusCell}<td style="padding:9px 14px;color:#94a3b8;font-size:12px;">${i + 1}</td><td style="padding:9px 14px;color:#111;font-size:13px;">${short}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.mentioned}/${r.total}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.mRate}%</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.cRate}%</td></tr>`;
+              return `<tr style="border-bottom:1px solid #f1f5f9;">${statusCell}<td style="padding:9px 14px;color:#94a3b8;font-size:12px;">${i + 1}</td><td style="padding:9px 14px;color:#111;font-size:13px;">${safeShort}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.mentioned}/${r.total}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.mRate}%</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.cRate}%</td></tr>`;
             })
             .join('');
 
-          // Competitor rows (top 10)
+          // Competitor rows (top 10). c.name is AI-extracted — Claude
+          // controls it via prompt injection (F3-07 surface) — must escape.
           const competitorRows = sortedCompetitors.slice(0, 10).map((c, i) =>
-            `<tr style="border-bottom:1px solid #f1f5f9;"><td style="padding:9px 14px;color:#94a3b8;font-size:12px;">${i + 1}</td><td style="padding:9px 14px;color:#111;font-weight:600;font-size:13px;">${c.name}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${c.mentions}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${c.citations}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${c.visibility}%</td></tr>`
+            `<tr style="border-bottom:1px solid #f1f5f9;"><td style="padding:9px 14px;color:#94a3b8;font-size:12px;">${i + 1}</td><td style="padding:9px 14px;color:#111;font-weight:600;font-size:13px;">${htmlEscape(c.name)}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${c.mentions}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${c.citations}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${c.visibility}%</td></tr>`
           ).join('');
 
           // Action item rows (high priority first, max 5)
@@ -1246,21 +1538,28 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
             .sort((a, b) => (priOrder[a.priority] || 0) - (priOrder[b.priority] || 0))
             .slice(0, 5)
             .map((item) => {
+              // Action items are server-generated from PLATFORM_DISPLAY +
+              // hardcoded templates, but escape for defense-in-depth in case
+              // future generators incorporate user data.
               const bg = item.priority === 'high' ? '#ef4444' : item.priority === 'medium' ? '#f59e0b' : '#22c55e';
-              return `<tr style="border-bottom:1px solid #f1f5f9;"><td style="padding:10px 14px;white-space:nowrap;"><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;text-transform:uppercase;color:#fff;background:${bg};">${item.priority}</span></td><td style="padding:10px 14px;"><div style="color:#111;font-size:13px;font-weight:600;margin-bottom:2px;">${item.title}</div><div style="color:#64748b;font-size:12px;">${item.description}</div></td><td style="padding:10px 14px;color:#4f46e5;font-size:12px;font-weight:600;white-space:nowrap;">${item.impact}</td></tr>`;
+              return `<tr style="border-bottom:1px solid #f1f5f9;"><td style="padding:10px 14px;white-space:nowrap;"><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;text-transform:uppercase;color:#fff;background:${bg};">${htmlEscape(item.priority)}</span></td><td style="padding:10px 14px;"><div style="color:#111;font-size:13px;font-weight:600;margin-bottom:2px;">${htmlEscape(item.title)}</div><div style="color:#64748b;font-size:12px;">${htmlEscape(item.description)}</div></td><td style="padding:10px 14px;color:#4f46e5;font-size:12px;font-weight:600;white-space:nowrap;">${htmlEscape(item.impact)}</td></tr>`;
             })
             .join('');
 
           const appUrl = process.env.FRONTEND_URL || 'https://app.suparank.ai';
           const dashboardUrl = `${appUrl}/workspace/${ws?.workspaceNumber || 1}/ai-tracker`;
 
+          // Pre-escape template variables that hold user-controlled strings.
+          // The downstream template engine may render `{{var}}` as raw HTML
+          // (some engines do this for plain `{{}}`; safer ones use `{{{}}}`
+          // for raw). Either way, escaping here is defense-in-depth (F4-23).
           const emailOptions = {
             to: owner.email,
             fromName: 'SupaRank',
             data: {
-              userName: owner.profile?.name || owner.email.split('@')[0],
-              trackerName: tracker.name || tracker.domain,
-              domain: tracker.domain,
+              userName: htmlEscape(owner.profile?.name || owner.email.split('@')[0]),
+              trackerName: htmlEscape(tracker.name || tracker.domain),
+              domain: htmlEscape(tracker.domain),
               scanDate: now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
               promptsScanned: results.length === allActivePrompts.length
                 ? `${results.length} scanned`
@@ -1277,8 +1576,31 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
               dashboardUrl,
             },
           };
+          // F4-11: retry-with-backoff on send. Transient SMTP failures
+          // shouldn't silently lose scan-summary emails the user paid for.
           await applyCustomTemplate('scan_completed', emailOptions);
-          await sendEmail(emailOptions);
+          const maxAttempts = 3;
+          let sendErr = null;
+          for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            try {
+              await sendEmail(emailOptions);
+              sendErr = null;
+              break;
+            } catch (e) {
+              sendErr = e;
+              if (attempt < maxAttempts - 1) {
+                const delay = 2000 * Math.pow(2, attempt); // 2s, 4s
+                console.warn(`[ai-tracker-scan] email send failed (attempt ${attempt + 1}/${maxAttempts}) for tracker ${trackerId}: ${e.message}; retrying in ${delay}ms`);
+                await new Promise((r) => setTimeout(r, delay));
+              }
+            }
+          }
+          if (sendErr) {
+            // All attempts exhausted — surface the final failure with stack
+            // for SMTP diagnosis. The outer email-block catch will swallow this
+            // so the scan still completes; user can't retry from UI today.
+            throw sendErr;
+          }
           console.log(`[ai-tracker-scan] sent scan summary email to ${owner.email} for tracker ${trackerId}`);
         }
       }
@@ -1295,8 +1617,17 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
       });
     }
 
-    // Schedule retry in 1 hour so the cron auto-recovers transient failures
-    const retryAt = new Date(Date.now() + 60 * 60 * 1000);
+    // Mark the AiTrackerScan doc failed if one was created — otherwise it
+    // stays in 'running' (its schema default) and never reaches a terminal state.
+    if (scanDocId) {
+      await AiTrackerScan.findByIdAndUpdate(scanDocId, {
+        $set: { status: 'failed', completedAt: new Date() },
+      }).catch((e) => console.error(`[ai-tracker-scan] failed to mark scan doc failed for tracker ${trackerId}:`, e.message));
+    }
+
+    // Schedule retry in 1 hour so the cron auto-recovers transient failures.
+    // Scaled by _devTimeScale so dev-mode retries don't wait a real hour.
+    const retryAt = new Date(Date.now() + (60 * 60 * 1000) / (_devTimeScale || 1));
     await AiTracker.findByIdAndUpdate(trackerId, {
       $set: { scanStatus: 'failed', scanError: (err.message || 'Scan failed').slice(0, 500), currentScanId: null, nextScanAt: retryAt },
     }).catch((e) => console.error(`[ai-tracker-scan] failed to update scan failure status for tracker ${trackerId}:`, e.message));
@@ -1308,9 +1639,16 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function buildDashboardResponse(tracker) {
-  // Fetch all non-locked prompts (including inactive) so ManagePromptsView can show them
-  const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id, locked: { $ne: true } }).limit(500);
-  const activePromptCount = prompts.filter(p => p.active !== false).length;
+  // F20-01: include locked prompts too. The ManagePromptsView component
+  // imports and renders LockedSectionBanner + LockedBadge (components/ManagePromptsView.tsx:409-446)
+  // expecting locked prompts to be present in the dashboard response, but
+  // the prior `locked: { $ne: true }` filter stripped them — leaving the
+  // locked-section UI as dead code and users on a post-downgrade tracker
+  // with no indication that their previously-created prompts are archived.
+  // Now we fetch all prompts and let the frontend section-render them.
+  // `activePromptCount` continues to exclude locked so metrics stay accurate.
+  const prompts = await AiTrackerPrompt.find({ trackerId: tracker._id }).limit(500);
+  const activePromptCount = prompts.filter(p => p.active !== false && !p.locked).length;
 
   // recentScans (limit 12): used for trend chart and latestScan/previousScan references
   const recentScans = await AiTrackerScan.find({
@@ -1321,12 +1659,24 @@ async function buildDashboardResponse(tracker) {
     .limit(12)
     .lean();
 
-  // carryScans: anchored on oldest lastScannedAt so carry-forward never loses slow-frequency prompts
-  // A monthly prompt last scanned 30 days ago will always be found, regardless of scan volume since then
-  const activePrompts = prompts.filter(p => p.active !== false && p.lastScannedAt);
-  const oldestNeeded = activePrompts.length > 0
+  // carryScans: anchored on oldest lastScannedAt so carry-forward never loses slow-frequency prompts.
+  // A monthly prompt last scanned 30 days ago will always be found, regardless of scan volume since then.
+  //
+  // F18-03: clamp to 90 days. Without this, a corrupted `lastScannedAt`
+  // (e.g. epoch 0 from a botched migration) would make the query scan ALL
+  // historic ready scans for this tracker. 90 days is far longer than any
+  // legitimate cadence (monthly = 30 days), so a real slow-frequency prompt
+  // is still found while pathological data is bounded.
+  // F20-01: exclude locked from the carry-forward anchor so a locked prompt's
+  // stale lastScannedAt doesn't widen the carryScans window unnecessarily.
+  // Locked prompts still appear in `trackedPrompts` for the ManagePromptsView
+  // archive section; only the anchor calculation excludes them.
+  const activePrompts = prompts.filter(p => p.active !== false && !p.locked && p.lastScannedAt);
+  const NINETY_DAYS_AGO = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+  let oldestNeeded = activePrompts.length > 0
     ? activePrompts.reduce((min, p) => p.lastScannedAt < min ? p.lastScannedAt : min, activePrompts[0].lastScannedAt)
     : null;
+  if (oldestNeeded && oldestNeeded < NINETY_DAYS_AGO) oldestNeeded = NINETY_DAYS_AGO;
   let carryScans = oldestNeeded
     ? await AiTrackerScan.find({
         trackerId: tracker._id,
@@ -1336,10 +1686,19 @@ async function buildDashboardResponse(tracker) {
     : recentScans;
 
   // Fallback: if carryScans query returned nothing (e.g. prompts' lastScannedAt is newer
-  // than any scan's completedAt due to data cleanup), use recentScans instead
+  // than any scan's completedAt due to data cleanup, clock skew, or schema migration),
+  // use recentScans instead.
+  // F18-09: in this fallback path, carry-forward is silently capped to the
+  // recentScans limit (12). Acceptable because the fallback only fires for
+  // pathological data — typical traffic uses the unbounded carryScans query.
   if (carryScans.length === 0 && recentScans.length > 0) {
     carryScans = recentScans;
   }
+  // F18-08 (documented residual): dashboard trend chart is bounded to
+  // `recentScans.length` (≤12) while per-prompt charts in trackedPrompts
+  // can extend to `carryScans.length` (≥12 when slow-frequency prompts
+  // exist). Different windows are intentional — the dashboard chart is a
+  // recency overview; per-prompt detail benefits from longer history.
 
   const latestScan = recentScans[0] || null;
   const previousScan = recentScans[1] || null;
@@ -1347,14 +1706,20 @@ async function buildDashboardResponse(tracker) {
   const metrics = computeMetrics(latestScan, activePromptCount, carryScans, tracker.domain);
   const trackedPrompts = formatTrackedPrompts(prompts, latestScan, previousScan, carryScans, tracker.domain);
   const formattedCompetitors = formatCompetitors(latestScan, previousScan, tracker.domain);
-  const changes = computeChanges(latestScan, previousScan);
-  const trendData = computeTrendData(recentScans);
+  const changes = computeChanges(latestScan, previousScan, carryScans);
+  const trendData = computeTrendData(recentScans, carryScans);
   const actionItems = generateActionItems(latestScan);
   const platformStats = computePlatformStats(latestScan, tracker.domain);
 
   return {
     tracker: tracker.toTrackerState(),
     metrics,
+    // Top-level count so the scanning view (F14-07) can show real numbers
+    // during the first scan, when `metrics` is still null (no completed
+    // scan to compute aggregates from) and `trackedPrompts` is empty
+    // (formatTrackedPrompts only emits entries from the latest scan results).
+    activePromptCount,
+    availablePlatformIds: computeAvailablePlatformIds(tracker),
     trackedPrompts,
     competitors: formattedCompetitors,
     changes,
@@ -1402,6 +1767,15 @@ const updateTracker = async (req, res) => {
       // Validate against tier limit
       const validPlatformIds = PLATFORM_DISPLAY.map((p) => p.platformId);
       const filtered = defaultModels.filter((p) => validPlatformIds.includes(p));
+      // F19-03: reject empty (or all-filtered-out) defaultModels. Without this,
+      // `update.defaultModels = []` would re-trigger needsPlatformReselection
+      // on the dashboard, looping the user back to the reselection screen
+      // they just submitted. The frontend Save button is already gated on
+      // `selected.size >= 1`, but a direct API call (or a payload of only
+      // unknown platform IDs) could otherwise wedge the tracker.
+      if (filtered.length === 0) {
+        return res.status(400).json({ error: 'At least one valid platform must be selected' });
+      }
       const orgId = workspace.organizationId;
       if (orgId) {
         const { config, tier } = await tierService.getOrgTierConfig(orgId);
@@ -1415,6 +1789,14 @@ const updateTracker = async (req, res) => {
         }
       }
       update.defaultModels = filtered;
+      // F19-04: when this update is a reselection recovery (the tracker had
+      // empty defaultModels before), pull nextScanAt to now so cron picks
+      // up on the very next tick instead of leaving the user staring at a
+      // stale schedule from before the downgrade. For routine reorderings
+      // of an already-non-empty list, leave nextScanAt alone.
+      if (!Array.isArray(tracker.defaultModels) || tracker.defaultModels.length === 0) {
+        update.nextScanAt = new Date();
+      }
     }
 
     if (Object.keys(update).length === 0) {
@@ -1634,6 +2016,11 @@ Examples for suparank.com (SEO/AI visibility tool):
 // ─── POST /:workspaceNumber/ai-tracker/setup ──────────────────────────────
 
 const setup = async (req, res) => {
+  // F1-06: hoisted to function scope (not inside the try) so the outer catch
+  // can also invoke it. Any unhandled error between the quota increment and
+  // a structured failure path (e.g. a DB hiccup during the name-conflict
+  // findOne) escapes to the catch — without this we'd leak the quota.
+  let promptQuotaRollback = null;
   try {
     const workspace = req.workspace;
 
@@ -1648,6 +2035,18 @@ const setup = async (req, res) => {
     }
     if (!Array.isArray(prompts) || prompts.length === 0) {
       return res.status(400).json({ error: 'At least one prompt is required' });
+    }
+    // Reject submissions where every prompt is empty/whitespace — would otherwise
+    // provision an empty tracker silently after passing the length-> 0 check.
+    const nonEmptyPromptCount = prompts.filter((p) => typeof p === 'string' && p.trim().length > 0).length;
+    if (nonEmptyPromptCount === 0) {
+      return res.status(400).json({ error: 'At least one non-empty prompt is required' });
+    }
+    // F1-07: cap monitor name length. Without this the frontend cap (maxLength=100)
+    // was the only guard; a direct API caller could submit megabytes of name text
+    // which Mongo would error on or silently truncate. 100 chars matches the UI cap.
+    if (name != null && typeof name === 'string' && name.trim().length > 100) {
+      return res.status(400).json({ error: 'Monitor name must be 100 characters or fewer' });
     }
 
     // Validate platforms and monitor count against tier limits
@@ -1686,14 +2085,24 @@ const setup = async (req, res) => {
           const doc = await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, promptCount);
           newTotal = doc?.aiTrackerPromptsCreated ?? promptCount;
         }
-        if (newTotal > config.maxAiTrackerPromptsPerMonth) {
-          // Rollback the increment
-          if (limitType === 'lifetime' && req.user?.userId) {
-            await UserUsageTracker.increment(req.user.userId, 'aiTrackerPromptsCreated', -promptCount);
-          } else {
-            const period = tierService.getPeriod(limitType);
-            await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, -promptCount);
+        // F1-06: assign rollback closure so later failure paths can undo
+        // this increment. Self-nulling so a second call is a no-op.
+        const userId = req.user?.userId;
+        promptQuotaRollback = async () => {
+          promptQuotaRollback = null;
+          try {
+            if (limitType === 'lifetime' && userId) {
+              await UserUsageTracker.increment(userId, 'aiTrackerPromptsCreated', -promptCount);
+            } else {
+              const period2 = tierService.getPeriod(limitType);
+              await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period2, -promptCount);
+            }
+          } catch (rbErr) {
+            console.error('[ai-tracker-setup] prompt quota rollback failed:', rbErr.message);
           }
+        };
+        if (newTotal > config.maxAiTrackerPromptsPerMonth) {
+          await promptQuotaRollback();
           const used = newTotal - promptCount;
           return res.status(429).json({
             error: `Your ${tier} plan allows ${config.maxAiTrackerPromptsPerMonth} AI Tracker prompts (${used} used, ${promptCount} requested)`,
@@ -1708,6 +2117,8 @@ const setup = async (req, res) => {
       if (Array.isArray(platforms) && platforms.length > 0) {
         selectedPlatforms = platforms.filter((p) => validPlatformIds.includes(p));
         if (selectedPlatforms.length > maxPlatforms) {
+          // F1-06: roll back the prompt-quota increment before the 400.
+          if (promptQuotaRollback) await promptQuotaRollback();
           return res.status(400).json({
             error: `Your ${tier} plan allows up to ${maxPlatforms} AI platform${maxPlatforms !== 1 ? 's' : ''}`,
             code: 'PLATFORM_LIMIT',
@@ -1731,13 +2142,18 @@ const setup = async (req, res) => {
         suffix++;
         candidate = `${monitorName} (${suffix})`;
         if (suffix > 20) {
+          // F1-06: roll back the prompt-quota increment before returning.
+          if (promptQuotaRollback) await promptQuotaRollback();
           return res.status(409).json({ error: 'A monitor with this name already exists. Please choose a different name.' });
         }
       }
       monitorName = candidate;
     }
 
-    // Create tracker
+    // Create tracker.
+    // nextScanAt is set to now so that if the fire-and-forget first scan
+    // crashes before reaching B13 (which sets nextScanAt), the next cron
+    // tick still selects this tracker for recovery.
     let tracker;
     try {
       tracker = await AiTracker.create({
@@ -1746,32 +2162,46 @@ const setup = async (req, res) => {
         domain: domain.trim(),
         defaultModels: selectedPlatforms,
         scanStatus: 'pending',
+        nextScanAt: new Date(),
       });
     } catch (createErr) {
+      // F1-06: roll back the prompt-quota increment on any tracker create failure.
+      if (promptQuotaRollback) await promptQuotaRollback();
       if (createErr.code === 11000) {
         return res.status(409).json({ error: 'A monitor with this name already exists. Please choose a different name.' });
       }
       throw createErr;
     }
 
-    // Create prompts
+    // Create prompts.
+    // F1-05: if prompt insertion fails (non-11000), the tracker was already
+    // created — clean it up so we don't leave an orphan with zero prompts
+    // that the user can't recover from. Also roll back the quota increment.
     const promptDocs = prompts
       .filter((p) => typeof p === 'string' && p.trim())
       .map((p) => ({ trackerId: tracker._id, prompt: p.trim() }));
     if (promptDocs.length > 0) {
-      await AiTrackerPrompt.insertMany(promptDocs, { ordered: false }).catch((err) => {
-        // Ignore duplicate key errors from compound unique index
-        if (err.code !== 11000) throw err;
-      });
+      try {
+        await AiTrackerPrompt.insertMany(promptDocs, { ordered: false });
+      } catch (insertErr) {
+        if (insertErr.code !== 11000) {
+          await AiTracker.deleteOne({ _id: tracker._id }).catch((e) =>
+            console.error('[ai-tracker-setup] orphan tracker cleanup failed:', e.message));
+          if (promptQuotaRollback) await promptQuotaRollback();
+          throw insertErr;
+        }
+      }
     }
 
     // Usage already incremented atomically above (no separate increment needed)
 
     // Competitors are now fully auto-detected by the scan engine from AI responses
 
-    // Fire-and-forget: start first scan (pass userId so user free credits can be used)
+    // Fire-and-forget: start first scan (pass userId so user free credits can be used).
+    // The .catch is a safety net for synchronous-throw paths only; once executeScan
+    // returns its promise, errors are handled inside the function's outer try/catch.
     executeScan(tracker._id, req.user?.userId, { force: true }).catch((err) => {
-      console.error('[ai-tracker-setup] scan failed:', err.message);
+      console.error('[ai-tracker-setup] scan kickoff failed:', err.message);
     });
 
     res.status(201).json({
@@ -1779,12 +2209,27 @@ const setup = async (req, res) => {
       scanStatus: 'pending',
     });
   } catch (err) {
+    // F1-06: roll back any uncovered quota increment that escaped via an
+    // unhandled error path (e.g. DB hiccup during the name-conflict findOne).
+    // The closure self-nulls so this is a no-op if a structured path already
+    // invoked it.
+    if (promptQuotaRollback) await promptQuotaRollback();
     console.error('setup error:', err.message);
     res.status(500).json({ error: 'Failed to set up AI tracker' });
   }
 };
 
 // ─── GET /:workspaceNumber/ai-tracker/scan ────────────────────────────────
+
+// Compute the runtime platform list (defaultModels ∩ env-keys-present) so the
+// scanning UI can hide platforms that will never run due to missing API keys.
+// Without this, a chatgpt-disabled tracker showed chatgpt stuck "queued"
+// forever in the scanning view (F14-03).
+function computeAvailablePlatformIds(tracker) {
+  const env = getAvailablePlatformIdsSilent();
+  const dm = Array.isArray(tracker.defaultModels) ? tracker.defaultModels : [];
+  return env.filter((id) => dm.includes(id));
+}
 
 const getScanStatus = async (req, res) => {
   try {
@@ -1797,6 +2242,7 @@ const getScanStatus = async (req, res) => {
       status: tracker.scanStatus,
       progress: tracker.scanProgress,
       platformStatuses: tracker.platformStatuses || [],
+      availablePlatformIds: computeAvailablePlatformIds(tracker),
       ...(tracker.scanError ? { error: tracker.scanError } : {}),
     });
   } catch (err) {
@@ -1822,12 +2268,31 @@ const triggerScan = async (req, res) => {
       return res.status(409).json({ error: 'A scan is already in progress' });
     }
 
-    // S81: Workspace-level concurrent scan limit (max 2 simultaneous scans)
-    const activeScans = await AiTracker.countDocuments({
+    // Workspace-level concurrent scan cap (max 2 simultaneous scans).
+    //
+    // F4-04: this is a check-then-act race. N≥3 concurrent triggers on
+    // distinct trackers in the same workspace can all observe count=0 and
+    // all proceed to flip to 'pending', exceeding the cap by N-2.
+    //
+    // Mitigation here: tighten the count by excluding self. This is a no-op
+    // for the primary race (self is in 'ready' at this point, so original
+    // count was already exclusive) but makes the semantics explicit and
+    // documents the bound for future readers.
+    //
+    // Full fix (deferred): requires either a MongoDB transaction wrapping
+    // count + pending-flip, or a per-workspace atomic counter document.
+    // Both add complexity not justified by current user concurrency
+    // patterns (single user, <3 simultaneous tabs).
+    //
+    // Practical bound today: "cap + N-1 within the race window (~ms)".
+    // For N=3 simultaneous clicks across 3 trackers, all 3 may run.
+    // Cost impact: a few extra credits per incident.
+    const otherActiveScans = await AiTracker.countDocuments({
       workspaceId: tracker.workspaceId,
+      _id: { $ne: tracker._id },
       scanStatus: { $in: ['pending', 'scanning'] },
     });
-    if (activeScans >= 2) {
+    if (otherActiveScans >= 2) {
       return res.status(429).json({ error: 'Too many scans running in this workspace. Please wait for a scan to finish.' });
     }
 
@@ -1842,8 +2307,15 @@ const triggerScan = async (req, res) => {
 
     // Pre-check credit affordability so we can return 402 immediately.
     // Actual deduction happens inside executeScan (shared with cron path).
+    // Count only the prompts that will actually run (active + unlocked) so
+    // inactive/locked prompts don't inflate the estimate and block scans
+    // the user can afford.
     if (req.creditContext?.deductionEnabled) {
-      const prompts = await AiTrackerPrompt.countDocuments({ trackerId: tracker._id });
+      const prompts = await AiTrackerPrompt.countDocuments({
+        trackerId: tracker._id,
+        active: { $ne: false },
+        locked: { $ne: true },
+      });
       const platforms = tracker.defaultModels?.length || 0;
       const estimatedCredits = Math.max(1, prompts * platforms * 4);
       const canPay = await creditService.canAfford(req.creditContext.orgId, estimatedCredits, req.user?.userId);
@@ -1861,8 +2333,10 @@ const triggerScan = async (req, res) => {
       $set: { scanStatus: 'pending', scanProgress: 0, scanError: null },
     });
 
+    // executeScan handles its own errors via Phase H; the .catch here only
+    // catches a synchronous throw before the first await (essentially never).
     executeScan(tracker._id, req.user?.userId, { force: true }).catch((err) => {
-      console.error('[ai-tracker-scan] manual scan failed:', err.message);
+      console.error('[ai-tracker-scan] manual scan kickoff failed:', err.message);
     });
 
     res.json({ scanStatus: 'pending' });
@@ -1911,13 +2385,50 @@ const addPrompt = async (req, res) => {
       return res.status(409).json({ error: 'This prompt is already being tracked' });
     }
 
-    // Determine createdOnPlan based on quotaSource or current tier
+    // F5-04: cache the tier config once instead of looking it up twice (cap
+    // check + createdOnPlan derivation). Both call sites previously hit
+    // tierService independently on the addPrompt hot path.
+    let tierInfo = null;
+    if (workspace.organizationId) {
+      tierInfo = await tierService.getOrgTierConfig(workspace.organizationId);
+    }
+
+    // F4-15: enforce per-monitor prompt cap. Previously, executeScan did
+    // `.limit(500)` which silently truncated the back half of any tracker
+    // that exceeded 500 active+unlocked prompts. Reject at create time so the
+    // user knows their cap rather than discovering missing scan data later.
+    if (tierInfo) {
+      const { config, tier } = tierInfo;
+      const cap = config?.maxAiTrackerPromptsPerMonitor;
+      if (cap != null) {
+        const active = await AiTrackerPrompt.countDocuments({
+          trackerId: tracker._id,
+          active: { $ne: false },
+          locked: { $ne: true },
+        });
+        if (active >= cap) {
+          return res.status(429).json({
+            error: `Your ${tier} plan allows up to ${cap} active prompts per monitor`,
+            code: 'PROMPT_CAP_REACHED',
+            quota: { limit: cap, used: active, tier, limitKey: 'maxAiTrackerPromptsPerMonitor' },
+          });
+        }
+      }
+    }
+
+    // F5-01: derive createdOnPlan from the middleware-validated
+    // `req.tierQuota.isUserLevel` signal, NOT from the raw `req.body.quotaSource`.
+    // Pre-fix the body was trusted, letting a paid user submit `quotaSource: 'free'`
+    // on every prompt → all marked `createdOnPlan: 'free'` → downgradeService
+    // (lines 243-246) skipped them on downgrade (filter requires
+    // `createdOnPlan: 'paid'`). Net effect: paid user kept every prompt active
+    // after canceling. tierEnforcement middleware validates the claim and exposes
+    // `isUserLevel: true` only after the validation passes.
     let createdOnPlan = 'free';
-    if (req.body.quotaSource === 'free') {
+    if (req.tierQuota?.isUserLevel) {
       createdOnPlan = 'free';
-    } else if (workspace.organizationId) {
-      const { tier } = await tierService.getOrgTierConfig(workspace.organizationId);
-      createdOnPlan = tier === 'free' ? 'free' : 'paid';
+    } else if (tierInfo) {
+      createdOnPlan = tierInfo.tier === 'free' ? 'free' : 'paid';
     }
 
     const doc = await AiTrackerPrompt.create({
@@ -1994,10 +2505,44 @@ const updatePrompt = async (req, res) => {
       }
       update.frequency = frequency;
     }
-    if (active !== undefined) update.active = active;
+    // F5-06: validate `active` is strictly boolean. Pre-fix accepted any value
+    // (object, array, number) which Mongoose strict mode would error on or
+    // silently coerce — depending on schema config. Explicit reject is cleaner.
+    if (active !== undefined) {
+      if (typeof active !== 'boolean') {
+        return res.status(400).json({ error: '`active` must be a boolean' });
+      }
+      update.active = active;
+    }
 
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    // F5-02: when reactivating an inactive prompt, re-run the per-monitor cap
+    // check. Pre-fix the cycle "create N active → deactivate all → create N
+    // more → reactivate the originals" silently bypassed the cap. We load the
+    // doc first to know its current `active` state.
+    if (active === true && workspace.organizationId) {
+      const existing = await AiTrackerPrompt.findOne({ _id: promptId, trackerId: tracker._id }).select('active locked').lean();
+      if (existing && existing.active === false) {
+        const { config, tier } = await tierService.getOrgTierConfig(workspace.organizationId);
+        const cap = config?.maxAiTrackerPromptsPerMonitor;
+        if (cap != null) {
+          const activeCount = await AiTrackerPrompt.countDocuments({
+            trackerId: tracker._id,
+            active: { $ne: false },
+            locked: { $ne: true },
+          });
+          if (activeCount >= cap) {
+            return res.status(429).json({
+              error: `Your ${tier} plan allows up to ${cap} active prompts per monitor`,
+              code: 'PROMPT_CAP_REACHED',
+              quota: { limit: cap, used: activeCount, tier, limitKey: 'maxAiTrackerPromptsPerMonitor' },
+            });
+          }
+        }
+      }
     }
 
     const doc = await AiTrackerPrompt.findOneAndUpdate(
@@ -2010,16 +2555,29 @@ const updatePrompt = async (req, res) => {
       return res.status(404).json({ error: 'Prompt not found' });
     }
 
-    // If frequency changed to a shorter interval, pull nextScanAt forward on the tracker
+    // If frequency changed to a shorter interval, pull nextScanAt forward on the tracker.
+    //
+    // F5-03: pre-fix this was a read-then-write race — `tracker.nextScanAt` was
+    // captured at request entry, so a concurrent update setting nextScanAt to an
+    // EARLIER value could be silently pushed back by our $set. Now the filter
+    // requires nextScanAt to be null/missing OR strictly greater than our value
+    // before the $set fires, so we never extend a sooner schedule.
     if (frequency !== undefined) {
       const FREQ_DAYS = { 'Daily': 1, 'Weekly': 7, 'Bi-weekly': 14, 'Monthly': 30 };
-      const freqDays = FREQ_DAYS[frequency] || 7;
+      const freqDays = FREQ_DAYS[frequency];
       const baseTime = doc.lastScannedAt ? doc.lastScannedAt.getTime() : Date.now();
       const promptNextDue = new Date(baseTime + freqDays * 24 * 60 * 60 * 1000);
-      const currentNextScan = tracker.nextScanAt ? tracker.nextScanAt.getTime() : Infinity;
-      if (promptNextDue.getTime() < currentNextScan) {
-        await AiTracker.findByIdAndUpdate(tracker._id, { $set: { nextScanAt: promptNextDue } });
-      }
+      await AiTracker.findOneAndUpdate(
+        {
+          _id: tracker._id,
+          $or: [
+            { nextScanAt: null },
+            { nextScanAt: { $exists: false } },
+            { nextScanAt: { $gt: promptNextDue } },
+          ],
+        },
+        { $set: { nextScanAt: promptNextDue } }
+      );
     }
 
     res.json({
@@ -2199,6 +2757,9 @@ const listMonitors = async (req, res) => {
 // ─── POST /:wn/ai-tracker/monitors ──────────────────────────────────────
 
 const createMonitor = async (req, res) => {
+  // F1-06: hoisted to function scope so the outer catch can also invoke it
+  // (see `setup` for full rationale).
+  let promptQuotaRollback = null;
   try {
     const workspace = req.workspace;
 
@@ -2213,6 +2774,15 @@ const createMonitor = async (req, res) => {
     }
     if (!Array.isArray(prompts) || prompts.length === 0) {
       return res.status(400).json({ error: 'At least one prompt is required' });
+    }
+    // Reject submissions where every prompt is empty/whitespace.
+    const nonEmptyPromptCount = prompts.filter((p) => typeof p === 'string' && p.trim().length > 0).length;
+    if (nonEmptyPromptCount === 0) {
+      return res.status(400).json({ error: 'At least one non-empty prompt is required' });
+    }
+    // F1-07: cap monitor name length (matches frontend `maxLength={100}`).
+    if (name != null && typeof name === 'string' && name.trim().length > 100) {
+      return res.status(400).json({ error: 'Monitor name must be 100 characters or fewer' });
     }
 
     // Validate platforms, monitor count, and prompt quota against tier limits
@@ -2251,14 +2821,24 @@ const createMonitor = async (req, res) => {
           const doc = await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, promptCount);
           newTotal = doc?.aiTrackerPromptsCreated ?? promptCount;
         }
-        if (newTotal > config.maxAiTrackerPromptsPerMonth) {
-          // Rollback the increment
-          if (limitType === 'lifetime' && req.user?.userId) {
-            await UserUsageTracker.increment(req.user.userId, 'aiTrackerPromptsCreated', -promptCount);
-          } else {
-            const period = tierService.getPeriod(limitType);
-            await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period, -promptCount);
+        // F1-06: assign rollback closure so later failure paths can undo
+        // this increment. Self-nulling so a second call is a no-op.
+        const userId = req.user?.userId;
+        promptQuotaRollback = async () => {
+          promptQuotaRollback = null;
+          try {
+            if (limitType === 'lifetime' && userId) {
+              await UserUsageTracker.increment(userId, 'aiTrackerPromptsCreated', -promptCount);
+            } else {
+              const period2 = tierService.getPeriod(limitType);
+              await UsageTracker.increment(orgId, 'aiTrackerPromptsCreated', period2, -promptCount);
+            }
+          } catch (rbErr) {
+            console.error('[ai-tracker-setup] prompt quota rollback failed:', rbErr.message);
           }
+        };
+        if (newTotal > config.maxAiTrackerPromptsPerMonth) {
+          await promptQuotaRollback();
           const used = newTotal - promptCount;
           return res.status(429).json({
             error: `Your ${tier} plan allows ${config.maxAiTrackerPromptsPerMonth} AI Tracker prompts (${used} used, ${promptCount} requested)`,
@@ -2273,6 +2853,8 @@ const createMonitor = async (req, res) => {
       if (Array.isArray(platforms) && platforms.length > 0) {
         selectedPlatforms = platforms.filter((p) => validPlatformIds.includes(p));
         if (selectedPlatforms.length > maxPlatforms) {
+          // F1-06: roll back the prompt-quota increment before the 400.
+          if (promptQuotaRollback) await promptQuotaRollback();
           return res.status(400).json({
             error: `Your ${tier} plan allows up to ${maxPlatforms} AI platform${maxPlatforms !== 1 ? 's' : ''}`,
             code: 'PLATFORM_LIMIT',
@@ -2297,6 +2879,7 @@ const createMonitor = async (req, res) => {
         suffix++;
         candidate = `${monitorName} (${suffix})`;
         if (suffix > 20) {
+          if (promptQuotaRollback) await promptQuotaRollback();
           return res.status(409).json({ error: 'A monitor with this name already exists. Please choose a different name.' });
         }
       }
@@ -2304,7 +2887,9 @@ const createMonitor = async (req, res) => {
       console.log(`[createMonitor] auto-suffixed to "${monitorName}"`);
     }
 
-    // Create tracker
+    // Create tracker.
+    // nextScanAt set to now so a first-scan crash leaves the tracker still
+    // visible to the cron sweep (F4-24 mitigation).
     let tracker;
     try {
       console.log(`[createMonitor] creating tracker: workspace=${workspace._id}, name="${monitorName}", domain="${domain.trim()}"`);
@@ -2314,10 +2899,12 @@ const createMonitor = async (req, res) => {
         domain: domain.trim(),
         defaultModels: selectedPlatforms,
         scanStatus: 'pending',
+        nextScanAt: new Date(),
       });
       console.log(`[createMonitor] created successfully: _id=${tracker._id}`);
     } catch (createErr) {
       console.error(`[createMonitor] create error: code=${createErr.code}, message=${createErr.message}`);
+      if (promptQuotaRollback) await promptQuotaRollback();
       if (createErr.code === 11000) {
         // Log indexes to diagnose stale unique constraints
         try { const idxs = await AiTracker.collection.indexes(); console.error('[createMonitor] collection indexes:', JSON.stringify(idxs)); } catch {}
@@ -2326,23 +2913,31 @@ const createMonitor = async (req, res) => {
       throw createErr;
     }
 
-    // Create prompts
+    // Create prompts (F1-05: clean up orphan tracker + roll back quota on failure).
     const promptDocs = prompts
       .filter((p) => typeof p === 'string' && p.trim())
       .map((p) => ({ trackerId: tracker._id, prompt: p.trim() }));
     if (promptDocs.length > 0) {
-      await AiTrackerPrompt.insertMany(promptDocs, { ordered: false }).catch((err) => {
-        if (err.code !== 11000) throw err;
-      });
+      try {
+        await AiTrackerPrompt.insertMany(promptDocs, { ordered: false });
+      } catch (insertErr) {
+        if (insertErr.code !== 11000) {
+          await AiTracker.deleteOne({ _id: tracker._id }).catch((e) =>
+            console.error('[createMonitor] orphan tracker cleanup failed:', e.message));
+          if (promptQuotaRollback) await promptQuotaRollback();
+          throw insertErr;
+        }
+      }
     }
 
     // Usage already incremented atomically above (no separate increment needed)
 
     // Competitors are now fully auto-detected by the scan engine from AI responses
 
-    // Fire-and-forget: start first scan (pass userId so user free credits can be used)
+    // Fire-and-forget: start first scan. The .catch is a safety net for
+    // synchronous-throw paths only.
     executeScan(tracker._id, req.user?.userId, { force: true }).catch((err) => {
-      console.error('[ai-tracker-monitor] scan failed:', err.message);
+      console.error('[ai-tracker-monitor] scan kickoff failed:', err.message);
     });
 
     res.status(201).json({
@@ -2351,6 +2946,9 @@ const createMonitor = async (req, res) => {
       scanStatus: 'pending',
     });
   } catch (err) {
+    // F1-06: catch-net rollback for unhandled error paths. Self-nulling
+    // closure means no-op if a structured path already invoked it.
+    if (promptQuotaRollback) await promptQuotaRollback();
     console.error('createMonitor error:', err.message);
     res.status(500).json({ error: 'Failed to create monitor' });
   }
@@ -2411,6 +3009,10 @@ const updateMonitor = async (req, res) => {
     if (Array.isArray(defaultModels)) {
       const validPlatformIds = PLATFORM_DISPLAY.map((p) => p.platformId);
       const filtered = defaultModels.filter((p) => validPlatformIds.includes(p));
+      // F19-03: see updateTracker for rationale.
+      if (filtered.length === 0) {
+        return res.status(400).json({ error: 'At least one valid platform must be selected' });
+      }
       const orgId = workspace.organizationId;
       if (orgId) {
         const { config, tier } = await tierService.getOrgTierConfig(orgId);
@@ -2424,6 +3026,10 @@ const updateMonitor = async (req, res) => {
         }
       }
       update.defaultModels = filtered;
+      // F19-04: reselection-recovery nextScanAt reset (see updateTracker).
+      if (!Array.isArray(tracker.defaultModels) || tracker.defaultModels.length === 0) {
+        update.nextScanAt = new Date();
+      }
     }
     if (name && typeof name === 'string' && name.trim()) {
       if (name.trim().length > 253) {
@@ -2464,6 +3070,7 @@ const getMonitorScanStatus = async (req, res) => {
       status: tracker.scanStatus,
       progress: tracker.scanProgress,
       platformStatuses: tracker.platformStatuses || [],
+      availablePlatformIds: computeAvailablePlatformIds(tracker),
       ...(tracker.scanError ? { error: tracker.scanError } : {}),
     });
   } catch (err) {
@@ -2504,8 +3111,15 @@ const triggerMonitorScan = async (req, res) => {
 
     // Pre-check credit affordability so we can return 402 immediately.
     // Actual deduction happens inside executeScan (shared with cron path).
+    // Count only the prompts that will actually run (active + unlocked) so
+    // inactive/locked prompts don't inflate the estimate and block scans
+    // the user can afford.
     if (req.creditContext?.deductionEnabled) {
-      const prompts = await AiTrackerPrompt.countDocuments({ trackerId: tracker._id });
+      const prompts = await AiTrackerPrompt.countDocuments({
+        trackerId: tracker._id,
+        active: { $ne: false },
+        locked: { $ne: true },
+      });
       const platforms = tracker.defaultModels?.length || 0;
       const estimatedCredits = Math.max(1, prompts * platforms * 4);
       const canPay = await creditService.canAfford(req.creditContext.orgId, estimatedCredits, req.user?.userId);
@@ -2522,8 +3136,10 @@ const triggerMonitorScan = async (req, res) => {
     await AiTracker.findByIdAndUpdate(tracker._id, {
       $set: { scanStatus: 'pending', scanProgress: 0, scanError: null },
     });
+    // executeScan handles its own errors via Phase H; the .catch here only
+    // catches a synchronous throw before the first await (essentially never).
     executeScan(tracker._id, req.user?.userId, { force: true }).catch((err) => {
-      console.error('[ai-tracker-scan] manual scan failed:', err.message);
+      console.error('[ai-tracker-scan] manual monitor-scan kickoff failed:', err.message);
     });
 
     res.json({ scanStatus: 'pending' });
@@ -2565,13 +3181,38 @@ const addMonitorPrompt = async (req, res) => {
       return res.status(409).json({ error: 'This prompt is already being tracked' });
     }
 
-    // Determine createdOnPlan based on quotaSource or current tier
+    // F5-04: cache tier config (see addPrompt for rationale).
+    let tierInfo = null;
+    if (workspace.organizationId) {
+      tierInfo = await tierService.getOrgTierConfig(workspace.organizationId);
+    }
+
+    // F4-15: enforce per-monitor prompt cap (see addPrompt for full rationale).
+    if (tierInfo) {
+      const { config, tier } = tierInfo;
+      const cap = config?.maxAiTrackerPromptsPerMonitor;
+      if (cap != null) {
+        const active = await AiTrackerPrompt.countDocuments({
+          trackerId: tracker._id,
+          active: { $ne: false },
+          locked: { $ne: true },
+        });
+        if (active >= cap) {
+          return res.status(429).json({
+            error: `Your ${tier} plan allows up to ${cap} active prompts per monitor`,
+            code: 'PROMPT_CAP_REACHED',
+            quota: { limit: cap, used: active, tier, limitKey: 'maxAiTrackerPromptsPerMonitor' },
+          });
+        }
+      }
+    }
+
+    // F5-01: see addPrompt for rationale (middleware-validated signal instead of body trust).
     let createdOnPlan = 'free';
-    if (req.body.quotaSource === 'free') {
+    if (req.tierQuota?.isUserLevel) {
       createdOnPlan = 'free';
-    } else if (workspace.organizationId) {
-      const { tier } = await tierService.getOrgTierConfig(workspace.organizationId);
-      createdOnPlan = tier === 'free' ? 'free' : 'paid';
+    } else if (tierInfo) {
+      createdOnPlan = tierInfo.tier === 'free' ? 'free' : 'paid';
     }
 
     const doc = await AiTrackerPrompt.create({
@@ -2617,10 +3258,39 @@ const updateMonitorPrompt = async (req, res) => {
       }
       update.frequency = frequency;
     }
-    if (active !== undefined) update.active = active;
+    // F5-06: strict boolean check (see updatePrompt).
+    if (active !== undefined) {
+      if (typeof active !== 'boolean') {
+        return res.status(400).json({ error: '`active` must be a boolean' });
+      }
+      update.active = active;
+    }
 
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    // F5-02: cap recheck on reactivation (see updatePrompt for full rationale).
+    if (active === true && workspace.organizationId) {
+      const existing = await AiTrackerPrompt.findOne({ _id: promptId, trackerId: tracker._id }).select('active locked').lean();
+      if (existing && existing.active === false) {
+        const { config, tier } = await tierService.getOrgTierConfig(workspace.organizationId);
+        const cap = config?.maxAiTrackerPromptsPerMonitor;
+        if (cap != null) {
+          const activeCount = await AiTrackerPrompt.countDocuments({
+            trackerId: tracker._id,
+            active: { $ne: false },
+            locked: { $ne: true },
+          });
+          if (activeCount >= cap) {
+            return res.status(429).json({
+              error: `Your ${tier} plan allows up to ${cap} active prompts per monitor`,
+              code: 'PROMPT_CAP_REACHED',
+              quota: { limit: cap, used: activeCount, tier, limitKey: 'maxAiTrackerPromptsPerMonitor' },
+            });
+          }
+        }
+      }
     }
 
     const doc = await AiTrackerPrompt.findOneAndUpdate(
@@ -2633,16 +3303,23 @@ const updateMonitorPrompt = async (req, res) => {
       return res.status(404).json({ error: 'Prompt not found' });
     }
 
-    // If frequency changed to a shorter interval, pull nextScanAt forward on the tracker
+    // F5-03: atomic nextScanAt pull-forward (see updatePrompt for rationale).
     if (frequency !== undefined) {
       const FREQ_DAYS = { 'Daily': 1, 'Weekly': 7, 'Bi-weekly': 14, 'Monthly': 30 };
-      const freqDays = FREQ_DAYS[frequency] || 7;
+      const freqDays = FREQ_DAYS[frequency];
       const baseTime = doc.lastScannedAt ? doc.lastScannedAt.getTime() : Date.now();
       const promptNextDue = new Date(baseTime + freqDays * 24 * 60 * 60 * 1000);
-      const currentNextScan = tracker.nextScanAt ? tracker.nextScanAt.getTime() : Infinity;
-      if (promptNextDue.getTime() < currentNextScan) {
-        await AiTracker.findByIdAndUpdate(tracker._id, { $set: { nextScanAt: promptNextDue } });
-      }
+      await AiTracker.findOneAndUpdate(
+        {
+          _id: tracker._id,
+          $or: [
+            { nextScanAt: null },
+            { nextScanAt: { $exists: false } },
+            { nextScanAt: { $gt: promptNextDue } },
+          ],
+        },
+        { $set: { nextScanAt: promptNextDue } }
+      );
     }
 
     res.json({ id: doc._id.toString(), prompt: doc.prompt, models: doc.models, frequency: doc.frequency, active: doc.active });
@@ -2841,6 +3518,8 @@ const getScanDetails = async (req, res) => {
         sentimentScore: pl.sentimentScore ?? null,
         error: pl.error || false,
         fanoutQueries: pl.fanoutQueries || [],
+        // F11-02: see buildDashboardResponse for rationale.
+        ...(pl.fanoutUnavailable ? { fanoutUnavailable: true } : {}),
       }));
     }
 
@@ -2893,3 +3572,6 @@ module.exports = {
   setDevTimeScale,
   getDevTimeScale,
 };
+
+// Exported for F4-17 regression tests only — not part of the runtime API.
+module.exports.__test = { htmlEscape, computeMetrics, computeTrendData, computeChanges };

@@ -41,6 +41,11 @@ const tierConfigSchema = new mongoose.Schema(
     },
     maxAiTrackerMonitors: { type: Number, default: 1 },
     maxAiTrackerPlatforms: { type: Number, default: 2 },
+    // Hard cap on active prompts per monitor. F4-15: previously, executeScan
+    // did `.limit(500)` which silently truncated the back half of any
+    // tracker that exceeded 500 active prompts. Enforced at addPrompt time.
+    // null = unlimited.
+    maxAiTrackerPromptsPerMonitor: { type: Number, default: 100 },
     aiTrackerRefreshInterval: {
       type: String,
       enum: ['daily', 'weekly'],

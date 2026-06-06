@@ -1,7 +1,30 @@
+const mongoose = require('mongoose');
 const Sitemap = require('../models/Sitemap');
 const CrawlPage = require('../models/CrawlPage');
 const tierService = require('../services/tierService');
 const { crawlSite, generateSitemapXml } = require('../services/sitemapCrawlerService');
+
+// ─── Shared helpers ──────────────────────────────────────────────────────────
+
+function ensureValidObjectId(res, id, label) {
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    res.status(400).json({ error: `Invalid ${label}` });
+    return false;
+  }
+  return true;
+}
+
+function handleMongooseError(res, err) {
+  if (err instanceof mongoose.Error.ValidationError) {
+    res.status(400).json({ error: err.message });
+    return true;
+  }
+  if (err instanceof mongoose.Error.CastError) {
+    res.status(400).json({ error: `Invalid ${err.path || 'id'} format` });
+    return true;
+  }
+  return false;
+}
 
 // ─── CRUD ─────────────────────────────────────────────────────────────────────
 
@@ -14,6 +37,17 @@ const createSitemap = async (req, res) => {
     url = url.trim();
     if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
     if (url.length > 1 && url.endsWith('/')) url = url.slice(0, -1);
+
+    // Validate URL format before hitting the DB. Without this, garbage input
+    // like "not a url at all" reaches `new URL(url).hostname` below and
+    // throws a TypeError that escapes to the generic 500.
+    let parsedHostname;
+    try {
+      parsedHostname = new URL(url).hostname;
+      if (!parsedHostname) throw new Error('empty hostname');
+    } catch {
+      return res.status(400).json({ error: 'Invalid URL format' });
+    }
 
     const orgId = req.workspace.organizationId;
 
@@ -38,7 +72,7 @@ const createSitemap = async (req, res) => {
       organizationId: orgId,
       workspaceId: req.workspace._id,
       url,
-      label: label || new URL(url).hostname,
+      label: label || parsedHostname,
       schedule: schedule || 'weekly',
       nextCrawlAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
     });
@@ -51,6 +85,7 @@ const createSitemap = async (req, res) => {
 
     res.status(201).json({ sitemap });
   } catch (err) {
+    if (handleMongooseError(res, err)) return;
     console.error('createSitemap error:', err.message);
     res.status(500).json({ error: 'Failed to create sitemap' });
   }
@@ -74,6 +109,7 @@ const listSitemaps = async (req, res) => {
 
 const getSitemap = async (req, res) => {
   try {
+    if (!ensureValidObjectId(res, req.params.sitemapId, 'sitemap id')) return;
     const sitemap = await Sitemap.findOne({
       _id: req.params.sitemapId,
       organizationId: req.workspace.organizationId,
@@ -83,6 +119,7 @@ const getSitemap = async (req, res) => {
 
     res.json({ sitemap });
   } catch (err) {
+    if (handleMongooseError(res, err)) return;
     console.error('getSitemap error:', err.message);
     res.status(500).json({ error: 'Failed to get sitemap' });
   }
@@ -90,6 +127,7 @@ const getSitemap = async (req, res) => {
 
 const deleteSitemap = async (req, res) => {
   try {
+    if (!ensureValidObjectId(res, req.params.sitemapId, 'sitemap id')) return;
     const result = await Sitemap.findOneAndDelete({
       _id: req.params.sitemapId,
       organizationId: req.workspace.organizationId,
@@ -102,6 +140,7 @@ const deleteSitemap = async (req, res) => {
 
     res.json({ message: 'Sitemap deleted' });
   } catch (err) {
+    if (handleMongooseError(res, err)) return;
     console.error('deleteSitemap error:', err.message);
     res.status(500).json({ error: 'Failed to delete sitemap' });
   }
@@ -111,6 +150,7 @@ const deleteSitemap = async (req, res) => {
 
 const getSitemapPages = async (req, res) => {
   try {
+    if (!ensureValidObjectId(res, req.params.sitemapId, 'sitemap id')) return;
     const sitemap = await Sitemap.findOne({
       _id: req.params.sitemapId,
       organizationId: req.workspace.organizationId,
@@ -166,6 +206,7 @@ const getSitemapPages = async (req, res) => {
       totalPages: Math.ceil(total / limit),
     });
   } catch (err) {
+    if (handleMongooseError(res, err)) return;
     console.error('getSitemapPages error:', err.message);
     res.status(500).json({ error: 'Failed to get pages' });
   }
@@ -175,6 +216,7 @@ const getSitemapPages = async (req, res) => {
 
 const triggerCrawl = async (req, res) => {
   try {
+    if (!ensureValidObjectId(res, req.params.sitemapId, 'sitemap id')) return;
     const { config } = await tierService.getOrgTierConfig(req.workspace.organizationId);
     const maxPages = config.maxCrawlPages ?? 500;
 
@@ -205,6 +247,7 @@ const triggerCrawl = async (req, res) => {
 
     res.json({ message: 'Crawl started' });
   } catch (err) {
+    if (handleMongooseError(res, err)) return;
     console.error('triggerCrawl error:', err.message);
     res.status(500).json({ error: 'Failed to trigger crawl' });
   }
@@ -212,6 +255,7 @@ const triggerCrawl = async (req, res) => {
 
 const exportXml = async (req, res) => {
   try {
+    if (!ensureValidObjectId(res, req.params.sitemapId, 'sitemap id')) return;
     const sitemap = await Sitemap.findOne({
       _id: req.params.sitemapId,
       organizationId: req.workspace.organizationId,
@@ -238,6 +282,7 @@ const exportXml = async (req, res) => {
     res.set('Content-Disposition', `attachment; filename="${hostname}-sitemap.xml"`);
     res.send(xml);
   } catch (err) {
+    if (handleMongooseError(res, err)) return;
     console.error('exportXml error:', err.message);
     res.status(500).json({ error: 'Failed to export sitemap' });
   }

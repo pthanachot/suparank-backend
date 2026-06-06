@@ -31,9 +31,15 @@ function handleMongooseError(res, err) {
 const getGscAuthUrl = async (req, res) => {
   try {
     // Fail fast with a clear message if GSC OAuth isn't configured on this
-    // environment, rather than letting the OAuth2 client throw a generic
-    // error that maps to a misleading 500.
-    if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
+    // environment, rather than letting downstream code throw a generic error
+    // that maps to a misleading 500. generateAuthUrl needs all three: client
+    // id+secret for the OAuth2 client, and the encryption key for signing
+    // the state token (encryptState's HMAC throws on undefined).
+    if (
+      !process.env.GOOGLE_CLIENT_ID ||
+      !process.env.GOOGLE_CLIENT_SECRET ||
+      !process.env.GSC_TOKEN_ENCRYPTION_KEY
+    ) {
       return res.status(503).json({
         error: 'GSC OAuth is not configured on the server',
         code: 'GSC_NOT_CONFIGURED',

@@ -334,7 +334,10 @@ function extractLinksAndTitle(html, pageUrl, baseDomain) {
   const title = $('title').first().text().trim() || '';
 
   const links = new Set();
-  $('a[href]').each((_, el) => {
+  // Include <area href> for HTML image maps (e.g. paulgraham.com uses
+  // <map><area href="..."> for its main navigation). Semantically identical
+  // to <a href> — same href/rel/target attribute handling applies.
+  $('a[href], area[href]').each((_, el) => {
     const href = $(el).attr('href');
     if (!href) return;
 
@@ -483,22 +486,32 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
       queued.add(startUrl);
 
       if (error || !html) {
-        const reason = error === 'timeout'
-          ? `Cannot reach ${baseDomain} — connection timed out after ${REQUEST_TIMEOUT_MS / 1000}s`
-          : `Cannot reach ${baseDomain} — ${error || `HTTP ${statusCode} with no HTML content`}`;
+        // If we already seeded URLs from sitemap.xml, the homepage being
+        // non-HTML (typical for SPA / JS-rendered marketing sites) shouldn't
+        // kill the whole crawl. Skip the homepage and let BFS process the
+        // seeded URLs. Don't push the homepage to results — it returned no
+        // useful content and shouldn't appear in the output sitemap.
+        if (seededCount > 0) {
+          console.log(`[sitemap-crawler] homepage returned no HTML for ${sitemap.label || startUrl} (${error || `HTTP ${statusCode}`}) — continuing with ${seededCount} seeded URLs`);
+          pagesProcessed = 0;
+        } else {
+          const reason = error === 'timeout'
+            ? `Cannot reach ${baseDomain} — connection timed out after ${REQUEST_TIMEOUT_MS / 1000}s`
+            : `Cannot reach ${baseDomain} — ${error || `HTTP ${statusCode} with no HTML content`}`;
 
-        await Sitemap.updateOne({ _id: sitemapId }, {
-          $set: {
-            crawlStatus: 'error',
-            crawlProgress: 0,
-            crawlError: reason,
-            crawlPages: [],
-            crawlStats: { totalFound: 0, newUrls: 0, removedUrls: 0, unchanged: 0, errors: 1 },
-          },
-        });
-        console.log(`[sitemap-crawler] homepage unreachable for ${sitemap.label || startUrl}: ${reason}`);
-        return null;
-      }
+          await Sitemap.updateOne({ _id: sitemapId }, {
+            $set: {
+              crawlStatus: 'error',
+              crawlProgress: 0,
+              crawlError: reason,
+              crawlPages: [],
+              crawlStats: { totalFound: 0, newUrls: 0, removedUrls: 0, unchanged: 0, errors: 1 },
+            },
+          });
+          console.log(`[sitemap-crawler] homepage unreachable for ${sitemap.label || startUrl}: ${reason}`);
+          return null;
+        }
+      } else {
 
       // Homepage succeeded — seed BFS with its links
       const { title, links } = extractLinksAndTitle(html, startUrl, baseDomain);
@@ -533,6 +546,7 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
         await CrawlPage.deleteMany({ sitemapId: sitemap._id });
         console.log(`[sitemap-crawler] no internal links discovered for ${sitemap.label || startUrl}`);
         return null;
+      }
       }
     }
 

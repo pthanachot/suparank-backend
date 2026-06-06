@@ -35,8 +35,11 @@ function benchmarkToContentBrief(content) {
     // User instructions from wizard step 3
     authorContext: content.contentContext || '',
 
-    // Top NLP terms the content should include
-    nlpTerms: extractNlpTerms(benchmark),
+    // Top NLP terms the content should include. Each term gets a
+    // recommendedSection tag (Phase 2 / Task #99) derived from topic-cluster
+    // membership — frontend groups terms by section so writers see "this
+    // section needs these terms" instead of one flat 30-item list.
+    nlpTerms: extractNlpTerms(benchmark, benchmark.topicClusters),
 
     // Benchmark averages for competitive scoring (mirrors frontend BenchmarkData)
     benchmarkAverages: {
@@ -119,21 +122,53 @@ function extractSuggestedOutline(outline) {
 
 /**
  * Extract top NLP terms from benchmark for the Writing Engine.
+ *
+ * Phase 2 / Task #99: each term is tagged with `recommendedSection` —
+ * the topic cluster it belongs to. Frontend uses this to group terms in
+ * the sidebar gauge so writers see "Section X needs these terms" instead
+ * of one flat 30-item list. Terms not appearing in any cluster get an
+ * empty recommendedSection (rendered as the "General" bucket).
+ *
  * @param {Object} benchmark
- * @returns {string[]}
+ * @param {Array} topicClusters - clusters array (each { topic|label, terms[] })
+ * @returns {Array<{term, min, max, category, recommendedSection}>}
  */
-function extractNlpTerms(benchmark) {
+function extractNlpTerms(benchmark, topicClusters) {
   const terms = benchmark.topNlpTerms || [];
   if (!Array.isArray(terms)) return [];
+
+  // Build term → cluster-label map. Lowercased for case-insensitive lookup;
+  // a term that appears in multiple clusters takes its first appearance
+  // (clusters are already ranked by docFrequency upstream).
+  const termToCluster = new Map();
+  if (Array.isArray(topicClusters)) {
+    for (const c of topicClusters) {
+      const label = c.topic || c.label || '';
+      if (!label) continue;
+      const clusterTerms = Array.isArray(c.terms) ? c.terms : [];
+      for (const t of clusterTerms) {
+        const key = String(t || '').toLowerCase().trim();
+        if (key && !termToCluster.has(key)) {
+          termToCluster.set(key, label);
+        }
+      }
+    }
+  }
+
   return terms
     .slice(0, 30)
     .filter((t) => t.term)
-    .map((t) => ({
-      term: t.term,
-      min: t.usageRange?.min ?? 1,
-      max: t.usageRange?.max ?? Math.max(t.count || 1, 5),
-      category: t.category || 'nlp',
-    }));
+    .map((t) => {
+      const lookupKey = String(t.term).toLowerCase().trim();
+      const recommendedSection = termToCluster.get(lookupKey) || '';
+      return {
+        term: t.term,
+        min: t.usageRange?.min ?? 1,
+        max: t.usageRange?.max ?? Math.max(t.count || 1, 5),
+        category: t.category || 'nlp',
+        recommendedSection,
+      };
+    });
 }
 
 /**

@@ -1,12 +1,45 @@
+const mongoose = require('mongoose');
 const Site = require('../models/Site');
 const GscConnection = require('../models/GscConnection');
 const gscService = require('../services/gscService');
 const tierService = require('../services/tierService');
 
+// ─── Shared helpers ────────────────────────────────────────────────────────
+
+function ensureValidObjectId(res, id, label) {
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    res.status(400).json({ error: `Invalid ${label}` });
+    return false;
+  }
+  return true;
+}
+
+function handleMongooseError(res, err) {
+  if (err instanceof mongoose.Error.ValidationError) {
+    res.status(400).json({ error: err.message });
+    return true;
+  }
+  if (err instanceof mongoose.Error.CastError) {
+    res.status(400).json({ error: `Invalid ${err.path || 'id'} format` });
+    return true;
+  }
+  return false;
+}
+
 // ─── OAuth ─────────────────────────────────────────────────────────────────
 
 const getGscAuthUrl = async (req, res) => {
   try {
+    // Fail fast with a clear message if GSC OAuth isn't configured on this
+    // environment, rather than letting the OAuth2 client throw a generic
+    // error that maps to a misleading 500.
+    if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
+      return res.status(503).json({
+        error: 'GSC OAuth is not configured on the server',
+        code: 'GSC_NOT_CONFIGURED',
+      });
+    }
+
     const orgId = req.workspace.organizationId;
     const force = req.query.force === 'true';
 
@@ -230,6 +263,7 @@ const listSites = async (req, res) => {
 
 const getSite = async (req, res) => {
   try {
+    if (!ensureValidObjectId(res, req.params.siteId, 'site id')) return;
     const site = await Site.findOne({
       _id: req.params.siteId,
       workspaceId: req.workspace._id,
@@ -237,6 +271,7 @@ const getSite = async (req, res) => {
     if (!site) return res.status(404).json({ error: 'Site not found' });
     res.json({ site });
   } catch (err) {
+    if (handleMongooseError(res, err)) return;
     console.error('getSite error:', err.message);
     res.status(500).json({ error: 'Failed to get site' });
   }
@@ -244,6 +279,7 @@ const getSite = async (req, res) => {
 
 const deleteSite = async (req, res) => {
   try {
+    if (!ensureValidObjectId(res, req.params.siteId, 'site id')) return;
     const site = await Site.findOneAndDelete({
       _id: req.params.siteId,
       workspaceId: req.workspace._id,
@@ -251,6 +287,7 @@ const deleteSite = async (req, res) => {
     if (!site) return res.status(404).json({ error: 'Site not found' });
     res.json({ message: 'Site disconnected' });
   } catch (err) {
+    if (handleMongooseError(res, err)) return;
     console.error('deleteSite error:', err.message);
     res.status(500).json({ error: 'Failed to delete site' });
   }
@@ -260,6 +297,7 @@ const deleteSite = async (req, res) => {
 
 const getOverview = async (req, res) => {
   try {
+    if (!ensureValidObjectId(res, req.params.siteId, 'site id')) return;
     const site = await Site.findOne({ _id: req.params.siteId, workspaceId: req.workspace._id });
     if (!site) return res.status(404).json({ error: 'Site not found' });
     if (site.locked) return res.status(403).json({ error: 'Site is locked. Reconnect the matching GSC account.', code: 'SITE_LOCKED' });
@@ -275,6 +313,7 @@ const getOverview = async (req, res) => {
     if (err.code === 'GSC_NOT_CONNECTED') {
       return res.status(400).json({ error: 'GSC access revoked. Please reconnect.', code: 'GSC_REVOKED' });
     }
+    if (handleMongooseError(res, err)) return;
     console.error('getOverview error:', err.message);
     res.status(500).json({ error: 'Failed to fetch overview data' });
   }
@@ -282,6 +321,7 @@ const getOverview = async (req, res) => {
 
 const getDeclining = async (req, res) => {
   try {
+    if (!ensureValidObjectId(res, req.params.siteId, 'site id')) return;
     const site = await Site.findOne({ _id: req.params.siteId, workspaceId: req.workspace._id });
     if (!site) return res.status(404).json({ error: 'Site not found' });
     if (site.locked) return res.status(403).json({ error: 'Site is locked. Reconnect the matching GSC account.', code: 'SITE_LOCKED' });
@@ -295,6 +335,7 @@ const getDeclining = async (req, res) => {
     if (err.code === 'GSC_NOT_CONNECTED') {
       return res.status(400).json({ error: 'GSC access revoked. Please reconnect.', code: 'GSC_REVOKED' });
     }
+    if (handleMongooseError(res, err)) return;
     console.error('getDeclining error:', err.message);
     res.status(500).json({ error: 'Failed to fetch declining pages' });
   }
@@ -302,6 +343,7 @@ const getDeclining = async (req, res) => {
 
 const getTopPages = async (req, res) => {
   try {
+    if (!ensureValidObjectId(res, req.params.siteId, 'site id')) return;
     const site = await Site.findOne({ _id: req.params.siteId, workspaceId: req.workspace._id });
     if (!site) return res.status(404).json({ error: 'Site not found' });
     if (site.locked) return res.status(403).json({ error: 'Site is locked. Reconnect the matching GSC account.', code: 'SITE_LOCKED' });
@@ -317,6 +359,7 @@ const getTopPages = async (req, res) => {
     if (err.code === 'GSC_NOT_CONNECTED') {
       return res.status(400).json({ error: 'GSC access revoked. Please reconnect.', code: 'GSC_REVOKED' });
     }
+    if (handleMongooseError(res, err)) return;
     console.error('getTopPages error:', err.message);
     res.status(500).json({ error: 'Failed to fetch top pages' });
   }

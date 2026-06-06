@@ -1133,4 +1133,59 @@ const listSkills = async (req, res) => {
   }
 };
 
-module.exports = { chat, agent, generateImage, uploadImage, clarifyAnswer, planConfirm, toolConfirm, setExecutionMode, listSkills };
+// ─── Cross-controller helper ───────────────────────────────────────
+//
+// Phase 2 / Task #100: when analysis re-runs mid-edit, the engine session
+// keeps the stale brief in memory until the next setupSession() call (i.e.,
+// until the next chat/agent invocation). For a writer mid-conversation,
+// that means seeing the live SEO gauge with outdated targets.
+//
+// resyncBriefIfActive(contentId) re-pushes the brief + context files for
+// the already-open session, so the gauge updates as soon as analysis
+// finishes — no need to start a new chat to pick up the new data.
+//
+// Returns true when a push happened, false when no active session exists.
+// Logs errors but never throws; analysisController treats this as best-effort.
+async function resyncBriefIfActive(contentId) {
+  if (!contentId) return false;
+  const key = contentId.toString();
+  const entry = contentSessionMap.get(key);
+  if (!entry) return false;
+
+  // Reload the content with the freshly-saved analysis fields.
+  const content = await Content.findById(key).lean().catch(() => null);
+  if (!content) return false;
+
+  try {
+    const brief = benchmarkToContentBrief(content);
+    await writingEngine.pushBrief(entry.sessionId, brief);
+
+    // Also refresh the context files (research-outline / seo-targets /
+    // content-audit) so ReadFile tool calls in the next turn see the same
+    // updates the gauge does.
+    const contextFiles = {};
+    if (content.recommendedOutline || content.competitorPages?.length || content.peopleAlsoAsk?.length) {
+      contextFiles['research-outline.md'] = buildResearchOutlineMd(content);
+    }
+    if (brief && (brief.nlpTerms?.length || brief.secondaryKeywords?.length || brief.targetKeyword)) {
+      contextFiles['seo-targets.md'] = buildSeoTargetsMd(brief);
+    }
+    const latestAudit = content.audits?.[content.audits.length - 1];
+    if (latestAudit) {
+      const auditMd = buildContentAuditMd(latestAudit);
+      if (auditMd) contextFiles['content-audit.md'] = auditMd;
+    }
+    if (Object.keys(contextFiles).length > 0) {
+      await writingEngine.pushContextFiles(entry.sessionId, contextFiles);
+    }
+
+    entry.lastUsed = Date.now();
+    console.log(`[resync] pushed fresh brief + context to session ${entry.sessionId} for content ${key}`);
+    return true;
+  } catch (err) {
+    console.error(`[resync] failed for content ${key}:`, err.message);
+    return false;
+  }
+}
+
+module.exports = { chat, agent, generateImage, uploadImage, clarifyAnswer, planConfirm, toolConfirm, setExecutionMode, listSkills, resyncBriefIfActive };

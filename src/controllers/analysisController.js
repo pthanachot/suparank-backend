@@ -416,6 +416,19 @@ async function runAnalysis(contentId) {
 
     await Content.findByIdAndUpdate(contentId, { $set: updates });
     console.log(`[analysis] completed for content ${contentId}`);
+
+    // Phase 2 / Task #100: push the freshly-computed brief into any
+    // engine session currently open for this content. Lazy-require avoids
+    // a controller-controller import cycle at module load.
+    try {
+      const { resyncBriefIfActive } = require('./aiController');
+      const synced = await resyncBriefIfActive(contentId);
+      if (synced) {
+        console.log(`[analysis] resynced brief to active engine session for ${contentId}`);
+      }
+    } catch (resyncErr) {
+      console.error('[analysis] brief resync failed (non-fatal):', resyncErr.message);
+    }
   } catch (err) {
     console.error('[analysis] unexpected error:', err.message);
     await Content.findByIdAndUpdate(contentId, {

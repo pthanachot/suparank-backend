@@ -11,6 +11,12 @@ const crawlStatsSchema = new mongoose.Schema({
   removedUrls: { type: Number, default: 0 },
   unchanged: { type: Number, default: 0 },
   errors: { type: Number, default: 0 },
+  // True when the page cap was hit before the queue was empty. Lets the UI
+  // signal "your sitemap is incomplete — upgrade for higher cap".
+  truncated: { type: Boolean, default: false },
+  // Lower-bound count of additional URLs we had queued but didn't crawl
+  // because of the page cap (the queue length at loop exit).
+  discoveredButSkipped: { type: Number, default: 0 },
 }, { _id: false });
 
 const crawlHistoryEntrySchema = new mongoose.Schema({

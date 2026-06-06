@@ -70,6 +70,28 @@ function validateBrandVoiceSettings(settings) {
   return null;
 }
 
+// Validate that `id` is a well-formed ObjectId. Sends 400 and returns false if not.
+function ensureValidObjectId(res, id, label) {
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    res.status(400).json({ error: `Invalid ${label}` });
+    return false;
+  }
+  return true;
+}
+
+// If err is a Mongoose ValidationError/CastError, sends 400 and returns true.
+function handleMongooseError(res, err) {
+  if (err instanceof mongoose.Error.ValidationError) {
+    res.status(400).json({ error: err.message });
+    return true;
+  }
+  if (err instanceof mongoose.Error.CastError) {
+    res.status(400).json({ error: `Invalid ${err.path || 'id'} format` });
+    return true;
+  }
+  return false;
+}
+
 /* ── SSE streaming helper — lightweight rewrite via Writing Engine ────── */
 
 async function streamRewriteResponse(req, res, markdownContent, userInput) {
@@ -566,6 +588,7 @@ const createAvatar = async (req, res) => {
 
     res.status(201).json({ avatar });
   } catch (err) {
+    if (handleMongooseError(res, err)) return;
     console.error('createAvatar error:', err.message);
     res.status(500).json({ error: 'Failed to create avatar' });
   }
@@ -578,6 +601,8 @@ const getAvatar = async (req, res) => {
     const workspace = req.workspace;
 
     const { avatarId } = req.params;
+    if (!ensureValidObjectId(res, avatarId, 'avatar id')) return;
+
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
     if (!avatar) {
       return res.status(404).json({ error: 'Avatar not found' });
@@ -585,6 +610,7 @@ const getAvatar = async (req, res) => {
 
     res.json({ avatar });
   } catch (err) {
+    if (handleMongooseError(res, err)) return;
     console.error('getAvatar error:', err.message);
     res.status(500).json({ error: 'Failed to fetch avatar' });
   }
@@ -597,6 +623,8 @@ const updateAvatar = async (req, res) => {
     const workspace = req.workspace;
 
     const { avatarId } = req.params;
+    if (!ensureValidObjectId(res, avatarId, 'avatar id')) return;
+
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
     if (!avatar) {
       return res.status(404).json({ error: 'Avatar not found' });
@@ -647,8 +675,9 @@ const updateAvatar = async (req, res) => {
       console.log(`[brand-voice] Background generation finished: ${result}`);
     }
   } catch (err) {
+    if (!res.headersSent && handleMongooseError(res, err)) return;
     console.error('updateAvatar error:', err.message);
-    res.status(500).json({ error: 'Failed to update avatar' });
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to update avatar' });
   }
 };
 
@@ -659,6 +688,8 @@ const deleteAvatar = async (req, res) => {
     const workspace = req.workspace;
 
     const { avatarId } = req.params;
+    if (!ensureValidObjectId(res, avatarId, 'avatar id')) return;
+
     const avatar = await Avatar.findOneAndDelete({ _id: avatarId, workspace: workspace._id });
     if (!avatar) {
       return res.status(404).json({ error: 'Avatar not found' });
@@ -675,6 +706,7 @@ const deleteAvatar = async (req, res) => {
 
     res.json({ message: 'Avatar deleted' });
   } catch (err) {
+    if (handleMongooseError(res, err)) return;
     console.error('deleteAvatar error:', err.message);
     res.status(500).json({ error: 'Failed to delete avatar' });
   }
@@ -687,6 +719,8 @@ const toggleAvatar = async (req, res) => {
     const workspace = req.workspace;
 
     const { avatarId } = req.params;
+    if (!ensureValidObjectId(res, avatarId, 'avatar id')) return;
+
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
     if (!avatar) {
       return res.status(404).json({ error: 'Avatar not found' });
@@ -696,6 +730,7 @@ const toggleAvatar = async (req, res) => {
     await avatar.save();
     res.json({ avatar });
   } catch (err) {
+    if (handleMongooseError(res, err)) return;
     console.error('toggleAvatar error:', err.message);
     res.status(500).json({ error: 'Failed to toggle avatar' });
   }
@@ -708,6 +743,8 @@ const testAvatar = async (req, res) => {
     const workspace = req.workspace;
 
     const { avatarId } = req.params;
+    if (!ensureValidObjectId(res, avatarId, 'avatar id')) return;
+
     const input = (req.body.input || '').trim();
     if (!input) {
       return res.status(400).json({ error: 'input is required' });
@@ -756,6 +793,7 @@ const testAvatar = async (req, res) => {
     await recordTestUsage(req.user.userId);
     await streamRewriteResponse(req, res, combinedContent, input);
   } catch (err) {
+    if (!res.headersSent && handleMongooseError(res, err)) return;
     if (!res.headersSent) {
       console.error('testAvatar error:', err.message);
       res.status(500).json({ error: 'Test failed' });
@@ -770,6 +808,8 @@ const uploadAvatarFile = async (req, res) => {
     const workspace = req.workspace;
 
     const { avatarId } = req.params;
+    if (!ensureValidObjectId(res, avatarId, 'avatar id')) return;
+
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
     if (!avatar) {
       return res.status(404).json({ error: 'Avatar not found' });
@@ -878,6 +918,7 @@ Provide a concise style summary (max 200 words) that can be used to replicate th
 
     res.status(201).json({ avatar });
   } catch (err) {
+    if (handleMongooseError(res, err)) return;
     console.error('uploadAvatarFile error:', err.message);
     res.status(500).json({ error: 'Failed to upload file' });
   }
@@ -890,6 +931,9 @@ const deleteAvatarUpload = async (req, res) => {
     const workspace = req.workspace;
 
     const { avatarId, uploadId } = req.params;
+    if (!ensureValidObjectId(res, avatarId, 'avatar id')) return;
+    if (!ensureValidObjectId(res, uploadId, 'upload id')) return;
+
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
     if (!avatar) {
       return res.status(404).json({ error: 'Avatar not found' });
@@ -918,6 +962,7 @@ const deleteAvatarUpload = async (req, res) => {
 
     res.json({ avatar });
   } catch (err) {
+    if (handleMongooseError(res, err)) return;
     console.error('deleteAvatarUpload error:', err.message);
     res.status(500).json({ error: 'Failed to delete upload' });
   }
@@ -942,6 +987,8 @@ const uploadAvatarImage = async (req, res) => {
     const workspace = req.workspace;
 
     const { avatarId } = req.params;
+    if (!ensureValidObjectId(res, avatarId, 'avatar id')) return;
+
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
     if (!avatar) {
       return res.status(404).json({ error: 'Avatar not found' });
@@ -968,6 +1015,7 @@ const uploadAvatarImage = async (req, res) => {
 
     res.json({ avatar });
   } catch (err) {
+    if (handleMongooseError(res, err)) return;
     console.error('uploadAvatarImage error:', err.message);
     res.status(500).json({ error: 'Failed to upload avatar image' });
   }
@@ -980,6 +1028,8 @@ const deleteAvatarImage = async (req, res) => {
     const workspace = req.workspace;
 
     const { avatarId } = req.params;
+    if (!ensureValidObjectId(res, avatarId, 'avatar id')) return;
+
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
     if (!avatar) {
       return res.status(404).json({ error: 'Avatar not found' });
@@ -995,6 +1045,7 @@ const deleteAvatarImage = async (req, res) => {
 
     res.json({ avatar });
   } catch (err) {
+    if (handleMongooseError(res, err)) return;
     console.error('deleteAvatarImage error:', err.message);
     res.status(500).json({ error: 'Failed to delete avatar image' });
   }
@@ -1009,6 +1060,8 @@ const importGoogleDoc = async (req, res) => {
     const workspace = req.workspace;
 
     const { avatarId } = req.params;
+    if (!ensureValidObjectId(res, avatarId, 'avatar id')) return;
+
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
     if (!avatar) {
       return res.status(404).json({ error: 'Avatar not found' });
@@ -1141,6 +1194,7 @@ Provide a concise style summary (max 200 words) that can be used to replicate th
 
     res.status(201).json({ avatar });
   } catch (err) {
+    if (handleMongooseError(res, err)) return;
     console.error('importGoogleDoc error:', err.message);
     res.status(500).json({ error: 'Failed to import Google Doc' });
   }

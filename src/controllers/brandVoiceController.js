@@ -92,6 +92,50 @@ function handleMongooseError(res, err) {
   return false;
 }
 
+// Validates the parts of the avatar input that generateAvatarMarkdown calls
+// array methods on (traits, vocabulary.*). Returns null if valid, else error string.
+const AVATAR_STRING_FIELDS = ['name', 'emoji', 'role', 'experience', 'tagline',
+  'writingQuirks', 'openingStyle', 'sample', 'background'];
+
+function validateAvatarInput(body) {
+  if (body.traits !== undefined) {
+    if (!Array.isArray(body.traits) || !body.traits.every((s) => typeof s === 'string')) {
+      return 'traits must be an array of strings';
+    }
+  }
+  if (body.vocabulary !== undefined) {
+    const v = body.vocabulary;
+    if (typeof v !== 'object' || v === null || Array.isArray(v)) {
+      return 'vocabulary must be an object';
+    }
+    for (const k of ['uses', 'avoids']) {
+      if (v[k] !== undefined && (!Array.isArray(v[k]) || !v[k].every((s) => typeof s === 'string'))) {
+        return `vocabulary.${k} must be an array of strings`;
+      }
+    }
+  }
+  if (body.toneOverrides !== undefined) {
+    const t = body.toneOverrides;
+    if (typeof t !== 'object' || t === null || Array.isArray(t)) {
+      return 'toneOverrides must be an object';
+    }
+    for (const k of ['formality', 'warmth', 'humor']) {
+      const n = t[k];
+      if (n !== undefined && n !== null) {
+        if (typeof n !== 'number' || !Number.isFinite(n) || n < 0 || n > 100) {
+          return `toneOverrides.${k} must be a number 0–100 or null`;
+        }
+      }
+    }
+  }
+  for (const k of AVATAR_STRING_FIELDS) {
+    if (body[k] !== undefined && typeof body[k] !== 'string') {
+      return `${k} must be a string`;
+    }
+  }
+  return null;
+}
+
 /* ── SSE streaming helper — lightweight rewrite via Writing Engine ────── */
 
 async function streamRewriteResponse(req, res, markdownContent, userInput) {
@@ -546,6 +590,11 @@ const createAvatar = async (req, res) => {
       return res.status(400).json({ error: 'name is required' });
     }
 
+    const inputErr = validateAvatarInput(req.body);
+    if (inputErr) {
+      return res.status(400).json({ error: inputErr });
+    }
+
     // Check avatar count against tier limit (per workspace)
     const orgId = workspace.organizationId;
     if (orgId) {
@@ -624,6 +673,11 @@ const updateAvatar = async (req, res) => {
 
     const { avatarId } = req.params;
     if (!ensureValidObjectId(res, avatarId, 'avatar id')) return;
+
+    const inputErr = validateAvatarInput(req.body);
+    if (inputErr) {
+      return res.status(400).json({ error: inputErr });
+    }
 
     const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspace._id });
     if (!avatar) {

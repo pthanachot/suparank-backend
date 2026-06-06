@@ -17,7 +17,9 @@ const authenticateToken = (req, res, next) => {
 
   const token = authHeader.split(' ')[1];
 
-  jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, async (err, decoded) => {
+  // Pin the algorithm to mitigate algorithm-confusion attacks
+  // (e.g. forged tokens with alg: none) — never rely on the token's own header.
+  jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, { algorithms: ['HS256'] }, async (err, decoded) => {
     if (err) {
       return res.status(401).json({ error: 'Invalid or expired token' });
     }
@@ -74,7 +76,7 @@ const optionalAuth = (req, res, next) => {
 
   const token = authHeader.split(' ')[1];
 
-  jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, async (err, decoded) => {
+  jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, { algorithms: ['HS256'] }, async (err, decoded) => {
     if (err) {
       req.user = null;
       return next();

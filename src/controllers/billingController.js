@@ -661,7 +661,9 @@ const updateExtraSeats = async (req, res) => {
 
     res.json({
       extraSeats: qty,
-      effectiveMaxSeats: (config.maxSeats || 0) + qty,
+      // null `maxSeats` means unlimited — preserve it so the frontend doesn't
+      // mis-render a finite cap. Mirrors the same handling in tierController.
+      effectiveMaxSeats: config.maxSeats != null ? config.maxSeats + qty : null,
       pricePerSeat: config.extraSeatPrice,
       monthlyCost: config.extraSeatPrice * qty,
     });

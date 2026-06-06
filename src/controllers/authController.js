@@ -6,7 +6,7 @@ const Organization = require('../models/Organization');
 const Workspace = require('../models/Workspace');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
-const { generateTokens, generateAccessToken } = require('../utils/jwt');
+const { generateTokens, generateAccessToken, generateRefreshToken } = require('../utils/jwt');
 const ResetToken = require('../models/ResetToken');
 const { sendEmail, sendVerificationCodeEmail, sendPasswordResetCodeEmail } = require('../utils/emailService');
 const { verifyGoogleToken } = require('../middleware/auth');
@@ -35,9 +35,11 @@ async function getNextUserId() {
   return counter.seq + 1000000000;
 }
 
-// Generate 6-digit code
+// Generate cryptographically secure 6-digit code (100000–999999).
+// Math.random() is a PRNG and not suitable for security-sensitive codes;
+// crypto.randomInt is uniformly random and seeded from the OS entropy pool.
 function generateCode() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+  return crypto.randomInt(100000, 1000000).toString();
 }
 
 // Helper: auto-create a default organization + workspace for a newly registered user
@@ -398,15 +400,17 @@ const forgotPassword = async (req, res) => {
   try {
     const { email } = req.body;
 
-    // Always return success (security)
-    const user = await User.findOne({ email: email?.toLowerCase() });
-    if (!user) {
-      return res.json({ message: 'If an account exists, a reset code has been sent' });
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
     }
+    const lcEmail = email.toLowerCase();
 
-    // Rate limit: 1 code per 60s per email
+    // Rate limit applied uniformly per email, BEFORE the user-existence check,
+    // so an attacker can't probe account existence via differential responses.
+    // VerificationCode entries are created even for non-existent emails — they
+    // expire in 15 minutes via the model's TTL index.
     const recentCode = await VerificationCode.findOne({
-      email: email.toLowerCase(),
+      email: lcEmail,
       type: 'password_reset',
       lastSentAt: { $gt: new Date(Date.now() - 60 * 1000) },
     });
@@ -421,12 +425,13 @@ const forgotPassword = async (req, res) => {
       });
     }
 
+    // Always upsert a VC row so subsequent probes hit the rate-limit equally
+    // whether or not a user with this email exists.
     const code = generateCode();
-
     await VerificationCode.findOneAndUpdate(
-      { email: email.toLowerCase(), type: 'password_reset' },
+      { email: lcEmail, type: 'password_reset' },
       {
-        email: email.toLowerCase(),
+        email: lcEmail,
         code,
         type: 'password_reset',
         expiresAt: new Date(Date.now() + 15 * 60 * 1000),
@@ -436,7 +441,14 @@ const forgotPassword = async (req, res) => {
       { upsert: true, new: true }
     );
 
-    await sendPasswordResetCodeEmail(email, code);
+    // Send the email only if the user exists. Errors swallowed so timing
+    // doesn't leak — the response is identical regardless.
+    const user = await User.findOne({ email: lcEmail });
+    if (user) {
+      sendPasswordResetCodeEmail(email, code).catch((err) =>
+        console.error('Failed to send reset email:', err.message)
+      );
+    }
 
     res.json({ message: 'If an account exists, a reset code has been sent' });
   } catch (error) {
@@ -666,7 +678,13 @@ const refreshToken = async (req, res) => {
       return res.status(400).json({ error: 'Refresh token is required' });
     }
 
-    const decoded = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET);
+    // Pin algorithm and validate audience/issuer claims (set by generateRefreshToken)
+    // to mitigate algorithm-confusion and cross-system token reuse.
+    const decoded = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET, {
+      algorithms: ['HS256'],
+      audience: process.env.JWT_AUDIENCE || 'SupaRank',
+      issuer: process.env.JWT_ISSUER || 'SupaRank',
+    });
 
     const user = await User.findById(decoded.userId);
     if (!user) {
@@ -685,10 +703,16 @@ const refreshToken = async (req, res) => {
     session.lastActivity = new Date();
     await session.save();
 
+    // Sliding-expiry refresh: issue a fresh refresh token alongside the access
+    // token so the refresh-token lifetime renews on every use. (Not full
+    // rotation-with-reuse-detection — the old token remains valid until JWT
+    // expiry; tracking issued-token nonces in DB would be required for that.)
     const accessToken = generateAccessToken(user, decoded.sessionId);
+    const newRefreshToken = generateRefreshToken(user, decoded.sessionId);
 
     res.json({
       accessToken,
+      refreshToken: newRefreshToken,
       user: {
         id: user._id,
         userId: user.userId,

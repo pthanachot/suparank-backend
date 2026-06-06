@@ -153,4 +153,22 @@ userSchema.methods.updateLastActive = function () {
   return this.save();
 };
 
+// Defense-in-depth: strip sensitive fields from any serialization (res.json,
+// JSON.stringify, etc.) so a future controller that accidentally passes a
+// raw User document downstream doesn't leak credentials. Controllers today
+// already build explicit response objects — this is a belt-and-suspenders
+// guard against regression.
+userSchema.set('toJSON', {
+  transform: (_doc, ret) => {
+    delete ret.password;
+    delete ret.verificationToken;
+    delete ret.verificationExpires;
+    delete ret.tokenVersion;
+    delete ret.failedLoginAttempts;
+    delete ret.lockUntil;
+    delete ret.__v;
+    return ret;
+  },
+});
+
 module.exports = mongoose.model('User', userSchema);

@@ -417,6 +417,12 @@ async function applyLocksForOrg(orgId) {
     throw lastErr;
   }
 
+  // null `maxSeats` means unlimited — preserve null so lockMembers unlocks
+  // everything. Without this guard, `null + extraSeats` evaluates to
+  // `extraSeats`, mis-treating unlimited tiers as a finite cap and locking
+  // members beyond `extraSeats - 1`. Mirrors F-26/F-31 null-handling.
+  const effectiveMaxSeats = config.maxSeats != null ? config.maxSeats + extraSeats : null;
+
   await Promise.all([
     // Quota resources: unlock any previously locked articles (cleanup)
     // Skip for free tier — lockPaidCreatedResources already handled article locks
@@ -425,7 +431,7 @@ async function applyLocksForOrg(orgId) {
     lockWorkspaces(orgId, config.maxWorkspaces),
     lockBrandVoiceConfigs(orgId, config.maxBrandVoices),
     lockAvatars(orgId, config.maxAvatars),
-    lockMembers(orgId, config.maxSeats + extraSeats),
+    lockMembers(orgId, effectiveMaxSeats),
     // AI Tracker: clear platform selections that exceed new tier limit
     resetAiTrackerPlatforms(orgId, config.maxAiTrackerPlatforms),
   ]);

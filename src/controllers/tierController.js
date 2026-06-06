@@ -107,6 +107,11 @@ const getTierInfo = async (req, res) => {
       };
     }
 
+    // `maxSeats: null` means unlimited (e.g. a future tier). Treat null
+    // additions correctly so the limit stays null rather than becoming the
+    // raw extraSeats count, which would mis-render as a finite cap.
+    const seatsLimit = config.maxSeats != null ? config.maxSeats + extraSeats : null;
+
     const usage = {
       articlesCreated: usageEntry('articlesCreated', 'maxArticlesPerMonth', 'articleLimitType'),
       keywordSearches: usageEntry('keywordSearches', 'maxKeywordLookupsPerMonth', 'keywordLimitType'),
@@ -114,7 +119,7 @@ const getTierInfo = async (req, res) => {
       aiTrackerPromptsCreated: usageEntry('aiTrackerPromptsCreated', 'maxAiTrackerPromptsPerMonth', 'aiTrackerPromptLimitType'),
       creditsUsed: usageEntry('creditsUsed', 'creditsPerMonth', 'creditLimitType'),
       // Total counts (not periodic)
-      seats: { used: memberCount + 1, limit: config.maxSeats + extraSeats, baseLimit: config.maxSeats, extraSeats }, // +1 for owner
+      seats: { used: memberCount + 1, limit: seatsLimit, baseLimit: config.maxSeats, extraSeats }, // +1 for owner
       brandVoices: { used: brandVoiceCount, limit: config.maxBrandVoices },
       avatars: { used: avatarCount, limit: config.maxAvatars },
       workspaces: { used: wsCount, limit: config.maxWorkspaces },

@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const Stripe = require('stripe');
 const User = require('../models/User');
 const Session = require('../models/Session');
@@ -7,8 +8,21 @@ const Subscription = require('../models/Subscription');
 const Workspace = require('../models/Workspace');
 const { verifyGoogleToken } = require('../middleware/auth');
 const { clearTierCache } = require('../services/tierService');
+const { sendEmail } = require('../utils/emailService');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// Minimal HTML escape — guards against malformed user input being injected
+// into outbound notification email bodies. We don't validate email format
+// at the model level, so escape any user-provided string before interpolating.
+const escapeHtml = (s) =>
+  String(s ?? '').replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[c]));
 
 // ─── UPDATE PROFILE ────────────────────────────────────────────
 
@@ -27,7 +41,27 @@ const updateProfile = async (req, res) => {
       user.profile.name = name;
     }
     if (picture !== undefined) {
-      user.profile.picture = picture;
+      // Accept either null (removal), an https URL, or a base64 data URL up to ~2MB raw.
+      // Frontend hint says "Max 2MB" — enforce it here so a malformed client can't
+      // bypass the UI guard and bloat the User document or skirt the global 10mb body cap.
+      if (picture === null || picture === '') {
+        user.profile.picture = null;
+      } else if (typeof picture !== 'string') {
+        return res.status(400).json({ error: 'Picture must be a string URL or data URL' });
+      } else if (picture.startsWith('data:image/')) {
+        // base64 payload after the comma; 4 base64 chars = 3 raw bytes
+        const commaIdx = picture.indexOf(',');
+        const b64 = commaIdx >= 0 ? picture.slice(commaIdx + 1) : '';
+        const approxBytes = Math.floor((b64.length * 3) / 4);
+        if (approxBytes > 2 * 1024 * 1024) {
+          return res.status(413).json({ error: 'Picture exceeds 2MB limit' });
+        }
+        user.profile.picture = picture;
+      } else if (/^https:\/\//.test(picture)) {
+        user.profile.picture = picture;
+      } else {
+        return res.status(400).json({ error: 'Picture must be an https URL or image data URL' });
+      }
     }
 
     // Update timezone
@@ -45,18 +79,58 @@ const updateProfile = async (req, res) => {
     }
 
     // Handle email change (requires re-verification)
+    let emailChanged = false;
+    let previousEmail = null;
     if (email && email.toLowerCase() !== user.email) {
       const existingUser = await User.findOne({ email: email.toLowerCase() });
       if (existingUser) {
         return res.status(409).json({ error: 'Email is already in use' });
       }
+      previousEmail = user.email;
       user.email = email.toLowerCase();
       user.verified = false;
-      // TODO: Send re-verification email
+      // Issue a fresh verification token (consumed by POST /api/auth/verify-email)
+      user.verificationToken = crypto.randomBytes(32).toString('hex');
+      user.verificationExpires = Date.now() + 24 * 60 * 60 * 1000;
+      emailChanged = true;
     }
 
     user.lastActive = new Date();
     await user.save();
+
+    // Fire-and-forget email dispatch after save so a transient SMTP error
+    // doesn't roll back the profile update.
+    if (emailChanged) {
+      const verifyUrl = `${process.env.FRONTEND_URL}/verify-email?token=${user.verificationToken}`;
+      // Verification email to the NEW address
+      sendEmail({
+        to: user.email,
+        subject: 'Verify your new email — SupaRank',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
+            <h2 style="color: #111; margin-bottom: 16px;">Verify your new email</h2>
+            <p style="color: #555; margin-bottom: 24px;">You changed your SupaRank email to this address. Click the button below to confirm:</p>
+            <a href="${verifyUrl}" style="display: inline-block; padding: 14px 32px; background: #4F46E5; color: white; text-decoration: none; border-radius: 12px; font-weight: bold; font-size: 14px;">Verify email</a>
+            <p style="color: #888; font-size: 14px; margin-top: 24px;">This link expires in 24 hours. If you didn't change your email, contact support@suparank.ai immediately.</p>
+          </div>
+        `,
+      }).catch((err) => console.error('Failed to send verify-email to new address:', err.message));
+
+      // Notification to the OLD address so a legit owner can react to unauthorized change
+      if (previousEmail) {
+        sendEmail({
+          to: previousEmail,
+          subject: 'Your SupaRank email was changed',
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
+              <h2 style="color: #111; margin-bottom: 16px;">Email address changed</h2>
+              <p style="color: #555;">The email on your SupaRank account was just changed to <strong>${escapeHtml(user.email)}</strong>.</p>
+              <p style="color: #555; margin-top: 16px;">If this wasn't you, contact <a href="mailto:support@suparank.ai">support@suparank.ai</a> right away.</p>
+            </div>
+          `,
+        }).catch((err) => console.error('Failed to notify old email of change:', err.message));
+      }
+    }
 
     res.json({
       id: user._id,
@@ -66,6 +140,7 @@ const updateProfile = async (req, res) => {
       timezone: user.preferences?.timezone,
       emailNotifications: user.preferences?.emailNotifications ?? true,
       verified: user.verified,
+      emailChanged,
     });
   } catch (error) {
     console.error('Update profile error:', error);

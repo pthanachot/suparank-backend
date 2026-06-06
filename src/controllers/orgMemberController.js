@@ -100,7 +100,10 @@ const listMembers = async (req, res) => {
       return {
         _id: m._id,
         userId: m.userId,
-        email: m.email,
+        // Prefer the live User.email — OrgMember.email is denormalized at
+        // invite time and goes stale when the user later changes their
+        // email via Profile settings.
+        email: u?.email || m.email,
         name: u?.profile?.name || '',
         picture: u?.profile?.picture || '',
         role: m.role,

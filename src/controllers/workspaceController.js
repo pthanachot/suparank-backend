@@ -475,6 +475,29 @@ const moveWorkspace = async (req, res) => {
       return res.status(403).json({ error: 'You must own the target organization' });
     }
 
+    // No-op if the workspace is already in the target org.
+    if (workspace.organizationId && workspace.organizationId.equals(targetOrg._id)) {
+      return res.json({ workspace });
+    }
+
+    // Enforce target org's tier maxWorkspaces — moving in shouldn't push
+    // the destination over its quota.
+    const { config, tier } = await tierService.getOrgTierConfig(targetOrg._id);
+    const maxWs = config?.maxWorkspaces;
+    if (maxWs != null) {
+      const wsCount = await Workspace.countDocuments({
+        organizationId: targetOrg._id,
+        locked: { $ne: true },
+      });
+      if (wsCount >= maxWs) {
+        return res.status(429).json({
+          error: `Your ${config.displayName || tier} plan allows ${maxWs} workspace(s) in the target organization. Upgrade or remove a workspace first.`,
+          code: 'QUOTA_EXCEEDED',
+          quota: { limit: maxWs, used: wsCount, tier, limitKey: 'maxWorkspaces' },
+        });
+      }
+    }
+
     workspace.organizationId = targetOrg._id;
     await workspace.save();
 

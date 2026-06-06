@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const BrandVoice = require('../models/BrandVoice');
 const Avatar = require('../models/Avatar');
 const BrandVoiceTestLog = require('../models/BrandVoiceTestLog');
@@ -36,6 +37,37 @@ const MAX_TEST_WORDS = 150;
 
 function countWords(text) {
   return text.trim().split(/\s+/).filter(Boolean).length;
+}
+
+const SLIDER_KEYS = ['formality', 'warmth', 'humor', 'technicality'];
+const PERSPECTIVE_VALUES = ['you', 'we', 'they'];
+const SENTENCE_STYLE_VALUES = ['short', 'mixed', 'detailed'];
+
+// Returns null when settings are valid, or an error string when not.
+function validateBrandVoiceSettings(settings) {
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+    return 'settings must be an object';
+  }
+  for (const key of SLIDER_KEYS) {
+    if (settings[key] === undefined) continue;
+    const v = settings[key];
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 100) {
+      return `${key} must be a number between 0 and 100`;
+    }
+  }
+  if (settings.perspective !== undefined && !PERSPECTIVE_VALUES.includes(settings.perspective)) {
+    return `perspective must be one of: ${PERSPECTIVE_VALUES.join(', ')}`;
+  }
+  if (settings.sentenceStyle !== undefined && !SENTENCE_STYLE_VALUES.includes(settings.sentenceStyle)) {
+    return `sentenceStyle must be one of: ${SENTENCE_STYLE_VALUES.join(', ')}`;
+  }
+  for (const arrKey of ['formattingHabits', 'useWords', 'avoidWords']) {
+    if (settings[arrKey] === undefined) continue;
+    if (!Array.isArray(settings[arrKey]) || !settings[arrKey].every((s) => typeof s === 'string')) {
+      return `${arrKey} must be an array of strings`;
+    }
+  }
+  return null;
 }
 
 /* ── SSE streaming helper — lightweight rewrite via Writing Engine ────── */
@@ -359,11 +391,18 @@ const saveBrandVoice = async (req, res) => {
     if (!settings) {
       return res.status(400).json({ error: 'settings is required' });
     }
-
-    const content = generateBrandVoiceMarkdown(settings);
+    const settingsErr = validateBrandVoiceSettings(settings);
+    if (settingsErr) {
+      return res.status(400).json({ error: settingsErr });
+    }
 
     // Find target brand voice: by brandVoiceId param, or active one
     const brandVoiceId = req.params.brandVoiceId;
+    if (brandVoiceId && !mongoose.Types.ObjectId.isValid(brandVoiceId)) {
+      return res.status(400).json({ error: 'Invalid brand voice id' });
+    }
+
+    const content = generateBrandVoiceMarkdown(settings);
     const filter = brandVoiceId
       ? { _id: brandVoiceId, workspace: workspace._id }
       : { workspace: workspace._id, active: true };
@@ -389,6 +428,12 @@ const saveBrandVoice = async (req, res) => {
     console.log(`[saveBrandVoice] DB save took ${Date.now() - t0}ms`);
     res.json({ brandVoice });
   } catch (err) {
+    if (err instanceof mongoose.Error.ValidationError) {
+      return res.status(400).json({ error: err.message });
+    }
+    if (err instanceof mongoose.Error.CastError) {
+      return res.status(400).json({ error: `Invalid ${err.path || 'id'} format` });
+    }
     console.error('saveBrandVoice error:', err.message);
     res.status(500).json({ error: 'Failed to save brand voice' });
   }
@@ -1206,6 +1251,10 @@ const deleteBrandVoice = async (req, res) => {
     const workspace = req.workspace;
     const { brandVoiceId } = req.params;
 
+    if (!mongoose.Types.ObjectId.isValid(brandVoiceId)) {
+      return res.status(400).json({ error: 'Invalid brand voice id' });
+    }
+
     const bv = await BrandVoice.findOne({ _id: brandVoiceId, workspace: workspace._id });
     if (!bv) {
       return res.status(404).json({ error: 'Brand voice not found' });
@@ -1236,6 +1285,9 @@ const deleteBrandVoice = async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
+    if (err instanceof mongoose.Error.CastError) {
+      return res.status(400).json({ error: `Invalid ${err.path || 'id'} format` });
+    }
     console.error('deleteBrandVoice error:', err.message);
     res.status(500).json({ error: 'Failed to delete brand voice' });
   }
@@ -1245,6 +1297,10 @@ const toggleBrandVoice = async (req, res) => {
   try {
     const workspace = req.workspace;
     const { brandVoiceId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(brandVoiceId)) {
+      return res.status(400).json({ error: 'Invalid brand voice id' });
+    }
 
     const bv = await BrandVoice.findOne({ _id: brandVoiceId, workspace: workspace._id });
     if (!bv) {
@@ -1261,6 +1317,9 @@ const toggleBrandVoice = async (req, res) => {
 
     res.json({ brandVoice: bv });
   } catch (err) {
+    if (err instanceof mongoose.Error.CastError) {
+      return res.status(400).json({ error: `Invalid ${err.path || 'id'} format` });
+    }
     console.error('toggleBrandVoice error:', err.message);
     res.status(500).json({ error: 'Failed to toggle brand voice' });
   }

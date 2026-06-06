@@ -1,6 +1,7 @@
 const Organization = require('../models/Organization');
 const OrgMember = require('../models/OrgMember');
 const Workspace = require('../models/Workspace');
+const Subscription = require('../models/Subscription');
 const User = require('../models/User');
 const tierService = require('../services/tierService');
 const creditService = require('../services/creditService');
@@ -199,6 +200,33 @@ const deleteOrganization = async (req, res) => {
     if (!org.ownerId.equals(req.user.userId)) {
       return res.status(403).json({ error: 'Only the organization owner can delete it' });
     }
+
+    // Personal orgs are auto-created (legacy migration) and are referenced by
+    // multiple middleware paths (tierEnforcement, permissions, creditGate) via
+    // `findOne({ ownerId, isPersonal: true })`. Allowing them to be deleted
+    // would silently break those paths for the user.
+    if (org.isPersonal) {
+      return res.status(400).json({
+        error: 'Cannot delete your personal organization.',
+        code: 'PERSONAL_ORG',
+      });
+    }
+
+    // Active subscriptions tied to this org would be orphaned (continued
+    // Stripe billing with no UI to manage). Force the owner to cancel first.
+    const activeSub = await Subscription.findOne({
+      organizationId: org._id,
+      status: { $in: ['active', 'trialing', 'past_due'] },
+      stripeSubscriptionId: { $exists: true, $ne: null },
+    }).select('_id planId').lean();
+    if (activeSub) {
+      return res.status(400).json({
+        error: 'Cancel your subscription before deleting this organization.',
+        code: 'ACTIVE_SUBSCRIPTION',
+        planId: activeSub.planId,
+      });
+    }
+
     // Check for workspaces
     const wsCount = await Workspace.countDocuments({ organizationId: org._id });
     if (wsCount > 0) {
@@ -207,8 +235,9 @@ const deleteOrganization = async (req, res) => {
       });
     }
 
-    // Remove all members
+    // Cascade: members + non-active subscription rows (canceled history)
     await OrgMember.deleteMany({ organizationId: org._id });
+    await Subscription.deleteMany({ organizationId: org._id });
     await org.deleteOne();
 
     res.json({ message: 'Organization deleted' });

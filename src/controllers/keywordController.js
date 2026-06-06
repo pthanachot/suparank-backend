@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const KeywordSearch = require('../models/KeywordSearch');
 const KeywordDetail = require('../models/KeywordDetail');
 const KeywordResearchHistory = require('../models/KeywordResearchHistory');
@@ -228,6 +229,9 @@ async function deleteSearchHistory(req, res) {
     const workspace = req.workspace;
 
     const { historyId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(historyId)) {
+      return res.status(400).json({ error: 'Invalid history id' });
+    }
 
     const deleted = await KeywordResearchHistory.findOneAndDelete({
       _id: historyId,
@@ -240,8 +244,11 @@ async function deleteSearchHistory(req, res) {
 
     return res.json({ success: true });
   } catch (err) {
+    if (err instanceof mongoose.Error.CastError) {
+      return res.status(400).json({ error: `Invalid ${err.path || 'id'} format` });
+    }
     console.error('[keywordController] deleteSearchHistory error:', err.message);
-    return res.status(500).json({ error: err.message || 'Failed to delete history entry' });
+    return res.status(500).json({ error: 'Failed to delete history entry' });
   }
 }
 

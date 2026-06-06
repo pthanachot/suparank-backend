@@ -254,6 +254,17 @@ function isSameDomain(url, baseDomain) {
   }
 }
 
+// Known-infrastructure path prefixes that should never appear in a sitemap
+// (CDN protection endpoints, CMS admin areas, well-known config paths).
+const SKIP_PATH_PREFIXES = [
+  '/cdn-cgi/',          // Cloudflare email-protection, challenges, etc.
+  '/wp-admin/',         // WordPress admin
+  '/wp-json/',          // WordPress REST API
+  '/wp-login.php',      // WordPress login
+  '/.well-known/',      // RFC 8615 metadata endpoints
+  '/xmlrpc.php',        // Legacy WordPress RPC
+];
+
 function shouldSkipUrl(url) {
   try {
     const parsed = new URL(url);
@@ -265,6 +276,9 @@ function shouldSkipUrl(url) {
     }
     if (parsed.protocol === 'mailto:' || parsed.protocol === 'tel:' || parsed.protocol === 'javascript:') {
       return true;
+    }
+    for (const prefix of SKIP_PATH_PREFIXES) {
+      if (path.startsWith(prefix)) return true;
     }
     return false;
   } catch {
@@ -323,6 +337,12 @@ function extractLinksAndTitle(html, pageUrl, baseDomain) {
   $('a[href]').each((_, el) => {
     const href = $(el).attr('href');
     if (!href) return;
+
+    // Honor rel="nofollow" — covers Cloudflare email-protection wrappers,
+    // sponsored/ad links, and any link the site explicitly marks as not
+    // indexable. Splits on whitespace because rel can have multiple tokens.
+    const rel = ($(el).attr('rel') || '').toLowerCase().split(/\s+/);
+    if (rel.includes('nofollow')) return;
 
     const normalized = normalizeUrl(href, pageUrl);
     if (!normalized) return;
@@ -399,7 +419,11 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
     return null;
   }
 
-  const startUrl = sitemap.url.endsWith('/') ? sitemap.url.slice(0, -1) : sitemap.url;
+  // Canonicalize the seed URL using the same normalizer that discovered links
+  // pass through. Without this, the controller stores 'https://example.com'
+  // (trailing slash stripped) while normalizeUrl produces 'https://example.com/'
+  // (root slash preserved), causing the root to appear twice in the sitemap.
+  const startUrl = normalizeUrl(sitemap.url, sitemap.url) || sitemap.url;
   const baseDomain = new URL(startUrl).hostname;
   const origin = new URL(startUrl).origin;
   console.log(`[sitemap-crawler] starting crawl for ${sitemap.label || startUrl} (max ${maxPages} pages)`);
@@ -489,6 +513,27 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
         }
       }
       pagesProcessed = 1;
+
+      // ── 4b. Fail loudly if no internal links were discovered ────────────
+      // Catches frameset-based sites, SPAs / JS-rendered apps, and sites
+      // with non-standard navigation — all of which would otherwise complete
+      // with a misleading 1-URL "successful" sitemap. Only error if BOTH
+      // sources (homepage <a> extraction AND sitemap.xml seeding) yielded
+      // zero same-domain URLs.
+      if (seededCount === 0 && links.length === 0) {
+        await Sitemap.updateOne({ _id: sitemapId }, {
+          $set: {
+            crawlStatus: 'error',
+            crawlProgress: 0,
+            crawlError: 'No internal links discovered. The site may be JavaScript-rendered or use non-standard navigation.',
+            crawlPages: [],
+            crawlStats: { totalFound: 0, newUrls: 0, removedUrls: 0, unchanged: 0, errors: 1 },
+          },
+        });
+        await CrawlPage.deleteMany({ sitemapId: sitemap._id });
+        console.log(`[sitemap-crawler] no internal links discovered for ${sitemap.label || startUrl}`);
+        return null;
+      }
     }
 
     // ── 5. BFS crawl remaining pages ──────────────────────────────────────
@@ -586,12 +631,18 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
       }
     }
 
+    // discoveredButSkipped = URLs we had queued but didn't crawl because the
+    // page cap was hit. The BFS loop exits on `visited.size >= maxPages`, so
+    // anything left in `queue` is the lower-bound of "more pages exist".
+    const truncated = visited.size >= maxPages && queue.length > 0;
     const stats = {
       totalFound: results.length,
       newUrls: crawlPages.filter((p) => p.diffStatus === 'new').length,
       removedUrls: crawlPages.filter((p) => p.diffStatus === 'removed').length,
       unchanged: crawlPages.filter((p) => p.diffStatus === 'unchanged').length,
       errors: errorCount,
+      truncated,
+      discoveredButSkipped: queue.length,
     };
 
     // ── 7. Save results to CrawlPage collection + update Sitemap ──────

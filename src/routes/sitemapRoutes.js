@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+require('../middleware/validateIdParams')(router);
 const sitemapController = require('../controllers/sitemapController');
 const { authenticateToken } = require('../middleware/auth');
 const {

@@ -1,35 +1,50 @@
 const mongoose = require('mongoose');
 
 /**
- * Auto-validate any req.params key matching the ID pattern against
- * Mongoose's ObjectId check. Lets us delete the per-controller guards
- * (ensureValidObjectId) we've been sprinkling everywhere.
+ * Install ObjectId validation onto a router for every known ID parameter.
  *
- * Matches the convention: param keys ending in 'Id' (avatarId, sitemapId,
- * monitorId, etc.) and the bare 'id' key. Skips numeric route params like
- * 'workspaceNumber' which are not ObjectIds.
+ * Express 4.x param callbacks are router-local — they don't propagate to
+ * mounted sub-routers. So `app.param(...)` on the main app does NOT fire
+ * for params extracted by sub-routers. The correct hook is to register
+ * on each router that actually defines the parameter.
  *
- * On invalid, responds 400 with the offending key — clients get a clear
- * signal instead of the previous "500 Failed to do X" generic catch.
+ * On invalid input, responds 400 with the offending key. Eliminates the
+ * CastError-500 bug family at the framework level — no individual handler
+ * has to remember.
  *
- * Mount globally BEFORE route handlers:
- *   app.use(validateIdParams);
+ * Usage (at top of each route file that uses ID params):
+ *   const router = express.Router();
+ *   require('../middleware/validateIdParams')(router);
+ *   router.get('/:sitemapId', handler);
  *
- * Or per-router if global is too aggressive.
+ * To support a new ID param name, add it to ID_PARAMS below.
  */
-const ID_KEY_RE = /Id$/;
 
-function validateIdParams(req, res, next) {
-  for (const [key, value] of Object.entries(req.params || {})) {
-    // Skip non-Id-looking params (workspaceNumber, contentNumber, etc.)
-    if (key !== 'id' && !ID_KEY_RE.test(key)) continue;
-    // Skip if value happens to be all-digit (numeric ID — different scheme)
-    if (typeof value === 'string' && /^\d+$/.test(value)) continue;
-    if (!mongoose.Types.ObjectId.isValid(value)) {
-      return res.status(400).json({ error: `Invalid ${key}` });
-    }
+// Every ObjectId-shaped param name used across the route tree. Numeric IDs
+// (workspaceNumber, contentNumber) are intentionally omitted — those use a
+// different scheme and pass through unchecked.
+const ID_PARAMS = [
+  'avatarId',
+  'sitemapId',
+  'siteId',
+  'monitorId',
+  'promptId',
+  'competitorId',
+  'uploadId',
+  'brandVoiceId',
+  'historyId',
+];
+
+function installIdValidators(router) {
+  for (const name of ID_PARAMS) {
+    router.param(name, (req, res, next, value) => {
+      if (!mongoose.Types.ObjectId.isValid(value)) {
+        return res.status(400).json({ error: `Invalid ${name}` });
+      }
+      return next();
+    });
   }
-  return next();
 }
 
-module.exports = validateIdParams;
+module.exports = installIdValidators;
+module.exports.ID_PARAMS = ID_PARAMS;

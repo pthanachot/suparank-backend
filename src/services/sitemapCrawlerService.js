@@ -568,21 +568,24 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
 
         if (error || !html) {
           errorCount++;
-          return { url: item.url, title: '', statusCode, depth: item.depth, responseTimeMs, links: [] };
+          // ok:false covers BOTH cases: network/timeout errors (statusCode=0)
+          // AND HTTP 200 with non-HTML content (statusCode=200, html=null).
+          // The latter would otherwise pass a `statusCode >= 200 && < 400`
+          // check and pollute the sitemap with empty entries.
+          return { url: item.url, title: '', statusCode, depth: item.depth, responseTimeMs, links: [], ok: false };
         }
 
         const { title, links } = extractLinksAndTitle(html, item.url, baseDomain);
-        return { url: item.url, title, statusCode, depth: item.depth, responseTimeMs, links };
+        return { url: item.url, title, statusCode, depth: item.depth, responseTimeMs, links, ok: true };
       });
 
       for (const page of batchResults) {
-        // Only store URLs that returned a successful response. Failed fetches
-        // (4xx/5xx) shouldn't appear in the exported sitemap.xml — they're
-        // already tracked in the errorCount stat. This was the smoking gun
-        // on news.ycombinator.com: 68/100 stored URLs were /vote?id=... 401
-        // endpoints polluting the output.
-        const ok = page.statusCode && page.statusCode >= 200 && page.statusCode < 400;
-        if (ok) {
+        // Only store URLs that successfully returned crawlable HTML. Failed
+        // fetches (4xx/5xx, network errors, non-HTML 200s) are tracked in
+        // errorCount but excluded from the exported sitemap. Smoking gun
+        // case: news.ycombinator.com /vote?id=... 401 endpoints — 68 of 100
+        // results were dead URLs before this filter.
+        if (page.ok) {
           results.push({
             url: page.url,
             title: page.title,

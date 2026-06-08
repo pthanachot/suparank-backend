@@ -135,12 +135,10 @@ const apiLimiter = rateLimit({
 });
 app.use('/api/', apiLimiter);
 
-// Validate any req.params key ending in `Id` (avatarId, sitemapId, etc.)
-// against ObjectId regex. Eliminates the CastError-500 bug family at the
-// framework level — no individual handler has to remember.
-app.use('/api/', require('./middleware/validateIdParams'));
-
 // Routes
+// Note: ObjectId param validation is installed inside each individual route
+// module via `installIdValidators(router)` — Express 4.x param callbacks
+// are router-local and don't propagate from app to sub-routers.
 const authRoutes = require('./routes/authRoutes');
 const userRoutes = require('./routes/userRoutes');
 const billingRoutes = require('./routes/billingRoutes');

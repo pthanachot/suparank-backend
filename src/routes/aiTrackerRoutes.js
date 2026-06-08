@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+require('../middleware/validateIdParams')(router);
 const mongoose = require('mongoose');
 const AiTrackerPrompt = require('../models/AiTrackerPrompt');
 const AiTracker = require('../models/AiTracker');

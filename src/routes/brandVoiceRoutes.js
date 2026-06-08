@@ -1,6 +1,7 @@
 const express = require('express');
 const multer = require('multer');
 const router = express.Router();
+require('../middleware/validateIdParams')(router);
 const brandVoiceController = require('../controllers/brandVoiceController');
 const { authenticateToken } = require('../middleware/auth');
 

@@ -8,6 +8,27 @@ const cookieParser = require('cookie-parser');
 
 dotenv.config();
 
+// Fail-fast on missing env vars so config issues surface at deploy time
+// instead of as opaque 500s on the first request. Names match what the
+// codebase actually reads (middleware/auth.js uses ACCESS_TOKEN_SECRET,
+// not the generic JWT_SECRET).
+require('./utils/requireEnv')({
+  required: [
+    'MONGODB_URI',
+    'ACCESS_TOKEN_SECRET',
+    'REFRESH_TOKEN_SECRET',
+  ],
+  optional: [
+    'GOOGLE_CLIENT_ID',
+    'GOOGLE_CLIENT_SECRET',
+    'GSC_TOKEN_ENCRYPTION_KEY',
+    'B2_BUCKET',
+    'B2_KEY_ID',
+    'B2_APP_KEY',
+    'CHATGPT_API_KEY',
+  ],
+});
+
 const { connectDB, checkConnectionHealth } = require('./config/database');
 const { syncConfig } = require('./scripts/configSync');
 
@@ -113,6 +134,11 @@ const apiLimiter = rateLimit({
   skip: (req) => req.originalUrl.startsWith('/api/internal/'),
 });
 app.use('/api/', apiLimiter);
+
+// Validate any req.params key ending in `Id` (avatarId, sitemapId, etc.)
+// against ObjectId regex. Eliminates the CastError-500 bug family at the
+// framework level — no individual handler has to remember.
+app.use('/api/', require('./middleware/validateIdParams'));
 
 // Routes
 const authRoutes = require('./routes/authRoutes');
@@ -338,6 +364,34 @@ app.use((req, res) => {
 
 // Error handler
 app.use((err, req, res, next) => {
+  // Mongoose error normalization — convert framework errors that escape
+  // per-controller try/catch into clean 4xx responses with stable codes.
+  // Eliminates the "leaky generic 500" pattern across all controllers.
+  const mongoose = require('mongoose');
+
+  if (err instanceof mongoose.Error.ValidationError) {
+    return res.status(400).json({
+      status: 'error',
+      code: 'VALIDATION_ERROR',
+      message: err.message,
+    });
+  }
+  if (err instanceof mongoose.Error.CastError) {
+    return res.status(400).json({
+      status: 'error',
+      code: 'INVALID_ID',
+      message: `Invalid ${err.path || 'id'} format`,
+    });
+  }
+  // MongoServerError 11000 = duplicate key (unique index violation)
+  if (err && err.code === 11000) {
+    return res.status(409).json({
+      status: 'error',
+      code: 'DUPLICATE_KEY',
+      message: 'Resource already exists',
+    });
+  }
+
   console.error('Error:', err.message);
   res.status(err.status || 500).json({
     status: 'error',

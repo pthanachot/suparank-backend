@@ -349,26 +349,6 @@ async function submitToolConfirm(sessionId, action) {
   return res.json();
 }
 
-/**
- * Set execution mode on a running session.
- * Called when user toggles "auto edit" / "ask first" mid-run.
- *
- * @param {string} sessionId - Go engine session ID
- * @param {string} mode - "auto" or "step-by-step"
- */
-async function setExecutionMode(sessionId, mode) {
-  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/execution-mode`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ mode }),
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Writing Engine: set execution mode failed (${res.status}): ${body}`);
-  }
-  return res.json();
-}
-
 module.exports = {
   createSession,
   pushDocument,
@@ -386,6 +366,5 @@ module.exports = {
   pushContextFiles,
   submitPlanConfirm,
   submitToolConfirm,
-  setExecutionMode,
   WRITING_ENGINE_URL,
 };

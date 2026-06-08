@@ -7,13 +7,18 @@ const {
   requirePermission: rp,
   requireFeature: rf,
 } = require('../middleware/permissions');
+const validateBody = require('../middleware/validateBody');
+const { createSitemapSchema } = require('../validators/sitemapValidators');
 
 router.use(authenticateToken);
 
 const rwrSitemap = [rwr, rf('sitemap')];
 
 // CRUD
-router.post('/:workspaceNumber/sitemaps',              ...rwrSitemap, rp('sitemap', 'manage'), sitemapController.createSitemap);
+// validateBody(createSitemapSchema) replaces the old in-controller "if (!url)
+// return 400" checks with a declarative schema. Pattern for rolling out
+// across the rest of the API — see src/validators/ and src/middleware/validateBody.js.
+router.post('/:workspaceNumber/sitemaps',              ...rwrSitemap, rp('sitemap', 'manage'), validateBody(createSitemapSchema), sitemapController.createSitemap);
 router.get('/:workspaceNumber/sitemaps',               ...rwrSitemap, rp('sitemap', 'read'),   sitemapController.listSitemaps);
 router.get('/:workspaceNumber/sitemaps/:sitemapId',    ...rwrSitemap, rp('sitemap', 'read'),   sitemapController.getSitemap);
 router.delete('/:workspaceNumber/sitemaps/:sitemapId', ...rwrSitemap, rp('sitemap', 'manage'), sitemapController.deleteSitemap);

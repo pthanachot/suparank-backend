@@ -576,13 +576,21 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
       });
 
       for (const page of batchResults) {
-        results.push({
-          url: page.url,
-          title: page.title,
-          statusCode: page.statusCode,
-          depth: page.depth,
-          responseTimeMs: page.responseTimeMs,
-        });
+        // Only store URLs that returned a successful response. Failed fetches
+        // (4xx/5xx) shouldn't appear in the exported sitemap.xml — they're
+        // already tracked in the errorCount stat. This was the smoking gun
+        // on news.ycombinator.com: 68/100 stored URLs were /vote?id=... 401
+        // endpoints polluting the output.
+        const ok = page.statusCode && page.statusCode >= 200 && page.statusCode < 400;
+        if (ok) {
+          results.push({
+            url: page.url,
+            title: page.title,
+            statusCode: page.statusCode,
+            depth: page.depth,
+            responseTimeMs: page.responseTimeMs,
+          });
+        }
 
         for (const link of page.links) {
           if (!visited.has(link) && !queued.has(link)) {
@@ -756,4 +764,9 @@ function escapeXml(str) {
     .replace(/'/g, '&apos;');
 }
 
-module.exports = { crawlSite, generateSitemapXml };
+module.exports = {
+  crawlSite,
+  generateSitemapXml,
+  // Exposed for unit testing. Not intended for external use.
+  _internals: { normalizeUrl, shouldSkipUrl, extractLinksAndTitle, isSameDomain },
+};

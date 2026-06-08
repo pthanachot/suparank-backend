@@ -461,7 +461,7 @@ const agent = async (req, res) => {
     const content = await resolveContent(req, res);
     if (!content) return;
 
-    const { goal, targetScore, maxIterations, allowedTools, avatarId, mode, executionMode } = req.body;
+    const { goal, targetScore, maxIterations, allowedTools, avatarId, mode } = req.body;
     if (!goal || typeof goal !== 'string') {
       return res.status(400).json({ error: 'goal is required' });
     }
@@ -469,15 +469,6 @@ const agent = async (req, res) => {
     // Set up Writing Engine session (reuse for conversation memory in freeform mode)
     const isFreeform = !mode || mode === 'freeform';
     const { sessionId } = await setupSession(content, { avatarId, reuseSession: isFreeform });
-
-    // Push execution mode to engine if specified
-    if (executionMode) {
-      try {
-        await writingEngine.setExecutionMode(sessionId, executionMode);
-      } catch (err) {
-        console.error('Set execution mode failed (non-fatal):', err.message);
-      }
-    }
 
     // Pre-deduct credits before starting the stream
     if (req.creditContext?.deductionEnabled) {
@@ -1089,36 +1080,6 @@ const toolConfirm = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-// POST /:workspaceNumber/content/:contentNumber/ai/execution-mode
-// Sets the execution mode (auto / step-by-step) on a running session.
-// Called when user toggles the mode mid-run.
-// ─────────────────────────────────────────────────────────────
-const setExecutionMode = async (req, res) => {
-  try {
-    const content = await resolveContent(req, res);
-    if (!content) return;
-
-    const { mode } = req.body;
-    if (!mode || !['auto', 'step-by-step'].includes(mode)) {
-      return res.status(400).json({ error: 'mode must be "auto" or "step-by-step"' });
-    }
-
-    // Find active session for this content
-    const contentId = content._id.toString();
-    const existing = contentSessionMap.get(contentId);
-    if (!existing) {
-      return res.status(404).json({ error: 'No active session for this content' });
-    }
-
-    const result = await writingEngine.setExecutionMode(existing.sessionId, mode);
-    return res.json(result);
-  } catch (err) {
-    console.error('Set execution mode error:', err);
-    return res.status(500).json({ error: err.message || 'Failed to set execution mode' });
-  }
-};
-
-// ─────────────────────────────────────────────────────────────
 // GET /skills — user-facing wrapper around the internal skills bridge.
 // Auth is the workspaceRoutes global token check; we don't require a
 // workspaceNumber because skills are global to the writing-engine.
@@ -1188,4 +1149,4 @@ async function resyncBriefIfActive(contentId) {
   }
 }
 
-module.exports = { chat, agent, generateImage, uploadImage, clarifyAnswer, planConfirm, toolConfirm, setExecutionMode, listSkills, resyncBriefIfActive };
+module.exports = { chat, agent, generateImage, uploadImage, clarifyAnswer, planConfirm, toolConfirm, listSkills, resyncBriefIfActive };

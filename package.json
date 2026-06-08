@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "test": "node --test tests/planValidator.test.js tests/jsonPatch.test.js tests/planSkeleton.test.js tests/contextFsFrontmatter.test.js tests/contextFsAnchors.test.js tests/contextFs.test.js tests/contextController.test.js tests/internalAuth.test.js tests/planModel.test.js tests/planSerializer.test.js tests/conformance.test.js tests/internalSkillsRoute.test.js tests/aiTrackerEngine.test.js tests/benchmarkToContentBrief.test.js",
+    "test": "node --test tests/planValidator.test.js tests/jsonPatch.test.js tests/planSkeleton.test.js tests/contextFsFrontmatter.test.js tests/contextFsAnchors.test.js tests/contextFs.test.js tests/contextController.test.js tests/internalAuth.test.js tests/planModel.test.js tests/planSerializer.test.js tests/conformance.test.js tests/internalSkillsRoute.test.js tests/aiTrackerEngine.test.js tests/benchmarkToContentBrief.test.js tests/sitemapCrawler.test.js",
+    "test:crawler": "node --test tests/sitemapCrawler.test.js",
     "test:aitracker": "node --test tests/aiTrackerEngine.test.js",
     "test:db": "node --test tests/planModel.test.js"
   },
@@ -32,7 +33,8 @@
     "nodemailer": "^6.10.0",
     "pdf-parse": "^1.1.1",
     "stripe": "^20.4.1",
-    "ws": "^8.20.0"
+    "ws": "^8.20.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"

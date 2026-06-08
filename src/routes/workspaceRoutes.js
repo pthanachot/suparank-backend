@@ -55,7 +55,6 @@ router.post('/:workspaceNumber/content/:contentNumber/ai/upload-image', rwr, rp(
 router.post('/:workspaceNumber/content/:contentNumber/ai/clarify-answer', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.clarifyAnswer);
 router.post('/:workspaceNumber/content/:contentNumber/ai/plan-confirm', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.planConfirm);
 router.post('/:workspaceNumber/content/:contentNumber/ai/tool-confirm', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.toolConfirm);
-router.post('/:workspaceNumber/content/:contentNumber/ai/execution-mode', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.setExecutionMode);
 
 // Plan mode under content (M1 — writing-engine plan mode)
 router.post('/:workspaceNumber/content/:contentNumber/plan/enter', planController.enter);

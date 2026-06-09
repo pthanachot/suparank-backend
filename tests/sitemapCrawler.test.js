@@ -53,6 +53,51 @@ test('normalizeUrl returns null on truly invalid input', () => {
   assert.equal(normalizeUrl('', ''), null);
 });
 
+// ─── Same-domain scheme upgrade (Follow-up #1) ─────────────────────────────
+
+test('normalizeUrl upgrades same-domain http→https when origin is https', () => {
+  // Smoking gun: github.com had `http://github.com/features/ai` in results
+  // despite the seed being https. With baseDomain + originScheme, the http
+  // version gets canonicalized to match the seed.
+  assert.equal(
+    normalizeUrl('http://example.com/page', 'https://example.com', 'example.com', 'https:'),
+    'https://example.com/page',
+  );
+});
+
+test('normalizeUrl upgrades same-domain http→https for subdomains', () => {
+  assert.equal(
+    normalizeUrl('http://blog.example.com/post', 'https://example.com', 'example.com', 'https:'),
+    'https://blog.example.com/post',
+  );
+});
+
+test('normalizeUrl does NOT upgrade http→https for off-domain URLs', () => {
+  // Leave other-domain links alone — they may genuinely only support http.
+  assert.equal(
+    normalizeUrl('http://attacker.com/x', 'https://example.com', 'example.com', 'https:'),
+    'http://attacker.com/x',
+  );
+});
+
+test('normalizeUrl does NOT upgrade when origin is http (no signal)', () => {
+  // If the seed is http, we have no evidence the site supports https, so
+  // leave http URLs alone.
+  assert.equal(
+    normalizeUrl('http://example.com/x', 'http://example.com', 'example.com', 'http:'),
+    'http://example.com/x',
+  );
+});
+
+test('normalizeUrl is backward-compatible — 2-arg form unchanged', () => {
+  // All existing call sites and tests pre-Follow-up #1 only pass 2 args.
+  // Without baseDomain/originScheme, the scheme upgrade is silently skipped.
+  assert.equal(
+    normalizeUrl('http://example.com/x', 'https://example.com'),
+    'http://example.com/x',
+  );
+});
+
 // ─── shouldSkipUrl ─────────────────────────────────────────────────────────
 
 test('shouldSkipUrl filters CDN protection paths (BUG #2 fix)', () => {

@@ -229,8 +229,15 @@ async function fetchSitemapXml(sitemapUrl, baseDomain, maxUrls = 5000) {
 
 /**
  * Normalize a URL: resolve relative paths, strip fragments and trailing slashes.
+ *
+ * Optional 3rd/4th args enable same-domain scheme upgrade: when crawling an
+ * https origin, any discovered http://samedomain URL is rewritten to https.
+ * Most sites force-redirect http→https anyway, so this prevents non-canonical
+ * (http) entries from polluting the output sitemap (smoking gun: github.com
+ * had `http://github.com/features/ai` in results despite the seed being https).
+ * Backward-compatible — call sites that pass only 2 args get the old behavior.
  */
-function normalizeUrl(href, baseUrl) {
+function normalizeUrl(href, baseUrl, baseDomain = null, originScheme = null) {
   try {
     const parsed = new URL(href, baseUrl);
     parsed.hash = '';
@@ -239,6 +246,14 @@ function normalizeUrl(href, baseUrl) {
       pathname = pathname.slice(0, -1);
     }
     parsed.pathname = pathname;
+    if (
+      originScheme === 'https:' &&
+      parsed.protocol === 'http:' &&
+      baseDomain &&
+      (parsed.hostname === baseDomain || parsed.hostname.endsWith('.' + baseDomain))
+    ) {
+      parsed.protocol = 'https:';
+    }
     return parsed.href;
   } catch {
     return null;
@@ -329,7 +344,7 @@ async function fetchPage(url) {
 /**
  * Extract internal links and page title from HTML using Cheerio.
  */
-function extractLinksAndTitle(html, pageUrl, baseDomain) {
+function extractLinksAndTitle(html, pageUrl, baseDomain, originScheme = null) {
   const $ = cheerio.load(html);
   const title = $('title').first().text().trim() || '';
 
@@ -347,7 +362,7 @@ function extractLinksAndTitle(html, pageUrl, baseDomain) {
     const rel = ($(el).attr('rel') || '').toLowerCase().split(/\s+/);
     if (rel.includes('nofollow')) return;
 
-    const normalized = normalizeUrl(href, pageUrl);
+    const normalized = normalizeUrl(href, pageUrl, baseDomain, originScheme);
     if (!normalized) return;
     if (!isSameDomain(normalized, baseDomain)) return;
     if (shouldSkipUrl(normalized)) return;
@@ -429,6 +444,7 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
   const startUrl = normalizeUrl(sitemap.url, sitemap.url) || sitemap.url;
   const baseDomain = new URL(startUrl).hostname;
   const origin = new URL(startUrl).origin;
+  const originScheme = new URL(startUrl).protocol; // 'https:' or 'http:'
   console.log(`[sitemap-crawler] starting crawl for ${sitemap.label || startUrl} (max ${maxPages} pages)`);
 
   const visited = new Set();
@@ -457,7 +473,7 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
     for (const sitemapUrl of sitemapSeedUrls) {
       const discovered = await fetchSitemapXml(sitemapUrl, baseDomain, maxPages);
       for (const url of discovered) {
-        const normalized = normalizeUrl(url, origin);
+        const normalized = normalizeUrl(url, origin, baseDomain, originScheme);
         if (normalized && !queued.has(normalized) && !shouldSkipUrl(normalized)) {
           const urlPath = new URL(normalized).pathname;
           if (isAllowedByRobots(urlPath, robotsRules)) {
@@ -514,7 +530,21 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
       } else {
 
       // Homepage succeeded — seed BFS with its links
-      const { title, links } = extractLinksAndTitle(html, startUrl, baseDomain);
+      const { title, links } = extractLinksAndTitle(html, startUrl, baseDomain, originScheme);
+
+      // Follow-up #2: thin-response diagnostic. When the homepage fetches
+      // successfully but produces very few or zero same-domain links, that's
+      // usually one of: (a) JS-rendered SPA, (b) anti-bot HTML stripped of
+      // navigation, (c) parser mismatch. Log the byte size and link counts
+      // so future "1-URL completed" mysteries (paulgraham.com) are debuggable
+      // from production logs without having to repro locally.
+      if (links.length < 5) {
+        const $ = cheerio.load(html);
+        const anchorCount = $('a[href]').length;
+        const areaCount = $('area[href]').length;
+        console.log(`[sitemap-crawler] thin-response diag for ${baseDomain}: htmlBytes=${html.length} anchors=${anchorCount} areas=${areaCount} sameDomainLinks=${links.length} seededCount=${seededCount}`);
+      }
+
       results.push({ url: startUrl, title, statusCode, depth: 0, responseTimeMs });
       for (const link of links) {
         if (!queued.has(link)) {
@@ -577,7 +607,7 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
           return { url: item.url, title: '', statusCode, depth: item.depth, responseTimeMs, links: [], ok: false };
         }
 
-        const { title, links } = extractLinksAndTitle(html, item.url, baseDomain);
+        const { title, links } = extractLinksAndTitle(html, item.url, baseDomain, originScheme);
         return { url: item.url, title, statusCode, depth: item.depth, responseTimeMs, links, ok: true };
       });
 

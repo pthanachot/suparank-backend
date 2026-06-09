@@ -13,7 +13,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { _internals } = require('../src/services/sitemapCrawlerService');
-const { normalizeUrl, shouldSkipUrl, extractLinksAndTitle, isSameDomain } = _internals;
+const { normalizeUrl, shouldSkipUrl, extractLinksAndTitle, isSameDomain, parseRobotsTxt, isAllowedByRobots } = _internals;
 
 // ─── normalizeUrl ──────────────────────────────────────────────────────────
 
@@ -96,6 +96,107 @@ test('normalizeUrl is backward-compatible — 2-arg form unchanged', () => {
     normalizeUrl('http://example.com/x', 'https://example.com'),
     'http://example.com/x',
   );
+});
+
+// ─── parseRobotsTxt + isAllowedByRobots (BUG #16 — group-leak regression) ──
+
+test('parseRobotsTxt — Disallow: / from named-bot block does NOT leak into *', () => {
+  // Smoking-gun fixture: real paulgraham.com robots.txt. Previously the
+  // Disallow: / from the Roverbot block leaked into the * ruleset because
+  // currentAgents was never reset between groups, blocking every URL for
+  // our crawler.
+  const pgRobots = [
+    'User-agent: *',
+    'Disallow: /cgi-bin/',
+    'Disallow: /RT/',
+    'Disallow: /cs/',
+    '',
+    'User-agent: Roverbot',
+    'Disallow: /',
+    '',
+    'Sitemap: /sitemap.xml',
+  ].join('\n');
+
+  const { rules } = parseRobotsTxt(pgRobots);
+  // We get the * rules (since SupaRankBot isn't named) — must NOT include the
+  // Disallow: / from Roverbot.
+  assert.ok(!rules.some((r) => r.path === '/'), 'Disallow: / leaked from Roverbot into wildcard rules');
+  // Sanity: the * rules ARE present
+  assert.ok(rules.some((r) => r.path === '/cgi-bin/'), 'expected /cgi-bin/ in rules');
+  // And /articles.html should be allowed under these rules
+  assert.equal(isAllowedByRobots('/articles.html', rules), true);
+});
+
+test('parseRobotsTxt — techcrunch-style file with many named-bot blocks', () => {
+  // Stress test: many named bot groups each with Disallow: /. Pre-fix, each
+  // of these leaked into * and blocked everything.
+  const tcRobots = [
+    'User-agent: *',
+    'Disallow: /wp-admin/',
+    'Allow: /wp-admin/admin-ajax.php',
+    '',
+    'User-agent: anthropic-ai',
+    'Disallow: /',
+    '',
+    'User-agent: GPTBot',
+    'Disallow: /',
+    '',
+    'User-agent: Claude-Web',
+    'User-agent: ClaudeBot',  // multi-agent group syntax
+    'Disallow: /',
+  ].join('\n');
+
+  const { rules } = parseRobotsTxt(tcRobots);
+  // The * rules should only contain the wp-admin entries
+  assert.ok(!rules.some((r) => r.path === '/'), 'Disallow: / leaked from named bots into wildcard rules');
+  assert.ok(rules.some((r) => r.path === '/wp-admin/'));
+  // /articles is allowed
+  assert.equal(isAllowedByRobots('/articles', rules), true);
+  // /wp-admin/ is blocked
+  assert.equal(isAllowedByRobots('/wp-admin/edit.php', rules), false);
+  // /wp-admin/admin-ajax.php is allowed (Allow rule wins via longer path)
+  assert.equal(isAllowedByRobots('/wp-admin/admin-ajax.php', rules), true);
+});
+
+test('parseRobotsTxt — consecutive User-agent lines apply to one rule block', () => {
+  // Per RFC 9309: User-agent lines can stack before a single rule block.
+  // E.g. real techcrunch.com:
+  //   User-agent: Claude-Web
+  //   User-agent: ClaudeBot
+  //   Disallow: /
+  // Both agents get the same rules; consecutive User-agent lines are
+  // a single group, not separate ones.
+  //
+  // We don't ASSERT that SupaRankBot would be in those groups (it isn't),
+  // but we DO assert the * ruleset stays clean.
+  const robots = [
+    'User-agent: *',
+    'Disallow: /admin/',
+    '',
+    'User-agent: BotA',
+    'User-agent: BotB',
+    'Disallow: /private/',
+  ].join('\n');
+
+  const { rules } = parseRobotsTxt(robots);
+  assert.ok(rules.some((r) => r.path === '/admin/'));
+  assert.ok(!rules.some((r) => r.path === '/private/'), '/private/ leaked from BotA/BotB into wildcard');
+});
+
+test('parseRobotsTxt — SupaRankBot-named rules override wildcard', () => {
+  const robots = [
+    'User-agent: *',
+    'Disallow: /',
+    '',
+    'User-agent: SupaRankBot',
+    'Allow: /',
+    'Disallow: /private/',
+  ].join('\n');
+
+  const { rules } = parseRobotsTxt(robots);
+  // Should be the SupaRankBot rules, not *
+  assert.equal(isAllowedByRobots('/articles', rules), true, 'SupaRankBot Allow: / should win over wildcard');
+  assert.equal(isAllowedByRobots('/private/x', rules), false);
 });
 
 // ─── shouldSkipUrl ─────────────────────────────────────────────────────────

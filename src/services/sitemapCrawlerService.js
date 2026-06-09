@@ -90,6 +90,17 @@ async function fetchRobotsTxt(origin) {
 
 /**
  * Parse robots.txt content. Extracts rules for our bot or the wildcard agent.
+ *
+ * Critical correctness rule (per RFC 9309 §2.2.1): a "group" is one or more
+ * consecutive User-agent lines followed by one or more rules. A new
+ * User-agent line that follows a rule line starts a NEW group — its agents
+ * should NOT inherit prior groups' agents.
+ *
+ * Smoking-gun bug we fixed: previously currentAgents was never cleared
+ * between groups, so `Disallow: /` under `User-agent: Roverbot` would also
+ * get attributed to `User-agent: *` from the prior group, blocking every
+ * path for our crawler (which falls back to wildcard rules). This was the
+ * cause of the paulgraham.com and techcrunch.com "thin result" mysteries.
  */
 function parseRobotsTxt(text) {
   const lines = text.split('\n').map((l) => l.trim());
@@ -98,6 +109,7 @@ function parseRobotsTxt(text) {
   let allRules = []; // rules under User-agent: *
   let botRules = []; // rules under User-agent: SupaRankBot
   let foundBot = false;
+  let sawRuleInGroup = false; // tracks transition from rules → next group
 
   for (const line of lines) {
     if (line.startsWith('#') || line === '') continue;
@@ -110,6 +122,13 @@ function parseRobotsTxt(text) {
 
     const agentMatch = line.match(/^User-agent:\s*(.+)/i);
     if (agentMatch) {
+      // Start of a NEW group: a User-agent line that follows a rule line
+      // closes the previous group and opens a new one. Consecutive
+      // User-agent lines (no rule between) are part of the same group.
+      if (sawRuleInGroup) {
+        currentAgents = [];
+        sawRuleInGroup = false;
+      }
       currentAgents.push(agentMatch[1].trim().toLowerCase());
       continue;
     }
@@ -118,6 +137,7 @@ function parseRobotsTxt(text) {
     const allowMatch = line.match(/^Allow:\s*(.*)/i);
 
     if (disallowMatch || allowMatch) {
+      sawRuleInGroup = true;
       const isAllow = !!allowMatch;
       const path = (isAllow ? allowMatch[1] : disallowMatch[1]).trim();
       if (!path && !isAllow) continue; // empty Disallow = allow all
@@ -813,5 +833,5 @@ module.exports = {
   crawlSite,
   generateSitemapXml,
   // Exposed for unit testing. Not intended for external use.
-  _internals: { normalizeUrl, shouldSkipUrl, extractLinksAndTitle, isSameDomain },
+  _internals: { normalizeUrl, shouldSkipUrl, extractLinksAndTitle, isSameDomain, parseRobotsTxt, isAllowedByRobots },
 };

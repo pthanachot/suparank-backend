@@ -1710,26 +1710,46 @@ async function buildDashboardResponse(tracker) {
   // Merge in tracked competitors (created via POST /competitors). The dashboard
   // previously surfaced only auto-discovered ones (with synthetic `auto-N` ids),
   // so customer-added competitors were invisible despite existing in the DB.
-  // Deduplicate by case-insensitive name to avoid double-listing entries that
-  // appear in both the scan output and the tracked collection.
+  //
+  // Collision policy: when a tracked competitor matches an auto-discovered one
+  // by case-insensitive name, the TRACKED entry wins (real ObjectId so it can
+  // be deleted/updated) but preserves the scan metrics from the auto entry.
+  // Pre-fix the merge silently dropped the tracked entry — customers couldn't
+  // manage their own tracked competitors that the scan also discovered.
   try {
     const trackedComps = await AiTrackerCompetitor.find({ trackerId: tracker._id })
       .select('_id name isOwn')
       .lean();
-    const seenNames = new Set(formattedCompetitors.map((c) => (c.name || '').toLowerCase()));
+    const byName = new Map();
+    for (let i = 0; i < formattedCompetitors.length; i++) {
+      const key = (formattedCompetitors[i].name || '').toLowerCase();
+      byName.set(key, i);
+    }
     for (const tc of trackedComps) {
       const key = (tc.name || '').toLowerCase();
-      if (seenNames.has(key)) continue;
-      formattedCompetitors.push({
-        id: tc._id.toString(),
-        name: tc.name,
-        isOwn: !!tc.isOwn,
-        mentions: 0,
-        citations: 0,
-        visibility: 0,
-        isTracked: true,
-      });
-      seenNames.add(key);
+      const existingIdx = byName.get(key);
+      if (existingIdx !== undefined) {
+        // Collision: replace the auto entry's synthetic id with the real one,
+        // mark as tracked, preserve metrics.
+        const existing = formattedCompetitors[existingIdx];
+        formattedCompetitors[existingIdx] = {
+          ...existing,
+          id: tc._id.toString(),
+          isOwn: !!tc.isOwn || !!existing.isOwn,
+          isTracked: true,
+        };
+      } else {
+        formattedCompetitors.push({
+          id: tc._id.toString(),
+          name: tc.name,
+          isOwn: !!tc.isOwn,
+          mentions: 0,
+          citations: 0,
+          visibility: 0,
+          isTracked: true,
+        });
+        byName.set(key, formattedCompetitors.length - 1);
+      }
     }
   } catch (err) {
     console.error('[ai-tracker] failed to merge tracked competitors:', err.message);
@@ -2520,14 +2540,6 @@ const updatePrompt = async (req, res) => {
     const { promptId } = req.params;
     if (!isValidObjectId(promptId)) return res.status(400).json({ error: 'Invalid prompt ID' });
 
-    // Prompt text is immutable — see updateMonitorPrompt for rationale.
-    if (req.body.prompt !== undefined) {
-      return res.status(400).json({
-        error: 'Prompt text cannot be edited after creation. Delete this prompt and add a new one with the corrected text.',
-        code: 'PROMPT_TEXT_IMMUTABLE',
-      });
-    }
-
     const { models, frequency, active } = req.body;
 
     const VALID_PLATFORMS = ['chatgpt', 'gemini', 'claude', 'perplexity'];
@@ -2552,7 +2564,14 @@ const updatePrompt = async (req, res) => {
       update.active = active;
     }
 
+    // See updateMonitorPrompt for the prompt-immutable rationale + form-fill tolerance.
     if (Object.keys(update).length === 0) {
+      if (req.body.prompt !== undefined) {
+        return res.status(400).json({
+          error: 'Prompt text cannot be edited after creation. Delete this prompt and add a new one with the corrected text.',
+          code: 'PROMPT_TEXT_IMMUTABLE',
+        });
+      }
       return res.status(400).json({ error: 'No fields to update' });
     }
 
@@ -3281,17 +3300,6 @@ const updateMonitorPrompt = async (req, res) => {
     const { promptId } = req.params;
     if (!isValidObjectId(promptId)) return res.status(400).json({ error: 'Invalid prompt ID' });
 
-    // Prompt text is immutable after creation (historical scan results would
-    // be misleading otherwise). If the client sends `prompt`, return a clear
-    // error pointing to the correct flow rather than the misleading
-    // "No fields to update" we used to return.
-    if (req.body.prompt !== undefined) {
-      return res.status(400).json({
-        error: 'Prompt text cannot be edited after creation. Delete this prompt and add a new one with the corrected text.',
-        code: 'PROMPT_TEXT_IMMUTABLE',
-      });
-    }
-
     const { models, frequency, active } = req.body;
 
     const VALID_PLATFORMS = ['chatgpt', 'gemini', 'claude', 'perplexity'];
@@ -3314,7 +3322,20 @@ const updateMonitorPrompt = async (req, res) => {
       update.active = active;
     }
 
+    // Prompt text is immutable after creation (historical scan results would
+    // be misleading otherwise). If client ONLY sent `prompt` with no other
+    // updatable fields, return a clear error pointing to the correct flow.
+    // If client sent `prompt` alongside other valid fields, silently ignore
+    // the prompt field (form-fill UIs that send the whole doc back keep
+    // working). This matches the pre-fix tolerance while still surfacing
+    // the misleading "No fields to update" case explicitly.
     if (Object.keys(update).length === 0) {
+      if (req.body.prompt !== undefined) {
+        return res.status(400).json({
+          error: 'Prompt text cannot be edited after creation. Delete this prompt and add a new one with the corrected text.',
+          code: 'PROMPT_TEXT_IMMUTABLE',
+        });
+      }
       return res.status(400).json({ error: 'No fields to update' });
     }
 

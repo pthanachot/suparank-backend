@@ -1706,6 +1706,35 @@ async function buildDashboardResponse(tracker) {
   const metrics = computeMetrics(latestScan, activePromptCount, carryScans, tracker.domain);
   const trackedPrompts = formatTrackedPrompts(prompts, latestScan, previousScan, carryScans, tracker.domain);
   const formattedCompetitors = formatCompetitors(latestScan, previousScan, tracker.domain);
+
+  // Merge in tracked competitors (created via POST /competitors). The dashboard
+  // previously surfaced only auto-discovered ones (with synthetic `auto-N` ids),
+  // so customer-added competitors were invisible despite existing in the DB.
+  // Deduplicate by case-insensitive name to avoid double-listing entries that
+  // appear in both the scan output and the tracked collection.
+  try {
+    const trackedComps = await AiTrackerCompetitor.find({ trackerId: tracker._id })
+      .select('_id name isOwn')
+      .lean();
+    const seenNames = new Set(formattedCompetitors.map((c) => (c.name || '').toLowerCase()));
+    for (const tc of trackedComps) {
+      const key = (tc.name || '').toLowerCase();
+      if (seenNames.has(key)) continue;
+      formattedCompetitors.push({
+        id: tc._id.toString(),
+        name: tc.name,
+        isOwn: !!tc.isOwn,
+        mentions: 0,
+        citations: 0,
+        visibility: 0,
+        isTracked: true,
+      });
+      seenNames.add(key);
+    }
+  } catch (err) {
+    console.error('[ai-tracker] failed to merge tracked competitors:', err.message);
+  }
+
   const changes = computeChanges(latestScan, previousScan, carryScans);
   const trendData = computeTrendData(recentScans, carryScans);
   const actionItems = generateActionItems(latestScan);
@@ -2491,6 +2520,14 @@ const updatePrompt = async (req, res) => {
     const { promptId } = req.params;
     if (!isValidObjectId(promptId)) return res.status(400).json({ error: 'Invalid prompt ID' });
 
+    // Prompt text is immutable — see updateMonitorPrompt for rationale.
+    if (req.body.prompt !== undefined) {
+      return res.status(400).json({
+        error: 'Prompt text cannot be edited after creation. Delete this prompt and add a new one with the corrected text.',
+        code: 'PROMPT_TEXT_IMMUTABLE',
+      });
+    }
+
     const { models, frequency, active } = req.body;
 
     const VALID_PLATFORMS = ['chatgpt', 'gemini', 'claude', 'perplexity'];
@@ -3243,6 +3280,17 @@ const updateMonitorPrompt = async (req, res) => {
 
     const { promptId } = req.params;
     if (!isValidObjectId(promptId)) return res.status(400).json({ error: 'Invalid prompt ID' });
+
+    // Prompt text is immutable after creation (historical scan results would
+    // be misleading otherwise). If the client sends `prompt`, return a clear
+    // error pointing to the correct flow rather than the misleading
+    // "No fields to update" we used to return.
+    if (req.body.prompt !== undefined) {
+      return res.status(400).json({
+        error: 'Prompt text cannot be edited after creation. Delete this prompt and add a new one with the corrected text.',
+        code: 'PROMPT_TEXT_IMMUTABLE',
+      });
+    }
 
     const { models, frequency, active } = req.body;
 

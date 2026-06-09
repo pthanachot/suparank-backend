@@ -532,17 +532,23 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
       // Homepage succeeded — seed BFS with its links
       const { title, links } = extractLinksAndTitle(html, startUrl, baseDomain, originScheme);
 
-      // Follow-up #2: thin-response diagnostic. When the homepage fetches
-      // successfully but produces very few or zero same-domain links, that's
-      // usually one of: (a) JS-rendered SPA, (b) anti-bot HTML stripped of
-      // navigation, (c) parser mismatch. Log the byte size and link counts
-      // so future "1-URL completed" mysteries (paulgraham.com) are debuggable
-      // from production logs without having to repro locally.
+      // Capture diagnostic info (cheap — single cheerio parse already done).
+      // Persisted on the Sitemap doc at the end of the crawl so customer-
+      // reported "thin result" cases can be diagnosed via GET /sitemaps/:id
+      // without needing Railway log access.
+      {
+        const $diag = cheerio.load(html);
+        // eslint-disable-next-line no-var
+        var crawlDiag = {
+          htmlBytes: html.length,
+          anchors: $diag('a[href]').length,
+          areas: $diag('area[href]').length,
+          sameDomainLinks: links.length,
+          seededCount,
+        };
+      }
       if (links.length < 5) {
-        const $ = cheerio.load(html);
-        const anchorCount = $('a[href]').length;
-        const areaCount = $('area[href]').length;
-        console.log(`[sitemap-crawler] thin-response diag for ${baseDomain}: htmlBytes=${html.length} anchors=${anchorCount} areas=${areaCount} sameDomainLinks=${links.length} seededCount=${seededCount}`);
+        console.log(`[sitemap-crawler] thin-response diag for ${baseDomain}: ${JSON.stringify(crawlDiag)}`);
       }
 
       results.push({ url: startUrl, title, statusCode, depth: 0, responseTimeMs });
@@ -700,6 +706,10 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
       errors: errorCount,
       truncated,
       discoveredButSkipped: queue.length,
+      // crawlDiag is set in the homepage-success branch (~line 535). If the
+      // homepage never succeeded (took the error path), the field stays as
+      // the schema default (all zeros) — also a valid diagnostic signal.
+      diag: typeof crawlDiag !== 'undefined' ? crawlDiag : undefined,
     };
 
     // ── 7. Save results to CrawlPage collection + update Sitemap ──────

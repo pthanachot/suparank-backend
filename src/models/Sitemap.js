@@ -17,6 +17,19 @@ const crawlStatsSchema = new mongoose.Schema({
   // Lower-bound count of additional URLs we had queued but didn't crawl
   // because of the page cap (the queue length at loop exit).
   discoveredButSkipped: { type: Number, default: 0 },
+  // Diagnostic info captured when the homepage produced <5 same-domain
+  // links. Populated for ALL crawls (cheap to compute), but only really
+  // useful when sniffing "why did this crawl produce a thin result?"
+  // (paulgraham.com / techcrunch.com cases). Surfacing via API removes
+  // the need for Railway-log SSH access to diagnose customer-reported
+  // thin sitemaps.
+  diag: {
+    htmlBytes: { type: Number, default: 0 },
+    anchors: { type: Number, default: 0 },
+    areas: { type: Number, default: 0 },
+    sameDomainLinks: { type: Number, default: 0 },
+    seededCount: { type: Number, default: 0 },
+  },
 }, { _id: false });
 
 const crawlHistoryEntrySchema = new mongoose.Schema({

@@ -136,15 +136,15 @@ async function getKeywordDetail(req, res) {
     });
 
     if (cached) {
-      // Track quota only after successful result
-      if (req.tierQuota) {
-        await tierService.incrementQuota(req.tierQuota);
-      }
-
+      // Cache hits are FREE — only fresh fetches (which cost a real Serper
+      // API call) burn quota. The /cached endpoint enforces the same rule
+      // and customers expect parity. Smoking gun: the smoke test showed
+      // /detail incrementing quota even when no Serper call was made.
       return res.json({
         keyword: cached.keyword,
         serpResults: cached.serpResults,
         paaQuestions: cached.paaQuestions,
+        fromCache: true,
       });
     }
 

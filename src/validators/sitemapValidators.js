@@ -26,7 +26,9 @@ const createSitemapSchema = z.object({
     .min(1, 'url is required')
     .max(2048, 'url too long (max 2048 chars)'),
   label: z.string().max(255).optional(),
-  schedule: z.enum(['daily', 'weekly', 'monthly']).optional(),
+  // Match the Sitemap model's enum (currently ['weekly'] only). If more
+  // schedules are added, update this and the schema at the same time.
+  schedule: z.enum(['weekly']).optional(),
 });
 
 module.exports = { createSitemapSchema };

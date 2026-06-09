@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+require('../middleware/validateIdParams')(router);
 const orgMemberController = require('../controllers/orgMemberController');
 const tierController = require('../controllers/tierController');
 const creditController = require('../controllers/creditController');

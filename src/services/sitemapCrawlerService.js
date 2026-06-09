@@ -566,12 +566,14 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
         await new Promise((r) => setTimeout(r, REQUEST_DELAY_MS));
         const { html, statusCode, error, responseTimeMs } = await fetchPage(item.url);
 
-        if (error || !html) {
+        // ok requires THREE things: no network error, response had HTML body,
+        // AND HTTP status was 2xx/3xx (3xx is rare since fetch follows redirects).
+        // Without the status check, HN-style 503-with-HTML error pages would
+        // pass the html-exists check and pollute the sitemap. Smoking-gun fix:
+        // /hide?id=...&goto=news returns 503 with HTML — we still don't want it.
+        const okStatus = statusCode >= 200 && statusCode < 400;
+        if (error || !html || !okStatus) {
           errorCount++;
-          // ok:false covers BOTH cases: network/timeout errors (statusCode=0)
-          // AND HTTP 200 with non-HTML content (statusCode=200, html=null).
-          // The latter would otherwise pass a `statusCode >= 200 && < 400`
-          // check and pollute the sitemap with empty entries.
           return { url: item.url, title: '', statusCode, depth: item.depth, responseTimeMs, links: [], ok: false };
         }
 

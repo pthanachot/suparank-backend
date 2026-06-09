@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+require('../middleware/validateIdParams')(router);
 const workspaceController = require('../controllers/workspaceController');
 const contentController = require('../controllers/contentController');
 const analysisController = require('../controllers/analysisController');

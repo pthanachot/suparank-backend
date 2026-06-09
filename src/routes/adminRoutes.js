@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+require('../middleware/validateIdParams')(router);
 const { authenticateToken } = require('../middleware/auth');
 const adminController = require('../controllers/adminController');
 const emailPortalController = require('../controllers/emailPortalController');

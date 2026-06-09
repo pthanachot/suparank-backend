@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+require('../middleware/validateIdParams')(router);
 const userController = require('../controllers/userController');
 const { authenticateToken } = require('../middleware/auth');
 

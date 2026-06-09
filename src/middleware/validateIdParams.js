@@ -24,15 +24,27 @@ const mongoose = require('mongoose');
 // (workspaceNumber, contentNumber) are intentionally omitted — those use a
 // different scheme and pass through unchecked.
 const ID_PARAMS = [
+  // Bare :id (used in admin email-template / feedback routes)
+  'id',
+  // Workspace tools
   'avatarId',
-  'sitemapId',
-  'siteId',
+  'brandVoiceId',
+  'competitorId',
+  'historyId',
   'monitorId',
   'promptId',
-  'competitorId',
+  'siteId',
+  'sitemapId',
   'uploadId',
-  'brandVoiceId',
-  'historyId',
+  // Org / user / admin
+  'commentId',
+  'memberId',
+  'orgId',
+  'sessionId',
+  'subId',
+  'triggerId',
+  'userId',
+  'workspaceId',
 ];
 
 function installIdValidators(router) {

@@ -23,6 +23,14 @@ const mongoose = require('mongoose');
 // Every ObjectId-shaped param name used across the route tree. Numeric IDs
 // (workspaceNumber, contentNumber) are intentionally omitted — those use a
 // different scheme and pass through unchecked.
+// CAUTION: only include param names that are ACTUAL Mongoose ObjectIds.
+// `commentId` was wrongly added in an earlier pass — comments use a custom
+// string id like `c1781012097288_la17`, NOT an ObjectId. Including it here
+// caused validateIdParams to reject every real comment edit/delete with a
+// misleading "Invalid commentId" 400. The smoke test caught it.
+//
+// When adding a new param, verify by inspecting the model — if its `_id`
+// field is `String` (or custom), do NOT add it here.
 const ID_PARAMS = [
   // Bare :id (used in admin email-template / feedback routes)
   'id',
@@ -37,7 +45,6 @@ const ID_PARAMS = [
   'sitemapId',
   'uploadId',
   // Org / user / admin
-  'commentId',
   'memberId',
   'orgId',
   'sessionId',
@@ -46,6 +53,11 @@ const ID_PARAMS = [
   'userId',
   'workspaceId',
 ];
+
+// Numeric-id route params (contentNumber, workspaceNumber). Smoke test
+// caught these returning 500 on non-numeric values because the controller
+// does Number(rawValue) → NaN → query throws somewhere downstream.
+const NUMERIC_PARAMS = ['contentNumber', 'workspaceNumber'];
 
 function installIdValidators(router) {
   for (const name of ID_PARAMS) {
@@ -56,7 +68,16 @@ function installIdValidators(router) {
       return next();
     });
   }
+  for (const name of NUMERIC_PARAMS) {
+    router.param(name, (req, res, next, value) => {
+      if (!/^\d+$/.test(value)) {
+        return res.status(400).json({ error: `Invalid ${name}` });
+      }
+      return next();
+    });
+  }
 }
 
 module.exports = installIdValidators;
 module.exports.ID_PARAMS = ID_PARAMS;
+module.exports.NUMERIC_PARAMS = NUMERIC_PARAMS;

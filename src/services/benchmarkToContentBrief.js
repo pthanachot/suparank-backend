@@ -55,6 +55,10 @@ function benchmarkToContentBrief(content) {
       readingLevel: benchmark.avgReadingLevel || 60,
       keywordInH2Rate: benchmark.keywordInH2Rate || 0,
       keywordInFirst100Rate: benchmark.keywordInFirst100Rate || 0,
+      // Engine uses this as the Internal Links signal target (falls back to
+      // min(5, len(availableLinks)) when 0) — keeps the engine's live score
+      // aligned with the frontend's, which reads avgInternalLinks directly.
+      internalLinks: benchmark.avgInternalLinks || 0,
       pageCount: benchmark.pageCount || 0,
     },
 
@@ -187,4 +191,135 @@ function mapContentType(intent) {
   }
 }
 
-module.exports = { benchmarkToContentBrief };
+/**
+ * Build the internal-link inventory (ContentBrief.availableLinks) from the
+ * workspace's crawled sitemap pages. The Writing Engine verifies every link
+ * the AI inserts against this allowlist (hallucinated-link detection) and
+ * scores link coverage — the signal is SKIPPED when the array is empty, so
+ * workspaces without a completed crawl are unaffected.
+ *
+ * Ranking: stemmed-token overlap between the target/secondary keywords and
+ * each page's title + URL slug; ties broken by depth (shallower first),
+ * sitemap priority, then recency.
+ *
+ * @param {ObjectId|string} workspaceId
+ * @param {string} targetKeyword
+ * @param {string[]} secondaryKeywords
+ * @param {{limit?: number}} [opts]
+ * @returns {Promise<Array<{url, anchorText, title, relevance}>>}
+ */
+// setupSession runs on EVERY chat/agent request and re-pushes the brief, so
+// without a cache this would hit Mongo (Sitemap + up to 500 CrawlPages) and
+// re-stem every page title on every message. Crawled pages change rarely —
+// a short TTL keeps sessions fresh without the per-message cost.
+const linksCache = new Map(); // key: `${workspaceId}|${targetKeyword}` → { links, at }
+const LINKS_CACHE_TTL_MS = 5 * 60 * 1000;
+const LINKS_CACHE_MAX = 200;
+
+async function buildAvailableLinks(workspaceId, targetKeyword, secondaryKeywords = [], { limit = 30 } = {}) {
+  if (!workspaceId) return [];
+
+  const cacheKey = `${workspaceId}|${(targetKeyword || '').toLowerCase()}|${(secondaryKeywords || [])
+    .map((k) => String(k).toLowerCase())
+    .sort()
+    .join(',')}`;
+  const cached = linksCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < LINKS_CACHE_TTL_MS) {
+    // Defensive copy: three independent call sites receive this — a mutation
+    // by any of them must not poison the cache.
+    return cached.links.map((l) => ({ ...l }));
+  }
+  // Lazy requires keep this module dependency-light for its sync default export.
+  const Sitemap = require('../models/Sitemap');
+  const CrawlPage = require('../models/CrawlPage');
+  const { stem, tokenize } = require('./stemmer');
+
+  const sitemaps = await Sitemap.find({ workspaceId, crawlCompletedAt: { $ne: null } })
+    .sort({ crawlCompletedAt: -1 })
+    .select('_id')
+    .limit(5)
+    .lean();
+  if (sitemaps.length === 0) {
+    cachePut(cacheKey, []);
+    return [];
+  }
+
+  const pages = await CrawlPage.find({
+    sitemapId: { $in: sitemaps.map((s) => s._id) },
+    diffStatus: { $ne: 'removed' },
+    title: { $nin: [null, ''] },
+    $or: [{ statusCode: 200 }, { statusCode: null }, { statusCode: { $exists: false } }],
+  })
+    .select('url title depth priority updatedAt')
+    .lean();
+  if (pages.length === 0) {
+    cachePut(cacheKey, []);
+    return [];
+  }
+
+  // Stemmed keyword set from target + secondary keywords.
+  const keywordStems = new Set(
+    [targetKeyword, ...(secondaryKeywords || [])]
+      .filter(Boolean)
+      .flatMap((kw) => tokenize(kw).map(stem)),
+  );
+
+  const scored = [];
+  const seenUrls = new Set();
+  for (const page of pages) {
+    if (seenUrls.has(page.url)) continue; // dedupe across sitemaps
+    seenUrls.add(page.url);
+
+    let slugText = '';
+    try {
+      slugText = decodeURIComponent(new URL(page.url).pathname).replace(/[-_/]+/g, ' ');
+    } catch {
+      /* unparseable URL — rank on title alone */
+    }
+    const pageStems = new Set(tokenize(`${page.title} ${slugText}`).map(stem));
+    let overlap = 0;
+    for (const ks of keywordStems) {
+      if (pageStems.has(ks)) overlap++;
+    }
+    scored.push({ page, overlap });
+  }
+
+  scored.sort((a, b) =>
+    b.overlap - a.overlap ||
+    (a.page.depth ?? 99) - (b.page.depth ?? 99) ||
+    (b.page.priority ?? 0) - (a.page.priority ?? 0) ||
+    new Date(b.page.updatedAt || 0) - new Date(a.page.updatedAt || 0),
+  );
+
+  const links = scored.slice(0, limit).map(({ page, overlap }) => ({
+    url: page.url,
+    anchorText: page.title,
+    title: page.title,
+    relevance: overlap >= 2 ? 'high' : overlap === 1 ? 'medium' : 'low',
+  }));
+  cachePut(cacheKey, links);
+  return links;
+}
+
+/**
+ * Drop every cached link inventory for a workspace — called when a sitemap
+ * crawl completes so fresh pages appear immediately instead of after the TTL.
+ */
+function invalidateLinksCache(workspaceId) {
+  if (!workspaceId) return;
+  const prefix = `${workspaceId}|`;
+  for (const key of linksCache.keys()) {
+    if (key.startsWith(prefix)) linksCache.delete(key);
+  }
+}
+
+function cachePut(key, links) {
+  if (linksCache.size >= LINKS_CACHE_MAX) {
+    // Drop the oldest entry (Map preserves insertion order).
+    const first = linksCache.keys().next().value;
+    if (first !== undefined) linksCache.delete(first);
+  }
+  linksCache.set(key, { links, at: Date.now() });
+}
+
+module.exports = { benchmarkToContentBrief, buildAvailableLinks, invalidateLinksCache };

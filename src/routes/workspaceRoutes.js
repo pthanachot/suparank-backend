@@ -43,8 +43,12 @@ router.post('/:workspaceNumber/content/:contentNumber/writing-quality', rwr, rf(
 // Analysis under content: /api/workspace/:workspaceNumber/content/:contentNumber/...
 router.post('/:workspaceNumber/content/:contentNumber/analyze', rwr, rf('analysis'), rp('analysis', 'use'), rq('auditsRun', 'maxAuditsPerMonth', 'auditLimitType'), analysisController.triggerAnalysis);
 router.get('/:workspaceNumber/content/:contentNumber/benchmark', rwr, rf('analysis'), rp('analysis', 'read'), analysisController.getBenchmark);
+
+// Internal-link inventory (same list pushed to the writing engine as brief.availableLinks)
+router.get('/:workspaceNumber/content/:contentNumber/available-links', rwr, rp('content', 'read'), contentController.getAvailableLinks);
 router.post('/:workspaceNumber/content/:contentNumber/reanalyze', rwr, rf('analysis'), rp('analysis', 'use'), analysisController.reanalyze);
 router.post('/:workspaceNumber/content/:contentNumber/score', rwr, rf('analysis'), rp('analysis', 'use'), analysisController.computeScore);
+router.post('/:workspaceNumber/content/:contentNumber/score-terms', rwr, rf('analysis'), rp('analysis', 'use'), analysisController.scoreTerms);
 router.post('/:workspaceNumber/content/:contentNumber/readability-check', rwr, rf('analysis'), rp('analysis', 'use'), analysisController.readabilityCheck);
 router.post('/:workspaceNumber/content/:contentNumber/regenerate-outline', rwr, rf('analysis'), rp('analysis', 'use'), analysisController.regenerateOutline);
 

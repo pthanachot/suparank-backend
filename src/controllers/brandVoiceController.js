@@ -453,13 +453,25 @@ const saveBrandVoice = async (req, res) => {
   try {
     const workspace = req.workspace;
 
-    const { settings, name } = req.body;
+    const { settings, name, imageStyle } = req.body;
     if (!settings) {
       return res.status(400).json({ error: 'settings is required' });
     }
     const settingsErr = validateBrandVoiceSettings(settings);
     if (settingsErr) {
       return res.status(400).json({ error: settingsErr });
+    }
+    // imageStyle: preset name or custom prompt; empty string clears it.
+    // Validated here because this handler whitelists fields explicitly.
+    let trimmedImageStyle;
+    if (imageStyle !== undefined) {
+      if (typeof imageStyle !== 'string') {
+        return res.status(400).json({ error: 'imageStyle must be a string' });
+      }
+      trimmedImageStyle = imageStyle.trim();
+      if (trimmedImageStyle.length > 2000) {
+        return res.status(400).json({ error: 'imageStyle must be 2000 characters or less' });
+      }
     }
 
     // Find target brand voice: by brandVoiceId param, or active one
@@ -475,6 +487,7 @@ const saveBrandVoice = async (req, res) => {
 
     const updateFields = { settings, content, filename: 'brand_voice.md' };
     if (name) updateFields.name = name;
+    if (trimmedImageStyle !== undefined) updateFields.imageStyle = trimmedImageStyle;
 
     const brandVoice = await BrandVoice.findOne(filter);
     if (!brandVoice) {

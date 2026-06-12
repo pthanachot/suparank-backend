@@ -81,6 +81,28 @@ async function pushBrandVoice(sessionId, markdownContent) {
 }
 
 /**
+ * Push the workspace's image style to a Writing Engine session.
+ * The engine applies it to AI-generated images and AI-modified stock photos
+ * so the site's visuals stay consistent.
+ *
+ * NOTE: no early-return on empty — an empty style is meaningful (it CLEARS
+ * the style, important for reused sessions after the user removes a style).
+ *
+ * @param {string} sessionId
+ * @param {string} style - preset name (e.g. "editorial") or custom prompt; '' clears
+ */
+async function pushImageStyle(sessionId, style) {
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/image-style`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ style: style || '' }),
+  });
+  if (!res.ok) {
+    throw new Error(`Writing Engine: push image style failed (${res.status})`);
+  }
+}
+
+/**
  * Send a chat message to the Writing Engine via SSE streaming.
  * The engine's /chat endpoint streams every event (thinking_delta,
  * text_delta, tool_start, document_diff, complete, error) so the UI
@@ -354,6 +376,7 @@ module.exports = {
   pushDocument,
   pushBrief,
   pushBrandVoice,
+  pushImageStyle,
   pushMode,
   pushPlan,
   pushCFSConfig,

@@ -749,4 +749,38 @@ const runWritingQualityAudit = async (req, res) => {
   }
 };
 
-module.exports = { listContents, getContent, createContent, updateContent, deleteContent, addComment, updateComment, deleteComment, runAudit, runWritingQualityAudit };
+
+/**
+ * GET available internal links for a content — the same inventory the
+ * backend pushes to the writing engine as brief.availableLinks (single
+ * source of truth: buildAvailableLinks). The editor uses it for the
+ * client-side Internal Links scoring signal + hallucinated-link warnings.
+ * Empty array when the workspace has no completed sitemap crawl.
+ */
+const getAvailableLinks = async (req, res) => {
+  try {
+    const workspace = req.workspace;
+    const content = await Content.findByNumber(workspace._id, req.params.contentNumber);
+    if (!content) {
+      return res.status(404).json({ error: 'Content not found' });
+    }
+    // Same lock gate as getContent — locked content must not leak its data.
+    if (content.locked) {
+      return res.status(403).json({ error: 'This content is locked. Upgrade your plan to regain access.', locked: true });
+    }
+
+    const { benchmarkToContentBrief, buildAvailableLinks } = require('../services/benchmarkToContentBrief');
+    const brief = benchmarkToContentBrief(content);
+    const links = await buildAvailableLinks(
+      content.workspaceId || workspace._id,
+      brief.targetKeyword,
+      brief.secondaryKeywords,
+    );
+    res.json({ links });
+  } catch (err) {
+    console.error('getAvailableLinks error:', err.message);
+    res.status(500).json({ error: 'Failed to load available links' });
+  }
+};
+
+module.exports = { listContents, getContent, getAvailableLinks, createContent, updateContent, deleteContent, addComment, updateComment, deleteComment, runAudit, runWritingQualityAudit };

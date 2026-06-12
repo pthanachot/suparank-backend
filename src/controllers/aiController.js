@@ -6,7 +6,7 @@ const Plan = require('../models/Plan');
 const AgentUsageLog = require('../models/AgentUsageLog');
 const { blocksToMarkdown, stripHtml } = require('../services/blocksToMarkdown');
 const { markdownToBlocks } = require('../services/markdownToBlocks');
-const { benchmarkToContentBrief } = require('../services/benchmarkToContentBrief');
+const { benchmarkToContentBrief, buildAvailableLinks } = require('../services/benchmarkToContentBrief');
 const { buildResearchOutlineMd, buildSeoTargetsMd, buildContentAuditMd } = require('../services/contextFileGenerators');
 const { mapEditsToPatches } = require('../services/mapEditsToPatches');
 const writingEngine = require('../services/writingEngine');
@@ -172,6 +172,18 @@ async function setupSession(content, { avatarId, reuseSession } = {}) {
     }
   }
 
+  // 3c. Internal-link inventory from the workspace's crawled sitemap pages
+  // (non-fatal — the engine skips the links signal when this is absent).
+  try {
+    brief.availableLinks = await buildAvailableLinks(
+      content.workspaceId || content.workspace,
+      brief.targetKeyword,
+      brief.secondaryKeywords,
+    );
+  } catch (err) {
+    console.error('availableLinks build failed (non-fatal):', err.message);
+  }
+
   await writingEngine.pushBrief(sessionId, brief);
 
   // 4. Generate and push context files for ReadFile tool (non-fatal)
@@ -222,6 +234,11 @@ async function setupSession(content, { avatarId, reuseSession } = {}) {
     if (combinedMarkdown.trim()) {
       await writingEngine.pushBrandVoice(sessionId, combinedMarkdown);
     }
+
+    // Push the workspace's image style. Always pushed (even empty) so a
+    // reused session is CLEARED when the user removes the style — the
+    // engine persists styles across sessions/restarts otherwise.
+    await writingEngine.pushImageStyle(sessionId, brandVoice?.imageStyle || '');
   } catch (err) {
     console.error('Brand voice push failed (non-fatal):', err.message);
   }
@@ -1119,6 +1136,18 @@ async function resyncBriefIfActive(contentId) {
 
   try {
     const brief = benchmarkToContentBrief(content);
+    // Re-append the link inventory — pushBrief replaces the whole brief on
+    // the engine, so omitting this here would strip availableLinks from the
+    // live session after every analysis re-run.
+    try {
+      brief.availableLinks = await buildAvailableLinks(
+        content.workspaceId || content.workspace,
+        brief.targetKeyword,
+        brief.secondaryKeywords,
+      );
+    } catch (err) {
+      console.error('availableLinks rebuild failed (non-fatal):', err.message);
+    }
     await writingEngine.pushBrief(entry.sessionId, brief);
 
     // Also refresh the context files (research-outline / seo-targets /

@@ -785,6 +785,15 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
     });
 
     console.log(`[sitemap-crawler] completed ${sitemap.label || startUrl}: ${stats.totalFound} pages (${stats.newUrls} new, ${stats.removedUrls} removed, ${errorCount} errors)`);
+
+    // Fresh pages should reach the editor/agent link inventory immediately,
+    // not after the 5-minute cache TTL.
+    try {
+      const { invalidateLinksCache } = require('./benchmarkToContentBrief');
+      invalidateLinksCache(sitemap.workspaceId);
+    } catch (cacheErr) {
+      console.warn('[sitemap-crawler] links cache invalidation failed:', cacheErr.message);
+    }
     return stats;
   } catch (err) {
     console.error(`[sitemap-crawler] error crawling ${sitemapId}:`, err.message);

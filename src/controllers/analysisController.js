@@ -552,6 +552,61 @@ const computeScore = async (req, res) => {
   }
 };
 
+// ─── POST /:contentNumber/score-terms — engine-canonical term counting ───
+// Proxies to the Go engine's /api/score so term counts use the exact
+// tokenizer/stemmer that built the benchmark usage ranges. The editor's
+// local regex counting misses inflected forms ("credit card" vs "credit
+// cards") and over-matches short terms inside longer words ("ai" in
+// "maintain"); the engine is the single source of truth for counts.
+
+const scoreTerms = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+
+    const { content: draftText, terms } = req.body;
+    if (!draftText || typeof draftText !== 'string') {
+      return res.status(400).json({ error: 'content (draft text) is required' });
+    }
+    if (!Array.isArray(terms) || terms.length === 0) {
+      return res.status(400).json({ error: 'terms are required' });
+    }
+    if (terms.length > 500) {
+      return res.status(400).json({ error: 'maximum 500 terms' });
+    }
+
+    const engineRes = await fetch(`${ENGINE_URL}/api/score`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        keyword: (content.targetKeywords && content.targetKeywords[0]) || '',
+        content: draftText,
+        terms,
+      }),
+      signal: AbortSignal.timeout(15000), // scoring is sub-second; don't hang on a stuck engine
+    });
+    if (!engineRes.ok) {
+      const text = await engineRes.text();
+      console.error('scoreTerms engine error:', engineRes.status, text.slice(0, 200));
+      return res.status(502).json({ error: 'Engine scoring unavailable' });
+    }
+    res.json(await engineRes.json());
+  } catch (err) {
+    // Distinguish infrastructure failures from controller bugs so callers
+    // and logs can tell a stuck/down engine apart from a 500.
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      console.error('scoreTerms: engine timed out');
+      return res.status(504).json({ error: 'Engine scoring timed out' });
+    }
+    if (err instanceof TypeError) {
+      console.error('scoreTerms: engine unreachable:', err.message);
+      return res.status(502).json({ error: 'Engine scoring unavailable' });
+    }
+    console.error('scoreTerms error:', err.message);
+    res.status(500).json({ error: 'Failed to score terms' });
+  }
+};
+
 // ─── POST /:contentNumber/readability-check — run AI readability check ───
 
 const readabilityCheck = async (req, res) => {
@@ -650,4 +705,4 @@ const regenerateOutline = async (req, res) => {
   }
 };
 
-module.exports = { triggerAnalysis, getBenchmark, reanalyze, runAnalysis, computeScore, readabilityCheck, regenerateOutline };
+module.exports = { triggerAnalysis, getBenchmark, reanalyze, runAnalysis, computeScore, scoreTerms, readabilityCheck, regenerateOutline };

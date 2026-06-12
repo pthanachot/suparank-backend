@@ -494,13 +494,20 @@ const saveBrandVoice = async (req, res) => {
       return res.status(404).json({ error: 'Brand voice not found' });
     }
 
-    // Upload brand_voice.md to B2
+    // Upload brand_voice.md to B2. The .md is an archival copy — the engine
+    // reads brandVoice.content from Mongo at session setup — so a failed or
+    // unconfigured B2 must not fail the save (envs without B2 keys couldn't
+    // save voices at all). Only record b2Key when the upload succeeded.
     const b2Key = `brand-voice/${workspace._id}/bv-${brandVoice._id}.md`;
     const t0 = Date.now();
-    await uploadBuffer(Buffer.from(content, 'utf-8'), 'text/markdown', b2Key);
-    console.log(`[saveBrandVoice] B2 upload took ${Date.now() - t0}ms`);
+    try {
+      await uploadBuffer(Buffer.from(content, 'utf-8'), 'text/markdown', b2Key);
+      console.log(`[saveBrandVoice] B2 upload took ${Date.now() - t0}ms`);
+      updateFields.b2Key = b2Key;
+    } catch (uploadErr) {
+      console.error(`[saveBrandVoice] B2 upload failed (saving anyway): ${uploadErr.message}`);
+    }
 
-    updateFields.b2Key = b2Key;
     Object.assign(brandVoice, updateFields);
     await brandVoice.save();
 

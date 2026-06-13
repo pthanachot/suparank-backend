@@ -607,6 +607,51 @@ const scoreTerms = async (req, res) => {
   }
 };
 
+// ─── POST /:contentNumber/import-url — fetch a page for content import ───
+// Proxies to the Go engine's /api/fetch-page, which fetches the URL
+// directly and falls back to the external fetch service (Scrappey) when the
+// page blocks plain HTTP. Returns the main content area as HTML; the editor
+// converts it to blocks client-side (htmlToBlocks).
+
+const importUrl = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+
+    const { url } = req.body;
+    if (!url || typeof url !== 'string' || !url.trim()) {
+      return res.status(400).json({ error: 'url is required' });
+    }
+
+    const engineRes = await fetch(`${ENGINE_URL}/api/fetch-page`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: url.trim() }),
+      // Scrappey fallback for protected pages can take a while.
+      signal: AbortSignal.timeout(95000),
+    });
+    const body = await engineRes.text();
+    if (!engineRes.ok) {
+      let message = 'Failed to fetch page';
+      try { message = JSON.parse(body).error || message; } catch { /* non-JSON upstream body */ }
+      console.error('importUrl engine error:', engineRes.status, body.slice(0, 200));
+      return res.status(engineRes.status === 400 ? 400 : 502).json({ error: message });
+    }
+    res.json(JSON.parse(body));
+  } catch (err) {
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      console.error('importUrl: engine timed out');
+      return res.status(504).json({ error: 'Page fetch timed out' });
+    }
+    if (err instanceof TypeError) {
+      console.error('importUrl: engine unreachable:', err.message);
+      return res.status(502).json({ error: 'Fetch service unavailable' });
+    }
+    console.error('importUrl error:', err.message);
+    res.status(500).json({ error: 'Failed to import page' });
+  }
+};
+
 // ─── POST /:contentNumber/readability-check — run AI readability check ───
 
 const readabilityCheck = async (req, res) => {
@@ -705,4 +750,4 @@ const regenerateOutline = async (req, res) => {
   }
 };
 
-module.exports = { triggerAnalysis, getBenchmark, reanalyze, runAnalysis, computeScore, scoreTerms, readabilityCheck, regenerateOutline };
+module.exports = { triggerAnalysis, getBenchmark, reanalyze, runAnalysis, computeScore, scoreTerms, importUrl, readabilityCheck, regenerateOutline };

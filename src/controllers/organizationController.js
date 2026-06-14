@@ -5,6 +5,7 @@ const Subscription = require('../models/Subscription');
 const User = require('../models/User');
 const tierService = require('../services/tierService');
 const creditService = require('../services/creditService');
+const { ensureUserHasOrg } = require('../services/orgBootstrapService');
 const { ORG_CONFIG } = require('../scripts/configOrganization');
 
 // ─── LIST ORGANIZATIONS ──────────────────────────────────────
@@ -13,13 +14,22 @@ const { ORG_CONFIG } = require('../scripts/configOrganization');
 const listOrganizations = async (req, res) => {
   try {
     // Orgs user owns
-    const ownedOrgs = await Organization.find({ ownerId: req.user.userId }).lean();
+    let ownedOrgs = await Organization.find({ ownerId: req.user.userId }).lean();
 
     // Orgs user is a member of
     const memberships = await OrgMember.find({
       userId: req.user.userId,
       status: 'active',
     }).lean();
+
+    // Self-heal: this list drives the frontend's "needs org" guard. If the user
+    // has none (legacy account, or a signup whose bootstrap failed), provision a
+    // default org now so they never hit the org-creation dead-end. Idempotent.
+    if (ownedOrgs.length === 0 && memberships.length === 0) {
+      const userDoc = await User.findById(req.user.userId).select('profile').lean();
+      await ensureUserHasOrg({ _id: req.user.userId, profile: userDoc?.profile });
+      ownedOrgs = await Organization.find({ ownerId: req.user.userId }).lean();
+    }
     const memberOrgIds = memberships.map((m) => m.organizationId);
     const memberOrgs = memberOrgIds.length
       ? await Organization.find({ _id: { $in: memberOrgIds } }).lean()

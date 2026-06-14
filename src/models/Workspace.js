@@ -43,18 +43,22 @@ workspaceSchema.index({ userId: 1, name: 1 }, { unique: true });
 workspaceSchema.index({ userId: 1, isDefault: 1 });
 workspaceSchema.index({ 'members.userId': 1 });
 
-// Generate random 6-digit workspace number (100000–999999)
-workspaceSchema.statics.getNextNumber = async function () {
+// Generate random 6-digit workspace number (100000–999999).
+// Accepts an optional Mongoose session so callers inside a transaction read
+// their own writes consistently. NOTE: this only proposes a free number — the
+// unique index on workspaceNumber is the real guard, so callers that create
+// concurrently must retry on a duplicate-key (11000) collision.
+workspaceSchema.statics.getNextNumber = async function (session = null) {
   for (let i = 0; i < 10; i++) {
     const num = Math.floor(100000 + Math.random() * 900000);
-    const exists = await this.findOne({ workspaceNumber: num });
+    const exists = await this.findOne({ workspaceNumber: num }).session(session);
     if (!exists) return num;
   }
   // Extremely unlikely fallback: use counter
   const counter = await Counter.findByIdAndUpdate(
     'workspaceNumber',
     { $inc: { seq: 1 } },
-    { new: true, upsert: true }
+    { new: true, upsert: true, session }
   );
   return counter.seq + 100000;
 };

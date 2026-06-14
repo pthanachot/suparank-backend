@@ -12,6 +12,7 @@ const { sendEmail, sendVerificationCodeEmail, sendPasswordResetCodeEmail } = req
 const { verifyGoogleToken } = require('../middleware/auth');
 const creditService = require('../services/creditService');
 const tierService = require('../services/tierService');
+const { bootstrapNewUser, ensureUserHasOrg } = require('../services/orgBootstrapService');
 
 // Helper: is onboarding considered done (completed, skipped, or pre-existing user)?
 // Mongoose applies defaults for inline subdocs, so user.onboarding always exists in memory.
@@ -42,41 +43,9 @@ function generateCode() {
   return crypto.randomInt(100000, 1000000).toString();
 }
 
-// Helper: auto-create a default organization + workspace for a newly registered user
-// so they can land in the workspace immediately after registration/onboarding.
-async function bootstrapNewUser(userId, displayName) {
-  const orgName = displayName ? `${displayName}'s Organization` : 'My Organization';
-  const slug = await Organization.generateSlug(orgName, userId);
-  const org = await Organization.create({
-    name: orgName,
-    slug,
-    ownerId: userId,
-    isPersonal: false,
-  });
-
-  const workspaceNumber = await Workspace.getNextNumber();
-  const workspace = await Workspace.create({
-    workspaceNumber,
-    name: 'My Workspace',
-    userId,
-    organizationId: org._id,
-    isDefault: true,
-  });
-
-  await User.findByIdAndUpdate(userId, { activeWorkspaceId: workspace._id });
-
-  // Grant free credits to the org (idempotent — no-op if already granted on signup)
-  try {
-    const { config } = await tierService.getOrgTierConfig(org._id);
-    if (config?.creditsPerMonth) {
-      await creditService.grantFreeCreditsIfNew(userId, config.creditsPerMonth);
-    }
-  } catch (err) {
-    console.error(`[bootstrap] org credit grant failed user=${userId}:`, err.message);
-  }
-
-  return { org, workspace };
-}
+// Default org + workspace provisioning lives in orgBootstrapService:
+//   bootstrapNewUser  — atomic create on signup
+//   ensureUserHasOrg  — idempotent self-heal on login / org list
 
 // ─── EMAIL SIGNUP ───────────────────────────────────────────────
 
@@ -226,6 +195,10 @@ const emailLogin = async (req, res) => {
 
     await user.registerLoginAttempt(true);
 
+    // Self-heal: guarantee the user has an org (covers legacy / failed-bootstrap
+    // accounts). No-op when they already have one.
+    const healed = await ensureUserHasOrg(user);
+
     const session = await Session.create({
       userId: user._id,
       userAgent: req.headers['user-agent'],
@@ -245,7 +218,7 @@ const emailLogin = async (req, res) => {
         emailNotifications: user.preferences?.emailNotifications ?? true,
         verified: user.verified,
         connectedProviders: user.getConnectedProviders(),
-        activeWorkspaceId: user.activeWorkspaceId || null,
+        activeWorkspaceId: healed?.workspace?._id || user.activeWorkspaceId || null,
         onboardingCompleted: isOnboardingDone(user),
       },
       ...tokens,
@@ -585,6 +558,7 @@ const googleAuth = async (req, res) => {
 
     let isNewUser = false;
     let bootstrapResult = null;
+    let healedResult = null;
 
     if (user) {
       // Update Google account info
@@ -605,6 +579,10 @@ const googleAuth = async (req, res) => {
       }
       user.verified = true;
       await user.save();
+
+      // Self-heal: guarantee an existing Google user has an org (legacy /
+      // failed-bootstrap accounts). No-op when they already have one.
+      healedResult = await ensureUserHasOrg(user);
     } else {
       // Create new user
       isNewUser = true;
@@ -656,7 +634,7 @@ const googleAuth = async (req, res) => {
         emailNotifications: user.preferences?.emailNotifications ?? true,
         verified: user.verified,
         connectedProviders: user.getConnectedProviders(),
-        activeWorkspaceId: bootstrapResult?.workspace?._id || user.activeWorkspaceId || null,
+        activeWorkspaceId: bootstrapResult?.workspace?._id || healedResult?.workspace?._id || user.activeWorkspaceId || null,
         onboardingCompleted: isOnboardingDone(user),
       },
       ...tokens,

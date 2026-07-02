@@ -12,6 +12,7 @@
 const Workspace = require('../models/Workspace');
 const Organization = require('../models/Organization');
 const OrgMember = require('../models/OrgMember');
+const WorkspaceMember = require('../models/WorkspaceMember');
 const Permission = require('../models/Permission');
 const FeatureFlag = require('../models/FeatureFlag');
 const Subscription = require('../models/Subscription');
@@ -68,8 +69,12 @@ function _meetsMinimumPlan(userPlanId, minimumPlan) {
 // Replaces the inline resolveWorkspace() from contentController.js.
 //
 // 1. Finds workspace by req.params.workspaceNumber
-// 2. workspace.userId === req.user.userId → role = 'owner'
-// 3. If workspace.organizationId → check OrgMember by org
+// 2. Org workspace: org owner → 'owner';
+//    OrgMember accessScope 'all'      → org-wide role;
+//    OrgMember accessScope 'assigned' → WorkspaceMember role for THIS
+//    workspace, or 403 (no fall-through to legacy paths — an assigned
+//    member's access is exactly their grants, nothing more)
+// 3. Personal workspace (no org): creator → 'owner'
 // 4. Fallback: OrgMember.findMembership(workspace.userId, req.user.userId)
 // 5. Legacy fallback: Workspace.members[] array → 'editor'
 // 6. Sets req.workspace + req.workspaceRole, or 403
@@ -106,6 +111,25 @@ const resolveWorkspaceWithRole = async (req, res, next) => {
           req.user.userId
         );
         if (membership) {
+          if (membership.accessScope === 'assigned') {
+            // Scoped member: role comes from the per-workspace grant.
+            // No grant for this workspace = no access — deliberately do
+            // NOT fall through to the legacy paths below, which could
+            // silently widen a scoped member's access.
+            const wsMembership = await WorkspaceMember.findMembership(
+              workspace._id,
+              req.user.userId
+            );
+            if (wsMembership) {
+              req.workspace = workspace;
+              req.workspaceRole = wsMembership.role;
+              return next();
+            }
+            return res
+              .status(403)
+              .json({ error: 'You do not have access to this workspace' });
+          }
+          // accessScope 'all' (default): org-wide role, legacy behavior
           req.workspace = workspace;
           req.workspaceRole = membership.role;
           return next();

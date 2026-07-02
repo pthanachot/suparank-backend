@@ -12,6 +12,7 @@ const creditService = require('../services/creditService');
 const { getPlanFromPriceId, EXTRA_SEAT_PRICE_SET } = require('../config/stripePrices');
 const { applyCustomTemplate } = require('./emailPortalController');
 const { sendEmail } = require('../utils/emailService');
+const { getSettings } = require('../services/systemSettingsService');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -38,6 +39,7 @@ function formatEmailDate(d) {
 // emailNotifications preference and skips if template resolution fails.
 async function notifyOrgOwner(organizationId, triggerId, data) {
   try {
+    if (getSettings().emailNotificationsEnabled === false) return;
     const org = await Organization.findById(organizationId).lean();
     const owner = org?.ownerId ? await User.findById(org.ownerId).lean() : null;
     if (!owner?.email || owner.preferences?.emailNotifications === false) return;
@@ -383,30 +385,12 @@ async function handleSubscriptionDeleted(stripeSub) {
     console.error(`[usage] Failed to reset counters for org=${sub.organizationId}:`, err.message);
   }
 
-  // Send cancellation email via triggerable template
-  try {
-    const org = await Organization.findById(sub.organizationId).lean();
-    const owner = org?.ownerId ? await User.findById(org.ownerId).lean() : null;
-    if (owner?.email && owner.preferences?.emailNotifications !== false) {
-      const planName = sub.planId ? sub.planId.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()) : 'Your Plan';
-      const endDate = sub.currentPeriodEnd
-        ? new Date(sub.currentPeriodEnd).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
-        : 'N/A';
-      const emailOptions = {
-        to: owner.email,
-        data: {
-          userName: owner.profile?.name || 'there',
-          planName,
-          endDate,
-        },
-      };
-      await applyCustomTemplate('subscription_canceled', emailOptions);
-      await sendEmail(emailOptions);
-      console.log(`[email] Cancellation email sent to ${owner.email} for org=${sub.organizationId}`);
-    }
-  } catch (err) {
-    console.error(`[email] Failed to send cancellation email for org=${sub.organizationId}:`, err.message);
-  }
+  // Cancellation email via triggerable template — notifyOrgOwner handles the
+  // kill-switch, owner lookup, opt-out check, and never throws.
+  await notifyOrgOwner(sub.organizationId, 'subscription_canceled', {
+    planName: formatPlanName(sub.planId),
+    endDate: formatEmailDate(sub.currentPeriodEnd),
+  });
 
   // Auto-delete user account if they requested deletion while subscription was active
   try {
@@ -480,14 +464,17 @@ async function handlePaymentSucceeded(invoice) {
     }
   }
 
-  // Payment confirmation email via triggerable template
-  await notifyOrgOwner(sub.organizationId, 'payment_confirmation', {
-    planName: formatPlanName(sub.planId),
-    amount: `$${((invoice.amount_paid || 0) / 100).toFixed(2)} ${(invoice.currency || 'usd').toUpperCase()}`,
-    nextBillingDate: formatEmailDate(
-      parseStripeDate(invoice.lines?.data?.[0]?.period?.end) || sub.currentPeriodEnd
-    ),
-  });
+  // Payment confirmation email via triggerable template. Skip $0 invoices
+  // (trials, 100% coupons, proration credit) — "you paid $0.00" reads as a bug.
+  if ((invoice.amount_paid || 0) > 0) {
+    await notifyOrgOwner(sub.organizationId, 'payment_confirmation', {
+      planName: formatPlanName(sub.planId),
+      amount: `$${(invoice.amount_paid / 100).toFixed(2)} ${(invoice.currency || 'usd').toUpperCase()}`,
+      nextBillingDate: formatEmailDate(
+        parseStripeDate(invoice.lines?.data?.[0]?.period?.end) || sub.currentPeriodEnd
+      ),
+    });
+  }
 
   console.log(`Invoice saved: ${invoice.id} for sub=${invoice.subscription}`);
 }

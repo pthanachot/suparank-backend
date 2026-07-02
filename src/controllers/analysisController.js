@@ -652,6 +652,64 @@ const importUrl = async (req, res) => {
   }
 };
 
+// ─── POST /:contentNumber/internal-links — suggest internal links ───
+// Assembles the internal-link inventory from the sitemap crawl
+// (buildAvailableLinks) server-side, then asks the Go engine to find where
+// each page's topic appears in the draft and propose an anchor + placement.
+// The draft sections come from the request (unsaved editor state).
+
+const internalLinks = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+
+    const { sections, max_suggestions } = req.body;
+    if (!Array.isArray(sections) || sections.length === 0) {
+      return res.status(400).json({ error: 'sections are required' });
+    }
+
+    const { benchmarkToContentBrief, buildAvailableLinks } = require('../services/benchmarkToContentBrief');
+    const brief = benchmarkToContentBrief(content);
+    const links = await buildAvailableLinks(
+      content.workspaceId || req.workspace._id,
+      brief.targetKeyword,
+      brief.secondaryKeywords,
+    );
+    // No completed sitemap crawl → no inventory → nothing to suggest.
+    if (!links.length) {
+      return res.json({ suggestions: [], count: 0, reason: 'no_sitemap' });
+    }
+
+    const engineRes = await fetch(`${ENGINE_URL}/api/internal-links`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sections,
+        links: links.map((l) => ({ url: l.url, title: l.title, relevance: l.relevance })),
+        max_suggestions: max_suggestions || undefined,
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+    const body = await engineRes.text();
+    if (!engineRes.ok) {
+      let message = 'Failed to suggest internal links';
+      try { message = JSON.parse(body).error || message; } catch { /* non-JSON */ }
+      console.error('internalLinks engine error:', engineRes.status, body.slice(0, 200));
+      return res.status(engineRes.status === 400 ? 400 : 502).json({ error: message });
+    }
+    res.json(JSON.parse(body));
+  } catch (err) {
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      return res.status(504).json({ error: 'Internal-link suggestion timed out' });
+    }
+    if (err instanceof TypeError) {
+      return res.status(502).json({ error: 'Engine unavailable' });
+    }
+    console.error('internalLinks error:', err.message);
+    res.status(500).json({ error: 'Failed to suggest internal links' });
+  }
+};
+
 // ─── POST /:contentNumber/readability-check — run AI readability check ───
 
 const readabilityCheck = async (req, res) => {
@@ -750,4 +808,4 @@ const regenerateOutline = async (req, res) => {
   }
 };
 
-module.exports = { triggerAnalysis, getBenchmark, reanalyze, runAnalysis, computeScore, scoreTerms, importUrl, readabilityCheck, regenerateOutline };
+module.exports = { triggerAnalysis, getBenchmark, reanalyze, runAnalysis, computeScore, scoreTerms, importUrl, internalLinks, readabilityCheck, regenerateOutline };

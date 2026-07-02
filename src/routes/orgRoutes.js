@@ -28,6 +28,8 @@ router.get('/credits/history', creditController.getCreditHistory);
 router.get('/organizations/:orgId/members', orgMemberController.listMembers);
 router.post('/organizations/:orgId/members', orgMemberController.inviteMember);
 router.put('/organizations/:orgId/members/:memberId/role', rejectIfLocked(OrgMember, 'memberId'), orgMemberController.changeRole);
+router.put('/organizations/:orgId/members/:memberId/scope', rejectIfLocked(OrgMember, 'memberId'), orgMemberController.updateMemberScope);
+router.put('/organizations/:orgId/members/:memberId/workspaces', rejectIfLocked(OrgMember, 'memberId'), orgMemberController.setMemberWorkspaces);
 router.delete('/organizations/:orgId/members/:memberId', orgMemberController.removeMember);
 router.post('/organizations/:orgId/transfer-ownership', orgMemberController.transferOwnership);
 router.post('/organizations/:orgId/leave', orgMemberController.leaveOrganization);

@@ -670,6 +670,8 @@ const LOW_BALANCE_FLOOR = 50; // fire below this many credits when tier has no m
 async function maybeNotifyLowBalance(orgId) {
   try {
     if (!orgId) return;
+    const { getSettings } = require('./systemSettingsService');
+    if (getSettings().emailNotificationsEnabled === false) return;
     const credit = await Credit.findOne({ organizationId: orgId });
     if (!credit || credit.lowBalanceNotifiedAt) return;
 

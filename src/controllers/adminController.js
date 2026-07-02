@@ -45,9 +45,12 @@ const userLookup = async (req, res) => {
       return res.status(403).json({ valid: false, error: 'User account not active' });
     }
 
-    // Check admin email list
+    // Check admin email list — union of env var and DB-managed settings list
+    const { getSettings } = require('../services/systemSettingsService');
     const adminEmails = (process.env.ADMIN_EMAILS || '').split(',').map((e) => e.trim().toLowerCase());
-    const isAdmin = adminEmails.includes(user.email.toLowerCase());
+    const dbAdminEmails = (getSettings().adminEmails || []).map((e) => String(e).toLowerCase());
+    const isAdmin =
+      adminEmails.includes(user.email.toLowerCase()) || dbAdminEmails.includes(user.email.toLowerCase());
 
     // Also check roles array
     const hasAdminRole =
@@ -657,6 +660,7 @@ const manageOrgCredits = async (req, res) => {
       credit[field] = amount;
     }
 
+    if (action !== 'subtract') credit.lowBalanceNotifiedAt = null; // re-arm credits_low
     await credit.save();
 
     await CreditTransaction.logTransaction({
@@ -1455,6 +1459,7 @@ const bulkManageCredits = async (req, res) => {
           if (operation === 'add') credit[field] += amount;
           else if (operation === 'subtract') credit[field] = Math.max(0, credit[field] - amount);
           else if (operation === 'set') credit[field] = amount;
+          if (operation !== 'subtract') credit.lowBalanceNotifiedAt = null; // re-arm credits_low
           await credit.save();
           await CreditTransaction.logTransaction({
             orgId: targetId, userId: null,

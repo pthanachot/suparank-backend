@@ -3,6 +3,7 @@ const Workspace = require('../models/Workspace');
 const Organization = require('../models/Organization');
 const User = require('../models/User');
 const OrgMember = require('../models/OrgMember');
+const WorkspaceMember = require('../models/WorkspaceMember');
 const tierService = require('../services/tierService');
 const creditService = require('../services/creditService');
 
@@ -83,12 +84,19 @@ const listWorkspaces = async (req, res) => {
       status: 'active',
     }).lean();
 
-    // Build role lookup: organizationId → role, ownerId → role
+    // Build role lookup: organizationId → role, ownerId → role.
+    // accessScope 'assigned' members do NOT get org-wide visibility —
+    // their workspaces come exclusively from WorkspaceMember grants.
     const roleByOrg = {};
     const roleByOwner = {};
-    const memberOrgIds = [];
+    const memberOrgIds = []; // 'all'-scope org memberships only
     const memberOwnerIds = [];
+    const assignedOrgIds = [];
     for (const m of memberships) {
+      if (m.accessScope === 'assigned') {
+        if (m.organizationId) assignedOrgIds.push(m.organizationId);
+        continue;
+      }
       if (m.organizationId) {
         roleByOrg[m.organizationId.toString()] = m.role;
         memberOrgIds.push(m.organizationId);
@@ -97,16 +105,35 @@ const listWorkspaces = async (req, res) => {
       memberOwnerIds.push(m.ownerId);
     }
 
+    // Per-workspace grants for 'assigned'-scope memberships
+    const grants = assignedOrgIds.length
+      ? await WorkspaceMember.find({
+          organizationId: { $in: assignedOrgIds },
+          userId: req.user.userId,
+          status: 'active',
+          locked: { $ne: true },
+        })
+          .select('workspaceId role')
+          .lean()
+      : [];
+    const roleByWorkspaceId = {};
+    const grantedWorkspaceIds = grants.map((g) => {
+      roleByWorkspaceId[g.workspaceId.toString()] = g.role;
+      return g.workspaceId;
+    });
+
     // Orgs the user owns (for workspaces belonging to those orgs)
     const ownedOrgs = await Organization.find({ ownerId: req.user.userId }).select('_id').lean();
     const ownedOrgIds = ownedOrgs.map((o) => o._id);
 
-    // Query workspaces: own + org-owned + org-member + owner-member + legacy
+    // Query workspaces: own + org-owned + org-member (all-scope) +
+    // granted (assigned-scope) + owner-member + legacy
     const workspaces = await Workspace.find({
       $or: [
         { userId: req.user.userId },
         { organizationId: { $in: ownedOrgIds } },
         { organizationId: { $in: memberOrgIds } },
+        { _id: { $in: grantedWorkspaceIds } },
         { userId: { $in: memberOwnerIds } },
         { 'members.userId': req.user.userId }, // legacy fallback
       ],
@@ -132,7 +159,10 @@ const listWorkspaces = async (req, res) => {
         if (ownedOrgIds.some((id) => id.equals(ws.organizationId))) {
           return { ...ws, role: 'owner' };
         }
-        // Org member
+        // Assigned-scope member: role from the per-workspace grant
+        const grantRole = roleByWorkspaceId[ws._id.toString()];
+        if (grantRole) return { ...ws, role: grantRole };
+        // Org member ('all' scope)
         const orgRole = roleByOrg[ws.organizationId.toString()];
         if (orgRole) return { ...ws, role: orgRole };
       }

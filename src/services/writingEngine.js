@@ -13,13 +13,28 @@
 const WRITING_ENGINE_URL = process.env.WRITING_ENGINE_URL || 'http://localhost:8090';
 
 /**
+ * Standard headers for engine calls. The engine authenticates callers with
+ * a shared internal key (X-Internal-Key ← ENGINE_INTERNAL_KEY) and rejects
+ * requests without it — see writing-engine internal auth middleware.
+ */
+function engineHeaders(extra = {}) {
+  return {
+    'Content-Type': 'application/json',
+    ...(process.env.ENGINE_INTERNAL_KEY && {
+      'X-Internal-Key': process.env.ENGINE_INTERNAL_KEY,
+    }),
+    ...extra,
+  };
+}
+
+/**
  * Create a new Writing Engine session.
  * @returns {Promise<string>} sessionId
  */
 async function createSession(signal) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: engineHeaders(),
     signal,
   });
   if (!res.ok) {
@@ -37,7 +52,7 @@ async function createSession(signal) {
 async function pushDocument(sessionId, markdownContent, signal) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/document`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: engineHeaders(),
     body: JSON.stringify({ content: markdownContent }),
     signal,
   });
@@ -55,7 +70,7 @@ async function pushBrief(sessionId, brief) {
   if (!brief || !brief.targetKeyword) return;
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/brief`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: engineHeaders(),
     body: JSON.stringify(brief),
   });
   if (!res.ok) {
@@ -72,7 +87,7 @@ async function pushBrandVoice(sessionId, markdownContent) {
   if (!markdownContent) return;
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/brand-voice`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: engineHeaders(),
     body: JSON.stringify({ content: markdownContent }),
   });
   if (!res.ok) {
@@ -94,7 +109,7 @@ async function pushBrandVoice(sessionId, markdownContent) {
 async function pushImageStyle(sessionId, style) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/image-style`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: engineHeaders(),
     body: JSON.stringify({ style: style || '' }),
   });
   if (!res.ok) {
@@ -119,7 +134,7 @@ async function pushImageStyle(sessionId, style) {
 async function sendChatMessageStream(sessionId, prompt, signal) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/chat`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: engineHeaders(),
     body: JSON.stringify({ prompt }),
     signal,
   });
@@ -152,7 +167,7 @@ async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5, 
   }
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/agent`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: engineHeaders(),
     body: JSON.stringify(payload),
     signal,
   });
@@ -175,7 +190,7 @@ async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5, 
 async function generateImage(sessionId, { description, format, style }) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/generate-image`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: engineHeaders(),
     body: JSON.stringify({ description, format, style }),
     signal: AbortSignal.timeout(60000),
   });
@@ -209,7 +224,7 @@ async function pushMode(sessionId, mode, allowedTools) {
   }
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/mode`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: engineHeaders(),
     body: JSON.stringify(body),
   });
   if (!res.ok) {
@@ -231,7 +246,7 @@ async function pushPlan(sessionId, plan) {
   const payload = plan == null ? 'null' : JSON.stringify(plan);
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/plan`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: engineHeaders(),
     body: payload,
   });
   if (!res.ok) {
@@ -249,7 +264,7 @@ async function pushPlan(sessionId, plan) {
 async function pushCFSConfig(sessionId, { baseUrl, apiKey, workspaceNumber, contentNumber }) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/cfs`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: engineHeaders(),
     body: JSON.stringify({ baseUrl, apiKey, workspaceNumber, contentNumber }),
   });
   if (!res.ok) {
@@ -267,7 +282,7 @@ async function pushCFSConfig(sessionId, { baseUrl, apiKey, workspaceNumber, cont
 async function generateFastPlan(sessionId, { brief, outline, indexSummary }) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/fast-plan`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: engineHeaders(),
     body: JSON.stringify({ brief, outline, indexSummary }),
   });
   if (!res.ok) {
@@ -284,7 +299,7 @@ async function generateFastPlan(sessionId, { brief, outline, indexSummary }) {
 async function listSkills() {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/skills`, {
     method: 'GET',
-    headers: { 'Accept': 'application/json' },
+    headers: engineHeaders({ Accept: 'application/json' }),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -304,7 +319,7 @@ async function listSkills() {
 async function submitClarifyAnswer(sessionId, answer) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/clarify-answer`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: engineHeaders(),
     body: JSON.stringify({ answer }),
   });
   if (!res.ok) {
@@ -325,7 +340,7 @@ async function pushContextFiles(sessionId, files) {
   if (!files || Object.keys(files).length === 0) return;
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/context-files`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: engineHeaders(),
     body: JSON.stringify({ files }),
   });
   if (!res.ok) {
@@ -342,7 +357,7 @@ async function pushContextFiles(sessionId, files) {
 async function submitPlanConfirm(sessionId, response) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/plan-confirm`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: engineHeaders(),
     body: JSON.stringify(response),
   });
   if (!res.ok) {
@@ -361,7 +376,7 @@ async function submitPlanConfirm(sessionId, response) {
 async function submitToolConfirm(sessionId, action) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/tool-confirm`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: engineHeaders(),
     body: JSON.stringify({ action }),
   });
   if (!res.ok) {
@@ -390,4 +405,5 @@ module.exports = {
   submitPlanConfirm,
   submitToolConfirm,
   WRITING_ENGINE_URL,
+  engineHeaders,
 };

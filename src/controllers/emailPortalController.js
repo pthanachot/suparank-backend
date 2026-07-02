@@ -412,6 +412,13 @@ const getSubscribedUsers = async (req, res) => {
 
 const sendBulkEmails = async (req, res) => {
   try {
+    const { getSettings } = require('../services/systemSettingsService');
+    if (getSettings().emailNotificationsEnabled === false) {
+      return res.status(409).json({
+        error: 'Email notifications are disabled in system settings. Enable them in Settings before sending.',
+      });
+    }
+
     const { subject, htmlContent, recipients, fromName, replyTo } = req.body;
 
     if (!subject || !htmlContent || !recipients?.length) {
@@ -693,4 +700,7 @@ module.exports = {
   getDefaultTemplate,
   updateDefaultTemplate,
   applyCustomTemplate,
+  // Exported for tests: template/variable contract verification
+  SYSTEM_TRIGGERS,
+  ORIGINAL_DEFAULT_TEMPLATES,
 };

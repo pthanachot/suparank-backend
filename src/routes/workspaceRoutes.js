@@ -46,10 +46,12 @@ router.get('/:workspaceNumber/content/:contentNumber/benchmark', rwr, rf('analys
 
 // Internal-link inventory (same list pushed to the writing engine as brief.availableLinks)
 router.get('/:workspaceNumber/content/:contentNumber/available-links', rwr, rp('content', 'read'), contentController.getAvailableLinks);
+router.get('/:workspaceNumber/content/:contentNumber/movement', rwr, rp('content', 'read'), contentController.getMovement);
 router.post('/:workspaceNumber/content/:contentNumber/reanalyze', rwr, rf('analysis'), rp('analysis', 'use'), analysisController.reanalyze);
 router.post('/:workspaceNumber/content/:contentNumber/score', rwr, rf('analysis'), rp('analysis', 'use'), analysisController.computeScore);
 router.post('/:workspaceNumber/content/:contentNumber/score-terms', rwr, rf('analysis'), rp('analysis', 'use'), analysisController.scoreTerms);
 router.post('/:workspaceNumber/content/:contentNumber/import-url', rwr, rp('content', 'update'), analysisController.importUrl);
+router.post('/:workspaceNumber/content/:contentNumber/internal-links', rwr, rp('analysis', 'use'), analysisController.internalLinks);
 router.post('/:workspaceNumber/content/:contentNumber/readability-check', rwr, rf('analysis'), rp('analysis', 'use'), analysisController.readabilityCheck);
 router.post('/:workspaceNumber/content/:contentNumber/regenerate-outline', rwr, rf('analysis'), rp('analysis', 'use'), analysisController.regenerateOutline);
 

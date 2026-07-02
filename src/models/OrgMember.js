@@ -40,6 +40,14 @@ const orgMemberSchema = new mongoose.Schema(
       enum: ['active', 'pending'],
       default: 'active',
     },
+    accessScope: {
+      type: String,
+      enum: ['all', 'assigned'],
+      default: 'all',
+      // 'all'      — role applies to every workspace in the org (legacy behavior)
+      // 'assigned' — access only to workspaces with a WorkspaceMember row;
+      //              the per-workspace role comes from that row, not this one.
+    },
     invitedAt: { type: Date, default: Date.now },
 
     // Downgrade locking — locked members are suspended until the org upgrades

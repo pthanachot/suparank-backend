@@ -5,18 +5,27 @@ const { authenticateToken } = require('../middleware/auth');
 const adminController = require('../controllers/adminController');
 const emailPortalController = require('../controllers/emailPortalController');
 const feedbackController = require('../controllers/feedbackController');
+const adminSettingsController = require('../controllers/adminSettingsController');
+const adminSessionsController = require('../controllers/adminSessionsController');
+const adminBackupsController = require('../controllers/adminBackupsController');
+const { getSettings } = require('../services/systemSettingsService');
 
 // ─── Admin email validation middleware ──────────────────────
+// Admin = union of the ADMIN_EMAILS env var (locked safety floor) and the
+// DB-managed SystemSettings.adminEmails list (editable in the dashboard).
+// Reads the settings cache — synchronous, no DB hit on the request path.
+// Deliberately ignores req.user.roles: JWT claims are stale until re-login.
 
 function validateAdmin(req, res, next) {
-  const adminEmails = (process.env.ADMIN_EMAILS || '')
+  const envAdmins = (process.env.ADMIN_EMAILS || '')
     .split(',')
     .map((e) => e.trim().toLowerCase())
     .filter(Boolean);
+  const dbAdmins = (getSettings().adminEmails || []).map((e) => String(e).toLowerCase());
 
   const userEmail = req.user?.email?.toLowerCase();
 
-  if (!userEmail || !adminEmails.includes(userEmail)) {
+  if (!userEmail || (!envAdmins.includes(userEmail) && !dbAdmins.includes(userEmail))) {
     return res.status(403).json({ error: 'Admin access required' });
   }
 
@@ -30,6 +39,16 @@ const adminMiddleware = [authenticateToken, validateAdmin];
 
 router.post('/user-lookup', authenticateToken, adminController.userLookup);
 router.get('/stats', adminMiddleware, adminController.getDashboardStats);
+router.get('/settings', adminMiddleware, adminSettingsController.getSystemSettings);
+router.put('/settings', adminMiddleware, adminSettingsController.updateSystemSettings);
+router.get('/settings/admins', adminMiddleware, adminSettingsController.listAdmins);
+router.post('/settings/admins', adminMiddleware, adminSettingsController.addAdmin);
+router.delete('/settings/admins/:email', adminMiddleware, adminSettingsController.removeAdmin);
+router.get('/backups', adminMiddleware, adminBackupsController.getBackups);
+router.post('/backups/run', adminMiddleware, adminBackupsController.runBackupNow);
+router.get('/sessions', adminMiddleware, adminSessionsController.listSessions);
+router.delete('/sessions/:sessionId', adminMiddleware, adminSessionsController.revokeSession);
+router.post('/users/:userId/revoke-sessions', adminMiddleware, adminSessionsController.revokeAllUserSessions);
 router.get('/users', adminMiddleware, adminController.getUsers);
 router.get('/subscriptions/stats', adminMiddleware, adminController.getSubscriptionStats);
 router.get('/subscriptions', adminMiddleware, adminController.getSubscriptions);

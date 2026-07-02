@@ -139,6 +139,19 @@ const contentSchema = new mongoose.Schema(
       default: [],
       validate: [arr => arr.length <= 5, 'Maximum 5 keywords allowed'],
     },
+    // The existing page being optimized, when this content was started from a
+    // GSC striking-distance opportunity ("improve /blog/x that ranks #12").
+    // Lets the editor show/import the target page so the user improves it
+    // rather than creating a second page that competes with their own.
+    targetPageUrl: { type: String, default: '' },
+    // Position snapshot when this draft was started from a GSC
+    // striking-distance opportunity — lets us show how far the page moved.
+    strikingSnapshot: {
+      positionAtStart: { type: Number, default: null },
+      siteId: { type: mongoose.Schema.Types.ObjectId, ref: 'Site', default: null },
+      dateRange: { type: String, default: '' },
+      snapshotAt: { type: Date, default: null },
+    },
     country: { type: String, default: '' },
     device: { type: String, enum: ['desktop', 'mobile', ''], default: '' },
     score: { type: Number, default: 0, min: 0, max: 100 },

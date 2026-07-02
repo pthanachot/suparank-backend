@@ -10,6 +10,7 @@ const { generateTokens, generateAccessToken, generateRefreshToken } = require('.
 const ResetToken = require('../models/ResetToken');
 const { sendEmail, sendVerificationCodeEmail, sendPasswordResetCodeEmail } = require('../utils/emailService');
 const { applyCustomTemplate } = require('./emailPortalController');
+const { getSettings } = require('../services/systemSettingsService');
 const { verifyGoogleToken } = require('../middleware/auth');
 const creditService = require('../services/creditService');
 const tierService = require('../services/tierService');
@@ -53,6 +54,7 @@ function generateCode() {
 // verification, or Google auth). Fire-and-forget — never blocks the flow.
 const sendWelcomeEmail = async (user) => {
   try {
+    if (getSettings().emailNotificationsEnabled === false) return;
     if (user.preferences?.emailNotifications === false) return;
     const emailOptions = {
       to: user.email,

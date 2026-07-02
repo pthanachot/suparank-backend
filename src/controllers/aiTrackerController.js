@@ -1426,7 +1426,10 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
         console.log(`[ai-tracker-scan] skipping email for tracker ${trackerId}: no ownerId (userId=${userId}, ws.userId=${ws?.userId})`);
       } else {
         const owner = await User.findById(ownerId).select('email profile preferences').lean();
-        if (!owner) {
+        const { getSettings } = require('../services/systemSettingsService');
+        if (getSettings().emailNotificationsEnabled === false) {
+          console.log(`[ai-tracker-scan] skipping email for tracker ${trackerId}: email notifications disabled system-wide`);
+        } else if (!owner) {
           console.log(`[ai-tracker-scan] skipping email for tracker ${trackerId}: user ${ownerId} not found`);
         } else if (!owner.email) {
           console.log(`[ai-tracker-scan] skipping email for tracker ${trackerId}: user ${ownerId} has no email`);

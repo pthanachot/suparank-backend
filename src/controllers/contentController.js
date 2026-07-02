@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const Content = require('../models/Content');
 const { runAnalysis } = require('./analysisController');
 const imageStorage = require('../services/imageStorage');
@@ -62,7 +63,7 @@ const createContent = async (req, res) => {
     const workspace = req.workspace;
 
     const contentNumber = await Content.getNextContentNumber();
-    const { title, slug, description, blocks, targetKeywords, country, device, score, wordCount, status, folder, platform, versions } = req.body;
+    const { title, slug, description, blocks, targetKeywords, targetPageUrl, strikingSnapshot, country, device, score, wordCount, status, folder, platform, versions } = req.body;
 
     // Determine plan tier at creation time.
     // Paid users can opt to use a free lifetime slot (quotaSource='free').
@@ -86,6 +87,10 @@ const createContent = async (req, res) => {
       description,
       blocks: blocks || [],
       targetKeywords: targetKeywords || [],
+      targetPageUrl: targetPageUrl || '',
+      strikingSnapshot: (strikingSnapshot && strikingSnapshot.positionAtStart != null)
+        ? { positionAtStart: strikingSnapshot.positionAtStart, siteId: strikingSnapshot.siteId || null, dateRange: strikingSnapshot.dateRange || '', snapshotAt: new Date() }
+        : undefined,
       country,
       device,
       score,
@@ -783,4 +788,58 @@ const getAvailableLinks = async (req, res) => {
   }
 };
 
-module.exports = { listContents, getContent, getAvailableLinks, createContent, updateContent, deleteContent, addComment, updateComment, deleteComment, runAudit, runWritingQualityAudit };
+// ─── GET /:contentNumber/movement — striking-distance outcome ───
+// For content started from a GSC striking-distance opportunity, re-pulls the
+// keyword's current position (same window) and reports the delta vs. start.
+const getMovement = async (req, res) => {
+  try {
+    const content = await Content.findByNumber(req.workspace._id, req.params.contentNumber);
+    if (!content) return res.status(404).json({ error: 'Content not found' });
+    // Consistent with getContent/getAvailableLinks — locked content leaks nothing.
+    if (content.locked) return res.status(403).json({ error: 'This content is locked.', locked: true });
+
+    const snap = content.strikingSnapshot;
+    // Guard against a missing/malformed siteId so a bad ref can't throw a
+    // CastError (500) — just report movement as unavailable.
+    if (!snap || snap.positionAtStart == null || !snap.siteId || !mongoose.Types.ObjectId.isValid(snap.siteId)) {
+      return res.json({ available: false });
+    }
+    const keyword = (content.targetKeywords || [])[0];
+    if (!keyword) return res.json({ available: false });
+
+    const Site = require('../models/Site');
+    const site = await Site.findOne({ _id: snap.siteId, workspaceId: req.workspace._id });
+    if (!site || site.locked) return res.json({ available: false });
+
+    const gscService = require('../services/gscService');
+    // Default to the short-lived cache — a 28-day average barely moves between
+    // opens, so an uncached GSC call on every editor open would waste quota.
+    // ?fresh=1 forces a live re-pull for an explicit refresh.
+    const fresh = req.query.fresh === '1';
+    let currentPosition = null;
+    try {
+      currentPosition = await gscService.getKeywordPosition(
+        req.workspace.organizationId, site.gscPropertyId, keyword, snap.dateRange || '28d',
+        { fresh, page: content.targetPageUrl || '' },
+      );
+    } catch (e) {
+      if (e.code === 'GSC_NOT_CONNECTED') return res.json({ available: false, reason: 'gsc_disconnected' });
+      throw e;
+    }
+
+    res.json({
+      available: true,
+      keyword,
+      positionAtStart: snap.positionAtStart,
+      currentPosition,
+      // Positive delta = improved (lower position is better).
+      delta: currentPosition != null ? +(snap.positionAtStart - currentPosition).toFixed(1) : null,
+      snapshotAt: snap.snapshotAt,
+    });
+  } catch (err) {
+    console.error('getMovement error:', err.message);
+    res.status(500).json({ error: 'Failed to compute movement' });
+  }
+};
+
+module.exports = { listContents, getContent, getAvailableLinks, getMovement, createContent, updateContent, deleteContent, addComment, updateComment, deleteComment, runAudit, runWritingQualityAudit };

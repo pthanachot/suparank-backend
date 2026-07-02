@@ -30,6 +30,14 @@ const ROLES = [
     description: 'Read-only access to content and workspaces.',
     isSystem: true,
   },
+  {
+    name: 'client',
+    displayName: 'Client',
+    level: 4,
+    description:
+      'External client access. Reads content, reports, and AI visibility for assigned workspaces only; can comment. No editing, AI usage, or team visibility.',
+    isSystem: true,
+  },
 ];
 
 async function syncRoles() {

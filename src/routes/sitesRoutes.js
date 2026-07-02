@@ -30,5 +30,6 @@ router.delete('/:workspaceNumber/sites/:siteId',       ...rwrSites, rp('sites', 
 router.get('/:workspaceNumber/sites/:siteId/overview',   ...rwrSites, rp('sites', 'read'), sitesController.getOverview);
 router.get('/:workspaceNumber/sites/:siteId/declining',  ...rwrSites, rp('sites', 'read'), sitesController.getDeclining);
 router.get('/:workspaceNumber/sites/:siteId/top-pages',  ...rwrSites, rp('sites', 'read'), sitesController.getTopPages);
+router.get('/:workspaceNumber/sites/:siteId/striking-distance', ...rwrSites, rp('sites', 'read'), sitesController.getStrikingDistance);
 
 module.exports = router;

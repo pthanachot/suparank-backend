@@ -31,6 +31,7 @@ require('./utils/requireEnv')({
 
 const { connectDB, checkConnectionHealth } = require('./config/database');
 const { syncConfig } = require('./scripts/configSync');
+const systemSettingsService = require('./services/systemSettingsService');
 
 const app = express();
 
@@ -90,6 +91,7 @@ connectDB()
     }
   })
   .then(() => syncConfig())
+  .then(() => systemSettingsService.loadSettings())
   .then(() => console.log('Database ready'))
   .catch((error) => {
     console.error('Failed to connect to database:', error.message);
@@ -114,6 +116,24 @@ app.use(cors(corsOptions));
 const { handleWebhook } = require('./controllers/webhookController');
 app.post('/api/billing/webhooks', express.raw({ type: 'application/json' }), handleWebhook);
 
+// Maintenance mode gate. Exemptions: /api/auth (admins must be able to log
+// in), /api/admin (the dashboard, including the toggle to turn this off),
+// /api/internal (server-to-server engine traffic), /health. Stripe webhooks
+// are mounted above this middleware so they bypass it entirely.
+app.use((req, res, next) => {
+  if (!systemSettingsService.getSettings().maintenanceMode) return next();
+  const url = req.originalUrl;
+  if (
+    url.startsWith('/api/auth') ||
+    url.startsWith('/api/admin') ||
+    url.startsWith('/api/internal') ||
+    url.startsWith('/health')
+  ) {
+    return next();
+  }
+  return res.status(503).json({ error: 'SupaRank is undergoing maintenance. Please try again shortly.' });
+});
+
 // Body parsing
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -126,14 +146,31 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Uses req.originalUrl (always the full pathname) rather than req.path
 // (which depends on Express's mount-stripping behavior). (Bug 4 from M2
 // second-round review.)
-const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: process.env.NODE_ENV === 'production' ? 100 : 1000,
-  standardHeaders: true,
-  legacyHeaders: false,
-  skip: (req) => req.originalUrl.startsWith('/api/internal/'),
+const ENV_DEFAULT_MAX = process.env.NODE_ENV === 'production' ? 100 : 1000;
+function buildApiLimiter() {
+  const rl = systemSettingsService.getSettings().rateLimit || {};
+  return rateLimit({
+    // windowMs is fixed at construction — express-rate-limit only re-evaluates
+    // `max` per request, so the limiter is rebuilt on settings change.
+    windowMs: rl.windowMs || 15 * 60 * 1000,
+    max: () => systemSettingsService.getSettings().rateLimit?.max || ENV_DEFAULT_MAX,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => req.originalUrl.startsWith('/api/internal/'),
+  });
+}
+let apiLimiter = buildApiLimiter();
+// Rebuild only when windowMs actually changes — `max` is already read
+// per-request, and every rebuild resets the in-memory hit counters, so
+// unrelated settings saves (email toggle, backup config) must not trigger it.
+let limiterWindowMs = systemSettingsService.getSettings().rateLimit?.windowMs ?? null;
+systemSettingsService.onSettingsChange((settings) => {
+  const nextWindowMs = settings.rateLimit?.windowMs ?? null;
+  if (nextWindowMs === limiterWindowMs) return;
+  limiterWindowMs = nextWindowMs;
+  apiLimiter = buildApiLimiter();
 });
-app.use('/api/', apiLimiter);
+app.use('/api/', (req, res, next) => apiLimiter(req, res, next));
 
 // Routes
 // Note: ObjectId param validation is installed inside each individual route

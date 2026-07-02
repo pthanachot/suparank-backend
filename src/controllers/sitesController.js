@@ -371,6 +371,32 @@ const getTopPages = async (req, res) => {
   }
 };
 
+
+const getStrikingDistance = async (req, res) => {
+  try {
+    if (!ensureValidObjectId(res, req.params.siteId, 'site id')) return;
+    const site = await Site.findOne({ _id: req.params.siteId, workspaceId: req.workspace._id });
+    if (!site) return res.status(404).json({ error: 'Site not found' });
+    if (site.locked) return res.status(403).json({ error: 'Site is locked. Reconnect the matching GSC account.', code: 'SITE_LOCKED' });
+
+    const dateRange = req.query.dateRange || '28d';
+    const fresh = req.query.fresh === '1';
+    const data = await gscService.getStrikingDistance(
+      req.workspace.organizationId,
+      site.gscPropertyId,
+      { dateRange, fresh },
+    );
+    res.json(data);
+  } catch (err) {
+    if (err.code === 'GSC_NOT_CONNECTED') {
+      return res.status(400).json({ error: 'GSC access revoked. Please reconnect.', code: 'GSC_REVOKED' });
+    }
+    if (handleMongooseError(res, err)) return;
+    console.error('getStrikingDistance error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch striking-distance keywords' });
+  }
+};
+
 module.exports = {
   getGscAuthUrl,
   handleGscCallback,
@@ -385,4 +411,5 @@ module.exports = {
   getOverview,
   getDeclining,
   getTopPages,
+  getStrikingDistance,
 };

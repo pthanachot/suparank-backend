@@ -161,7 +161,7 @@ RULES:
   const apiRes = await fetch(`${writingEngine.WRITING_ENGINE_URL}/api/rewrite`, {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
+      ...writingEngine.engineHeaders(),
       ...(process.env.REWRITE_SECRET && { 'X-Rewrite-Secret': process.env.REWRITE_SECRET }),
     },
     body: JSON.stringify({
@@ -264,7 +264,7 @@ async function generateOnePreview(markdownContent, userMessage, signal) {
   const response = await fetch(`${writingEngine.WRITING_ENGINE_URL}/api/rewrite`, {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
+      ...writingEngine.engineHeaders(),
       ...(process.env.REWRITE_SECRET && { 'X-Rewrite-Secret': process.env.REWRITE_SECRET }),
     },
     body: JSON.stringify({
@@ -941,7 +941,7 @@ Provide a concise style summary (max 200 words) that can be used to replicate th
         const response = await fetch(`${writingEngine.WRITING_ENGINE_URL}/api/rewrite`, {
           method: 'POST',
           headers: {
-            'Content-Type': 'application/json',
+            ...writingEngine.engineHeaders(),
             ...(process.env.REWRITE_SECRET && { 'X-Rewrite-Secret': process.env.REWRITE_SECRET }),
           },
           body: JSON.stringify({
@@ -1220,7 +1220,7 @@ Provide a concise style summary (max 200 words) that can be used to replicate th
         const response = await fetch(`${writingEngine.WRITING_ENGINE_URL}/api/rewrite`, {
           method: 'POST',
           headers: {
-            'Content-Type': 'application/json',
+            ...writingEngine.engineHeaders(),
             ...(process.env.REWRITE_SECRET && { 'X-Rewrite-Secret': process.env.REWRITE_SECRET }),
           },
           body: JSON.stringify({

@@ -385,6 +385,117 @@ async function getTopPages(orgId, siteUrl, dateRange) {
   return result;
 }
 
+// rankStrikingDistance is the pure filter/rank step for striking-distance
+// keywords. Given raw GSC ['query','page'] rows, it keeps those in the
+// position band with enough impressions, dedups to one row per query (best
+// ranking page), and ranks by opportunity = impressions × closeness, where
+// closeness rewards being nearer the top of the band (closer to page 1).
+// Exported for unit testing without a live GSC.
+function rankStrikingDistance(rows, opts = {}) {
+  const minPos = opts.minPos ?? 11;
+  const maxPos = opts.maxPos ?? 20;
+  const minImpressions = opts.minImpressions ?? 30;
+  const cap = opts.cap ?? 200;         // most opportunities shown in the worklist
+  const targetCTR = opts.targetCTR ?? 0.05; // assumed CTR if it reached top-5
+
+  // Filter to the band + minimum impressions.
+  const filtered = (rows || []).filter(
+    (r) => r && r.position >= minPos && r.position <= maxPos && r.impressions >= minImpressions,
+  );
+
+  // Dedup: one row per query, keeping the highest-impression ranking page.
+  const byQuery = new Map();
+  for (const r of filtered) {
+    const query = r.keys[0];
+    const existing = byQuery.get(query);
+    if (!existing || r.impressions > existing.impressions) byQuery.set(query, r);
+  }
+
+  const span = maxPos - minPos + 1;
+  const ranked = [];
+  for (const r of byQuery.values()) {
+    const position = +r.position.toFixed(1);
+    const closeness = (maxPos - position + 1) / span; // 1.0 at minPos → ~1/span at maxPos
+    ranked.push({
+      keyword: r.keys[0],
+      page: r.keys[1],
+      position,
+      impressions: r.impressions,
+      clicks: r.clicks,
+      ctr: +((r.ctr || 0) * 100).toFixed(1), // percent
+      opportunity: Math.round(r.impressions * closeness),
+      potentialClicks: Math.max(0, Math.round(r.impressions * targetCTR) - r.clicks),
+    });
+  }
+
+  ranked.sort((a, b) => b.opportunity - a.opportunity);
+
+  const truncated = ranked.length > cap;
+  return { rows: truncated ? ranked.slice(0, cap) : ranked, truncated };
+}
+
+// getStrikingDistance returns page-2 keyword opportunities for a site.
+async function getStrikingDistance(orgId, siteUrl, opts = {}) {
+  const dateRange = opts.dateRange || '28d';
+  const minPos = opts.minPos ?? 11;
+  const maxPos = opts.maxPos ?? 20;
+  const minImpressions = opts.minImpressions ?? 30;
+  const FETCH_LIMIT = 25000; // GSC per-request maximum
+
+  const cacheKey = `striking:${orgId}:${siteUrl}:${dateRange}:${minPos}-${maxPos}:${minImpressions}`;
+  if (!opts.fresh) {
+    const cached = cacheGet(cacheKey);
+    if (cached) return cached;
+  }
+
+  const { startDate, endDate } = parseDateRange(dateRange);
+  const data = await querySearchAnalytics(orgId, siteUrl, {
+    startDate,
+    endDate,
+    dimensions: ['query', 'page'],
+    rowLimit: FETCH_LIMIT,
+  });
+  const raw = data.rows || [];
+  // GSC returns rows by clicks desc; page-2 keywords have low clicks, so a
+  // site with more than FETCH_LIMIT query/page rows may hide some. Surface
+  // that rather than implying completeness.
+  const fetchTruncated = raw.length >= FETCH_LIMIT;
+
+  const { rows, truncated: rankTruncated } = rankStrikingDistance(raw, { minPos, maxPos, minImpressions });
+  const result = { rows, band: [minPos, maxPos], dateRange, truncated: fetchTruncated || rankTruncated };
+  cacheSet(cacheKey, result);
+  return result;
+}
+
+// getKeywordPosition returns the site's current average position for one
+// exact query over the window, or null if it doesn't rank there. Used by the
+// striking-distance movement check.
+async function getKeywordPosition(orgId, siteUrl, keyword, dateRange = '28d', opts = {}) {
+  const page = opts.page || '';
+  const cacheKey = `kwpos:${orgId}:${siteUrl}:${keyword}:${page}:${dateRange}`;
+  if (!opts.fresh) {
+    const cached = cacheGet(cacheKey);
+    if (cached !== null) return cached;
+  }
+  const { startDate, endDate } = parseDateRange(dateRange);
+  // Filter by query AND (when known) the specific ranking page, so the
+  // re-check is apples-to-apples with the snapshotted (query, page) position
+  // rather than the site's aggregate position across all pages.
+  const filters = [{ dimension: 'query', operator: 'equals', expression: keyword }];
+  if (page) filters.push({ dimension: 'page', operator: 'equals', expression: page });
+  const data = await querySearchAnalytics(orgId, siteUrl, {
+    startDate,
+    endDate,
+    dimensions: ['query'],
+    rowLimit: 1,
+    dimensionFilterGroups: [{ filters }],
+  });
+  const row = (data.rows || [])[0];
+  const position = row ? +row.position.toFixed(1) : null;
+  if (position !== null) cacheSet(cacheKey, position);
+  return position;
+}
+
 async function refreshSiteStats(siteId) {
   const site = await Site.findById(siteId);
   if (!site) return;
@@ -468,5 +579,8 @@ module.exports = {
   getOverviewData,
   getDecliningPages,
   getTopPages,
+  getStrikingDistance,
+  rankStrikingDistance,
+  getKeywordPosition,
   refreshSiteStats,
 };

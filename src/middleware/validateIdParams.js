@@ -50,14 +50,17 @@ const ID_PARAMS = [
   'sessionId',
   'subId',
   'triggerId',
-  'userId',
   'workspaceId',
 ];
 
-// Numeric-id route params (contentNumber, workspaceNumber). Smoke test
-// caught these returning 500 on non-numeric values because the controller
-// does Number(rawValue) → NaN → query throws somewhere downstream.
-const NUMERIC_PARAMS = ['contentNumber', 'workspaceNumber'];
+// Numeric-id route params. Smoke test caught these returning 500 on
+// non-numeric values because the controller does Number(rawValue) → NaN →
+// query throws somewhere downstream.
+// `userId` lives here, NOT in ID_PARAMS: every :userId route (all in
+// adminRoutes) looks up the numeric public userId via
+// `findOne({ userId: parseInt(...) })` — validating it as an ObjectId
+// rejected every real admin user operation with 400 "Invalid userId".
+const NUMERIC_PARAMS = ['contentNumber', 'workspaceNumber', 'userId'];
 
 function installIdValidators(router) {
   for (const name of ID_PARAMS) {

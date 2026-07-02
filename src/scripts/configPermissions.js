@@ -2,60 +2,62 @@ const Permission = require('../models/Permission');
 
 // ─── Permission matrix — SOURCE OF TRUTH ────────────────────────────
 // Synced to database on every server startup.
-// Format: [resource, action, owner, admin, editor, viewer]
+// Format: [resource, action, owner, admin, editor, viewer, client]
 // true = allowed, false = denied
+// 'client' = external agency-client access (white-label): read + comment
+// on assigned workspaces only; no editing, AI usage, or team visibility.
 
 const MATRIX = [
   // Workspace
-  ['workspace', 'create', true, true, false, false],
-  ['workspace', 'read', true, true, true, true],
-  ['workspace', 'delete', true, false, false, false],
+  ['workspace', 'create', true, true, false, false, false],
+  ['workspace', 'read', true, true, true, true, true],
+  ['workspace', 'delete', true, false, false, false, false],
 
   // Members
-  ['members', 'read', true, true, true, true],
-  ['members', 'manage', true, true, false, false],
-  ['members', 'changeRole', true, true, false, false],
+  ['members', 'read', true, true, true, true, false],
+  ['members', 'manage', true, true, false, false, false],
+  ['members', 'changeRole', true, true, false, false, false],
 
   // Content
-  ['content', 'read', true, true, true, true],
-  ['content', 'create', true, true, true, false],
-  ['content', 'update', true, true, true, false],
-  ['content', 'delete', true, true, true, false],
-  ['content', 'comment', true, true, true, true],
+  ['content', 'read', true, true, true, true, true],
+  ['content', 'create', true, true, true, false, false],
+  ['content', 'update', true, true, true, false, false],
+  ['content', 'delete', true, true, true, false, false],
+  ['content', 'comment', true, true, true, true, true],
 
   // Analysis & AI
-  ['analysis', 'read', true, true, true, true],
-  ['analysis', 'use', true, true, true, false],
-  ['aiChat', 'use', true, true, true, false],
+  ['analysis', 'read', true, true, true, true, true],
+  ['analysis', 'use', true, true, true, false, false],
+  ['aiChat', 'use', true, true, true, false, false],
 
   // AI Tracker
-  ['aiTracker', 'read', true, true, true, true],
-  ['aiTracker', 'manage', true, true, false, false],
-  ['aiTracker', 'use', true, true, true, false],
+  ['aiTracker', 'read', true, true, true, true, true],
+  ['aiTracker', 'manage', true, true, false, false, false],
+  ['aiTracker', 'use', true, true, true, false, false],
 
   // Keywords
-  ['keywords', 'read', true, true, true, true],
-  ['keywords', 'use', true, true, true, false],
-  ['keywords', 'delete', true, true, true, false],
+  ['keywords', 'read', true, true, true, true, true],
+  ['keywords', 'use', true, true, true, false, false],
+  ['keywords', 'delete', true, true, true, false, false],
 
   // Billing
-  ['billing', 'manage', true, false, false, false],
+  ['billing', 'manage', true, false, false, false, false],
 
   // Brand Voice (not in user's matrix — defaulting to content-like access)
-  ['brandVoice', 'read', true, true, true, true],
-  ['brandVoice', 'manage', true, true, false, false],
+  ['brandVoice', 'read', true, true, true, true, false],
+  ['brandVoice', 'manage', true, true, false, false, false],
 
   // Sites / GSC
-  ['sites', 'read', true, true, true, true],
-  ['sites', 'manage', true, true, false, false],
+  ['sites', 'read', true, true, true, true, false],
+  ['sites', 'manage', true, true, false, false, false],
 
   // Sitemap Crawler
-  ['sitemap', 'read', true, true, true, true],
-  ['sitemap', 'manage', true, true, false, false],
-  ['sitemap', 'use', true, true, true, false],
+  ['sitemap', 'read', true, true, true, true, false],
+  ['sitemap', 'manage', true, true, false, false, false],
+  ['sitemap', 'use', true, true, true, false, false],
 ];
 
-const ROLE_NAMES = ['owner', 'admin', 'editor', 'viewer'];
+const ROLE_NAMES = ['owner', 'admin', 'editor', 'viewer', 'client'];
 
 async function syncPermissions() {
   let upserted = 0;

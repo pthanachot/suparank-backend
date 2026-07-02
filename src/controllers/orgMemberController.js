@@ -1,6 +1,8 @@
 const User = require('../models/User');
 const Organization = require('../models/Organization');
 const OrgMember = require('../models/OrgMember');
+const WorkspaceMember = require('../models/WorkspaceMember');
+const Workspace = require('../models/Workspace');
 const Subscription = require('../models/Subscription');
 const Role = require('../models/Role');
 const FeatureFlag = require('../models/FeatureFlag');
@@ -36,7 +38,7 @@ async function resolveOrgWithAccess(req, res, requireOwnerOrAdmin = false) {
     return null;
   }
 
-  return { org, callerRole: membership.role };
+  return { org, callerRole: membership.role, accessScope: membership.accessScope || 'all' };
 }
 
 // ─── LIST MEMBERS ────────────────────────────────────────────────
@@ -47,11 +49,30 @@ const listMembers = async (req, res) => {
   try {
     const result = await resolveOrgWithAccess(req, res);
     if (!result) return;
-    const { org } = result;
+    const { org, callerRole, accessScope } = result;
+
+    // Scoped members (agency clients / restricted staff) must not
+    // enumerate the org roster — they only ever see their own membership.
+    if (accessScope === 'assigned' && callerRole !== 'owner') {
+      return res
+        .status(403)
+        .json({ error: 'You do not have access to the member list' });
+    }
 
     const members = await OrgMember.find({ organizationId: org._id })
       .sort({ createdAt: 1 })
       .lean();
+
+    // Workspace assignments per member (for accessScope 'assigned' rows)
+    const assignments = await WorkspaceMember.find({ organizationId: org._id })
+      .select('userId workspaceId role')
+      .lean();
+    const assignmentsByUser = {};
+    for (const a of assignments) {
+      const key = a.userId.toString();
+      if (!assignmentsByUser[key]) assignmentsByUser[key] = [];
+      assignmentsByUser[key].push({ workspaceId: a.workspaceId, role: a.role });
+    }
 
     // ── Enforce seat-based locking based on current tier ──
     const { config } = await tierService.getOrgTierConfig(org._id);
@@ -110,6 +131,8 @@ const listMembers = async (req, res) => {
         status: m.status,
         locked,
         invitedAt: m.invitedAt,
+        accessScope: m.accessScope || 'all',
+        workspaceAssignments: assignmentsByUser[m.userId.toString()] || [],
       };
     });
 
@@ -137,7 +160,36 @@ const listMembers = async (req, res) => {
 
 // ─── INVITE MEMBER ───────────────────────────────────────────────
 // POST /api/organizations/:orgId/members
-// Body: { email, role }
+// Body: { email, role, accessScope?, workspaceIds? }
+//   accessScope 'all' (default): role applies org-wide.
+//   accessScope 'assigned': access limited to workspaceIds (required);
+//   role is applied per-workspace via WorkspaceMember rows, and may be
+//   'client' (external client access — never valid org-wide).
+
+const ORG_WIDE_ROLES = ['admin', 'editor', 'viewer'];
+const WORKSPACE_ROLES = ['admin', 'editor', 'viewer', 'client'];
+
+/**
+ * Validates that every id in workspaceIds is a workspace of this org.
+ * Returns the workspace docs, or null after writing the error response.
+ */
+async function resolveOrgWorkspaces(res, orgId, workspaceIds) {
+  if (!Array.isArray(workspaceIds) || workspaceIds.length === 0) {
+    res.status(400).json({ error: 'workspaceIds is required for assigned access' });
+    return null;
+  }
+  const workspaces = await Workspace.find({
+    _id: { $in: workspaceIds },
+    organizationId: orgId,
+  })
+    .select('_id')
+    .lean();
+  if (workspaces.length !== new Set(workspaceIds.map(String)).size) {
+    res.status(400).json({ error: 'One or more workspaces do not belong to this organization' });
+    return null;
+  }
+  return workspaces;
+}
 
 const inviteMember = async (req, res) => {
   try {
@@ -145,14 +197,21 @@ const inviteMember = async (req, res) => {
     if (!result) return;
     const { org } = result;
 
-    const { email, role } = req.body;
+    const { email, role, workspaceIds } = req.body;
+    const accessScope = req.body.accessScope === 'assigned' ? 'assigned' : 'all';
     if (!email || !email.trim()) {
       return res.status(400).json({ error: 'Email is required' });
     }
 
-    const validRoles = ['admin', 'editor', 'viewer'];
+    const validRoles = accessScope === 'assigned' ? WORKSPACE_ROLES : ORG_WIDE_ROLES;
     if (!validRoles.includes(role)) {
       return res.status(400).json({ error: `Role must be one of: ${validRoles.join(', ')}` });
+    }
+
+    let grantedWorkspaces = null;
+    if (accessScope === 'assigned') {
+      grantedWorkspaces = await resolveOrgWorkspaces(res, org._id, workspaceIds);
+      if (!grantedWorkspaces) return;
     }
 
     // Check seat limit from TierConfig (base + purchased extra seats)
@@ -199,10 +258,27 @@ const inviteMember = async (req, res) => {
       ownerId: org.ownerId,
       userId: targetUser._id,
       email: targetUser.email,
-      role,
+      // 'client' is a workspace-level role only; the org-level row for a
+      // scoped member is floored to 'viewer' (it grants nothing by itself).
+      role: accessScope === 'assigned' && role === 'client' ? 'viewer' : role,
+      accessScope,
       status: 'active',
       invitedAt: new Date(),
     });
+
+    if (accessScope === 'assigned') {
+      await WorkspaceMember.insertMany(
+        grantedWorkspaces.map((ws) => ({
+          workspaceId: ws._id,
+          organizationId: org._id,
+          userId: targetUser._id,
+          email: targetUser.email,
+          role,
+          status: 'active',
+          invitedBy: req.user.userId,
+        }))
+      );
+    }
 
     res.status(201).json({
       member: {
@@ -214,6 +290,11 @@ const inviteMember = async (req, res) => {
         role: member.role,
         status: member.status,
         invitedAt: member.invitedAt,
+        accessScope,
+        workspaceAssignments:
+          accessScope === 'assigned'
+            ? grantedWorkspaces.map((ws) => ({ workspaceId: ws._id, role }))
+            : [],
       },
     });
   } catch (error) {
@@ -280,10 +361,125 @@ const removeMember = async (req, res) => {
       return res.status(404).json({ error: 'Member not found' });
     }
 
+    // Remove any per-workspace grants along with the membership
+    await WorkspaceMember.deleteMany({
+      organizationId: org._id,
+      userId: member.userId,
+    });
+
     res.json({ message: 'Member removed' });
   } catch (error) {
     console.error('Remove org member error:', error);
     res.status(500).json({ error: 'Failed to remove member' });
+  }
+};
+
+// ─── UPDATE MEMBER SCOPE ─────────────────────────────────────────
+// PUT /api/organizations/:orgId/members/:memberId/scope
+// Body: { accessScope: 'all' | 'assigned' }
+// Switching to 'all' keeps any WorkspaceMember rows (inert but preserved,
+// so switching back restores the previous assignments).
+
+const updateMemberScope = async (req, res) => {
+  try {
+    const result = await resolveOrgWithAccess(req, res, true);
+    if (!result) return;
+    const { org } = result;
+
+    const { memberId } = req.params;
+    const { accessScope } = req.body;
+    if (!['all', 'assigned'].includes(accessScope)) {
+      return res.status(400).json({ error: "accessScope must be 'all' or 'assigned'" });
+    }
+
+    const member = await OrgMember.findOne({ _id: memberId, organizationId: org._id });
+    if (!member) {
+      return res.status(404).json({ error: 'Member not found' });
+    }
+
+    member.accessScope = accessScope;
+    await member.save();
+
+    res.json({
+      member: { _id: member._id, userId: member.userId, role: member.role, accessScope },
+    });
+  } catch (error) {
+    console.error('Update member scope error:', error);
+    res.status(500).json({ error: 'Failed to update member scope' });
+  }
+};
+
+// ─── SET MEMBER WORKSPACES ───────────────────────────────────────
+// PUT /api/organizations/:orgId/members/:memberId/workspaces
+// Body: { assignments: [{ workspaceId, role }] }
+// Replace-all semantics: grants not in the list are removed.
+
+const setMemberWorkspaces = async (req, res) => {
+  try {
+    const result = await resolveOrgWithAccess(req, res, true);
+    if (!result) return;
+    const { org } = result;
+
+    const { memberId } = req.params;
+    const { assignments } = req.body;
+    if (!Array.isArray(assignments)) {
+      return res.status(400).json({ error: 'assignments must be an array' });
+    }
+    for (const a of assignments) {
+      if (!a?.workspaceId || !WORKSPACE_ROLES.includes(a.role)) {
+        return res.status(400).json({
+          error: `Each assignment needs a workspaceId and a role (one of: ${WORKSPACE_ROLES.join(', ')})`,
+        });
+      }
+    }
+
+    const member = await OrgMember.findOne({ _id: memberId, organizationId: org._id });
+    if (!member) {
+      return res.status(404).json({ error: 'Member not found' });
+    }
+
+    if (assignments.length > 0) {
+      const valid = await resolveOrgWorkspaces(
+        res,
+        org._id,
+        assignments.map((a) => a.workspaceId)
+      );
+      if (!valid) return;
+    }
+
+    // Replace-all: upsert the given grants, remove the rest
+    const keepIds = assignments.map((a) => a.workspaceId);
+    await WorkspaceMember.deleteMany({
+      organizationId: org._id,
+      userId: member.userId,
+      workspaceId: { $nin: keepIds },
+    });
+    for (const a of assignments) {
+      await WorkspaceMember.updateOne(
+        { workspaceId: a.workspaceId, userId: member.userId },
+        {
+          $set: { role: a.role, status: 'active' },
+          $setOnInsert: {
+            organizationId: org._id,
+            email: member.email,
+            invitedBy: req.user.userId,
+          },
+        },
+        { upsert: true }
+      );
+    }
+
+    res.json({
+      member: {
+        _id: member._id,
+        userId: member.userId,
+        accessScope: member.accessScope || 'all',
+        workspaceAssignments: assignments,
+      },
+    });
+  } catch (error) {
+    console.error('Set member workspaces error:', error);
+    res.status(500).json({ error: 'Failed to update workspace assignments' });
   }
 };
 
@@ -419,6 +615,10 @@ const leaveOrganization = async (req, res) => {
     }
 
     await OrgMember.findByIdAndDelete(membership._id);
+    await WorkspaceMember.deleteMany({
+      organizationId: org._id,
+      userId: req.user.userId,
+    });
     res.json({ message: 'You have left the organization' });
   } catch (error) {
     console.error('Leave organization error:', error);
@@ -426,4 +626,4 @@ const leaveOrganization = async (req, res) => {
   }
 };
 
-module.exports = { listMembers, inviteMember, changeRole, removeMember, listRoles, listFeatureFlags, transferOwnership, leaveOrganization };
+module.exports = { listMembers, inviteMember, changeRole, removeMember, updateMemberScope, setMemberWorkspaces, listRoles, listFeatureFlags, transferOwnership, leaveOrganization };

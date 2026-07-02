@@ -22,6 +22,39 @@ function parseStripeDate(ts) {
   return isNaN(date.getTime()) ? undefined : date;
 }
 
+// Human-readable plan name from a planId like "standard-monthly"
+function formatPlanName(planId) {
+  if (!planId) return 'Your Plan';
+  return planId.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function formatEmailDate(d) {
+  if (!d) return 'N/A';
+  return new Date(d).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+}
+
+// Send a triggerable-template email to the org owner. Never throws —
+// email failure must not break webhook processing. Respects the owner's
+// emailNotifications preference and skips if template resolution fails.
+async function notifyOrgOwner(organizationId, triggerId, data) {
+  try {
+    const org = await Organization.findById(organizationId).lean();
+    const owner = org?.ownerId ? await User.findById(org.ownerId).lean() : null;
+    if (!owner?.email || owner.preferences?.emailNotifications === false) return;
+
+    const emailOptions = {
+      to: owner.email,
+      data: { userName: owner.profile?.name || 'there', ...data },
+    };
+    await applyCustomTemplate(triggerId, emailOptions);
+    if (!emailOptions.subject) return;
+    await sendEmail(emailOptions);
+    console.log(`[email] ${triggerId} email sent to ${owner.email} for org=${organizationId}`);
+  } catch (err) {
+    console.error(`[email] Failed to send ${triggerId} email for org=${organizationId}:`, err.message);
+  }
+}
+
 // ─── WEBHOOK HANDLER ──────────────────────────────────────────
 
 const handleWebhook = async (req, res) => {
@@ -447,6 +480,15 @@ async function handlePaymentSucceeded(invoice) {
     }
   }
 
+  // Payment confirmation email via triggerable template
+  await notifyOrgOwner(sub.organizationId, 'payment_confirmation', {
+    planName: formatPlanName(sub.planId),
+    amount: `$${((invoice.amount_paid || 0) / 100).toFixed(2)} ${(invoice.currency || 'usd').toUpperCase()}`,
+    nextBillingDate: formatEmailDate(
+      parseStripeDate(invoice.lines?.data?.[0]?.period?.end) || sub.currentPeriodEnd
+    ),
+  });
+
   console.log(`Invoice saved: ${invoice.id} for sub=${invoice.subscription}`);
 }
 
@@ -478,6 +520,15 @@ async function handlePaymentFailed(invoice) {
 
   await sub.save();
   clearTierCache();
+
+  // Payment failed notification via triggerable template
+  await notifyOrgOwner(sub.organizationId, 'payment_failed', {
+    planName: formatPlanName(sub.planId),
+    retryDate: invoice.next_payment_attempt
+      ? formatEmailDate(parseStripeDate(invoice.next_payment_attempt))
+      : 'soon',
+    updatePaymentUrl: `${process.env.FRONTEND_URL || 'https://app.suparank.ai'}/settings/billing`,
+  });
 
   console.log(`Payment failed: sub=${invoice.subscription}`);
 }

@@ -41,6 +41,11 @@ const creditSchema = new mongoose.Schema(
       default: null,
       // When subscription credits were last granted.
     },
+    lowBalanceNotifiedAt: {
+      type: Date,
+      default: null,
+      // Anti-spam flag for the credits_low email — set when sent, cleared on grant.
+    },
   },
   { timestamps: true }
 );

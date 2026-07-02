@@ -36,23 +36,6 @@ const SYSTEM_TRIGGERS = [
     variables: ['code', 'expiresIn'],
     triggerCount: 0,
   },
-  // Engagement
-  {
-    id: 'feature_announcement',
-    name: 'Feature Announcement',
-    description: 'Announce new features to users',
-    category: 'engagement',
-    variables: ['userName', 'featureName', 'featureDescription', 'ctaUrl'],
-    triggerCount: 0,
-  },
-  {
-    id: 'usage_tips',
-    name: 'Usage Tips',
-    description: 'Tips for getting more from SupaRank',
-    category: 'engagement',
-    variables: ['userName', 'tipTitle', 'tipContent'],
-    triggerCount: 0,
-  },
   // Billing
   {
     id: 'payment_confirmation',
@@ -156,28 +139,6 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
   <p style="color:#888;font-size:14px;">If you didn't request this, you can safely ignore this email.</p>
 </div>`,
     variables: ['code', 'expiresIn'],
-  },
-  feature_announcement: {
-    subject: 'New Feature: {{featureName}}',
-    html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;">
-  <h1 style="color:#111;font-size:24px;margin-bottom:16px;">New Feature Available!</h1>
-  <p style="color:#555;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
-  <p style="color:#555;font-size:16px;line-height:1.6;">We've just launched <strong>{{featureName}}</strong>!</p>
-  <p style="color:#555;font-size:16px;line-height:1.6;">{{featureDescription}}</p>
-  <div style="text-align:center;margin:32px 0;">
-    <a href="{{ctaUrl}}" style="background:#111;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:bold;display:inline-block;">Try It Now</a>
-  </div>
-</div>`,
-    variables: ['userName', 'featureName', 'featureDescription', 'ctaUrl'],
-  },
-  usage_tips: {
-    subject: 'SupaRank Tip: {{tipTitle}}',
-    html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;">
-  <h1 style="color:#111;font-size:24px;margin-bottom:16px;">{{tipTitle}}</h1>
-  <p style="color:#555;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
-  <div style="color:#555;font-size:16px;line-height:1.6;">{{tipContent}}</div>
-</div>`,
-    variables: ['userName', 'tipTitle', 'tipContent'],
   },
   payment_confirmation: {
     subject: 'Payment Confirmed - {{planName}}',

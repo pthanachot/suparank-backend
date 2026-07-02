@@ -507,6 +507,9 @@ async function settle(transactionId, actualAmount) {
     { $set: { status: 'settled' } }
   );
 
+  // Fire-and-forget low balance check now that the deduction is final
+  maybeNotifyLowBalance(tx.organizationId);
+
   return { refunded: Math.max(0, totalDeducted - actualAmount) };
 }
 
@@ -586,6 +589,7 @@ async function grantSubscriptionCredits(orgId, amount, expiresAt) {
   credit.subscriptionCredits = amount;
   credit.subscriptionCreditsExpireAt = expiresAt || null;
   credit.lastResetAt = new Date();
+  credit.lowBalanceNotifiedAt = null; // re-arm the credits_low notification
   await credit.save();
 
   await CreditTransaction.logTransaction({
@@ -612,7 +616,7 @@ async function grantGeneralCredits(orgId, amount, description = 'General credits
 
   const updated = await Credit.findOneAndUpdate(
     { organizationId: orgId },
-    { $inc: { generalCredits: amount } },
+    { $inc: { generalCredits: amount }, $set: { lowBalanceNotifiedAt: null } },
     { new: true, upsert: true, setDefaultsOnInsert: true }
   );
 
@@ -652,6 +656,59 @@ async function expireSubscriptionCredits(orgId) {
 
   console.log(`[creditService] Expired ${expired} subscription credits for org ${orgId}`);
   return { expired };
+}
+
+// ─── Low-balance notification ───────────────────────────────
+
+const LOW_BALANCE_FLOOR = 50; // fire below this many credits when tier has no monthly allotment
+
+/**
+ * Fire the credits_low email once per low period. Anti-spam via
+ * Credit.lowBalanceNotifiedAt — set here, cleared when credits are granted.
+ * Never throws; called fire-and-forget from settle().
+ */
+async function maybeNotifyLowBalance(orgId) {
+  try {
+    if (!orgId) return;
+    const credit = await Credit.findOne({ organizationId: orgId });
+    if (!credit || credit.lowBalanceNotifiedAt) return;
+
+    const balance = credit.subscriptionCredits + credit.generalCredits;
+    const { tier, config } = await tierService.getOrgTierConfig(orgId);
+    const threshold = config?.creditsPerMonth
+      ? Math.max(Math.floor(config.creditsPerMonth * 0.2), LOW_BALANCE_FLOOR)
+      : LOW_BALANCE_FLOOR;
+    if (balance >= threshold) return;
+
+    // Set the flag before sending so a send failure can't cause a retry storm.
+    credit.lowBalanceNotifiedAt = new Date();
+    await credit.save();
+
+    // Lazy requires — keeps the service loadable without the controller layer.
+    const Organization = require('../models/Organization');
+    const User = require('../models/User');
+    const { applyCustomTemplate } = require('../controllers/emailPortalController');
+    const { sendEmail } = require('../utils/emailService');
+
+    const org = await Organization.findById(orgId).lean();
+    const owner = org?.ownerId ? await User.findById(org.ownerId).lean() : null;
+    if (!owner?.email || owner.preferences?.emailNotifications === false) return;
+
+    const emailOptions = {
+      to: owner.email,
+      data: {
+        userName: owner.profile?.name || 'there',
+        remainingCredits: String(balance),
+        planName: tier ? tier.charAt(0).toUpperCase() + tier.slice(1) : 'Free',
+      },
+    };
+    await applyCustomTemplate('credits_low', emailOptions);
+    if (!emailOptions.subject) return;
+    await sendEmail(emailOptions);
+    console.log(`[creditService] credits_low email sent to ${owner.email} for org ${orgId} (balance=${balance})`);
+  } catch (err) {
+    console.error(`[creditService] Low-balance notify failed for org ${orgId}:`, err.message);
+  }
 }
 
 module.exports = {

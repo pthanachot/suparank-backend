@@ -693,19 +693,83 @@ const updateSubscription = async (req, res) => {
     const sub = await Subscription.findById(subId);
     if (!sub) return res.status(404).json({ error: 'Subscription not found' });
 
-    if (action === 'cancel_at_period_end') {
-      sub.cancelAtPeriodEnd = true;
-      sub.canceledAt = new Date();
-    } else if (action === 'reactivate') {
-      sub.cancelAtPeriodEnd = false;
-      sub.canceledAt = null;
-      if (sub.status === 'canceled') sub.status = 'active';
-    } else if (action === 'cancel_immediately') {
-      sub.status = 'canceled';
-      sub.canceledAt = new Date();
-      await creditService.expireSubscriptionCredits(sub.organizationId);
-    } else {
+    const VALID_ACTIONS = ['cancel_at_period_end', 'reactivate', 'cancel_immediately'];
+    if (!VALID_ACTIONS.includes(action)) {
       return res.status(400).json({ error: 'Invalid action' });
+    }
+
+    if (sub.stripeSubscriptionId) {
+      // Stripe is the source of truth: call it first, persist only on success.
+      // Credits expiry, usage reset, and customer email are owned by the
+      // webhook handlers (subscription.updated / subscription.deleted).
+      const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+      try {
+        if (action === 'cancel_at_period_end') {
+          await stripe.subscriptions.update(sub.stripeSubscriptionId, {
+            cancel_at_period_end: true,
+          });
+          sub.cancelAtPeriodEnd = true;
+          // canceledAt is set by the subscription.updated webhook — the sub
+          // is only scheduled to cancel, not canceled yet.
+        } else if (action === 'reactivate') {
+          if (sub.status === 'canceled') {
+            return res.status(409).json({
+              error:
+                'Subscription is already terminated at Stripe and cannot be reactivated. Create a new subscription instead.',
+            });
+          }
+          await stripe.subscriptions.update(sub.stripeSubscriptionId, {
+            cancel_at_period_end: false,
+          });
+          sub.cancelAtPeriodEnd = false;
+          sub.canceledAt = null;
+        } else if (action === 'cancel_immediately') {
+          await stripe.subscriptions.cancel(sub.stripeSubscriptionId);
+          sub.status = 'canceled';
+          sub.canceledAt = new Date();
+        }
+      } catch (stripeError) {
+        if (stripeError.code === 'resource_missing') {
+          // Already gone at Stripe — reconcile the local record.
+          sub.status = 'canceled';
+          sub.canceledAt = sub.canceledAt || new Date();
+          sub.cancelAtPeriodEnd = false;
+          await sub.save();
+          if (action === 'reactivate') {
+            return res.status(409).json({
+              error:
+                'Subscription no longer exists at Stripe and cannot be reactivated. Create a new subscription instead.',
+            });
+          }
+          // For cancel actions the desired end state is reached — respond normally.
+          return res.json({
+            success: true,
+            subscription: {
+              id: sub._id,
+              status: sub.status,
+              cancelAtPeriodEnd: sub.cancelAtPeriodEnd,
+              canceledAt: sub.canceledAt,
+            },
+          });
+        }
+        console.error('[admin] updateSubscription Stripe error:', stripeError.message);
+        return res.status(502).json({ error: `Stripe error: ${stripeError.message}` });
+      }
+    } else {
+      // Manual/legacy subscription with no Stripe record — DB-only override.
+      console.log(`[admin] manual (non-Stripe) subscription override: sub=${subId} action=${action}`);
+      if (action === 'cancel_at_period_end') {
+        sub.cancelAtPeriodEnd = true;
+        sub.canceledAt = new Date();
+      } else if (action === 'reactivate') {
+        sub.cancelAtPeriodEnd = false;
+        sub.canceledAt = null;
+        if (sub.status === 'canceled') sub.status = 'active';
+      } else if (action === 'cancel_immediately') {
+        sub.status = 'canceled';
+        sub.canceledAt = new Date();
+        await creditService.expireSubscriptionCredits(sub.organizationId);
+      }
     }
 
     await sub.save();

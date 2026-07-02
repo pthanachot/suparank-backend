@@ -9,6 +9,7 @@ const jwt = require('jsonwebtoken');
 const { generateTokens, generateAccessToken, generateRefreshToken } = require('../utils/jwt');
 const ResetToken = require('../models/ResetToken');
 const { sendEmail, sendVerificationCodeEmail, sendPasswordResetCodeEmail } = require('../utils/emailService');
+const { applyCustomTemplate } = require('./emailPortalController');
 const { verifyGoogleToken } = require('../middleware/auth');
 const creditService = require('../services/creditService');
 const tierService = require('../services/tierService');
@@ -46,6 +47,28 @@ function generateCode() {
 // Default org + workspace provisioning lives in orgBootstrapService:
 //   bootstrapNewUser  — atomic create on signup
 //   ensureUserHasOrg  — idempotent self-heal on login / org list
+
+// ─── Welcome email ──────────────────────────────────────────────
+// Sent once when an account becomes verified (signup with code, email
+// verification, or Google auth). Fire-and-forget — never blocks the flow.
+const sendWelcomeEmail = async (user) => {
+  try {
+    if (user.preferences?.emailNotifications === false) return;
+    const emailOptions = {
+      to: user.email,
+      data: {
+        userName: user.profile?.name || 'there',
+        loginUrl: `${process.env.FRONTEND_URL || 'https://app.suparank.ai'}/login`,
+      },
+    };
+    await applyCustomTemplate('welcome', emailOptions);
+    if (!emailOptions.subject) return;
+    await sendEmail(emailOptions);
+    console.log(`[email] Welcome email sent to ${user.email}`);
+  } catch (err) {
+    console.error(`[email] Failed to send welcome email to ${user.email}:`, err.message);
+  }
+};
 
 // ─── EMAIL SIGNUP ───────────────────────────────────────────────
 
@@ -115,6 +138,9 @@ const emailSignup = async (req, res) => {
     } catch (err) {
       console.error(`[auth] Failed to bootstrap org/workspace for user=${user._id}:`, err.message);
     }
+
+    // Verified at creation (signed up with a code) — send welcome now
+    if (user.verified) sendWelcomeEmail(user);
 
     // Send verification email if not already verified
     if (!user.verified) {
@@ -253,6 +279,8 @@ const verifyEmail = async (req, res) => {
     user.verificationExpires = undefined;
     await user.save();
 
+    sendWelcomeEmail(user);
+
     res.json({ message: 'Email verified successfully' });
   } catch (error) {
     console.error('Verify email error:', error);
@@ -358,7 +386,15 @@ const sendVerificationCode = async (req, res) => {
       { upsert: true, new: true }
     );
 
-    await sendVerificationCodeEmail(email, code);
+    // Route through the admin-editable trigger template; fall back to the
+    // hardcoded email if template resolution fails.
+    const emailOptions = { to: email, data: { code, expiresIn: '15 minutes' } };
+    await applyCustomTemplate('verify_email', emailOptions);
+    if (emailOptions.subject) {
+      await sendEmail(emailOptions);
+    } else {
+      await sendVerificationCodeEmail(email, code);
+    }
 
     res.json({ message: 'Verification code sent' });
   } catch (error) {
@@ -418,9 +454,10 @@ const forgotPassword = async (req, res) => {
     // doesn't leak — the response is identical regardless.
     const user = await User.findOne({ email: lcEmail });
     if (user) {
-      sendPasswordResetCodeEmail(email, code).catch((err) =>
-        console.error('Failed to send reset email:', err.message)
-      );
+      const emailOptions = { to: email, data: { code, expiresIn: '15 minutes' } };
+      applyCustomTemplate('password_reset', emailOptions)
+        .then(() => (emailOptions.subject ? sendEmail(emailOptions) : sendPasswordResetCodeEmail(email, code)))
+        .catch((err) => console.error('Failed to send reset email:', err.message));
     }
 
     res.json({ message: 'If an account exists, a reset code has been sent' });
@@ -577,8 +614,12 @@ const googleAuth = async (req, res) => {
         user.profile = user.profile || {};
         user.profile.picture = picture;
       }
+      const wasUnverified = !user.verified;
       user.verified = true;
       await user.save();
+
+      // Welcome on first verification (guarded — this runs on every Google login)
+      if (wasUnverified) sendWelcomeEmail(user);
 
       // Self-heal: guarantee an existing Google user has an org (legacy /
       // failed-bootstrap accounts). No-op when they already have one.
@@ -596,6 +637,9 @@ const googleAuth = async (req, res) => {
         },
         verified: true,
       });
+
+      // New Google accounts are verified at creation — welcome them
+      sendWelcomeEmail(user);
 
       // Grant free credits to the new user
       try {

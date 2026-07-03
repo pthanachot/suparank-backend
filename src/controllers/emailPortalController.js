@@ -36,6 +36,14 @@ const SYSTEM_TRIGGERS = [
     variables: ['code', 'expiresIn'],
     triggerCount: 0,
   },
+  {
+    id: 'member_invite',
+    name: 'Member Invitation',
+    description: 'Sent when someone is invited to join an organization',
+    category: 'auth',
+    variables: ['inviterName', 'orgName', 'role', 'acceptUrl'],
+    triggerCount: 0,
+  },
   // Billing
   {
     id: 'payment_confirmation',
@@ -139,6 +147,19 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
   <p style="color:#888;font-size:14px;">If you didn't request this, you can safely ignore this email.</p>
 </div>`,
     variables: ['code', 'expiresIn'],
+  },
+  member_invite: {
+    subject: "You've been invited to join {{orgName}}",
+    html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;">
+  <h2 style="color:#111;margin-bottom:16px;">You're invited</h2>
+  <p style="color:#555;font-size:16px;line-height:1.6;">{{inviterName}} has invited you to join <strong>{{orgName}}</strong> as {{role}}.</p>
+  <div style="text-align:center;margin:32px 0;">
+    <a href="{{acceptUrl}}" style="background:#111;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:bold;display:inline-block;">Accept invitation</a>
+  </div>
+  <p style="color:#888;font-size:14px;">This invitation expires in 7 days.</p>
+  <p style="color:#888;font-size:14px;">If you weren't expecting this, you can safely ignore this email.</p>
+</div>`,
+    variables: ['inviterName', 'orgName', 'role', 'acceptUrl'],
   },
   payment_confirmation: {
     subject: 'Payment Confirmed - {{planName}}',

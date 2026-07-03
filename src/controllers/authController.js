@@ -15,6 +15,7 @@ const { verifyGoogleToken } = require('../middleware/auth');
 const creditService = require('../services/creditService');
 const tierService = require('../services/tierService');
 const { bootstrapNewUser, ensureUserHasOrg } = require('../services/orgBootstrapService');
+const inviteService = require('../services/inviteService');
 
 // Helper: is onboarding considered done (completed, skipped, or pre-existing user)?
 // Mongoose applies defaults for inline subdocs, so user.onboarding always exists in memory.
@@ -72,11 +73,28 @@ const sendWelcomeEmail = async (user) => {
   }
 };
 
+/**
+ * Resolve + accept an invite during signup/login. Returns the acceptance
+ * result, or null when the token is absent/invalid/for another email —
+ * callers fall back to the normal bootstrap path in that case.
+ */
+const tryAcceptInviteForUser = async (inviteToken, user) => {
+  if (!inviteToken) return null;
+  try {
+    const invite = await inviteService.findValidInvite(inviteToken);
+    if (!invite || invite.email !== user.email) return null;
+    return await inviteService.acceptInvite(invite, user);
+  } catch (err) {
+    console.error(`[auth] Invite acceptance failed for user=${user._id}:`, err.message);
+    return null;
+  }
+};
+
 // ─── EMAIL SIGNUP ───────────────────────────────────────────────
 
 const emailSignup = async (req, res) => {
   try {
-    const { name, email, password, verificationCode } = req.body;
+    const { name, email, password, verificationCode, inviteToken } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
@@ -104,6 +122,15 @@ const emailSignup = async (req, res) => {
       await VerificationCode.deleteOne({ _id: codeRecord._id });
     }
 
+    // Invite-based signup: a valid invite token whose email matches proves
+    // inbox ownership (the token only ever existed in that email), so the
+    // account starts verified and org bootstrap is replaced by acceptance.
+    let invite = null;
+    if (inviteToken) {
+      const candidate = await inviteService.findValidInvite(inviteToken);
+      if (candidate && candidate.email === email.toLowerCase()) invite = candidate;
+    }
+
     // Create user
     const userId = await getNextUserId();
     const user = new User({
@@ -111,11 +138,12 @@ const emailSignup = async (req, res) => {
       email: email.toLowerCase(),
       password,
       profile: { name: name || email.split('@')[0] },
-      verified: !!verificationCode, // verified if code was provided
+      verified: !!verificationCode || !!invite, // code or invite link proves the email
     });
 
-    // If no verification code was provided, generate a verification token and send email
-    if (!verificationCode) {
+    // If neither a verification code nor an invite proved the email,
+    // generate a verification token and send the email
+    if (!verificationCode && !invite) {
       const token = crypto.randomBytes(32).toString('hex');
       user.verificationToken = token;
       user.verificationExpires = Date.now() + 24 * 60 * 60 * 1000; // 24h
@@ -133,12 +161,20 @@ const emailSignup = async (req, res) => {
       console.error(`[auth] Failed to grant free credits for user=${user._id}:`, err.message);
     }
 
-    // Auto-create default organization + workspace for the new user
+    // Invited users join the inviting org instead of getting their own —
+    // no personal org, no stray free workspace (white-label Phase 3).
     let bootstrapResult = null;
-    try {
-      bootstrapResult = await bootstrapNewUser(user._id, user.profile.name);
-    } catch (err) {
-      console.error(`[auth] Failed to bootstrap org/workspace for user=${user._id}:`, err.message);
+    let inviteResult = null;
+    if (invite) {
+      inviteResult = await tryAcceptInviteForUser(inviteToken, user);
+    }
+    if (!inviteResult) {
+      // Auto-create default organization + workspace for the new user
+      try {
+        bootstrapResult = await bootstrapNewUser(user._id, user.profile.name);
+      } catch (err) {
+        console.error(`[auth] Failed to bootstrap org/workspace for user=${user._id}:`, err.message);
+      }
     }
 
     // Verified at creation (signed up with a code) — send welcome now
@@ -180,7 +216,8 @@ const emailSignup = async (req, res) => {
         picture: user.profile?.picture,
         verified: user.verified,
         connectedProviders: user.getConnectedProviders(),
-        activeWorkspaceId: bootstrapResult?.workspace?._id || user.activeWorkspaceId || null,
+        activeWorkspaceId:
+          inviteResult?.workspace?._id || bootstrapResult?.workspace?._id || user.activeWorkspaceId || null,
         onboardingCompleted: isOnboardingDone(user),
       },
       ...tokens,
@@ -579,7 +616,7 @@ const resetPassword = async (req, res) => {
 
 const googleAuth = async (req, res) => {
   try {
-    const { credential } = req.body;
+    const { credential, inviteToken } = req.body;
 
     if (!credential) {
       return res.status(400).json({ error: 'Google credential is required' });
@@ -598,6 +635,7 @@ const googleAuth = async (req, res) => {
     let isNewUser = false;
     let bootstrapResult = null;
     let healedResult = null;
+    let inviteResult = null;
 
     if (user) {
       // Update Google account info
@@ -622,6 +660,10 @@ const googleAuth = async (req, res) => {
 
       // Welcome on first verification (guarded — this runs on every Google login)
       if (wasUnverified) sendWelcomeEmail(user);
+
+      // Existing user clicking an invite link — accept before the org
+      // self-heal so the membership (not a fresh personal org) wins.
+      inviteResult = await tryAcceptInviteForUser(inviteToken, user);
 
       // Self-heal: guarantee an existing Google user has an org (legacy /
       // failed-bootstrap accounts). No-op when they already have one.
@@ -653,11 +695,16 @@ const googleAuth = async (req, res) => {
         console.error(`[auth] Failed to grant free credits for user=${user._id}:`, err.message);
       }
 
-      // Auto-create default organization + workspace for the new user
-      try {
-        bootstrapResult = await bootstrapNewUser(user._id, user.profile.name);
-      } catch (err) {
-        console.error(`[auth] Failed to bootstrap org/workspace for user=${user._id}:`, err.message);
+      // Invited signup joins the inviting org instead of getting a
+      // personal org (white-label Phase 3)
+      inviteResult = await tryAcceptInviteForUser(inviteToken, user);
+      if (!inviteResult) {
+        // Auto-create default organization + workspace for the new user
+        try {
+          bootstrapResult = await bootstrapNewUser(user._id, user.profile.name);
+        } catch (err) {
+          console.error(`[auth] Failed to bootstrap org/workspace for user=${user._id}:`, err.message);
+        }
       }
     }
 
@@ -680,7 +727,12 @@ const googleAuth = async (req, res) => {
         emailNotifications: user.preferences?.emailNotifications ?? true,
         verified: user.verified,
         connectedProviders: user.getConnectedProviders(),
-        activeWorkspaceId: bootstrapResult?.workspace?._id || healedResult?.workspace?._id || user.activeWorkspaceId || null,
+        activeWorkspaceId:
+          inviteResult?.workspace?._id ||
+          bootstrapResult?.workspace?._id ||
+          healedResult?.workspace?._id ||
+          user.activeWorkspaceId ||
+          null,
         onboardingCompleted: isOnboardingDone(user),
       },
       ...tokens,

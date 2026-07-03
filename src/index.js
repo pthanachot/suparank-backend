@@ -210,6 +210,7 @@ app.use('/api/workspace', workspaceRoutes);
 app.use('/api/workspaces', workspaceCrudRoutes);
 app.use('/api/org', orgRoutes);
 app.use('/api/organizations', organizationRoutes);
+app.use('/api/invites', require('./routes/inviteRoutes'));
 app.use('/api/admin', adminRoutes);
 app.use('/api/feedback', feedbackRoutes);
 app.use('/api/contact', contactRoutes);

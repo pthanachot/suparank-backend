@@ -3,6 +3,8 @@ const Organization = require('../models/Organization');
 const OrgMember = require('../models/OrgMember');
 const WorkspaceMember = require('../models/WorkspaceMember');
 const Workspace = require('../models/Workspace');
+const Invite = require('../models/Invite');
+const inviteService = require('../services/inviteService');
 const Subscription = require('../models/Subscription');
 const Role = require('../models/Role');
 const FeatureFlag = require('../models/FeatureFlag');
@@ -136,6 +138,15 @@ const listMembers = async (req, res) => {
       };
     });
 
+    // Pending invites (not yet accepted; expired ones are TTL-deleted)
+    const pendingInvites = await Invite.find({
+      organizationId: org._id,
+      expiresAt: { $gt: new Date() },
+    })
+      .select('email role accessScope workspaceIds expiresAt createdAt')
+      .sort({ createdAt: 1 })
+      .lean();
+
     // Get owner info
     const owner = await User.findById(org.ownerId)
       .select('email profile.name profile.picture')
@@ -143,6 +154,7 @@ const listMembers = async (req, res) => {
 
     res.json({
       organization: { _id: org._id, name: org.name, slug: org.slug },
+      invites: pendingInvites,
       owner: {
         userId: org.ownerId,
         email: owner?.email || '',
@@ -225,8 +237,13 @@ const inviteMember = async (req, res) => {
       const effectiveMaxSeats = config.maxSeats + extraSeats;
 
       const memberCount = await OrgMember.countDocuments({ organizationId: org._id, locked: { $ne: true } });
+      // Pending invites reserve seats so accepting can't blow the limit
+      const pendingInviteCount = await Invite.countDocuments({
+        organizationId: org._id,
+        expiresAt: { $gt: new Date() },
+      });
       // +1 because the org owner is not in OrgMember but counts as a seat
-      const totalSeats = memberCount + 1;
+      const totalSeats = memberCount + pendingInviteCount + 1;
       if (totalSeats >= effectiveMaxSeats) {
         return res.status(429).json({
           error: `Your ${config.displayName || tier} plan allows ${effectiveMaxSeats} seat(s).${extraSeats > 0 ? '' : ' Upgrade or purchase extra seats for more.'}`,
@@ -238,7 +255,28 @@ const inviteMember = async (req, res) => {
 
     const targetUser = await User.findOne({ email: email.trim().toLowerCase() });
     if (!targetUser) {
-      return res.status(404).json({ error: 'No user found with that email' });
+      // No account yet — create a pending invite and email the accept link.
+      const inviter = await User.findById(req.user.userId).select('profile.name email').lean();
+      const invite = await inviteService.createInvite({
+        org,
+        email,
+        role,
+        accessScope,
+        workspaceIds: accessScope === 'assigned' ? grantedWorkspaces.map((ws) => ws._id) : [],
+        invitedBy: req.user.userId,
+        inviterName: inviter?.profile?.name || inviter?.email,
+      });
+      return res.status(201).json({
+        invite: {
+          _id: invite._id,
+          email: invite.email,
+          role: invite.role,
+          accessScope: invite.accessScope,
+          workspaceIds: invite.workspaceIds,
+          status: 'invited',
+          expiresAt: invite.expiresAt,
+        },
+      });
     }
     if (targetUser._id.equals(org.ownerId)) {
       return res.status(400).json({ error: 'Cannot invite the organization owner' });
@@ -278,6 +316,29 @@ const inviteMember = async (req, res) => {
           invitedBy: req.user.userId,
         }))
       );
+    }
+
+    // Notify the (existing) user — membership is already active, the link
+    // just takes them to the app. Fire-and-forget.
+    try {
+      const inviter = await User.findById(req.user.userId).select('profile.name email').lean();
+      const { applyCustomTemplate } = require('./emailPortalController');
+      const { sendEmail } = require('../utils/emailService');
+      const emailOptions = {
+        to: targetUser.email,
+        data: {
+          inviterName: inviter?.profile?.name || inviter?.email || 'A team member',
+          orgName: org.name,
+          role,
+          acceptUrl: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/login`,
+        },
+      };
+      await applyCustomTemplate('member_invite', emailOptions);
+      sendEmail(emailOptions).catch((err) =>
+        console.error('[invite] notification email failed:', err.message)
+      );
+    } catch (err) {
+      console.error('[invite] notification email failed:', err.message);
     }
 
     res.status(201).json({
@@ -371,6 +432,30 @@ const removeMember = async (req, res) => {
   } catch (error) {
     console.error('Remove org member error:', error);
     res.status(500).json({ error: 'Failed to remove member' });
+  }
+};
+
+// ─── REVOKE INVITE ───────────────────────────────────────────────
+// DELETE /api/org/organizations/:orgId/invites/:inviteId
+
+const revokeInvite = async (req, res) => {
+  try {
+    const result = await resolveOrgWithAccess(req, res, true);
+    if (!result) return;
+    const { org } = result;
+
+    const invite = await Invite.findOneAndDelete({
+      _id: req.params.inviteId,
+      organizationId: org._id,
+    });
+    if (!invite) {
+      return res.status(404).json({ error: 'Invite not found' });
+    }
+
+    res.json({ message: 'Invite revoked' });
+  } catch (error) {
+    console.error('Revoke invite error:', error);
+    res.status(500).json({ error: 'Failed to revoke invite' });
   }
 };
 
@@ -626,4 +711,4 @@ const leaveOrganization = async (req, res) => {
   }
 };
 
-module.exports = { listMembers, inviteMember, changeRole, removeMember, updateMemberScope, setMemberWorkspaces, listRoles, listFeatureFlags, transferOwnership, leaveOrganization };
+module.exports = { listMembers, inviteMember, changeRole, removeMember, revokeInvite, updateMemberScope, setMemberWorkspaces, listRoles, listFeatureFlags, transferOwnership, leaveOrganization };

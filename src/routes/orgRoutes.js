@@ -31,6 +31,7 @@ router.put('/organizations/:orgId/members/:memberId/role', rejectIfLocked(OrgMem
 router.put('/organizations/:orgId/members/:memberId/scope', rejectIfLocked(OrgMember, 'memberId'), orgMemberController.updateMemberScope);
 router.put('/organizations/:orgId/members/:memberId/workspaces', rejectIfLocked(OrgMember, 'memberId'), orgMemberController.setMemberWorkspaces);
 router.delete('/organizations/:orgId/members/:memberId', orgMemberController.removeMember);
+router.delete('/organizations/:orgId/invites/:inviteId', orgMemberController.revokeInvite);
 router.post('/organizations/:orgId/transfer-ownership', orgMemberController.transferOwnership);
 router.post('/organizations/:orgId/leave', orgMemberController.leaveOrganization);
 

@@ -40,6 +40,15 @@ describe('reportService period validation', () => {
     assert.equal(reportService.previousPeriod(new Date(Date.UTC(2026, 6, 1))), '2026-06');
     assert.equal(reportService.currentPeriod(new Date(Date.UTC(2026, 6, 3))), '2026-07');
   });
+
+  it('formatPeriodLabel renders a human-readable month for client emails', () => {
+    assert.equal(reportService.formatPeriodLabel('2026-06'), 'June 2026');
+    assert.equal(reportService.formatPeriodLabel('2025-12'), 'December 2025');
+    // malformed input falls back to the raw string, never throws
+    assert.equal(reportService.formatPeriodLabel('nonsense'), 'nonsense');
+    assert.equal(reportService.formatPeriodLabel(''), '');
+    assert.equal(reportService.formatPeriodLabel(null), '');
+  });
 });
 
 // ─── Token hashing (mirrors Invite semantics) ────────────────────

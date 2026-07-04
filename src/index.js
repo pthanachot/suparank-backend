@@ -512,7 +512,9 @@ cron.schedule('30 3 1 * *', async () => {
                   orgId, // Phase 11 tenant sender identity
                   data: {
                     workspaceName: ws.name || 'Workspace',
-                    period,
+                    // Human-readable for the client-facing email ('June 2026').
+                    // The raw 'YYYY-MM' period is used for all DB/query work.
+                    period: reportServiceForCron.formatPeriodLabel(period),
                     reportUrl,
                   },
                 };

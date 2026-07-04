@@ -57,6 +57,21 @@ function previousPeriod(now = new Date()) {
   return _formatPeriod(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1)));
 }
 
+/**
+ * Human-readable label for a 'YYYY-MM' period, e.g. '2026-06' → 'June 2026'.
+ * For client-facing surfaces (emails); falls back to the raw string if the
+ * input isn't a well-formed period.
+ */
+function formatPeriodLabel(period) {
+  const m = /^(\d{4})-(\d{2})$/.exec(String(period || ''));
+  if (!m) return String(period || '');
+  return new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, 1)).toLocaleString('en-US', {
+    month: 'long',
+    year: 'numeric',
+    timeZone: 'UTC',
+  });
+}
+
 // ─── Source aggregators (each returns its section or throws) ────
 
 async function _aggregateContent(workspaceId, { start, end }) {
@@ -386,6 +401,7 @@ module.exports = {
   periodBounds,
   currentPeriod,
   previousPeriod,
+  formatPeriodLabel,
   generateSnapshot,
   getSnapshots,
   createShare,

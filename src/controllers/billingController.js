@@ -650,6 +650,7 @@ const updateExtraSeats = async (req, res) => {
       sub.stripeExtraSeatItemId = null;
     }
 
+    const prevSeats = sub.purchasedExtraSeats || 0;
     sub.purchasedExtraSeats = qty;
     sub.extraSeatsUpdatedAt = new Date();
     await sub.save();
@@ -658,6 +659,18 @@ const updateExtraSeats = async (req, res) => {
     applyLocksForOrg(orgId).catch((err) =>
       console.error(`[downgradeService] extra seats lock error for org=${orgId}:`, err.message)
     );
+
+    // Attribute the seat change to the acting admin — the Stripe webhook
+    // that follows is filtered out as a sync, not a lifecycle event.
+    require('../services/auditService').record({
+      organizationId: orgId,
+      userId: req.user.userId,
+      actorEmail: req.user.email,
+      action: 'billing.seats_updated',
+      resourceId: sub.stripeSubscriptionId,
+      meta: { extraSeats: qty, previousExtraSeats: prevSeats },
+      ip: req.ip,
+    });
 
     res.json({
       extraSeats: qty,

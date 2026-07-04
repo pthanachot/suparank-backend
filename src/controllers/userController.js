@@ -9,6 +9,7 @@ const Workspace = require('../models/Workspace');
 const { verifyGoogleToken } = require('../middleware/auth');
 const { clearTierCache } = require('../services/tierService');
 const { sendEmail } = require('../utils/emailService');
+const { applyCustomTemplate } = require('./emailPortalController');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -101,20 +102,34 @@ const updateProfile = async (req, res) => {
     // Fire-and-forget email dispatch after save so a transient SMTP error
     // doesn't roll back the profile update.
     if (emailChanged) {
-      const verifyUrl = `${process.env.FRONTEND_URL}/verify-email?token=${user.verificationToken}`;
-      // Verification email to the NEW address
-      sendEmail({
+      // Invariant I1 (Phase 10): validated request host, phishing-safe
+      const emailBase = await require('../services/domainService').resolveBaseUrlFromRequest(req);
+      const verifyUrl = `${emailBase}/verify-email?token=${user.verificationToken}`;
+      // Verification email to the NEW address — routed through the trigger
+      // template, falling back to the hardcoded email if resolution fails.
+      // orgId null: the user's active org isn't reliably the sender context yet.
+      const emailOptions = {
         to: user.email,
-        subject: 'Verify your new email — SupaRank',
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
-            <h2 style="color: #111; margin-bottom: 16px;">Verify your new email</h2>
-            <p style="color: #555; margin-bottom: 24px;">You changed your SupaRank email to this address. Click the button below to confirm:</p>
-            <a href="${verifyUrl}" style="display: inline-block; padding: 14px 32px; background: #4F46E5; color: white; text-decoration: none; border-radius: 12px; font-weight: bold; font-size: 14px;">Verify email</a>
-            <p style="color: #888; font-size: 14px; margin-top: 24px;">This link expires in 24 hours. If you didn't change your email, contact support@suparank.ai immediately.</p>
-          </div>
-        `,
-      }).catch((err) => console.error('Failed to send verify-email to new address:', err.message));
+        data: { userName: user.profile?.name || 'there', verifyUrl },
+      };
+      applyCustomTemplate('verify_email_link', emailOptions, null)
+        .then(() =>
+          emailOptions.subject
+            ? sendEmail(emailOptions)
+            : sendEmail({
+                to: user.email,
+                subject: 'Verify your new email — SupaRank',
+                html: `
+                  <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
+                    <h2 style="color: #111; margin-bottom: 16px;">Verify your new email</h2>
+                    <p style="color: #555; margin-bottom: 24px;">You changed your SupaRank email to this address. Click the button below to confirm:</p>
+                    <a href="${verifyUrl}" style="display: inline-block; padding: 14px 32px; background: #4F46E5; color: white; text-decoration: none; border-radius: 12px; font-weight: bold; font-size: 14px;">Verify email</a>
+                    <p style="color: #888; font-size: 14px; margin-top: 24px;">This link expires in 24 hours. If you didn't change your email, contact support@suparank.ai immediately.</p>
+                  </div>
+                `,
+              })
+        )
+        .catch((err) => console.error('Failed to send verify-email to new address:', err.message));
 
       // Notification to the OLD address so a legit owner can react to unauthorized change
       if (previousEmail) {

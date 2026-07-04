@@ -698,13 +698,14 @@ async function maybeNotifyLowBalance(orgId) {
 
     const emailOptions = {
       to: owner.email,
+      orgId, // Phase 11 sender identity
       data: {
         userName: owner.profile?.name || 'there',
         remainingCredits: String(balance),
         planName: tier ? tier.charAt(0).toUpperCase() + tier.slice(1) : 'Free',
       },
     };
-    await applyCustomTemplate('credits_low', emailOptions);
+    await applyCustomTemplate('credits_low', emailOptions, orgId);
     if (!emailOptions.subject) return;
     await sendEmail(emailOptions);
     console.log(`[creditService] credits_low email sent to ${owner.email} for org ${orgId} (balance=${balance})`);

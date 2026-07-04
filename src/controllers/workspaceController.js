@@ -6,6 +6,21 @@ const OrgMember = require('../models/OrgMember');
 const WorkspaceMember = require('../models/WorkspaceMember');
 const tierService = require('../services/tierService');
 const creditService = require('../services/creditService');
+const auditService = require('../services/auditService');
+
+/** Audit shorthand for workspace lifecycle events (fire-and-forget). */
+function auditWorkspace(req, organizationId, workspace, action, extraMeta = {}) {
+  auditService.record({
+    organizationId,
+    workspaceId: workspace._id,
+    userId: req.user.userId,
+    actorEmail: req.user.email,
+    action,
+    resourceId: workspace._id,
+    meta: { name: workspace.name, ...extraMeta },
+    ip: req.ip,
+  });
+}
 
 // ─── GET WORKSPACE (resolve through active org — no ghost creation) ──
 const getWorkspace = async (req, res) => {
@@ -230,6 +245,7 @@ const createWorkspace = async (req, res) => {
       organizationId: orgId,
       color: color || '#6366F1',
     });
+    auditWorkspace(req, orgId, workspace, 'workspace.create');
     res.status(201).json({ workspace });
   } catch (error) {
     if (error.code === 11000) {
@@ -252,6 +268,7 @@ const updateWorkspace = async (req, res) => {
     if (name !== undefined) workspace.name = name.trim();
     if (color !== undefined) workspace.color = color;
     await workspace.save();
+    auditWorkspace(req, workspace.organizationId, workspace, 'workspace.update');
     res.json({ workspace });
   } catch (error) {
     if (error.code === 11000) {
@@ -318,6 +335,7 @@ const deleteWorkspace = async (req, res) => {
       { _id: req.user.userId, activeWorkspaceId: workspaceId },
       { $set: { activeWorkspaceId: null } }
     );
+    auditWorkspace(req, workspace.organizationId, workspace, 'workspace.delete');
     res.json({ message: 'Workspace deleted' });
   } catch (error) {
     console.error('Delete workspace error:', error);
@@ -528,9 +546,19 @@ const moveWorkspace = async (req, res) => {
       }
     }
 
+    // Record the departure in the SOURCE org's log before overwriting —
+    // its admins need to see that the workspace left, not just the
+    // destination org seeing it arrive.
+    const sourceOrgId = workspace.organizationId;
     workspace.organizationId = targetOrg._id;
     await workspace.save();
 
+    auditWorkspace(req, sourceOrgId, workspace, 'workspace.move_out', {
+      targetOrgId: String(targetOrg._id),
+    });
+    auditWorkspace(req, targetOrg._id, workspace, 'workspace.move_in', {
+      sourceOrgId: sourceOrgId ? String(sourceOrgId) : null,
+    });
     res.json({ workspace });
   } catch (error) {
     console.error('Move workspace error:', error);

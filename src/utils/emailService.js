@@ -33,13 +33,28 @@ transporter.verify().then(() => {
 });
 
 /**
- * Send an email
+ * Send an email.
+ *
+ * `orgId` (optional) makes the FROM identity tenant-aware (Phase 11):
+ * a white-label org with a verified sender domain sends as
+ * "Their Name <no-reply@their-domain>"; a custom from-name without a
+ * verified domain sends as "Their Name <platform address>". Resolution is
+ * fail-open — identity problems fall back to the platform default and the
+ * email still goes out.
  */
-const sendEmail = async ({ to, subject, html, fromName, replyTo }) => {
+const sendEmail = async ({ to, subject, html, fromName, replyTo, orgId }) => {
   const defaultFrom = process.env.EMAIL_FROM || 'SupaRank <no-reply@suparank.com>';
-  const from = fromName
+  let from = fromName
     ? `${fromName} <${defaultFrom.match(/<(.+)>/)?.[1] || 'no-reply@suparank.ai'}>`
     : defaultFrom;
+
+  if (orgId) {
+    // Lazy require: emailService is a util loaded at boot by many modules;
+    // the identity service pulls in brand/tier services.
+    const { resolveSenderIdentity } = require('../services/emailIdentityService');
+    const identity = await resolveSenderIdentity(orgId);
+    if (identity) from = `${identity.fromName} <${identity.fromEmail}>`;
+  }
 
   // Use privateemail SMTP when sending to support@suparank.ai (SPF workaround)
   const useSupportTransport =

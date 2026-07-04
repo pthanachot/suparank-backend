@@ -162,6 +162,9 @@ const TIERS = [
     creditLimitType: 'monthly',
     contentVersionHistoryDays: 180,
     custom: {
+      // White-label entitlement — gates BrandConfig (custom branding),
+      // and later tenant domains + per-tenant email (Phases 8-12).
+      whiteLabel: true,
       creditDeductionFlags: {
         aiChat: true,
         aiAgent: true,

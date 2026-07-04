@@ -179,15 +179,29 @@ const updateOrganization = async (req, res) => {
       return res.status(403).json({ error: 'Only the organization owner can update it' });
     }
 
-    if (name && name.trim()) {
+    const changed = [];
+    if (name && name.trim() && name.trim() !== org.name) {
       org.name = name.trim();
       org.slug = await Organization.generateSlug(name.trim(), req.user.userId);
+      changed.push('name');
     }
-    if (avatar !== undefined) {
+    if (avatar !== undefined && avatar !== org.avatar) {
       org.avatar = avatar;
+      changed.push('avatar');
     }
 
     await org.save();
+    if (changed.length > 0) {
+      require('../services/auditService').record({
+        organizationId: org._id,
+        userId: req.user.userId,
+        actorEmail: req.user.email,
+        action: 'org.update',
+        resourceId: org._id,
+        meta: { name: org.name, changed },
+        ip: req.ip,
+      });
+    }
     res.json({ organization: org.toObject() });
   } catch (error) {
     if (error.code === 11000) {

@@ -7,6 +7,7 @@ const analysisController = require('../controllers/analysisController');
 const aiController = require('../controllers/aiController');
 const planController = require('../controllers/planController');
 const contextController = require('../controllers/contextController');
+const reportController = require('../controllers/reportController');
 const { authenticateToken } = require('../middleware/auth');
 const { resolveWorkspaceWithRole: rwr, requirePermission: rp, requireFeature: rf } = require('../middleware/permissions');
 const { requireQuota: rq } = require('../middleware/tierEnforcement');
@@ -54,6 +55,16 @@ router.post('/:workspaceNumber/content/:contentNumber/import-url', rwr, rp('cont
 router.post('/:workspaceNumber/content/:contentNumber/internal-links', rwr, rp('analysis', 'use'), analysisController.internalLinks);
 router.post('/:workspaceNumber/content/:contentNumber/readability-check', rwr, rf('analysis'), rp('analysis', 'use'), analysisController.readabilityCheck);
 router.post('/:workspaceNumber/content/:contentNumber/regenerate-outline', rwr, rf('analysis'), rp('analysis', 'use'), analysisController.regenerateOutline);
+
+// Monthly reports (Phase 14): /api/workspace/:workspaceNumber/reports
+// 'analysis' read = client-visible; 'analysis' use = editors+; share
+// management is owner/admin only ('members' manage).
+router.get('/:workspaceNumber/reports', rwr, rp('analysis', 'read'), reportController.listReports);
+router.post('/:workspaceNumber/reports/generate', rwr, rp('analysis', 'use'), reportController.generateReport);
+router.get('/:workspaceNumber/reports/:period', rwr, rp('analysis', 'read'), reportController.getReport);
+router.post('/:workspaceNumber/reports/:period/share', rwr, rp('members', 'manage'), reportController.createShareLink);
+router.delete('/:workspaceNumber/reports/:period/share', rwr, rp('members', 'manage'), reportController.revokeShareLink);
+router.get('/:workspaceNumber/reports/:period/pdf', rwr, rp('analysis', 'read'), reportController.downloadPdf);
 
 // AI writing under content: /api/workspace/:workspaceNumber/content/:contentNumber/ai/...
 router.post('/:workspaceNumber/content/:contentNumber/ai/chat', rwr, rf('aiChat'), rp('aiChat', 'use'), rc('aiChat', 10), aiController.chat);

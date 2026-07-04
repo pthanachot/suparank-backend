@@ -13,6 +13,7 @@ const { getPlanFromPriceId, EXTRA_SEAT_PRICE_SET } = require('../config/stripePr
 const { applyCustomTemplate } = require('./emailPortalController');
 const { sendEmail } = require('../utils/emailService');
 const { getSettings } = require('../services/systemSettingsService');
+const auditService = require('../services/auditService');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -46,9 +47,10 @@ async function notifyOrgOwner(organizationId, triggerId, data) {
 
     const emailOptions = {
       to: owner.email,
+      orgId: organizationId, // Phase 11 sender identity
       data: { userName: owner.profile?.name || 'there', ...data },
     };
-    await applyCustomTemplate(triggerId, emailOptions);
+    await applyCustomTemplate(triggerId, emailOptions, organizationId);
     if (!emailOptions.subject) return;
     await sendEmail(emailOptions);
     console.log(`[email] ${triggerId} email sent to ${owner.email} for org=${organizationId}`);
@@ -251,6 +253,11 @@ async function handleSubscriptionUpdated(stripeSub) {
   // Detect plan change for credit pro-rating
   const oldPlanId = sub.planId;
   const isPlanChange = planId && oldPlanId && planId !== oldPlanId;
+  // Snapshot pre-update values so the audit entry only records meaningful
+  // transitions (Stripe fires this event on renewals, seat syncs, and
+  // payment-method changes too — those must not flood the activity feed).
+  const prevStatus = sub.status;
+  const prevCancelAtPeriodEnd = sub.cancelAtPeriodEnd;
 
   if (planId) sub.planId = planId;
 
@@ -345,6 +352,24 @@ async function handleSubscriptionUpdated(stripeSub) {
     }
   }
 
+  // Audit only meaningful lifecycle transitions — plan change, status
+  // change, or cancellation scheduled/undone. Renewals, seat syncs, and
+  // payment-method updates fire this webhook too and are noise here.
+  const meaningful =
+    isPlanChange ||
+    sub.status !== prevStatus ||
+    sub.cancelAtPeriodEnd !== prevCancelAtPeriodEnd;
+  if (sub.organizationId && meaningful) {
+    auditService.record({
+      organizationId: sub.organizationId,
+      userId: null, // system actor
+      actorEmail: 'stripe',
+      action: isPlanChange ? 'billing.plan_change' : 'billing.subscription_updated',
+      resourceId: stripeSub.id,
+      meta: { planId: sub.planId, status: sub.status, cancelAtPeriodEnd: sub.cancelAtPeriodEnd },
+    });
+  }
+
   console.log(`Subscription updated: sub=${stripeSub.id} status=${stripeSub.status}`);
 }
 
@@ -373,6 +398,15 @@ async function handleSubscriptionDeleted(stripeSub) {
   } catch (err) {
     console.error(`[credits] Failed to expire on cancel for org=${sub.organizationId}:`, err.message);
   }
+
+  auditService.record({
+    organizationId: sub.organizationId,
+    userId: null, // system actor
+    actorEmail: 'stripe',
+    action: 'billing.subscription_canceled',
+    resourceId: stripeSub.id,
+    meta: { planId: sub.planId },
+  });
 
   // Reset monthly usage counters — org has no free tier, so stale counters
   // would block the user when they re-subscribe to a new paid plan.
@@ -508,13 +542,15 @@ async function handlePaymentFailed(invoice) {
   await sub.save();
   clearTierCache();
 
-  // Payment failed notification via triggerable template
+  // Payment failed notification via triggerable template.
+  // Invariant I1: tenant-facing links use the org's custom domain when active
+  const baseUrl = await require('../services/domainService').resolveBaseUrl(sub.organizationId);
   await notifyOrgOwner(sub.organizationId, 'payment_failed', {
     planName: formatPlanName(sub.planId),
     retryDate: invoice.next_payment_attempt
       ? formatEmailDate(parseStripeDate(invoice.next_payment_attempt))
       : 'soon',
-    updatePaymentUrl: `${process.env.FRONTEND_URL || 'https://app.suparank.ai'}/settings/billing`,
+    updatePaymentUrl: `${baseUrl}/settings/billing`,
   });
 
   console.log(`Payment failed: sub=${invoice.subscription}`);

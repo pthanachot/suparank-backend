@@ -1549,7 +1549,11 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
             })
             .join('');
 
-          const appUrl = process.env.FRONTEND_URL || 'https://app.suparank.ai';
+          // Invariant I1: tenant-facing links use the org's custom domain
+          // when active (falls back to FRONTEND_URL for org-less workspaces).
+          const appUrl = await require('../services/domainService').resolveBaseUrl(
+            ws?.organizationId
+          );
           const dashboardUrl = `${appUrl}/workspace/${ws?.workspaceNumber || 1}/ai-tracker`;
 
           // Pre-escape template variables that hold user-controlled strings.
@@ -1559,6 +1563,7 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
           const emailOptions = {
             to: owner.email,
             fromName: 'SupaRank',
+            orgId: ws?.organizationId || null, // Phase 11 sender identity
             data: {
               userName: htmlEscape(owner.profile?.name || owner.email.split('@')[0]),
               trackerName: htmlEscape(tracker.name || tracker.domain),
@@ -1581,7 +1586,7 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
           };
           // F4-11: retry-with-backoff on send. Transient SMTP failures
           // shouldn't silently lose scan-summary emails the user paid for.
-          await applyCustomTemplate('scan_completed', emailOptions);
+          await applyCustomTemplate('scan_completed', emailOptions, ws?.organizationId || null);
           const maxAttempts = 3;
           let sendErr = null;
           for (let attempt = 0; attempt < maxAttempts; attempt++) {

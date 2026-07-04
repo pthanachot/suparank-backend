@@ -16,6 +16,8 @@ const Workspace = require('../models/Workspace');
 const User = require('../models/User');
 const { applyCustomTemplate } = require('../controllers/emailPortalController');
 const { sendEmail } = require('../utils/emailService');
+const auditService = require('./auditService');
+const domainService = require('./domainService');
 
 const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
@@ -41,12 +43,13 @@ async function createInvite({ org, email, role, accessScope, workspaceIds = [], 
     expiresAt: new Date(Date.now() + INVITE_TTL_MS),
   });
 
-  // TODO(Phase 9): build from resolveBaseUrl(org._id) once tenant domains exist
-  const baseUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+  // Invariant I1: tenant-facing links use the org's custom domain when active
+  const baseUrl = await domainService.resolveBaseUrl(org._id);
   const acceptUrl = `${baseUrl}/accept-invite?token=${rawToken}`;
 
   const emailOptions = {
     to: normalizedEmail,
+    orgId: org._id, // Phase 11 sender identity
     data: {
       inviterName: inviterName || 'A team member',
       orgName: org.name,
@@ -54,7 +57,22 @@ async function createInvite({ org, email, role, accessScope, workspaceIds = [], 
       acceptUrl,
     },
   };
-  await applyCustomTemplate('member_invite', emailOptions);
+  await applyCustomTemplate('member_invite', emailOptions, org._id);
+  // Template resolution failing (transient DB error) must not send a
+  // subject-less shell — the invite email IS the deliverable. Hardcoded
+  // fallback mirrors the default template.
+  if (!emailOptions.subject) {
+    emailOptions.subject = `You've been invited to join ${org.name}`;
+    emailOptions.html = `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;">
+  <h2 style="color:#111;margin-bottom:16px;">You're invited</h2>
+  <p style="color:#555;font-size:16px;line-height:1.6;">${inviterName || 'A team member'} has invited you to join <strong>${org.name}</strong> as ${role}.</p>
+  <div style="text-align:center;margin:32px 0;">
+    <a href="${acceptUrl}" style="background:#111;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:bold;display:inline-block;">Accept invitation</a>
+  </div>
+  <p style="color:#888;font-size:14px;">This invitation expires in 7 days.</p>
+</div>`;
+    delete emailOptions.data;
+  }
   await sendEmail(emailOptions);
 
   return invite;
@@ -146,6 +164,23 @@ async function acceptInvite(invite, user) {
   }
 
   await Invite.deleteOne({ _id: invite._id });
+
+  if (!alreadyMember) {
+    auditService.record({
+      organizationId: org._id,
+      userId: user._id,
+      actorEmail: user.email,
+      action: 'member.join',
+      resource: 'member',
+      resourceId: user._id,
+      meta: {
+        email: user.email,
+        role: invite.role,
+        accessScope: invite.accessScope,
+        via: 'invite',
+      },
+    });
+  }
 
   return { org, alreadyMember, workspace: activeWorkspace };
 }

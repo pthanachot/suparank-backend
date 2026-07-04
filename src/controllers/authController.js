@@ -61,6 +61,9 @@ const sendWelcomeEmail = async (user) => {
       to: user.email,
       data: {
         userName: user.profile?.name || 'there',
+        // Welcome links to the platform login: sendWelcomeEmail has no
+        // request context, and the whole template becomes tenant-scoped in
+        // Phase 12 (per-tenant email templates) — solve it there.
         loginUrl: `${process.env.FRONTEND_URL || 'https://app.suparank.ai'}/login`,
       },
     };
@@ -182,20 +185,36 @@ const emailSignup = async (req, res) => {
 
     // Send verification email if not already verified
     if (!user.verified) {
-      const verifyUrl = `${process.env.FRONTEND_URL}/verify-email?token=${user.verificationToken}`;
-      await sendEmail({
+      // Invariant I1 (Phase 10): signup that arrived on a VERIFIED tenant
+      // domain keeps its links there; the header is only trusted after a
+      // DB match, so it can't inject a phishing host.
+      const signupBase = await require('../services/domainService').resolveBaseUrlFromRequest(req);
+      const verifyUrl = `${signupBase}/verify-email?token=${user.verificationToken}`;
+      // Route through the admin-editable trigger template; fall back to the
+      // hardcoded email if template resolution fails. Signup has no org
+      // context yet → platform-scoped (null).
+      const emailOptions = {
         to: user.email,
-        subject: 'Verify your SupaRank account',
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
-            <h2 style="color: #111; margin-bottom: 16px;">Welcome to SupaRank!</h2>
-            <p style="color: #555; margin-bottom: 24px;">Click the button below to verify your email address:</p>
-            <a href="${verifyUrl}" style="display: inline-block; padding: 14px 32px; background: #4F46E5; color: white; text-decoration: none; border-radius: 12px; font-weight: bold; font-size: 14px;">Verify Email</a>
-            <p style="color: #888; font-size: 14px; margin-top: 24px;">This link expires in 24 hours.</p>
-            <p style="color: #888; font-size: 14px;">If you didn't create an account, you can safely ignore this email.</p>
-          </div>
-        `,
-      });
+        data: { userName: user.profile?.name || 'there', verifyUrl },
+      };
+      await applyCustomTemplate('verify_email_link', emailOptions, null);
+      if (emailOptions.subject) {
+        await sendEmail(emailOptions);
+      } else {
+        await sendEmail({
+          to: user.email,
+          subject: 'Verify your SupaRank account',
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
+              <h2 style="color: #111; margin-bottom: 16px;">Welcome to SupaRank!</h2>
+              <p style="color: #555; margin-bottom: 24px;">Click the button below to verify your email address:</p>
+              <a href="${verifyUrl}" style="display: inline-block; padding: 14px 32px; background: #4F46E5; color: white; text-decoration: none; border-radius: 12px; font-weight: bold; font-size: 14px;">Verify Email</a>
+              <p style="color: #888; font-size: 14px; margin-top: 24px;">This link expires in 24 hours.</p>
+              <p style="color: #888; font-size: 14px;">If you didn't create an account, you can safely ignore this email.</p>
+            </div>
+          `,
+        });
+      }
     }
 
     // Create session
@@ -362,19 +381,32 @@ const resendVerification = async (req, res) => {
     user.verificationExpires = Date.now() + 24 * 60 * 60 * 1000;
     await user.save();
 
-    const verifyUrl = `${process.env.FRONTEND_URL}/verify-email?token=${token}`;
-    await sendEmail({
+    // Invariant I1 (Phase 10): validated request host (see emailSignup)
+    const resendBase = await require('../services/domainService').resolveBaseUrlFromRequest(req);
+    const verifyUrl = `${resendBase}/verify-email?token=${token}`;
+    // Route through the admin-editable trigger template; fall back to the
+    // hardcoded email if template resolution fails. No org context → null.
+    const emailOptions = {
       to: user.email,
-      subject: 'Verify your SupaRank account',
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
-          <h2 style="color: #111; margin-bottom: 16px;">Verify your email</h2>
-          <p style="color: #555; margin-bottom: 24px;">Click the button below to verify your email address:</p>
-          <a href="${verifyUrl}" style="display: inline-block; padding: 14px 32px; background: #4F46E5; color: white; text-decoration: none; border-radius: 12px; font-weight: bold; font-size: 14px;">Verify Email</a>
-          <p style="color: #888; font-size: 14px; margin-top: 24px;">This link expires in 24 hours.</p>
-        </div>
-      `,
-    });
+      data: { userName: user.profile?.name || 'there', verifyUrl },
+    };
+    await applyCustomTemplate('verify_email_link', emailOptions, null);
+    if (emailOptions.subject) {
+      await sendEmail(emailOptions);
+    } else {
+      await sendEmail({
+        to: user.email,
+        subject: 'Verify your SupaRank account',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
+            <h2 style="color: #111; margin-bottom: 16px;">Verify your email</h2>
+            <p style="color: #555; margin-bottom: 24px;">Click the button below to verify your email address:</p>
+            <a href="${verifyUrl}" style="display: inline-block; padding: 14px 32px; background: #4F46E5; color: white; text-decoration: none; border-radius: 12px; font-weight: bold; font-size: 14px;">Verify Email</a>
+            <p style="color: #888; font-size: 14px; margin-top: 24px;">This link expires in 24 hours.</p>
+          </div>
+        `,
+      });
+    }
 
     res.json({ message: 'Verification email sent' });
   } catch (error) {

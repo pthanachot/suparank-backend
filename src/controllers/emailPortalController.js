@@ -7,6 +7,9 @@ const EmailTemplate = require('../models/EmailTemplate');
 const EmailSendLog = require('../models/EmailSendLog');
 const TriggerableEmailTemplate = require('../models/TriggerableEmailTemplate');
 const { sendEmail } = require('../utils/emailService');
+// Called via module property (not destructured) so tests can stub them.
+const flagService = require('../services/flagService');
+const brandService = require('../services/brandService');
 
 // ─── System email triggers (SupaRank-specific) ─────────────
 
@@ -17,7 +20,7 @@ const SYSTEM_TRIGGERS = [
     name: 'Welcome Email',
     description: 'Sent when a new user signs up',
     category: 'auth',
-    variables: ['userName', 'loginUrl'],
+    variables: ['userName', 'loginUrl', 'brandName', 'supportEmail'],
     triggerCount: 0,
   },
   {
@@ -25,7 +28,15 @@ const SYSTEM_TRIGGERS = [
     name: 'Email Verification',
     description: 'Verification code sent during signup',
     category: 'auth',
-    variables: ['code', 'expiresIn'],
+    variables: ['code', 'expiresIn', 'brandName'],
+    triggerCount: 0,
+  },
+  {
+    id: 'verify_email_link',
+    name: 'Email Verification Link',
+    description: 'Link-based email verification (signup, resend, email change)',
+    category: 'auth',
+    variables: ['userName', 'verifyUrl', 'brandName'],
     triggerCount: 0,
   },
   {
@@ -33,7 +44,7 @@ const SYSTEM_TRIGGERS = [
     name: 'Password Reset',
     description: 'Password reset code',
     category: 'auth',
-    variables: ['code', 'expiresIn'],
+    variables: ['code', 'expiresIn', 'brandName'],
     triggerCount: 0,
   },
   {
@@ -41,7 +52,7 @@ const SYSTEM_TRIGGERS = [
     name: 'Member Invitation',
     description: 'Sent when someone is invited to join an organization',
     category: 'auth',
-    variables: ['inviterName', 'orgName', 'role', 'acceptUrl'],
+    variables: ['inviterName', 'orgName', 'role', 'acceptUrl', 'brandName'],
     triggerCount: 0,
   },
   // Billing
@@ -50,7 +61,7 @@ const SYSTEM_TRIGGERS = [
     name: 'Payment Confirmation',
     description: 'Sent after successful payment',
     category: 'billing',
-    variables: ['userName', 'planName', 'amount', 'nextBillingDate'],
+    variables: ['userName', 'planName', 'amount', 'nextBillingDate', 'brandName'],
     triggerCount: 0,
   },
   {
@@ -58,7 +69,7 @@ const SYSTEM_TRIGGERS = [
     name: 'Subscription Canceled',
     description: 'Confirmation of subscription cancellation',
     category: 'billing',
-    variables: ['userName', 'planName', 'endDate'],
+    variables: ['userName', 'planName', 'endDate', 'brandName'],
     triggerCount: 0,
   },
   {
@@ -66,7 +77,7 @@ const SYSTEM_TRIGGERS = [
     name: 'Payment Failed',
     description: 'Notification of failed payment',
     category: 'billing',
-    variables: ['userName', 'planName', 'retryDate', 'updatePaymentUrl'],
+    variables: ['userName', 'planName', 'retryDate', 'updatePaymentUrl', 'brandName'],
     triggerCount: 0,
   },
   {
@@ -74,7 +85,7 @@ const SYSTEM_TRIGGERS = [
     name: 'Credits Running Low',
     description: 'Notification when credits are below threshold',
     category: 'billing',
-    variables: ['userName', 'remainingCredits', 'planName'],
+    variables: ['userName', 'remainingCredits', 'planName', 'brandName'],
     triggerCount: 0,
   },
   // Feedback
@@ -83,7 +94,7 @@ const SYSTEM_TRIGGERS = [
     name: 'Feedback Submitted',
     description: 'Sent to support@suparank.ai when a user submits in-app feedback',
     category: 'engagement',
-    variables: ['feature', 'rating', 'stars', 'comment', 'userEmail', 'submittedAt'],
+    variables: ['feature', 'rating', 'stars', 'comment', 'userEmail', 'submittedAt', 'brandName'],
     triggerCount: 0,
   },
   // Support
@@ -92,7 +103,16 @@ const SYSTEM_TRIGGERS = [
     name: 'Contact Form Submitted',
     description: 'Sent to support when a user submits the contact form',
     category: 'support',
-    variables: ['userName', 'userEmail', 'subject', 'category', 'message', 'submittedAt'],
+    variables: ['userName', 'userEmail', 'subject', 'category', 'message', 'submittedAt', 'brandName'],
+    triggerCount: 0,
+  },
+  // Reports
+  {
+    id: 'monthly_report',
+    name: 'Monthly Workspace Report',
+    description: "Sent on the 1st of each month with a link to the previous month's workspace report",
+    category: 'reports',
+    variables: ['workspaceName', 'period', 'reportUrl', 'brandName'],
     triggerCount: 0,
   },
   // AI Tracker
@@ -101,7 +121,7 @@ const SYSTEM_TRIGGERS = [
     name: 'AI Scan Completed',
     description: 'Sent to the workspace owner when an AI Tracker scan finishes',
     category: 'ai-tracker',
-    variables: ['userName', 'trackerName', 'domain', 'scanDate', 'promptsScanned', 'visibility', 'mentionRate', 'shareOfVoice', 'citationRate', 'avgSentiment', 'platformRows', 'promptRows', 'competitorRows', 'actionRows', 'dashboardUrl'],
+    variables: ['userName', 'trackerName', 'domain', 'scanDate', 'promptsScanned', 'visibility', 'mentionRate', 'shareOfVoice', 'citationRate', 'avgSentiment', 'platformRows', 'promptRows', 'competitorRows', 'actionRows', 'dashboardUrl', 'brandName'],
     triggerCount: 0,
   },
 ];
@@ -110,20 +130,20 @@ const SYSTEM_TRIGGERS = [
 
 const ORIGINAL_DEFAULT_TEMPLATES = {
   welcome: {
-    subject: 'Welcome to SupaRank!',
+    subject: 'Welcome to {{brandName}}!',
     html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;">
-  <h1 style="color:#111;font-size:24px;margin-bottom:16px;">Welcome to SupaRank!</h1>
+  <h1 style="color:#111;font-size:24px;margin-bottom:16px;">Welcome to {{brandName}}!</h1>
   <p style="color:#555;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
-  <p style="color:#555;font-size:16px;line-height:1.6;">We're excited to have you on board. SupaRank helps you track your AI visibility, optimize your brand voice, and stay ahead of the competition.</p>
+  <p style="color:#555;font-size:16px;line-height:1.6;">We're excited to have you on board. {{brandName}} helps you track your AI visibility, optimize your brand voice, and stay ahead of the competition.</p>
   <div style="text-align:center;margin:32px 0;">
     <a href="{{loginUrl}}" style="background:#111;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:bold;display:inline-block;">Get Started</a>
   </div>
-  <p style="color:#888;font-size:14px;">If you have any questions, feel free to reach out to our support team.</p>
+  <p style="color:#888;font-size:14px;">If you have any questions, feel free to reach out to our support team at {{supportEmail}}.</p>
 </div>`,
-    variables: ['userName', 'loginUrl'],
+    variables: ['userName', 'loginUrl', 'brandName', 'supportEmail'],
   },
   verify_email: {
-    subject: 'SupaRank - Verify Your Email',
+    subject: '{{brandName}} — Verify your email',
     html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;">
   <h2 style="color:#111;margin-bottom:16px;">Verify your email</h2>
   <p style="color:#555;margin-bottom:24px;">Enter this code to verify your email address:</p>
@@ -133,10 +153,21 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
   <p style="color:#888;font-size:14px;">This code expires in {{expiresIn}}.</p>
   <p style="color:#888;font-size:14px;">If you didn't request this, you can safely ignore this email.</p>
 </div>`,
-    variables: ['code', 'expiresIn'],
+    variables: ['code', 'expiresIn', 'brandName'],
+  },
+  verify_email_link: {
+    subject: '{{brandName}} — Verify your email',
+    html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;">
+  <h2 style="color:#111;margin-bottom:16px;">Verify your email</h2>
+  <p style="color:#555;margin-bottom:24px;">Hi {{userName}}, click the button below to verify your email address:</p>
+  <a href="{{verifyUrl}}" style="display:inline-block;padding:14px 32px;background:#4F46E5;color:white;text-decoration:none;border-radius:12px;font-weight:bold;font-size:14px;">Verify Email</a>
+  <p style="color:#888;font-size:14px;margin-top:24px;">This link expires in 24 hours.</p>
+  <p style="color:#888;font-size:14px;">If you didn't request this, you can safely ignore this email.</p>
+</div>`,
+    variables: ['userName', 'verifyUrl', 'brandName'],
   },
   password_reset: {
-    subject: 'SupaRank - Reset Your Password',
+    subject: '{{brandName}} — Reset your password',
     html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;">
   <h2 style="color:#111;margin-bottom:16px;">Reset your password</h2>
   <p style="color:#555;margin-bottom:24px;">Enter this code to reset your password:</p>
@@ -146,7 +177,7 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
   <p style="color:#888;font-size:14px;">This code expires in {{expiresIn}}.</p>
   <p style="color:#888;font-size:14px;">If you didn't request this, you can safely ignore this email.</p>
 </div>`,
-    variables: ['code', 'expiresIn'],
+    variables: ['code', 'expiresIn', 'brandName'],
   },
   member_invite: {
     subject: "You've been invited to join {{orgName}}",
@@ -159,7 +190,7 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
   <p style="color:#888;font-size:14px;">This invitation expires in 7 days.</p>
   <p style="color:#888;font-size:14px;">If you weren't expecting this, you can safely ignore this email.</p>
 </div>`,
-    variables: ['inviterName', 'orgName', 'role', 'acceptUrl'],
+    variables: ['inviterName', 'orgName', 'role', 'acceptUrl', 'brandName'],
   },
   payment_confirmation: {
     subject: 'Payment Confirmed - {{planName}}',
@@ -173,10 +204,10 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
   </div>
   <p style="color:#888;font-size:14px;">Thank you for your continued support!</p>
 </div>`,
-    variables: ['userName', 'planName', 'amount', 'nextBillingDate'],
+    variables: ['userName', 'planName', 'amount', 'nextBillingDate', 'brandName'],
   },
   subscription_canceled: {
-    subject: 'Subscription Canceled - SupaRank',
+    subject: 'Subscription Canceled - {{brandName}}',
     html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;">
   <h1 style="color:#111;font-size:24px;margin-bottom:16px;">Subscription Canceled</h1>
   <p style="color:#555;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
@@ -187,7 +218,7 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
   <p style="color:#555;font-size:16px;line-height:1.6;">If you change your mind, you can re-subscribe at any time from your billing settings.</p>
   <p style="color:#888;font-size:14px;">We hope to see you back soon!</p>
 </div>`,
-    variables: ['userName', 'planName', 'endDate'],
+    variables: ['userName', 'planName', 'endDate', 'brandName'],
   },
   payment_failed: {
     subject: 'Payment Failed - Action Required',
@@ -202,23 +233,23 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
     <a href="{{updatePaymentUrl}}" style="background:#dc2626;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:bold;display:inline-block;">Update Payment Method</a>
   </div>
 </div>`,
-    variables: ['userName', 'planName', 'retryDate', 'updatePaymentUrl'],
+    variables: ['userName', 'planName', 'retryDate', 'updatePaymentUrl', 'brandName'],
   },
   credits_low: {
-    subject: 'Credits Running Low - SupaRank',
+    subject: 'Credits Running Low - {{brandName}}',
     html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;">
   <h1 style="color:#f59e0b;font-size:24px;margin-bottom:16px;">Credits Running Low</h1>
   <p style="color:#555;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
   <p style="color:#555;font-size:16px;line-height:1.6;">You have <strong>{{remainingCredits}}</strong> credits remaining on your <strong>{{planName}}</strong> plan.</p>
   <p style="color:#555;font-size:16px;line-height:1.6;">Consider upgrading your plan to get more credits and continue using all features without interruption.</p>
 </div>`,
-    variables: ['userName', 'remainingCredits', 'planName'],
+    variables: ['userName', 'remainingCredits', 'planName', 'brandName'],
   },
   feedback_submitted: {
-    subject: '[SupaRank Feedback] {{stars}} — {{feature}}',
+    subject: '[{{brandName}} Feedback] {{stars}} — {{feature}}',
     html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;border:1px solid #e5e7eb;border-radius:8px;">
   <h2 style="color:#111;margin-bottom:4px;">New Feedback Received</h2>
-  <p style="color:#6b7280;font-size:14px;margin-top:0;">SupaRank In-App Feedback</p>
+  <p style="color:#6b7280;font-size:14px;margin-top:0;">{{brandName}} In-App Feedback</p>
   <table style="width:100%;border-collapse:collapse;margin:24px 0;">
     <tr><td style="padding:8px 0;color:#374151;font-weight:600;width:140px;">Feature</td><td style="padding:8px 0;color:#111;">{{feature}}</td></tr>
     <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Rating</td><td style="padding:8px 0;color:#FFA163;font-size:20px;">{{stars}}</td></tr>
@@ -227,13 +258,13 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
     <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Submitted</td><td style="padding:8px 0;color:#6b7280;font-size:13px;">{{submittedAt}}</td></tr>
   </table>
 </div>`,
-    variables: ['feature', 'rating', 'stars', 'comment', 'userEmail', 'submittedAt'],
+    variables: ['feature', 'rating', 'stars', 'comment', 'userEmail', 'submittedAt', 'brandName'],
   },
   contact_submitted: {
-    subject: '[SupaRank Contact] {{category}} — {{subject}}',
+    subject: '[{{brandName}} Contact] {{category}} — {{subject}}',
     html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;border:1px solid #e5e7eb;border-radius:8px;">
   <h2 style="color:#111;margin-bottom:4px;">New Contact Form Submission</h2>
-  <p style="color:#6b7280;font-size:14px;margin-top:0;">SupaRank Help Center</p>
+  <p style="color:#6b7280;font-size:14px;margin-top:0;">{{brandName}} Help Center</p>
   <table style="width:100%;border-collapse:collapse;margin:24px 0;">
     <tr><td style="padding:8px 0;color:#374151;font-weight:600;width:140px;">User</td><td style="padding:8px 0;color:#111;">{{userName}}</td></tr>
     <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Email</td><td style="padding:8px 0;color:#111;">{{userEmail}}</td></tr>
@@ -243,7 +274,20 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
     <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Submitted</td><td style="padding:8px 0;color:#6b7280;font-size:13px;">{{submittedAt}}</td></tr>
   </table>
 </div>`,
-    variables: ['userName', 'userEmail', 'subject', 'category', 'message', 'submittedAt'],
+    variables: ['userName', 'userEmail', 'subject', 'category', 'message', 'submittedAt', 'brandName'],
+  },
+  monthly_report: {
+    subject: 'Your {{period}} report for {{workspaceName}} is ready',
+    html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;">
+  <h1 style="color:#111;font-size:24px;margin-bottom:16px;">Your monthly report is ready</h1>
+  <p style="color:#555;font-size:16px;line-height:1.6;">The <strong>{{period}}</strong> performance report for <strong>{{workspaceName}}</strong> has been generated.</p>
+  <p style="color:#555;font-size:16px;line-height:1.6;">It covers content production, on-page scores, AI visibility and search performance for the month.</p>
+  <div style="text-align:center;margin:32px 0;">
+    <a href="{{reportUrl}}" style="background:#111;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:bold;display:inline-block;">View Report</a>
+  </div>
+  <p style="color:#888;font-size:14px;">This link expires in 90 days. You're receiving this because you're part of this workspace on {{brandName}}.</p>
+</div>`,
+    variables: ['workspaceName', 'period', 'reportUrl', 'brandName'],
   },
   scan_completed: {
     subject: 'AI Scan Complete – {{trackerName}}',
@@ -336,19 +380,32 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
   <div style="text-align:center;margin-bottom:24px;">
     <a href="{{dashboardUrl}}" style="background:#4f46e5;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:700;font-size:14px;display:inline-block;">View Full Dashboard</a>
   </div>
-  <p style="color:#94a3b8;font-size:11px;text-align:center;margin:0;">You&rsquo;re receiving this because email notifications are enabled on your SupaRank account.</p>
+  <p style="color:#94a3b8;font-size:11px;text-align:center;margin:0;">You&rsquo;re receiving this because email notifications are enabled on your {{brandName}} account.</p>
 </div>`,
-    variables: ['userName', 'trackerName', 'domain', 'scanDate', 'promptsScanned', 'visibility', 'mentionRate', 'shareOfVoice', 'citationRate', 'avgSentiment', 'platformRows', 'promptRows', 'competitorRows', 'actionRows', 'dashboardUrl'],
+    variables: ['userName', 'trackerName', 'domain', 'scanDate', 'promptsScanned', 'visibility', 'mentionRate', 'shareOfVoice', 'citationRate', 'avgSentiment', 'platformRows', 'promptRows', 'competitorRows', 'actionRows', 'dashboardUrl', 'brandName'],
   },
 };
 
 // ─── Template resolution helpers ────────────────────────────
 
+// Legacy global rows predate the organizationId field entirely, so the
+// GLOBAL row is "organizationId null OR missing".
+const _globalRowFilter = (triggerId) => ({
+  triggerId,
+  $or: [{ organizationId: null }, { organizationId: { $exists: false } }],
+});
+
 /**
- * Resolve the template for a trigger (DB override > hardcoded original).
- * Also increments trigger stats (triggerCount, lastTriggered).
+ * Resolve the template for a trigger.
+ * Resolution order (Phase 12):
+ *   (a) TENANT override — only when organizationId is given AND the
+ *       whiteLabelEmail launch flag is live AND the org row exists;
+ *   (b) GLOBAL admin override (organizationId null/missing);
+ *   (c) hardcoded original default.
+ * Also increments trigger stats (triggerCount, lastTriggered) on the
+ * GLOBAL row — never creates tenant rows as a side effect.
  */
-const getTemplateForTrigger = async (triggerId) => {
+const getTemplateForTrigger = async (triggerId, organizationId = null) => {
   try {
     const originalDefault = ORIGINAL_DEFAULT_TEMPLATES[triggerId];
     if (!originalDefault) {
@@ -356,22 +413,41 @@ const getTemplateForTrigger = async (triggerId) => {
       return null;
     }
 
-    const saved = await TriggerableEmailTemplate.findOne({ triggerId }).lean();
+    let tenant = null;
+    if (organizationId && (await flagService.isFlagLive('whiteLabelEmail'))) {
+      // Downgrade semantics match brandService: the override row is retained
+      // but only APPLIES while the org keeps the white-label entitlement —
+      // otherwise a downgraded org's custom HTML would ship with platform
+      // branding substituted into it. Guarded so a brand-lookup failure
+      // only skips the tenant override (fail-closed) without breaking the
+      // global/default resolution below. (Both lookups are 5-min cached.)
+      let entitled = false;
+      try {
+        ({ entitled } = await brandService.getBrandForOrg(organizationId));
+      } catch (err) {
+        console.error('[triggers] entitlement lookup failed:', err.message);
+      }
+      if (entitled) {
+        tenant = await TriggerableEmailTemplate.findOne({ triggerId, organizationId }).lean();
+      }
+    }
 
-    // Increment stats
+    const saved = await TriggerableEmailTemplate.findOne(_globalRowFilter(triggerId)).lean();
+
+    // Increment stats — always on the GLOBAL row
     await TriggerableEmailTemplate.findOneAndUpdate(
-      { triggerId },
+      _globalRowFilter(triggerId),
       {
         $inc: { triggerCount: 1 },
         $set: { lastTriggered: new Date() },
-        $setOnInsert: { triggerId },
+        $setOnInsert: { triggerId, organizationId: null },
       },
       { upsert: true }
     );
 
     return {
-      subject: saved?.defaultSubject || originalDefault.subject,
-      html: saved?.defaultHtml || originalDefault.html,
+      subject: tenant?.defaultSubject || saved?.defaultSubject || originalDefault.subject,
+      html: tenant?.defaultHtml || saved?.defaultHtml || originalDefault.html,
     };
   } catch (error) {
     console.error(`[triggers] getTemplateForTrigger error for ${triggerId}:`, error.message);
@@ -382,16 +458,36 @@ const getTemplateForTrigger = async (triggerId) => {
 /**
  * Resolve a trigger template and apply {{variable}} substitution.
  * Mutates emailOptions in place — sets .subject and .html, removes .data.
+ * `brandName` / `supportEmail` are auto-injected into data (resolved brand
+ * of `organizationId`, or the platform brand) unless the caller set them.
  *
  * Usage:
  *   const emailOptions = { to: user.email, data: { userName: 'John', planName: 'Pro' } };
- *   await applyCustomTemplate('subscription_canceled', emailOptions);
+ *   await applyCustomTemplate('subscription_canceled', emailOptions, orgIdOrNull);
  *   await sendEmail(emailOptions);
  */
-const applyCustomTemplate = async (triggerId, emailOptions) => {
+const applyCustomTemplate = async (triggerId, emailOptions, organizationId = null) => {
   try {
-    const template = await getTemplateForTrigger(triggerId);
+    const template = await getTemplateForTrigger(triggerId, organizationId);
     if (template && emailOptions.data) {
+      // Enrich with brand variables before substitution. Emails must never
+      // fail on brand lookups — fall back to the platform identity.
+      if (emailOptions.data.brandName === undefined || emailOptions.data.supportEmail === undefined) {
+        let brandName = 'SupaRank';
+        let supportEmail = 'support@suparank.ai';
+        try {
+          const brand = organizationId
+            ? (await brandService.getBrandForOrg(organizationId)).brand
+            : await brandService.getPlatformBrand();
+          if (brand?.productName) brandName = brand.productName;
+          if (brand?.supportEmail) supportEmail = brand.supportEmail;
+        } catch (err) {
+          console.error(`[triggers] brand lookup failed for ${triggerId}:`, err.message);
+        }
+        if (emailOptions.data.brandName === undefined) emailOptions.data.brandName = brandName;
+        if (emailOptions.data.supportEmail === undefined) emailOptions.data.supportEmail = supportEmail;
+      }
+
       emailOptions.subject = Object.entries(emailOptions.data).reduce(
         (subj, [key, value]) =>
           subj.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), String(value ?? '')),
@@ -618,7 +714,10 @@ const deleteTemplate = async (req, res) => {
 
 const getTriggers = async (req, res) => {
   try {
-    const savedTriggers = await TriggerableEmailTemplate.find().lean();
+    // Global rows only — tenant overrides are managed via the org routes
+    const savedTriggers = await TriggerableEmailTemplate.find({
+      $or: [{ organizationId: null }, { organizationId: { $exists: false } }],
+    }).lean();
     const triggerMap = {};
     savedTriggers.forEach((t) => {
       triggerMap[t.triggerId] = t;
@@ -654,7 +753,7 @@ const getDefaultTemplate = async (req, res) => {
       return res.status(404).json({ error: 'No default template for this trigger' });
     }
 
-    const savedTrigger = await TriggerableEmailTemplate.findOne({ triggerId }).lean();
+    const savedTrigger = await TriggerableEmailTemplate.findOne(_globalRowFilter(triggerId)).lean();
 
     res.json({
       defaultTemplate: {
@@ -693,8 +792,8 @@ const updateDefaultTemplate = async (req, res) => {
     }
 
     await TriggerableEmailTemplate.findOneAndUpdate(
-      { triggerId },
-      { $set: update, $setOnInsert: { triggerId } },
+      _globalRowFilter(triggerId),
+      { $set: update, $setOnInsert: { triggerId, organizationId: null } },
       { upsert: true, new: true }
     );
 

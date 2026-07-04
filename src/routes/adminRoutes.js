@@ -86,6 +86,12 @@ router.get('/email-portal/triggers', adminMiddleware, emailPortalController.getT
 router.get('/email-portal/triggers/:triggerId/default', adminMiddleware, emailPortalController.getDefaultTemplate);
 router.put('/email-portal/triggers/:triggerId/default', adminMiddleware, emailPortalController.updateDefaultTemplate);
 
+// ─── White-label brand configs ──────────────────────────────
+
+const brandController = require('../controllers/brandController');
+router.get('/brand-configs', adminMiddleware, brandController.adminListBrandConfigs);
+router.put('/brand-configs/:orgId', adminMiddleware, brandController.adminUpdateBrandConfig);
+
 // ─── Feedback routes ────────────────────────────────────────
 
 router.get('/feedback', adminMiddleware, feedbackController.getFeedbackList);

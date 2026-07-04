@@ -211,9 +211,13 @@ app.use('/api/workspaces', workspaceCrudRoutes);
 app.use('/api/org', orgRoutes);
 app.use('/api/organizations', organizationRoutes);
 app.use('/api/invites', require('./routes/inviteRoutes'));
+app.use('/api/tenant', require('./routes/tenantRoutes'));
 app.use('/api/admin', adminRoutes);
 app.use('/api/feedback', feedbackRoutes);
 app.use('/api/contact', contactRoutes);
+
+// Public, unauthenticated endpoints (token-gated shared reports)
+app.use('/api/public', require('./routes/publicRoutes'));
 
 // Internal API for the Go writing-engine (CFS reads, plan writes, skills
 // bridge). Gated by internalAuth middleware — NOT user-facing.
@@ -382,6 +386,164 @@ cron.schedule(cronSchedule, async () => {
     console.error('[cron] sitemap scheduler error:', err.message);
   }
 });
+
+// ─── Tenant domain status re-check (daily) ──────────────────────────────────
+// Advances pending_ssl domains whose Cloudflare cert went active, and demotes
+// active domains whose CNAME no longer points at us. Sequential on purpose —
+// domain counts are small and we'd rather not burst DNS/CF lookups.
+const DomainForCron = require('./models/Domain');
+const domainServiceForCron = require('./services/domainService');
+cron.schedule(cronSchedule, async () => {
+  try {
+    const domains = await DomainForCron.find({ status: { $in: ['pending_ssl', 'active'] } });
+    if (domains.length === 0) return;
+    console.log(`[cron] re-checking ${domains.length} tenant domain(s)`);
+
+    for (const domain of domains) {
+      try {
+        await domainServiceForCron.refreshDomainStatus(domain);
+      } catch (err) {
+        console.error(`[cron] domain re-check failed for ${domain.hostname}:`, err.message);
+      }
+    }
+  } catch (err) {
+    console.error('[cron] domain re-check scheduler error:', err.message);
+  }
+});
+
+// ─── Monthly workspace reports (Phase 14) ───────────────────────────────────
+// 1st of each month at 03:30 UTC: for every org on a PAID tier
+// (active/trialing Subscription), generate the previous month's snapshot for
+// each workspace (if missing) and email the org owner + client-role workspace
+// members a fresh 90-day share link. Dedupe marker: reportEmailedAt on the
+// snapshot — emails go out whenever it is null (manual generation must not
+// suppress the monthly email; a crash between generate and email retries on
+// the next run), and re-runs (deploy/restart on the 1st) never double-send.
+const SubscriptionForReports = require('./models/Subscription');
+const ReportSnapshotForCron = require('./models/ReportSnapshot');
+const WorkspaceMemberForReports = require('./models/WorkspaceMember');
+const OrganizationForReports = require('./models/Organization');
+const UserForReports = require('./models/User');
+const reportServiceForCron = require('./services/reportService');
+const { applyCustomTemplate: applyTemplateForReports } = require('./controllers/emailPortalController');
+const { sendEmail: sendEmailForReports } = require('./utils/emailService');
+
+// timezone MUST be UTC: previousPeriod() is UTC month math. If this job
+// fired in server-local time on a UTC+N box, midnight-local on the 1st is
+// still the PREVIOUS month in UTC — previousPeriod() would compute the wrong
+// month, collide with the already-emailed snapshot, and silently skip every
+// workspace forever.
+cron.schedule('30 3 1 * *', async () => {
+  try {
+    const period = reportServiceForCron.previousPeriod();
+    const paidSubs = await SubscriptionForReports.find({
+      status: { $in: ['active', 'trialing'] },
+      planId: { $ne: 'free' },
+      organizationId: { $ne: null },
+    })
+      .select('organizationId')
+      .lean();
+
+    if (paidSubs.length === 0) return;
+    console.log(`[cron] monthly reports (${period}) — ${paidSubs.length} paid org(s)`);
+
+    for (const sub of paidSubs) {
+      const orgId = sub.organizationId;
+      try {
+        const [org, workspaces] = await Promise.all([
+          OrganizationForReports.findById(orgId).select('ownerId name').lean(),
+          Workspace.find({ organizationId: orgId }).select('_id name').lean(),
+        ]);
+        if (!org || workspaces.length === 0) continue;
+
+        const owner = await UserForReports.findById(org.ownerId).select('email').lean();
+        const baseUrl = await domainServiceForCron.resolveBaseUrl(orgId); // Invariant I1
+
+        for (const ws of workspaces) {
+          try {
+            let snapshot = await ReportSnapshotForCron.findOne({
+              workspaceId: ws._id,
+              period,
+            })
+              .select('_id reportEmailedAt')
+              .lean();
+            // Skip only when generated AND emailed — a manually generated
+            // snapshot (reportEmailedAt null) still gets its monthly email.
+            if (snapshot && snapshot.reportEmailedAt) continue;
+
+            if (!snapshot) {
+              snapshot = await reportServiceForCron.generateSnapshot(ws._id, period);
+            }
+
+            // Recipients: org owner + client-role members of THIS workspace
+            const clientMembers = await WorkspaceMemberForReports.find({
+              workspaceId: ws._id,
+              role: 'client',
+              status: 'active',
+            })
+              .select('email')
+              .lean();
+            const recipients = [
+              ...new Set(
+                [owner?.email, ...clientMembers.map((m) => m.email)].filter(Boolean)
+              ),
+            ];
+            if (recipients.length === 0) {
+              // Nothing to send — mark done so we don't re-check forever.
+              await ReportSnapshotForCron.updateOne(
+                { _id: snapshot._id },
+                { $set: { reportEmailedAt: new Date() } }
+              );
+              continue;
+            }
+
+            // rotateShare (revoke + create) preserves the one-live-link-per-
+            // report invariant — a bare createShare here would stack links.
+            const { rawToken } = await reportServiceForCron.rotateShare(snapshot._id, {
+              ttlDays: 90,
+            });
+            const reportUrl = `${baseUrl}/r/${rawToken}`;
+
+            let sentCount = 0;
+            for (const to of recipients) {
+              try {
+                const emailOptions = {
+                  to,
+                  orgId, // Phase 11 tenant sender identity
+                  data: {
+                    workspaceName: ws.name || 'Workspace',
+                    period,
+                    reportUrl,
+                  },
+                };
+                await applyTemplateForReports('monthly_report', emailOptions, orgId);
+                await sendEmailForReports(emailOptions);
+                sentCount++;
+              } catch (emailErr) {
+                console.error(`[cron] monthly report email to ${to} failed:`, emailErr.message);
+              }
+            }
+
+            // Mark emailed only if at least one send succeeded — a total
+            // outage (0 sent) leaves the marker null so the next run retries.
+            if (sentCount > 0) {
+              await ReportSnapshotForCron.updateOne(
+                { _id: snapshot._id },
+                { $set: { reportEmailedAt: new Date() } }
+              );
+            }
+          } catch (wsErr) {
+            console.error(`[cron] monthly report failed for workspace ${ws._id}:`, wsErr.message);
+          }
+        }
+      } catch (orgErr) {
+        console.error(`[cron] monthly reports failed for org ${orgId}:`, orgErr.message);
+      }
+    }
+  } catch (err) {
+    console.error('[cron] monthly report scheduler error:', err.message);
+  }
+}, { timezone: 'Etc/UTC' });
 
 // Health check
 app.get('/health', (req, res) => {

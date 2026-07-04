@@ -45,6 +45,7 @@ const ID_PARAMS = [
   'sitemapId',
   'uploadId',
   // Org / user / admin
+  'domainId',
   'memberId',
   'orgId',
   'sessionId',

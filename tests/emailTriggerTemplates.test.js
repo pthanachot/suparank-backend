@@ -29,10 +29,22 @@ const {
   applyCustomTemplate,
 } = require('../src/controllers/emailPortalController');
 const TriggerableEmailTemplate = require('../src/models/TriggerableEmailTemplate');
+const brandService = require('../src/services/brandService');
+const flagService = require('../src/services/flagService');
 
 // No DB: template lookups fall back to the hardcoded defaults
 TriggerableEmailTemplate.findOne = () => ({ lean: async () => null });
 TriggerableEmailTemplate.findOneAndUpdate = async () => null;
+
+// No DB: brand enrichment (Phase 12) resolves the platform defaults
+brandService.getPlatformBrand = async () => ({
+  productName: 'SupaRank',
+  supportEmail: 'support@suparank.ai',
+});
+brandService.getBrandForOrg = async () => ({
+  brand: { productName: 'SupaRank', supportEmail: 'support@suparank.ai' },
+});
+flagService.isFlagLive = async () => false;
 
 const PLACEHOLDER_RE = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
 
@@ -46,9 +58,14 @@ function placeholdersIn(text) {
 // The exact data keys each application call site sends. If a call site
 // changes its keys, update BOTH the sender and this table — the tests below
 // prove the keys cover the template.
+// 'brandName' and 'supportEmail' are auto-injected by applyCustomTemplate
+// (Phase 12) — no call site needs to send them explicitly.
+const AUTO_INJECTED_KEYS = ['brandName', 'supportEmail'];
+
 const CALLER_DATA_KEYS = {
   welcome: ['userName', 'loginUrl'], // authController.sendWelcomeEmail
   verify_email: ['code', 'expiresIn'], // authController.sendVerificationCode
+  verify_email_link: ['userName', 'verifyUrl'], // authController signup/resend, userController email change
   password_reset: ['code', 'expiresIn'], // authController.forgotPassword
   payment_confirmation: ['userName', 'planName', 'amount', 'nextBillingDate'], // webhook handlePaymentSucceeded
   subscription_canceled: ['userName', 'planName', 'endDate'], // webhook handleSubscriptionDeleted
@@ -96,7 +113,7 @@ describe('caller data keys cover the templates', () => {
       const used = new Set([...placeholdersIn(tpl.subject), ...placeholdersIn(tpl.html)]);
       for (const name of used) {
         assert.ok(
-          keys.includes(name),
+          keys.includes(name) || AUTO_INJECTED_KEYS.includes(name),
           `${triggerId}: template needs {{${name}}} but the call site does not send it`
         );
       }

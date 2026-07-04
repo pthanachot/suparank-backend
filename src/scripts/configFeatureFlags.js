@@ -238,6 +238,47 @@ const FLAGS = [
     },
   },
   {
+    // White-label tenant domains (Phases 8-10). Fully built; ships dark.
+    //
+    // LAUNCH ORDER (matters): 1) deploy the FRONTEND with
+    // NEXT_PUBLIC_TENANT_DOMAINS_ENABLED=true (build-time env — needs a
+    // redeploy, harmless while no domains are active), verify it, THEN
+    // 2) flip `implemented: true` here and deploy the backend. Backend-first
+    // would let domains activate while tenant hosts still serve the
+    // un-tenanted platform UI.
+    //
+    // KILL: edit this file (implemented: false) and redeploy — a restart
+    // clears all flag caches. Editing the FeatureFlag document directly in
+    // Mongo also works but propagates in ≤5 minutes (two per-process TTL
+    // caches) and is overwritten by the next deploy's config sync.
+    //
+    // While off: domain APIs return 404 'coming soon', host→org resolution
+    // returns null (tenant hosts get the platform brand), and
+    // resolveBaseUrl always uses FRONTEND_URL.
+    key: 'customDomains',
+    displayName: 'Custom Domains',
+    description: 'Serve the app on your own domain with your branding (white-label).',
+    enabled: true,
+    implemented: false,
+    conditions: {
+      custom: {},
+    },
+  },
+  {
+    // White-label email (Phases 11-12). Ships dark like customDomains.
+    // While off: email-domain + tenant-template APIs 404 'coming soon',
+    // sender identity always resolves to the platform default, and tenant
+    // template overrides are ignored (global/default chain still applies).
+    key: 'whiteLabelEmail',
+    displayName: 'White-label Email',
+    description: 'Send client emails from your own domain with your templates.',
+    enabled: true,
+    implemented: false,
+    conditions: {
+      custom: {},
+    },
+  },
+  {
     key: 'advancedAnalytics',
     displayName: 'Advanced Analytics',
     description: 'Advanced analytics dashboard with custom reporting.',

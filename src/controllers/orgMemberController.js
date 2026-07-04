@@ -3,8 +3,24 @@ const Organization = require('../models/Organization');
 const OrgMember = require('../models/OrgMember');
 const WorkspaceMember = require('../models/WorkspaceMember');
 const Workspace = require('../models/Workspace');
+const mongoose = require('mongoose');
 const Invite = require('../models/Invite');
+const AuditLog = require('../models/AuditLog');
 const inviteService = require('../services/inviteService');
+const auditService = require('../services/auditService');
+
+/** Audit shorthand for org-scoped member operations (fire-and-forget). */
+function auditOrg(req, org, action, resourceId, meta) {
+  auditService.record({
+    organizationId: org._id,
+    userId: req.user.userId,
+    actorEmail: req.user.email,
+    action,
+    resourceId,
+    meta,
+    ip: req.ip,
+  });
+}
 const Subscription = require('../models/Subscription');
 const Role = require('../models/Role');
 const FeatureFlag = require('../models/FeatureFlag');
@@ -266,6 +282,12 @@ const inviteMember = async (req, res) => {
         invitedBy: req.user.userId,
         inviterName: inviter?.profile?.name || inviter?.email,
       });
+      auditOrg(req, org, 'invite.send', invite._id, {
+        email: invite.email,
+        role,
+        accessScope,
+        workspaceCount: invite.workspaceIds.length,
+      });
       return res.status(201).json({
         invite: {
           _id: invite._id,
@@ -324,23 +346,35 @@ const inviteMember = async (req, res) => {
       const inviter = await User.findById(req.user.userId).select('profile.name email').lean();
       const { applyCustomTemplate } = require('./emailPortalController');
       const { sendEmail } = require('../utils/emailService');
+      // Invariant I1: tenant-facing links use the org's custom domain when active
+      const baseUrl = await require('../services/domainService').resolveBaseUrl(org._id);
       const emailOptions = {
         to: targetUser.email,
+        orgId: org._id, // Phase 11 sender identity
         data: {
           inviterName: inviter?.profile?.name || inviter?.email || 'A team member',
           orgName: org.name,
           role,
-          acceptUrl: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/login`,
+          acceptUrl: `${baseUrl}/login`,
         },
       };
-      await applyCustomTemplate('member_invite', emailOptions);
-      sendEmail(emailOptions).catch((err) =>
-        console.error('[invite] notification email failed:', err.message)
-      );
+      await applyCustomTemplate('member_invite', emailOptions, org._id);
+      // Template resolution can fail transiently — never dispatch a
+      // subject-less shell (this notification is best-effort anyway)
+      if (emailOptions.subject) {
+        sendEmail(emailOptions).catch((err) =>
+          console.error('[invite] notification email failed:', err.message)
+        );
+      }
     } catch (err) {
       console.error('[invite] notification email failed:', err.message);
     }
 
+    auditOrg(req, org, 'member.add', targetUser._id, {
+      email: targetUser.email,
+      role,
+      accessScope,
+    });
     res.status(201).json({
       member: {
         _id: member._id,
@@ -396,6 +430,7 @@ const changeRole = async (req, res) => {
     member.role = role;
     await member.save();
 
+    auditOrg(req, org, 'member.change_role', member.userId, { email: member.email, role });
     res.json({ member: { _id: member._id, userId: member.userId, role: member.role } });
   } catch (error) {
     console.error('Change role error:', error);
@@ -428,6 +463,7 @@ const removeMember = async (req, res) => {
       userId: member.userId,
     });
 
+    auditOrg(req, org, 'member.remove', member.userId, { email: member.email });
     res.json({ message: 'Member removed' });
   } catch (error) {
     console.error('Remove org member error:', error);
@@ -452,6 +488,7 @@ const revokeInvite = async (req, res) => {
       return res.status(404).json({ error: 'Invite not found' });
     }
 
+    auditOrg(req, org, 'invite.revoke', invite._id, { email: invite.email });
     res.json({ message: 'Invite revoked' });
   } catch (error) {
     console.error('Revoke invite error:', error);
@@ -485,6 +522,7 @@ const updateMemberScope = async (req, res) => {
     member.accessScope = accessScope;
     await member.save();
 
+    auditOrg(req, org, 'member.change_scope', member.userId, { email: member.email, accessScope });
     res.json({
       member: { _id: member._id, userId: member.userId, role: member.role, accessScope },
     });
@@ -554,6 +592,10 @@ const setMemberWorkspaces = async (req, res) => {
       );
     }
 
+    auditOrg(req, org, 'member.set_workspaces', member.userId, {
+      email: member.email,
+      workspaceCount: assignments.length,
+    });
     res.json({
       member: {
         _id: member._id,
@@ -565,6 +607,83 @@ const setMemberWorkspaces = async (req, res) => {
   } catch (error) {
     console.error('Set member workspaces error:', error);
     res.status(500).json({ error: 'Failed to update workspace assignments' });
+  }
+};
+
+// ─── AUDIT LOG ───────────────────────────────────────────────────
+// GET /api/org/organizations/:orgId/audit-log
+//   ?limit=&before=&beforeId=&action=&workspaceId=
+// Owner or org-wide admin only — scoped ('assigned') members must not
+// see other clients' activity. Cursor pagination via (before, beforeId)
+// from the last entry of the previous page; _id breaks same-millisecond
+// ties so no entry is ever skipped. `action` without a dot filters by
+// resource ('member' → all member.*), with a dot matches exactly.
+
+const listAuditLog = async (req, res) => {
+  try {
+    const result = await resolveOrgWithAccess(req, res, true);
+    if (!result) return;
+    const { org, callerRole, accessScope } = result;
+
+    // Same isolation rule as listMembers: assigned-scope members —
+    // even admins — must not read org-wide data across client workspaces.
+    if (accessScope === 'assigned' && callerRole !== 'owner') {
+      return res
+        .status(403)
+        .json({ error: 'You do not have access to the activity log' });
+    }
+
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
+
+    const filter = { organizationId: org._id };
+
+    // Cursor: strictly-older createdAt, OR same createdAt with smaller _id
+    if (req.query.before) {
+      const before = new Date(req.query.before);
+      if (!Number.isNaN(before.getTime())) {
+        const beforeId = req.query.beforeId;
+        if (beforeId && mongoose.Types.ObjectId.isValid(String(beforeId))) {
+          filter.$or = [
+            { createdAt: { $lt: before } },
+            { createdAt: before, _id: { $lt: new mongoose.Types.ObjectId(String(beforeId)) } },
+          ];
+        } else {
+          filter.createdAt = { $lt: before };
+        }
+      }
+    }
+
+    if (req.query.action) {
+      const action = String(req.query.action);
+      if (action.includes('.')) {
+        filter.action = action; // exact match, e.g. 'member.add'
+      } else {
+        // Category filter — every entry's resource equals its action prefix
+        filter.resource = action;
+      }
+    }
+
+    if (req.query.workspaceId) {
+      const wsId = String(req.query.workspaceId);
+      if (!mongoose.Types.ObjectId.isValid(wsId)) {
+        return res.status(400).json({ error: 'Invalid workspaceId' });
+      }
+      filter.workspaceId = wsId;
+    }
+
+    // Fetch one extra to compute hasMore without a count query
+    const entries = await AuditLog.find(filter)
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(limit + 1)
+      .lean();
+
+    const hasMore = entries.length > limit;
+    if (hasMore) entries.pop();
+
+    res.json({ entries, hasMore });
+  } catch (error) {
+    console.error('List audit log error:', error);
+    res.status(500).json({ error: 'Failed to load activity' });
   }
 };
 
@@ -668,6 +787,10 @@ const transferOwnership = async (req, res) => {
       invitedAt: new Date(),
     });
 
+    auditOrg(req, org, 'org.transfer_ownership', successorUserId, {
+      newOwnerEmail: successor.email,
+      oldOwnerRole: selfRole,
+    });
     res.json({ message: 'Ownership transferred successfully' });
   } catch (error) {
     console.error('Transfer ownership error:', error);
@@ -704,6 +827,7 @@ const leaveOrganization = async (req, res) => {
       organizationId: org._id,
       userId: req.user.userId,
     });
+    auditOrg(req, org, 'member.leave', req.user.userId, { email: membership.email });
     res.json({ message: 'You have left the organization' });
   } catch (error) {
     console.error('Leave organization error:', error);
@@ -711,4 +835,4 @@ const leaveOrganization = async (req, res) => {
   }
 };
 
-module.exports = { listMembers, inviteMember, changeRole, removeMember, revokeInvite, updateMemberScope, setMemberWorkspaces, listRoles, listFeatureFlags, transferOwnership, leaveOrganization };
+module.exports = { resolveOrgWithAccess, listMembers, inviteMember, changeRole, removeMember, revokeInvite, updateMemberScope, setMemberWorkspaces, listAuditLog, listRoles, listFeatureFlags, transferOwnership, leaveOrganization };

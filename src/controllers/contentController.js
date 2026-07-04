@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const Content = require('../models/Content');
 const { runAnalysis } = require('./analysisController');
 const imageStorage = require('../services/imageStorage');
+const auditService = require('../services/auditService');
 const creditService = require('../services/creditService');
 const tierService = require('../services/tierService');
 
@@ -113,6 +114,12 @@ const createContent = async (req, res) => {
       await tierService.incrementQuota(req.tierQuota);
     }
 
+    auditService.fromReq(req, {
+      action: 'content.create',
+      resource: 'content',
+      resourceId: content.contentNumber,
+      meta: { title: content.title || '(untitled)' },
+    });
     res.status(201).json({ content });
   } catch (err) {
     console.error('createContent error:', err.message);
@@ -171,6 +178,24 @@ const updateContent = async (req, res) => {
       return res.status(404).json({ error: 'Content not found' });
     }
 
+    // Autosave fires every ~1.5s while typing — dedupe to one entry per
+    // 30 minutes per user per document. Meaningful changes bypass the
+    // window: status/publish transitions always write, and a rename
+    // writes because the dedupe compares meta (title) content.
+    const significant =
+      updates.status !== undefined ||
+      updates.publishedAt !== undefined ||
+      updates.scheduledAt !== undefined;
+    auditService.fromReq(req, {
+      action: 'content.update',
+      resourceId: content.contentNumber,
+      meta: {
+        title: content.title || '(untitled)',
+        ...(updates.status !== undefined && { status: updates.status }),
+        ...(updates.publishedAt !== undefined && { published: true }),
+      },
+      dedupeMinutes: significant ? 0 : 30,
+    });
     res.json({ content });
   } catch (err) {
     console.error('updateContent error:', err.message);
@@ -191,6 +216,12 @@ const deleteContent = async (req, res) => {
     if (!content) {
       return res.status(404).json({ error: 'Content not found' });
     }
+    auditService.fromReq(req, {
+      action: 'content.delete',
+      resource: 'content',
+      resourceId: content.contentNumber,
+      meta: { title: content.title || '(untitled)' },
+    });
     res.json({ message: 'Content deleted' });
   } catch (err) {
     console.error('deleteContent error:', err.message);

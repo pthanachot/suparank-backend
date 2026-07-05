@@ -102,6 +102,16 @@ async function isWhiteLabelEntitled(organizationId) {
   }
 }
 
+/** True when the org's tier carries the SaaS-mode entitlement (Phase 16). */
+async function isSaasModeEntitled(organizationId) {
+  try {
+    const { config } = await tierService.getOrgTierConfig(organizationId);
+    return Boolean(config?.custom?.saasMode);
+  } catch {
+    return false; // entitlement check failing must not grant SaaS mode
+  }
+}
+
 /**
  * Fully-resolved brand for an org. Falls back to the platform brand when
  * the org has no config or lost the entitlement.
@@ -264,6 +274,7 @@ module.exports = {
   getBrandForOrg,
   resolveBrandByHost,
   isWhiteLabelEntitled,
+  isSaasModeEntitled,
   validateBrandPatch,
   updateBrand,
   clearBrandCache,

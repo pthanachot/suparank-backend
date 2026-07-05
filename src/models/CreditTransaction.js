@@ -75,6 +75,20 @@ const creditTransactionSchema = new mongoose.Schema(
 
 creditTransactionSchema.index({ organizationId: 1, createdAt: -1 });
 
+// Money-safety: at most ONE transaction may carry a given Stripe checkout
+// session id. This unique partial index is the concurrency gate for
+// idempotent one-time purchases (grantGeneralCreditsIdempotent) — a racing
+// duplicate webhook delivery fails to insert its marker (11000) and its
+// transaction aborts, so credits can never be granted twice for one payment.
+// Partial so the vast majority of transactions (no stripeSessionId) are exempt.
+creditTransactionSchema.index(
+  { 'metadata.stripeSessionId': 1 },
+  {
+    unique: true,
+    partialFilterExpression: { 'metadata.stripeSessionId': { $exists: true } },
+  }
+);
+
 /**
  * Create a transaction record.
  */

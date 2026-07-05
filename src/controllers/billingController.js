@@ -6,6 +6,7 @@ const Subscription = require('../models/Subscription');
 const { clearTierCache, getOrgTierConfig } = require('../services/tierService');
 const { applyLocksForOrg } = require('../services/downgradeService');
 const { getPlanFromPriceId, PRICE_TO_PLAN, EXTRA_SEAT_PRICES } = require('../config/stripePrices');
+const { CREDIT_PACKS, getPackById } = require('../config/creditPacks');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -53,6 +54,39 @@ async function validateOrgOwner(req, res, orgId) {
   }
 
   return org;
+}
+
+/**
+ * Reuse the org's existing Stripe customer, or create one if none exists.
+ * Shared by the subscription checkout and the credit-pack checkout so both
+ * flows attach to the SAME per-organization customer. Behavior is identical
+ * to the previously-inline logic in createCheckoutSession.
+ */
+async function getOrCreateStripeCustomer(org, user, orgId) {
+  const existingSub = await Subscription.findOne({ organizationId: orgId });
+  // Reuse a customer from either the Subscription (platform sub flow) or the
+  // Organization (persisted below). Credit-pack purchases can happen for orgs
+  // with no Subscription row, so without persisting we'd mint a duplicate
+  // Stripe customer on every purchase and fragment the org's billing history.
+  let customerId = existingSub?.stripeCustomerId || org.stripeCustomerId;
+
+  if (!customerId) {
+    const customer = await stripe.customers.create({
+      email: user.email,
+      name: `${org.name} (${user.profile?.name || user.email})`,
+      metadata: {
+        organizationId: orgId.toString(),
+        userId: user._id.toString(),
+      },
+    });
+    customerId = customer.id;
+    // Persist on the Organization so future purchases reuse this customer even
+    // when there's no Subscription row yet. (The subscription webhook still
+    // writes Subscription.stripeCustomerId for the platform sub flow.)
+    await Organization.updateOne({ _id: orgId }, { stripeCustomerId: customerId }).catch(() => {});
+  }
+
+  return customerId;
 }
 
 // ─── GET SUBSCRIPTION ─────────────────────────────────────────
@@ -237,20 +271,7 @@ const createCheckoutSession = async (req, res) => {
     }
 
     // Create or retrieve Stripe customer per organization
-    let existingSub = await Subscription.findOne({ organizationId: orgId });
-    let customerId = existingSub?.stripeCustomerId;
-
-    if (!customerId) {
-      const customer = await stripe.customers.create({
-        email: user.email,
-        name: `${org.name} (${user.profile?.name || user.email})`,
-        metadata: {
-          organizationId: orgId.toString(),
-          userId: user._id.toString(),
-        },
-      });
-      customerId = customer.id;
-    }
+    const customerId = await getOrCreateStripeCustomer(org, user, orgId);
 
     // Block checkout if org already has an active subscription
     const activeSub = await Subscription.findOne({
@@ -732,6 +753,83 @@ const getPrices = async (_req, res) => {
   }
 };
 
+// ─── CREDIT PACKS (one-time top-up purchases) ────────────────
+
+/**
+ * Return the credit-pack catalog for the UI. Display fields only —
+ * the Stripe price ID is never exposed to the client.
+ */
+const getCreditPacks = async (_req, res) => {
+  res.json({
+    packs: CREDIT_PACKS.map((p) => ({
+      id: p.id,
+      label: p.label,
+      credits: p.credits,
+      priceUsd: p.priceUsd,
+    })),
+  });
+};
+
+/**
+ * Create a one-time Stripe Checkout Session for a credit top-up pack.
+ * mode:'payment' (NOT subscription) — fulfillment happens in the
+ * checkout.session.completed webhook (webhookController.fulfillCreditPackPurchase).
+ */
+const createCreditPackCheckout = async (req, res) => {
+  try {
+    const { orgId, packId } = req.body;
+
+    if (!packId) {
+      return res.status(400).json({ error: 'packId is required' });
+    }
+
+    const org = await validateOrgOwner(req, res, orgId);
+    if (!org) return;
+
+    const pack = getPackById(packId);
+    if (!pack) {
+      return res.status(400).json({ error: 'Invalid credit pack' });
+    }
+
+    // Dark-ship friendly: the pack exists in the catalog but its Stripe
+    // one-time Price hasn't been wired up yet. Let the UI render it but
+    // refuse checkout instead of creating a broken session.
+    if (!pack.stripePriceId) {
+      return res.status(503).json({ error: 'Credit packs are not configured yet' });
+    }
+
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Reuse the same per-org Stripe customer as the subscription checkout.
+    const customerId = await getOrCreateStripeCustomer(org, user, orgId);
+
+    const session = await stripe.checkout.sessions.create({
+      customer: customerId,
+      mode: 'payment', // one-time charge, NOT a subscription
+      payment_method_types: ['card'],
+      line_items: [{ price: pack.stripePriceId, quantity: 1 }],
+      success_url: `${APP_URL}/settings/billing?credit_purchase=success`,
+      cancel_url: `${APP_URL}/settings/billing`,
+      // credits + creditPackId are the webhook's fulfillment inputs; the
+      // webhook branches on `mode === 'payment' && metadata.creditPackId`.
+      metadata: {
+        organizationId: orgId.toString(),
+        userId: user._id.toString(),
+        creditPackId: pack.id,
+        credits: String(pack.credits),
+      },
+    });
+
+    res.json({ url: session.url, sessionId: session.id });
+  } catch (error) {
+    console.error('Create credit pack checkout error:', error);
+    res.status(500).json({ error: 'Failed to create credit pack checkout' });
+  }
+};
+
 module.exports = {
   getSubscription,
   createCheckoutSession,
@@ -742,4 +840,6 @@ module.exports = {
   getInvoices,
   updateExtraSeats,
   getPrices,
+  getCreditPacks,
+  createCreditPackCheckout,
 };

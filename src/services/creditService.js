@@ -633,6 +633,76 @@ async function grantGeneralCredits(orgId, amount, description = 'General credits
 }
 
 /**
+ * Idempotent general-credit grant for one-time PURCHASES (credit packs).
+ *
+ * Money-safety invariant: the balance change (Credit $inc) and its
+ * ledger/idempotency marker (a `purchase` CreditTransaction carrying
+ * `metadata.stripeSessionId`) are committed in ONE MongoDB transaction, so no
+ * crash, error, or Stripe redelivery between the two can ever grant twice or
+ * grant-without-recording. The unique partial index on
+ * `metadata.stripeSessionId` (see CreditTransaction) is the concurrency gate:
+ * if two webhook deliveries race, the loser's marker insert throws 11000 and
+ * its whole transaction aborts — the grant is rolled back with it.
+ *
+ * `idempotencyKey` is the dedup key (the Stripe checkout session id).
+ * Returns { granted, alreadyFulfilled, balanceAfter }.
+ */
+async function grantGeneralCreditsIdempotent(orgId, amount, description, opts = {}) {
+  const { idempotencyKey, userId = null, meta = {} } = opts;
+  if (!idempotencyKey) throw new Error('grantGeneralCreditsIdempotent requires an idempotencyKey');
+  if (!amount || amount <= 0) return { granted: false, alreadyFulfilled: false, balanceAfter: 0 };
+
+  // Fast path: cheap dedup for the ordinary redelivery case. The unique index
+  // is the real guarantee for the concurrent-delivery case.
+  const existing = await CreditTransaction.findOne({ 'metadata.stripeSessionId': idempotencyKey }).lean();
+  if (existing) return { granted: false, alreadyFulfilled: true, balanceAfter: 0 };
+
+  const session = await mongoose.startSession();
+  try {
+    let balanceAfter = 0;
+    await session.withTransaction(async () => {
+      const updated = await Credit.findOneAndUpdate(
+        { organizationId: orgId },
+        { $inc: { generalCredits: amount }, $set: { lowBalanceNotifiedAt: null } },
+        { new: true, upsert: true, setDefaultsOnInsert: true, session }
+      );
+      balanceAfter = updated.generalCredits;
+      // Marker + ledger entry in the SAME transaction. The unique index on
+      // metadata.stripeSessionId aborts a racing duplicate right here.
+      await CreditTransaction.create(
+        [
+          {
+            organizationId: orgId,
+            userId,
+            type: 'purchase',
+            amount,
+            pool: 'general',
+            description,
+            metadata: { stripeSessionId: idempotencyKey, ...meta },
+            balanceAfter,
+            status: 'confirmed',
+          },
+        ],
+        { session }
+      );
+    });
+    console.log(`[creditService] Purchase granted ${amount} general credits for org ${orgId} (key=${idempotencyKey})`);
+    return { granted: true, alreadyFulfilled: false, balanceAfter };
+  } catch (err) {
+    if (require('../utils/mongoErrors').isDuplicateKeyError(err)) {
+      // A concurrent delivery won the race and committed the marker first —
+      // already fulfilled, not an error. The aborted txn rolled back our grant.
+      // (A duplicate-key inside a transaction can surface via writeErrors[],
+      // not just top-level err.code — see isDuplicateKeyError.)
+      return { granted: false, alreadyFulfilled: true, balanceAfter: 0 };
+    }
+    throw err; // transient DB error → propagate so the caller lets Stripe retry
+  } finally {
+    session.endSession();
+  }
+}
+
+/**
  * Expire remaining subscription credits (on cancellation or before renewal).
  */
 async function expireSubscriptionCredits(orgId) {
@@ -727,5 +797,6 @@ module.exports = {
   grantFreeCreditsIfNew,
   grantSubscriptionCredits,
   grantGeneralCredits,
+  grantGeneralCreditsIdempotent,
   expireSubscriptionCredits,
 };

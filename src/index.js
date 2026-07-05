@@ -116,6 +116,18 @@ app.use(cors(corsOptions));
 const { handleWebhook } = require('./controllers/webhookController');
 app.post('/api/billing/webhooks', express.raw({ type: 'application/json' }), handleWebhook);
 
+// Stripe CONNECT webhook (Phase 16) — separate endpoint + secret for
+// connected-account events. Also needs the raw body before JSON parsing and
+// bypasses the maintenance gate. Idempotent + signature-verified internally.
+const { handleConnectWebhook } = require('./controllers/connectWebhookController');
+app.post('/api/billing/connect-webhooks', express.raw({ type: 'application/json' }), handleConnectWebhook);
+// A missing secret makes EVERY connect event fail signature verification (400)
+// — a silent money-core outage. Warn loudly at boot so it's caught in ops, not
+// by a client complaint. (Dark feature, so not fatal.)
+if (!process.env.STRIPE_CONNECT_WEBHOOK_SECRET) {
+  console.warn('[boot] STRIPE_CONNECT_WEBHOOK_SECRET is not set — Connect (SaaS mode) webhooks will reject all events until it is configured.');
+}
+
 // Maintenance mode gate. Exemptions: /api/auth (admins must be able to log
 // in), /api/admin (the dashboard, including the toggle to turn this off),
 // /api/internal (server-to-server engine traffic), /health. Stripe webhooks

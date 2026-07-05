@@ -32,11 +32,32 @@ const organizationSchema = new mongoose.Schema(
       default: false,
       // true = auto-created personal org (one per user, cannot be deleted)
     },
+
+    // ─── Stripe Connect (Phase 16) ──────────────────────────────────
+    // Track this org's Stripe Connect *Standard* onboarding state. The agency
+    // owns its own Stripe account (disputes, tax, payouts); these flags are
+    // synced from `account.updated` Connect webhooks. All default to null/false
+    // (org has not connected yet).
+    stripeConnectAccountId: {
+      type: String,
+      default: null,
+      // Connected account id (acct_…). sparse index below — most orgs have none.
+    },
+    // The org's Stripe customer on the PLATFORM account (for platform billing +
+    // one-time credit-pack purchases). Persisted so repeat purchases reuse one
+    // customer instead of minting a duplicate each time.
+    stripeCustomerId: { type: String, default: null },
+    connectChargesEnabled: { type: Boolean, default: false },
+    connectPayoutsEnabled: { type: Boolean, default: false },
+    connectDetailsSubmitted: { type: Boolean, default: false },
+    connectOnboardedAt: { type: Date, default: null },
   },
   { timestamps: true }
 );
 
 organizationSchema.index({ ownerId: 1, name: 1 }, { unique: true });
+// Sparse: only orgs that have connected a Stripe account are indexed.
+organizationSchema.index({ stripeConnectAccountId: 1 }, { sparse: true });
 
 // Generate a URL-safe slug from the org name
 organizationSchema.statics.generateSlug = async function (name, ownerId) {

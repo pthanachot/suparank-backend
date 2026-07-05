@@ -6,10 +6,12 @@ const UsageTracker = require('../models/UsageTracker');
 const Session = require('../models/Session');
 const OrgMember = require('../models/OrgMember');
 const Workspace = require('../models/Workspace');
+const CreditTransaction = require('../models/CreditTransaction');
 const { clearTierCache, getOrgTierConfig, getTierConfig } = require('../services/tierService');
 const { applyLocksForOrg } = require('../services/downgradeService');
 const creditService = require('../services/creditService');
 const { getPlanFromPriceId, EXTRA_SEAT_PRICE_SET } = require('../config/stripePrices');
+const { getPackById } = require('../config/creditPacks');
 const { applyCustomTemplate } = require('./emailPortalController');
 const { sendEmail } = require('../utils/emailService');
 const { getSettings } = require('../services/systemSettingsService');
@@ -141,6 +143,13 @@ async function resolveOrgId(metadata) {
 // ─── EVENT HANDLERS ───────────────────────────────────────────
 
 async function handleCheckoutCompleted(session) {
+  // One-time credit-pack purchase. Branch EARLY and return — this fulfillment
+  // path is entirely separate from the subscription path below and must never
+  // fall through into subscription logic (no Subscription upsert, no plan credits).
+  if (session.mode === 'payment' && session.metadata?.creditPackId) {
+    return fulfillCreditPackPurchase(session);
+  }
+
   if (session.mode !== 'subscription') return;
 
   const organizationId = await resolveOrgId(session.metadata);
@@ -218,6 +227,77 @@ async function handleCheckoutCompleted(session) {
   }
 
   console.log(`Checkout completed: org=${organizationId} plan=${planId}`);
+}
+
+/**
+ * Fulfill a one-time credit-pack purchase (Stripe checkout mode:'payment').
+ *
+ * MONEY CODE — read the idempotency + retry reasoning before touching this.
+ *
+ * IDEMPOTENCY (mandatory): Stripe WILL redeliver checkout.session.completed
+ * (network retries, at-least-once delivery). grantGeneralCredits() is ADDITIVE,
+ * so processing the same event twice would hand out free credits. The dedup key
+ * is `session.id`, stored on the purchase-marker CreditTransaction at
+ * `metadata.stripeSessionId`. We check for that marker FIRST — if it exists we
+ * return without granting again.
+ *
+ * ORDERING: grantGeneralCredits() logs its own 'general_grant' txn but WITHOUT
+ * a stripeSessionId, so it can't serve as the dedup key. We therefore write a
+ * distinct 'purchase' marker txn carrying stripeSessionId. Grant happens first,
+ * marker second (per spec). The only re-grant window is a crash BETWEEN the grant
+ * and the marker write; that window is tiny and favors "granted once, maybe twice
+ * on a crash" over "never granted", which is the right trade-off for paid credits.
+ *
+ * RETRY vs. POISON: transient failures (DB down, grant throws) propagate up so the
+ * webhook returns 500 and Stripe RETRIES. Permanent failures (org unresolvable,
+ * bad credits amount) are logged loudly and return normally (=> 200) so Stripe
+ * STOPS retrying a poisoned event instead of hammering us forever.
+ */
+async function fulfillCreditPackPurchase(session) {
+  const creditPackId = session.metadata?.creditPackId;
+  const credits = parseInt(session.metadata?.credits, 10);
+  const organizationId = await resolveOrgId(session.metadata);
+
+  // Permanent failures — nothing to retry. Log loudly, return (=> 200) so
+  // Stripe stops redelivering a poisoned event.
+  if (!organizationId) {
+    console.error(`[credits] Credit pack purchase could not resolve org. session=${session.id} metadata:`, session.metadata);
+    return;
+  }
+  if (!Number.isFinite(credits) || credits <= 0) {
+    console.error(`[credits] Credit pack purchase has invalid credits="${session.metadata?.credits}" session=${session.id}`);
+    return;
+  }
+
+  const pack = getPackById(creditPackId);
+  const label = pack?.label || `${credits} credits`;
+
+  // Atomic + idempotent: grant and the session-keyed marker commit together in
+  // one transaction, so a crash, error, or Stripe redelivery can never
+  // double-grant. A transient DB error throws out of here → 500 → Stripe
+  // retries cleanly (the aborted txn granted nothing).
+  const result = await creditService.grantGeneralCreditsIdempotent(
+    organizationId,
+    credits,
+    `Credit pack: ${label}`,
+    { idempotencyKey: session.id, userId: session.metadata?.userId || null, meta: { creditPackId, credits } }
+  );
+
+  if (result.alreadyFulfilled) {
+    console.log(`[credits] Credit pack already fulfilled for session=${session.id} — skipping (Stripe redelivery)`);
+    return;
+  }
+
+  auditService.record({
+    organizationId,
+    userId: session.metadata?.userId || null,
+    actorEmail: 'stripe',
+    action: 'billing.credits_purchased',
+    resourceId: session.id,
+    meta: { credits, packId: creditPackId, sessionId: session.id },
+  });
+
+  console.log(`[credits] Credit pack fulfilled: org=${organizationId} pack=${creditPackId} credits=${credits} session=${session.id}`);
 }
 
 async function handleSubscriptionUpdated(stripeSub) {
@@ -556,4 +636,4 @@ async function handlePaymentFailed(invoice) {
   console.log(`Payment failed: sub=${invoice.subscription}`);
 }
 
-module.exports = { handleWebhook };
+module.exports = { handleWebhook, handleCheckoutCompleted, fulfillCreditPackPurchase };

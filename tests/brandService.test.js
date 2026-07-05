@@ -91,6 +91,25 @@ describe('brandService resolution', () => {
   });
 });
 
+describe('brandService.isSaasModeEntitled', () => {
+  it('is entitled when the agency tier carries custom.saasMode', async () => {
+    state.tierCustom[String(orgId)] = { saasMode: true };
+    assert.equal(await brandService.isSaasModeEntitled(orgId), true);
+  });
+
+  it('is not entitled without custom.saasMode', async () => {
+    state.tierCustom[String(orgId)] = { whiteLabel: true }; // white-label alone does not grant SaaS mode
+    assert.equal(await brandService.isSaasModeEntitled(orgId), false);
+  });
+
+  it('fails closed when the tier lookup throws', async () => {
+    tierService.getOrgTierConfig = async () => {
+      throw new Error('tier lookup down');
+    };
+    assert.equal(await brandService.isSaasModeEntitled(orgId), false);
+  });
+});
+
 describe('brandService.validateBrandPatch', () => {
   it('accepts a valid patch and strips unknown fields', () => {
     const r = brandService.validateBrandPatch({

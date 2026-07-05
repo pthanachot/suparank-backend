@@ -34,6 +34,15 @@ const workspaceSchema = new mongoose.Schema(
 
     // Downgrade locking — locked workspaces are inaccessible until the org upgrades
     locked: { type: Boolean, default: false },
+
+    // Client-billing lock (Phase 16) — SEPARATE from `locked`, which
+    // downgradeService owns for tier downgrades. Set true when this workspace's
+    // agency-billed ClientSubscription goes past_due/canceled; access is
+    // suspended independently of any tier downgrade.
+    // NOTE: access requires BOTH `locked !== true` AND `clientLocked !== true`
+    // (the sibling workstreams + listWorkspaces filter enforce this).
+    clientLocked: { type: Boolean, default: false },
+    clientLockedAt: { type: Date, default: null },
   },
   { timestamps: true }
 );

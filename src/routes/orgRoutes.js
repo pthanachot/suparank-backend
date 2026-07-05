@@ -64,6 +64,24 @@ router.get('/organizations/:orgId/email-templates', rfWlEmail, tenantEmailTempla
 router.put('/organizations/:orgId/email-templates/:triggerId', rfWlEmail, tenantEmailTemplateController.updateEmailTemplate);
 router.delete('/organizations/:orgId/email-templates/:triggerId', rfWlEmail, tenantEmailTemplateController.resetEmailTemplate);
 
+// Per-workspace usage (agency cost-visibility) — READ-ONLY, owner/org-admin.
+// Token-based proxy from AgentUsageLog; NOT credit attribution (see usageService).
+const usageController = require('../controllers/usageController');
+router.get('/organizations/:orgId/usage/by-workspace', usageController.getWorkspaceUsage);
+
+// SaaS mode — Stripe Connect onboarding + agency-defined client plans
+// (Phase 16), behind the saasMode flag. Ships DARK until the flag flips live.
+const connectController = require('../controllers/connectController');
+const agencyPlanController = require('../controllers/agencyPlanController');
+const rfSaas = requireFeature('saasMode');
+router.post('/organizations/:orgId/connect/onboard', rfSaas, connectController.startConnectOnboarding);
+router.get('/organizations/:orgId/connect/status', rfSaas, connectController.getConnectStatus);
+router.post('/organizations/:orgId/connect/disconnect', rfSaas, connectController.disconnect);
+router.get('/organizations/:orgId/agency-plans', rfSaas, agencyPlanController.listPlans);
+router.post('/organizations/:orgId/agency-plans', rfSaas, agencyPlanController.createPlan);
+router.put('/organizations/:orgId/agency-plans/:planId', rfSaas, agencyPlanController.updatePlan);
+router.delete('/organizations/:orgId/agency-plans/:planId', rfSaas, agencyPlanController.deletePlan);
+
 router.post('/organizations/:orgId/transfer-ownership', orgMemberController.transferOwnership);
 router.post('/organizations/:orgId/leave', orgMemberController.leaveOrganization);
 

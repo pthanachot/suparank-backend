@@ -165,6 +165,9 @@ const TIERS = [
       // White-label entitlement — gates BrandConfig (custom branding),
       // and later tenant domains + per-tenant email (Phases 8-12).
       whiteLabel: true,
+      // SaaS mode entitlement — gates agencies rebilling their own clients
+      // via Stripe Connect (Phase 16). Folds into the existing agency tier.
+      saasMode: true,
       creditDeductionFlags: {
         aiChat: true,
         aiAgent: true,

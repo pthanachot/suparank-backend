@@ -279,6 +279,32 @@ const FLAGS = [
     },
   },
   {
+    // SaaS mode (Phase 16 — Stripe Connect). Ships dark like customDomains.
+    //
+    // LAUNCH ORDER (matters): 1) deploy the FRONTEND with
+    // NEXT_PUBLIC_SAAS_MODE_ENABLED=true (build-time env — needs a redeploy,
+    // harmless while no agency has connected an account), verify it, THEN
+    // 2) flip `implemented: true` here and deploy the backend. Backend-first
+    // would expose rebilling endpoints while the tenant UI still lacks the
+    // Connect onboarding + client-billing surfaces.
+    //
+    // KILL: edit this file (implemented: false) and redeploy — a restart
+    // clears all flag caches. Editing the FeatureFlag document directly in
+    // Mongo also works but propagates in ≤5 minutes (two per-process TTL
+    // caches) and is overwritten by the next deploy's config sync.
+    //
+    // While off: Stripe Connect onboarding + client-rebilling APIs return
+    // 404 'coming soon', and no agency-managed subscriptions are created.
+    key: 'saasMode',
+    displayName: 'SaaS Mode',
+    description: 'SaaS mode — agencies rebill their own clients via Stripe Connect.',
+    enabled: true,
+    implemented: false,
+    conditions: {
+      custom: {},
+    },
+  },
+  {
     key: 'advancedAnalytics',
     displayName: 'Advanced Analytics',
     description: 'Advanced analytics dashboard with custom reporting.',

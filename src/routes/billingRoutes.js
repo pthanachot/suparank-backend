@@ -19,4 +19,8 @@ router.post('/reactivate', rf('billing'), billingController.reactivateSubscripti
 router.get('/invoices', rf('billing'), billingController.getInvoices);
 router.post('/extra-seats', rf('billing'), billingController.updateExtraSeats);
 
+// Credit top-up packs (one-time purchases → non-expiring general credits)
+router.get('/credit-packs', billingController.getCreditPacks);
+router.post('/credit-packs/checkout', rf('billing'), billingController.createCreditPackCheckout);
+
 module.exports = router;

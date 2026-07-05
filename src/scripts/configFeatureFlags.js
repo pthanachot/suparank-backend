@@ -299,7 +299,7 @@ const FLAGS = [
     displayName: 'SaaS Mode',
     description: 'SaaS mode — agencies rebill their own clients via Stripe Connect.',
     enabled: true,
-    implemented: false,
+    implemented: true,
     conditions: {
       custom: {},
     },

@@ -25,6 +25,7 @@ const AiTracker = require('../models/AiTracker');
 const AiTrackerPrompt = require('../models/AiTrackerPrompt');
 const KeywordResearchHistory = require('../models/KeywordResearchHistory');
 const tierService = require('./tierService');
+const seatService = require('./seatService');
 
 // ─── Helpers ────────────────────────────────────────────────────
 
@@ -151,24 +152,38 @@ async function lockAvatars(orgId, limit) {
   }));
 }
 
-async function lockMembers(orgId, maxSeats) {
+async function lockMembers(orgId, maxSeats, clientViewers) {
+  // Phase 9: two independent classes, split by ROLE (who can edit) — matching
+  // seatService. EDITOR SEATS = admin/editor members, capped at maxSeats (owner
+  // takes 1). CLIENT VIEWERS = viewer/client members, capped at clientViewers
+  // (no owner offset). null cap = unlimited → unlock that class. Locking
+  // oldest-first (createdAt) within each class so newest excess locks.
+  const EDITOR_ROLES = seatService.EDITOR_ROLES;
+
+  // ── Editor seats (admin/editor) ──
   if (maxSeats === null || maxSeats === undefined) {
     await OrgMember.updateMany(
-      { organizationId: orgId, locked: true },
+      { organizationId: orgId, role: { $in: EDITOR_ROLES }, locked: true },
       { $set: { locked: false } }
     );
-    return;
+  } else {
+    const memberSlots = Math.max(0, maxSeats - 1); // owner takes 1 implicit seat
+    const seatMembers = await OrgMember.find({ organizationId: orgId, role: { $in: EDITOR_ROLES } })
+      .sort({ createdAt: 1 }).select('_id').lean();
+    await applyLocks(OrgMember, seatMembers.map((m) => m._id), memberSlots);
   }
 
-  // Owner is implicit (not in OrgMember), takes 1 seat
-  const memberSlots = Math.max(0, maxSeats - 1);
-
-  const members = await OrgMember.find({ organizationId: orgId })
-    .sort({ createdAt: 1 })
-    .select('_id')
-    .lean();
-
-  await applyLocks(OrgMember, members.map((m) => m._id), memberSlots);
+  // ── Client viewers (viewer/client) ──
+  if (clientViewers === null || clientViewers === undefined) {
+    await OrgMember.updateMany(
+      { organizationId: orgId, role: { $nin: EDITOR_ROLES }, locked: true },
+      { $set: { locked: false } }
+    );
+  } else {
+    const viewers = await OrgMember.find({ organizationId: orgId, role: { $nin: EDITOR_ROLES } })
+      .sort({ createdAt: 1 }).select('_id').lean();
+    await applyLocks(OrgMember, viewers.map((v) => v._id), clientViewers);
+  }
 }
 
 /**
@@ -431,7 +446,7 @@ async function applyLocksForOrg(orgId) {
     lockWorkspaces(orgId, config.maxWorkspaces),
     lockBrandVoiceConfigs(orgId, config.maxBrandVoices),
     lockAvatars(orgId, config.maxAvatars),
-    lockMembers(orgId, effectiveMaxSeats),
+    lockMembers(orgId, effectiveMaxSeats, config.clientViewers),
     // AI Tracker: clear platform selections that exceed new tier limit
     resetAiTrackerPlatforms(orgId, config.maxAiTrackerPlatforms),
   ]);
@@ -452,4 +467,5 @@ async function applyLocksForOrg(orgId) {
 
 module.exports = {
   applyLocksForOrg,
+  lockMembers, // exported for Phase 9 tests
 };

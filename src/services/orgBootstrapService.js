@@ -23,17 +23,25 @@ const User = require('../models/User');
 const OrgMember = require('../models/OrgMember');
 const tierService = require('./tierService');
 const creditService = require('./creditService');
+const { FREE_SAMPLE_POOL_CREDITS } = require('../config/creditRules');
 
 const BOOTSTRAP_MAX_RETRIES = 3;
 
 // Best-effort, idempotent free-credit grant for a freshly created org.
 // Non-critical: kept OUTSIDE the org/workspace transaction so a credit
 // hiccup can never roll back (or block) account provisioning.
+//
+// Phase 7 / Option B: a new Free org is seeded the ONE-TIME 200-credit lifetime
+// sample pool (user_free) so it can try in-editor AI. This is a FIXED amount
+// (creditRules.FREE_SAMPLE_POOL_CREDITS), NOT config.creditsPerMonth — Free's
+// creditsPerMonth is 0. Paid tiers receive their monthly allocation via the
+// subscription webhook, never here (and new orgs are always Free at bootstrap).
+// grantFreeCreditsIfNew is idempotent per user (lifetime — nothing renews).
 async function grantOrgFreeCredits(userId, orgId) {
   try {
-    const { config } = await tierService.getOrgTierConfig(orgId);
-    if (config?.creditsPerMonth) {
-      await creditService.grantFreeCreditsIfNew(userId, config.creditsPerMonth);
+    const { tier } = await tierService.getOrgTierConfig(orgId);
+    if (!tier || tier === 'free') {
+      await creditService.grantFreeCreditsIfNew(userId, FREE_SAMPLE_POOL_CREDITS);
     }
   } catch (err) {
     console.error(`[orgBootstrap] credit grant failed user=${userId} org=${orgId}:`, err.message);
@@ -159,4 +167,4 @@ async function ensureUserHasOrg(user) {
   }
 }
 
-module.exports = { bootstrapNewUser, ensureUserHasOrg };
+module.exports = { bootstrapNewUser, ensureUserHasOrg, grantOrgFreeCredits };

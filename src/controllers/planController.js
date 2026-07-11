@@ -15,7 +15,6 @@
  * pattern (workspace members OR owner).
  */
 
-const Workspace = require('../models/Workspace');
 const Content = require('../models/Content');
 const Plan = require('../models/Plan');
 const AgentUsageLog = require('../models/AgentUsageLog');
@@ -58,22 +57,22 @@ function isDuplicateKey(err) {
 }
 
 
+// F1/B1: the workspace + role are already resolved by the rwr middleware on
+// every plan route (req.workspace). The old legacy `members[] OR userId`
+// re-query here IGNORED that and 404'd every org-scoped teammate (modern
+// membership lives in OrgMember). Scope content to the resolved workspace.
 async function resolveContent(req, res) {
-  const { workspaceNumber, contentNumber } = req.params;
-  const workspace = await Workspace.findOne({
-    workspaceNumber: Number(workspaceNumber),
-    $or: [
-      { userId: req.user.userId },
-      { 'members.userId': req.user.userId },
-    ],
-  });
-  if (!workspace) {
-    res.status(404).json({ error: 'Workspace not found' });
-    return null;
-  }
-  const content = await Content.findByNumber(workspace._id, contentNumber);
+  const { contentNumber } = req.params;
+  const content = await Content.findByNumber(req.workspace._id, contentNumber);
   if (!content) {
     res.status(404).json({ error: 'Content not found' });
+    return null;
+  }
+  // B4: locked content (e.g. paid-created content on a downgraded free tier)
+  // must not leak its data or accept AI/plan mutations. Same gate as
+  // contentController.getContent — closes the plan-route bypass of that gate.
+  if (content.locked) {
+    res.status(403).json({ error: 'This content is locked. Upgrade your plan to regain access.', locked: true });
     return null;
   }
   return content;
@@ -546,11 +545,13 @@ const fast = async (req, res) => {
     // session — so we don't pushBrief here (Bug #D cleanup).
     const brief = benchmarkToContentBrief(content);
     let generated = null;
+    let generatorFailed = false;
     try {
       const sessionId = await writingEngine.createSession();
       const resp = await writingEngine.generateFastPlan(sessionId, { brief });
       generated = resp && resp.plan;
     } catch (err) {
+      generatorFailed = true;
       console.error('[plan/fast] writing-engine generator failed:', err.message);
       // Fall through with the empty skeleton — the user can still iterate.
     }
@@ -577,11 +578,17 @@ const fast = async (req, res) => {
     res.status(200).json({
       plan,
       mode: content.mode,
+      // 16a: the draft is always usable, but a 200 with 0 sections used to hide
+      // WHY — a writing-engine outage looked identical to a legitimately empty
+      // skeleton. Surface the generator outcome so the FE can show "couldn't
+      // auto-build a plan, start from scratch" instead of a silent blank.
+      ...(generatorFailed && { warning: 'plan_generator_unavailable' }),
       event: {
         type: 'fast_plan_proposed',
         planId: plan._id,
         version: plan.version,
         sections: (plan.sections || []).length,
+        generated: !generatorFailed && !!(generated && Array.isArray(generated.sections) && generated.sections.length > 0),
       },
     });
   } catch (err) {

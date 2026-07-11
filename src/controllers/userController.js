@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const Stripe = require('stripe');
+const STRIPE_API_VERSION = require('../config/stripeApiVersion');
 const User = require('../models/User');
 const Session = require('../models/Session');
 const Organization = require('../models/Organization');
@@ -11,7 +12,7 @@ const { clearTierCache } = require('../services/tierService');
 const { sendEmail } = require('../utils/emailService');
 const { applyCustomTemplate } = require('./emailPortalController');
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: STRIPE_API_VERSION });
 
 // Minimal HTML escape — guards against malformed user input being injected
 // into outbound notification email bodies. We don't validate email format
@@ -83,6 +84,12 @@ const updateProfile = async (req, res) => {
     let emailChanged = false;
     let previousEmail = null;
     if (email && email.toLowerCase() !== user.email) {
+      // Phase 19B: an impersonation (support) session must never change the login
+      // email — that would let a short-lived token seize the account permanently
+      // via the public password-reset flow.
+      if (req.user?.impersonatedBy) {
+        return res.status(403).json({ error: 'Cannot change email while impersonating a user' });
+      }
       const existingUser = await User.findOne({ email: email.toLowerCase() });
       if (existingUser) {
         return res.status(409).json({ error: 'Email is already in use' });

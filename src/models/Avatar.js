@@ -30,6 +30,10 @@ const avatarSchema = new mongoose.Schema(
     content: { type: String, default: '' },
     name: { type: String, required: true, trim: true, maxlength: 50 },
     emoji: { type: String, default: '✍️' },
+    // Design v3.1 SVG icon id (av1–av9). When set, the frontend renders it in
+    // preference to emoji + avatarImage (useAvatars.ts AvatarAPI). Persisted so
+    // the icon picker sticks across reloads.
+    avatarIconId: { type: String, default: '', trim: true, maxlength: 20 },
     role: { type: String, trim: true, maxlength: 100, default: '' },
     experience: { type: String, trim: true, maxlength: 50, default: '' },
     tagline: { type: String, trim: true, maxlength: 200, default: '' },

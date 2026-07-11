@@ -9,6 +9,7 @@ const Credit = require('../models/Credit');
 const UserCredit = require('../models/UserCredit');
 const UserUsageTracker = require('../models/UserUsageTracker');
 const tierService = require('../services/tierService');
+const seatService = require('../services/seatService');
 
 /**
  * GET /api/org/tier-info?orgId=...
@@ -50,6 +51,10 @@ const getTierInfo = async (req, res) => {
       return res.status(404).json({ error: 'Organization not found' });
     }
     const isOwner = org.ownerId.equals(req.user.userId);
+    // Phase 7 RBAC: credits.viewBalance = Editor+ (Owner/Admin/Editor, active).
+    // tier-info also serves viewers/clients (tier + usage), so we don't 403 them
+    // here — we redact the ORG credit balance below instead of exposing it.
+    let canViewOrgCredits = isOwner;
     if (!isOwner) {
       const membership = await OrgMember.findOne({
         organizationId: orgId,
@@ -58,6 +63,8 @@ const getTierInfo = async (req, res) => {
       if (!membership) {
         return res.status(403).json({ error: 'Not a member of this organization' });
       }
+      canViewOrgCredits = membership.status === 'active'
+        && (membership.role === 'admin' || membership.role === 'editor');
     }
 
     const { tier, config } = await tierService.getOrgTierConfig(orgId);
@@ -85,8 +92,10 @@ const getTierInfo = async (req, res) => {
 
     // Total counts (live from documents, unlocked only for consistency with creation checks)
     const wsIds = await Workspace.find({ organizationId: orgId }).distinct('_id');
-    const [memberCount, avatarCount, brandVoiceCount, wsCount] = await Promise.all([
-      OrgMember.countDocuments({ organizationId: orgId, locked: { $ne: true } }),
+    const [seatUsage, avatarCount, brandVoiceCount, wsCount] = await Promise.all([
+      // Phase 9: editor seats (org-wide) vs free client viewers (assigned) —
+      // counted separately, both include pending invites.
+      seatService.getSeatUsage(orgId),
       Avatar.countDocuments({ workspace: { $in: wsIds }, locked: { $ne: true } }),
       BrandVoice.countDocuments({ workspace: { $in: wsIds }, locked: { $ne: true } }),
       Workspace.countDocuments({ organizationId: orgId, locked: { $ne: true } }),
@@ -119,7 +128,9 @@ const getTierInfo = async (req, res) => {
       aiTrackerPromptsCreated: usageEntry('aiTrackerPromptsCreated', 'maxAiTrackerPromptsPerMonth', 'aiTrackerPromptLimitType'),
       creditsUsed: usageEntry('creditsUsed', 'creditsPerMonth', 'creditLimitType'),
       // Total counts (not periodic)
-      seats: { used: memberCount + 1, limit: seatsLimit, baseLimit: config.maxSeats, extraSeats }, // +1 for owner
+      // seatUsage.seatsUsed already includes the owner (+1) and pending invites.
+      seats: { used: seatUsage.seatsUsed, limit: seatsLimit, baseLimit: config.maxSeats, extraSeats },
+      clientViewers: { used: seatUsage.viewersUsed, limit: config.clientViewers }, // null limit = unlimited
       brandVoices: { used: brandVoiceCount, limit: config.maxBrandVoices },
       avatars: { used: avatarCount, limit: config.maxAvatars },
       workspaces: { used: wsCount, limit: config.maxWorkspaces },
@@ -131,12 +142,21 @@ const getTierInfo = async (req, res) => {
       UserCredit.findOne({ userId: req.user.userId }).lean(),
     ]);
     const userFree = userCreditDoc?.freeCredits || 0;
-    const creditBalance = {
+    // Editor+ see the full org balance; viewers/clients see only their own
+    // user_free sample pool (org subscription/general balances are redacted — a
+    // viewer must not learn the org's billing posture). Mirrors creditController.
+    const creditBalance = canViewOrgCredits ? {
       subscription: creditDoc?.subscriptionCredits || 0,
       general: creditDoc?.generalCredits || 0,
       userFree,
       total: (creditDoc?.subscriptionCredits || 0) + userFree + (creditDoc?.generalCredits || 0),
       expiresAt: creditDoc?.subscriptionCreditsExpireAt || null,
+    } : {
+      subscription: null,
+      general: null,
+      userFree,
+      total: userFree,
+      expiresAt: null,
     };
 
     // Always include free-tier lifetime usage so paid users can see

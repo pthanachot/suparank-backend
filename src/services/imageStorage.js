@@ -8,6 +8,8 @@ const { NodeHttpHandler } = require('@smithy/node-http-handler');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const https = require('https');
 const crypto = require('crypto');
+const dns = require('dns').promises;
+const net = require('net');
 
 const B2_ENDPOINT = process.env.B2_ENDPOINT;
 const B2_REGION = process.env.B2_REGION || 'us-west-004';
@@ -191,6 +193,185 @@ async function uploadFromUrl(url, workspaceId, contentNumber) {
   return uploadImage(buffer, contentType, workspaceId, contentNumber);
 }
 
+// ─── R18: SSRF-hardened rehost of UNTRUSTED image URLs ────────
+// uploadFromUrl above is for TRUSTED internal URLs (the writing engine's own
+// temp image host, which is localhost/private and must NOT be blocked). The
+// helpers below are for user-supplied search-result URLs, which are hostile
+// input and must be validated against SSRF before we fetch them server-side.
+
+/** Thrown when an untrusted URL fails SSRF validation (→ HTTP 400). */
+class UrlValidationError extends Error {
+  constructor(message) { super(message); this.name = 'UrlValidationError'; }
+}
+
+const REHOST_ALLOWED_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+const REHOST_MAX_BYTES = 10 * 1024 * 1024; // 10MB
+const REHOST_MAX_REDIRECTS = 3;
+const REHOST_TIMEOUT_MS = 15000;
+
+const BLOCKED_HOSTNAMES = new Set([
+  'localhost', 'metadata.google.internal', 'metadata', 'instance-data',
+]);
+
+// Private / loopback / link-local / reserved ranges (IPv4 + IPv6).
+function isPrivateIp(ip) {
+  const kind = net.isIP(ip);
+  if (kind === 4) {
+    const p = ip.split('.').map(Number);
+    if (p[0] === 0) return true;                              // 0.0.0.0/8
+    if (p[0] === 10) return true;                             // 10/8 private
+    if (p[0] === 127) return true;                            // loopback
+    if (p[0] === 169 && p[1] === 254) return true;            // link-local
+    if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true; // 172.16/12
+    if (p[0] === 192 && p[1] === 168) return true;           // 192.168/16
+    if (p[0] === 100 && p[1] >= 64 && p[1] <= 127) return true; // CGNAT 100.64/10
+    if (p[0] >= 224) return true;                            // multicast/reserved
+    return false;
+  }
+  if (kind === 6) {
+    const h = ip.toLowerCase();
+    if (h === '::1' || h === '::') return true;              // loopback / unspecified
+    if (/^fe[89ab]/.test(h)) return true;                   // link-local fe80::/10
+    if (h.startsWith('fc') || h.startsWith('fd')) return true; // ULA fc00::/7
+    // IPv4-mapped ::ffff:a.b.c.d — new URL rewrites the dotted form to hex
+    // (::ffff:7f00:1), so decode BOTH forms and defer to the IPv4 rules. An
+    // unrecognized mapped form fails closed (returns true) rather than leak.
+    if (h.startsWith('::ffff:')) {
+      const tail = h.slice(7);
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(tail)) return isPrivateIp(tail);
+      const m = tail.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+      if (m) {
+        const hi = parseInt(m[1], 16), lo = parseInt(m[2], 16);
+        return isPrivateIp(`${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`);
+      }
+      return true; // unrecognized ::ffff: form — fail closed
+    }
+    return false;
+  }
+  return false; // not an IP literal
+}
+
+function isBlockedHostname(host) {
+  const h = host.toLowerCase().replace(/\.$/, '');
+  if (BLOCKED_HOSTNAMES.has(h)) return true;
+  return h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.localhost');
+}
+
+/**
+ * Validate an untrusted URL is safe to fetch server-side. Rejects non-http(s)
+ * schemes, embedded credentials, blocked hostnames, and literal or DNS-resolved
+ * private/loopback/link-local IPs (the DNS check defeats rebinding for THIS
+ * fetch). Throws UrlValidationError on any violation.
+ */
+async function assertSafeImageURL(urlStr) {
+  let u;
+  try { u = new URL(urlStr); } catch { throw new UrlValidationError('invalid URL'); }
+
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    throw new UrlValidationError(`scheme not allowed: ${u.protocol}`);
+  }
+  if (u.username || u.password) throw new UrlValidationError('credentials in URL not allowed');
+
+  const host = u.hostname;
+  if (!host) throw new UrlValidationError('missing host');
+  if (isBlockedHostname(host)) throw new UrlValidationError(`host not allowed: ${host}`);
+
+  // Literal IP host — check directly (no DNS). new URL keeps IPv6 hosts
+  // bracketed ("[::1]") and net.isIP rejects brackets, so strip them first;
+  // otherwise every IPv6 literal would skip this branch and fall to DNS.
+  const bare = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+  if (net.isIP(bare)) {
+    if (isPrivateIp(bare)) throw new UrlValidationError(`private IP not allowed: ${host}`);
+    return;
+  }
+
+  // Hostname — resolve and reject if ANY record is private (anti-rebinding).
+  let addrs;
+  try { addrs = await dns.lookup(host, { all: true }); }
+  catch { throw new UrlValidationError(`DNS resolution failed: ${host}`); }
+  if (!addrs.length) throw new UrlValidationError(`no DNS records: ${host}`);
+  for (const a of addrs) {
+    if (isPrivateIp(a.address)) throw new UrlValidationError(`host resolves to private IP: ${host}`);
+  }
+}
+
+/**
+ * Fetch an UNTRUSTED image URL (with SSRF validation, redirect re-validation,
+ * content-type allowlist, size cap, and timeout) and upload it to B2.
+ * Returns the backend-relative image path. Throws UrlValidationError for unsafe
+ * URLs / disallowed types / oversize; other Errors for network/B2 failures.
+ *
+ * @param {object} [opts]
+ * @param {Function} [opts.fetchImpl] - injectable fetch (tests); defaults to global fetch
+ */
+async function uploadFromExternalUrl(url, workspaceId, contentNumber, { fetchImpl = fetch } = {}) {
+  if (!isEnabled()) return url; // caller (handler) should short-circuit; defensive
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REHOST_TIMEOUT_MS);
+  try {
+    let current = url;
+    let res;
+    for (let hop = 0; ; hop++) {
+      await assertSafeImageURL(current); // re-validate every hop (defeats redirect-to-internal)
+      res = await fetchImpl(current, { redirect: 'manual', signal: controller.signal });
+      if (res.status >= 300 && res.status < 400) {
+        if (hop >= REHOST_MAX_REDIRECTS) throw new UrlValidationError('too many redirects');
+        const loc = res.headers.get('location');
+        if (!loc) throw new UrlValidationError('redirect without location');
+        current = new URL(loc, current).toString();
+        continue;
+      }
+      break;
+    }
+
+    if (!res.ok) throw new Error(`fetch failed: ${res.status}`);
+
+    const contentType = (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    if (!REHOST_ALLOWED_TYPES.has(contentType)) {
+      throw new UrlValidationError(`disallowed content-type: ${contentType || 'none'}`);
+    }
+    // Fast reject on an honest content-length, then enforce the cap on the
+    // ACTUAL bytes as we stream — so a server that omits/lies about
+    // content-length can't make us buffer an unbounded body (memory DoS).
+    const declared = Number(res.headers.get('content-length'));
+    if (declared && declared > REHOST_MAX_BYTES) throw new UrlValidationError('image exceeds size limit');
+
+    const buffer = await readBodyWithCap(res, REHOST_MAX_BYTES);
+    return uploadImage(buffer, contentType, workspaceId, contentNumber);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Read a fetch Response body, aborting as soon as it exceeds maxBytes so an
+ * oversize (or content-length-less) stream is never fully buffered. Throws
+ * UrlValidationError past the cap. Falls back to arrayBuffer() only if the
+ * response has no readable stream (defensive; real fetch always provides one).
+ */
+async function readBodyWithCap(res, maxBytes) {
+  const reader = res.body && typeof res.body.getReader === 'function' ? res.body.getReader() : null;
+  if (!reader) {
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > maxBytes) throw new UrlValidationError('image exceeds size limit');
+    return buf;
+  }
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > maxBytes) {
+      try { await reader.cancel(); } catch { /* already closing */ }
+      throw new UrlValidationError('image exceeds size limit');
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks);
+}
+
 /**
  * Upload a buffer to B2 with a custom key.
  * Generic version of uploadImage for non-image files (e.g. brand voice uploads).
@@ -308,6 +489,9 @@ module.exports = {
   uploadImage,
   uploadFromDataUri,
   uploadFromUrl,
+  uploadFromExternalUrl,
+  assertSafeImageURL,
+  UrlValidationError,
   uploadBuffer,
   deleteObject,
   getPresignedUrl,

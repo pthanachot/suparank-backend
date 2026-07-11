@@ -10,6 +10,7 @@ const AiTracker = require('../src/models/AiTracker');
 const AiTrackerScan = require('../src/models/AiTrackerScan');
 const Site = require('../src/models/Site');
 const brandService = require('../src/services/brandService');
+const outcomeService = require('../src/services/outcomeService');
 const reportService = require('../src/services/reportService');
 
 const { ObjectId } = mongoose.Types;
@@ -80,6 +81,7 @@ const originals = {
   shareFindOne: ReportShare.findOne,
   shareDeleteMany: ReportShare.deleteMany,
   getBrandForOrg: brandService.getBrandForOrg,
+  getReportDeltas: outcomeService.getReportDeltas,
 };
 
 let state;
@@ -189,6 +191,14 @@ beforeEach(() => {
       supportEmail: 'secret-internal@agency.com',
     },
   });
+
+  // Rec 14: outcomes source — stubbed (its own queries are covered in
+  // outcomeService.test.js). state.outcomeDeltas drives the fixture.
+  state.outcomeDeltas = [];
+  outcomeService.getReportDeltas = async () => {
+    if (state.outcomeDeltasError) throw state.outcomeDeltasError;
+    return state.outcomeDeltas;
+  };
 });
 
 afterEach(() => {
@@ -206,6 +216,7 @@ afterEach(() => {
   ReportShare.findOne = originals.shareFindOne;
   ReportShare.deleteMany = originals.shareDeleteMany;
   brandService.getBrandForOrg = originals.getBrandForOrg;
+  outcomeService.getReportDeltas = originals.getReportDeltas;
 });
 
 // ─── generateSnapshot ────────────────────────────────────────────
@@ -353,6 +364,31 @@ describe('reportService.generateSnapshot', () => {
     });
     assert.equal(data.tracker, null); // no monitors
     assert.equal(data.gsc, null); // no local GSC stats
+  });
+
+  it('Rec 14: outcome deltas land under data.outcomes when qualifying rows exist', async () => {
+    state.outcomeDeltas = [
+      { title: 'Improved article', contentNumber: 1, positionDelta: -6, clicksDelta: 20, scoreDelta: 15 },
+    ];
+    const snapshot = await reportService.generateSnapshot(state.workspace._id, '2026-06');
+    assert.equal(snapshot.data.outcomes.deltas.length, 1);
+    assert.equal(snapshot.data.outcomes.deltas[0].positionDelta, -6);
+    assert.equal(snapshot.data.sourceErrors, undefined);
+  });
+
+  it('Rec 14: no qualifying contents → outcomes null (key present, no fake table)', async () => {
+    state.outcomeDeltas = [];
+    const snapshot = await reportService.generateSnapshot(state.workspace._id, '2026-06');
+    assert.equal(snapshot.data.outcomes, null);
+  });
+
+  it('Rec 14: outcome source failure isolated to sourceErrors', async () => {
+    state.outcomeDeltasError = new Error('outcome db down');
+    const snapshot = await reportService.generateSnapshot(state.workspace._id, '2026-06');
+    assert.equal(snapshot.data.outcomes, null);
+    assert.ok(snapshot.data.sourceErrors.some((e) => e.source === 'outcomes'));
+    // Other sources unaffected.
+    assert.ok(snapshot.data.content);
   });
 
   it('a failing source lands as null + sourceErrors, others survive', async () => {

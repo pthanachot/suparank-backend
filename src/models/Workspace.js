@@ -43,6 +43,12 @@ const workspaceSchema = new mongoose.Schema(
     // (the sibling workstreams + listWorkspaces filter enforce this).
     clientLocked: { type: Boolean, default: false },
     clientLockedAt: { type: Date, default: null },
+
+    // Phase 17 auto-provisioning: the Stripe (connected-account) subscription id
+    // this workspace was created FOR by a self-serve client checkout. Sparse-
+    // unique so a webhook redelivery / concurrent delivery reuses this workspace
+    // instead of leaking a duplicate. null for all normally-created workspaces.
+    clientProvisionedSubId: { type: String, default: null },
   },
   { timestamps: true }
 );
@@ -51,6 +57,14 @@ workspaceSchema.index({ userId: 1, workspaceNumber: 1 });
 workspaceSchema.index({ userId: 1, name: 1 }, { unique: true });
 workspaceSchema.index({ userId: 1, isDefault: 1 });
 workspaceSchema.index({ 'members.userId': 1 });
+// PARTIAL (not sparse): a sparse index still indexes documents whose field is
+// present-but-null, and `default: null` above makes that EVERY normal workspace —
+// so a plain sparse-unique index would collide on the 2nd workspace ever created.
+// Restrict the unique index to rows that actually carry a provisioned sub id.
+workspaceSchema.index(
+  { clientProvisionedSubId: 1 },
+  { unique: true, partialFilterExpression: { clientProvisionedSubId: { $type: 'string' } } }
+);
 
 // Generate random 6-digit workspace number (100000–999999).
 // Accepts an optional Mongoose session so callers inside a transaction read

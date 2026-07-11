@@ -29,6 +29,16 @@ require('./utils/requireEnv')({
   ],
 });
 
+// Phase 13: catch a half-configured Stripe test→live cutover at boot. A live key
+// with stale/missing price env vars would otherwise fail silently at checkout
+// (the webhook drops the subscription). Fatal in production, warn-only in dev.
+require('./config/validateStripeConfig').assertStripeConfigAtBoot();
+
+// Catch a mis-configured engine deploy at boot: unset ENGINE_URL /
+// WRITING_ENGINE_URL in production would silently point live engine traffic at
+// localhost; identical hosts risk cross-wiring the two separate engines.
+require('./config/validateEngineConfig').assertEngineConfigAtBoot();
+
 const { connectDB, checkConnectionHealth } = require('./config/database');
 const { syncConfig } = require('./scripts/configSync');
 const systemSettingsService = require('./services/systemSettingsService');
@@ -149,6 +159,10 @@ app.use((req, res, next) => {
 // Body parsing
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Strip MongoDB operator-injection keys ($ne/$gt/$where/...) from all parsed
+// input before any route handler builds a query. (Phase 20 hardening.)
+app.use(require('./middleware/mongoSanitize'));
 
 // Rate limiting — skip the internal API. Internal traffic comes from the Go
 // writing-engine (server-to-server, authenticated by INTERNAL_API_KEY) and
@@ -399,6 +413,48 @@ cron.schedule(cronSchedule, async () => {
   }
 });
 
+// ─── SERP drift sweep (Rec 10) — weekly, Monday 04:00 ───────────────────────
+// Near-$0 dynamism: one Serper /api/discover query per eligible content (paid
+// orgs, analyzed >21d ago, active <90d, not already flagged; capped batch).
+// Flags drifted SERPs for USER-triggered (quota-gated, Rec 5) re-analysis —
+// this cron NEVER runs the LLM pipeline. Cost ≈ batchSize × (1 Serper query
+// PER targetKeyword, up to 5) — volume enrichment is skipped (skip_volumes).
+// Kill-switch: DRIFT_SWEEP_ENABLED=false. Offset to 04:00 Monday to stay
+// clear of the 03:00 dailies. Per-doc failures are counted inside the sweep;
+// this wrapper only catches programmer errors (loud, never muted).
+const { runDriftSweep } = require('./services/driftService');
+if (process.env.DRIFT_SWEEP_ENABLED !== 'false') {
+  cron.schedule('0 4 * * 1', async () => {
+    try {
+      await runDriftSweep({ batchSize: 50 });
+    } catch (err) {
+      console.error('[drift] sweep failed:', err.message, err.stack);
+    }
+  });
+  console.log('[cron] drift sweep scheduled: Mondays 04:00');
+} else {
+  console.log('[cron] drift sweep disabled (DRIFT_SWEEP_ENABLED=false)');
+}
+
+// ─── Outcome snapshots (Rec 14) — weekly, Monday 04:30 ──────────────────────
+// Records score/GSC-position/clicks/AI-visibility per analyzed content so the
+// editor's Results panel and monthly reports can show before/after deltas.
+// $0 external cost: GSC API is free (cached), rest is Mongo. Offset 30min
+// after the drift sweep. Kill-switch: OUTCOME_SWEEP_ENABLED=false.
+const { runOutcomeSweep } = require('./services/outcomeService');
+if (process.env.OUTCOME_SWEEP_ENABLED !== 'false') {
+  cron.schedule('30 4 * * 1', async () => {
+    try {
+      await runOutcomeSweep({ batchSize: 100 });
+    } catch (err) {
+      console.error('[outcome] sweep failed:', err.message, err.stack);
+    }
+  });
+  console.log('[cron] outcome sweep scheduled: Mondays 04:30');
+} else {
+  console.log('[cron] outcome sweep disabled (OUTCOME_SWEEP_ENABLED=false)');
+}
+
 // ─── Tenant domain status re-check (daily) ──────────────────────────────────
 // Advances pending_ssl domains whose Cloudflare cert went active, and demotes
 // active domains whose CNAME no longer points at us. Sequential on purpose —
@@ -559,12 +615,118 @@ cron.schedule('30 3 1 * *', async () => {
   }
 }, { timezone: 'Etc/UTC' });
 
-// Health check
-app.get('/health', (req, res) => {
+// ─── Phase 7: monthly subscription credit grant (daily, idempotent) ─────────
+// Grants each active paid org its monthly allocation with one-month rollover.
+// grantMonthlyCreditsIfDue keys on the calendar month (UTC), so running DAILY is
+// safe — it's a no-op once the month is granted and self-heals a missed day.
+// This is what makes a YEARLY plan still receive credits every month: Stripe
+// fires an invoice only once a year, so the renewal webhook alone would starve
+// months 2–12. Monthly plans are granted by whichever fires first (webhook or
+// this cron); the other no-ops. Daily at 04:00 UTC.
+const SubscriptionForCredits = require('./models/Subscription');
+const creditServiceForGrants = require('./services/creditService');
+cron.schedule('0 4 * * *', async () => {
+  try {
+    const subs = await SubscriptionForCredits.find({
+      status: { $in: ['active', 'trialing'] },
+      planId: { $ne: 'free' },
+      organizationId: { $ne: null },
+    }).select('organizationId').lean();
+    if (subs.length === 0) return;
+
+    let granted = 0;
+    for (const s of subs) {
+      try {
+        const { config } = await tierServiceForCron.getOrgTierConfig(s.organizationId);
+        if (!config?.creditsPerMonth) continue;
+        // Re-verify the sub is STILL active immediately before granting: the list
+        // above is a snapshot, and a cancellation mid-loop resets creditPeriodKey
+        // (for same-month resubscribe), which would otherwise let a stale entry
+        // re-grant a just-canceled org. Fresh indexed read → the window shrinks to
+        // ~nothing.
+        const stillActive = await SubscriptionForCredits.exists({
+          organizationId: s.organizationId,
+          status: { $in: ['active', 'trialing'] },
+          planId: { $ne: 'free' },
+        });
+        if (!stillActive) continue;
+        const r = await creditServiceForGrants.grantMonthlyCreditsIfDue(s.organizationId, config.creditsPerMonth);
+        if (r.granted) granted++;
+      } catch (err) {
+        console.error(`[cron] monthly credit grant failed org=${s.organizationId}:`, err.message);
+      }
+    }
+    if (granted > 0) console.log(`[cron] monthly credits: granted ${granted}/${subs.length} paid org(s)`);
+  } catch (err) {
+    console.error('[cron] monthly credit grant scheduler error:', err.message);
+  }
+}, { timezone: 'Etc/UTC' });
+
+// ─── Phase 18 (DARK): tenant lifecycle — suspend agency orgs whose offboarding
+// grace (30 days) has elapsed. runDueSuspensions() self-gates on the saasMode
+// flag, so this is a silent no-op until Phase 18 launches. Daily at 03:15 UTC.
+const lifecycleServiceForCron = require('./services/lifecycleService');
+cron.schedule('15 3 * * *', async () => {
+  try {
+    const result = await lifecycleServiceForCron.runDueSuspensions();
+    if (result.due > 0) {
+      console.log(`[cron] lifecycle: suspended ${result.suspended}/${result.due} agency org(s) past grace`);
+    }
+  } catch (err) {
+    console.error('[cron] lifecycle suspension scheduler error:', err.message);
+  }
+}, { timezone: 'Etc/UTC' });
+
+// ─── Phase 18C (DARK): retention purge — permanently erase the client workspaces
+// of suspended agency orgs whose 90-day retention (purgeAt) has elapsed.
+// runDuePurges() self-gates on the dataErasure flag, so this is a silent no-op
+// until Phase 18C launches. Daily at 03:45 UTC (after the suspension sweep).
+const deletionServiceForCron = require('./services/deletionService');
+cron.schedule('45 3 * * *', async () => {
+  try {
+    const result = await deletionServiceForCron.runDuePurges();
+    if (result.due > 0) {
+      console.log(`[cron] retention purge: purged ${result.purged}/${result.due} suspended org(s) past retention`);
+    }
+  } catch (err) {
+    console.error('[cron] retention purge scheduler error:', err.message);
+  }
+}, { timezone: 'Etc/UTC' });
+
+// ─── Phase 18D (DARK): hourly restore sweeps —
+//  (1) resumeStuckRestores: finish restores stranded in 'restoring' by a crash
+//      (not flag-gated: none can exist unless saasMode was live, and darking the
+//      flag must not strand them);
+//  (2) restoreEntitledSuspended: restore suspended orgs that re-subscribed while
+//      mid-'suspending'/'purging' (reconcile has no transient-state branch, so
+//      that wakeup would otherwise be lost until the next billing webhook).
+// Both are no-ops while saasMode has never been live. Hourly at :20.
+const restoreServiceForCron = require('./services/restoreService');
+cron.schedule('20 * * * *', async () => {
+  try {
+    const result = await restoreServiceForCron.resumeStuckRestores();
+    if (result.stuck > 0) {
+      console.log(`[cron] restore resume: resumed ${result.resumed}/${result.stuck} stranded 'restoring' org(s)`);
+    }
+    const swept = await restoreServiceForCron.restoreEntitledSuspended();
+    if (swept.restored > 0) {
+      console.log(`[cron] restore sweep: restored ${swept.restored}/${swept.checked} re-entitled suspended org(s)`);
+    }
+  } catch (err) {
+    console.error('[cron] restore resume scheduler error:', err.message);
+  }
+}, { timezone: 'Etc/UTC' });
+
+// Health check. DB drives the status code (liveness). E8: the writing-engine is
+// probed too, but NON-FATALLY — its reachability is reported for observability
+// and never flips the backend's own health (the engine has its own liveness).
+app.get('/health', async (req, res) => {
   const db = checkConnectionHealth();
+  const engine = await require('./services/writingEngine').checkEngineHealth();
   res.status(db.isConnected ? 200 : 503).json({
     status: db.isConnected ? 'ok' : 'error',
     database: db.state,
+    engine,
     uptime: Math.floor(process.uptime()),
   });
 });

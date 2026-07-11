@@ -62,8 +62,10 @@ const createSitemap = async (req, res) => {
       });
     }
 
-    // Duplicate check
-    const existing = await Sitemap.findOne({ organizationId: orgId, url });
+    // Duplicate check — scoped to THIS workspace (sitemaps belong to a workspace,
+    // per listSitemaps/getSitemap). Org-wide dedup would block a sibling client
+    // workspace from tracking the same public URL and leak its existence.
+    const existing = await Sitemap.findOne({ workspaceId: req.workspace._id, url });
     if (existing) {
       return res.status(409).json({ error: 'This URL is already added' });
     }
@@ -113,6 +115,7 @@ const getSitemap = async (req, res) => {
     const sitemap = await Sitemap.findOne({
       _id: req.params.sitemapId,
       organizationId: req.workspace.organizationId,
+      workspaceId: req.workspace._id,
     }).lean();
 
     if (!sitemap) return res.status(404).json({ error: 'Sitemap not found' });
@@ -131,6 +134,7 @@ const deleteSitemap = async (req, res) => {
     const result = await Sitemap.findOneAndDelete({
       _id: req.params.sitemapId,
       organizationId: req.workspace.organizationId,
+      workspaceId: req.workspace._id,
     });
 
     if (!result) return res.status(404).json({ error: 'Sitemap not found' });
@@ -154,6 +158,7 @@ const getSitemapPages = async (req, res) => {
     const sitemap = await Sitemap.findOne({
       _id: req.params.sitemapId,
       organizationId: req.workspace.organizationId,
+      workspaceId: req.workspace._id,
     });
 
     if (!sitemap) return res.status(404).json({ error: 'Sitemap not found' });
@@ -225,6 +230,7 @@ const triggerCrawl = async (req, res) => {
       {
         _id: req.params.sitemapId,
         organizationId: req.workspace.organizationId,
+        workspaceId: req.workspace._id,
         crawlStatus: { $in: ['idle', 'completed', 'error'] },
       },
       { $set: { crawlStatus: 'crawling', crawlProgress: 0, crawlError: null } },
@@ -235,6 +241,7 @@ const triggerCrawl = async (req, res) => {
       const existing = await Sitemap.findOne({
         _id: req.params.sitemapId,
         organizationId: req.workspace.organizationId,
+        workspaceId: req.workspace._id,
       });
       if (!existing) return res.status(404).json({ error: 'Sitemap not found' });
       return res.status(409).json({ error: 'Crawl already in progress' });
@@ -259,6 +266,7 @@ const exportXml = async (req, res) => {
     const sitemap = await Sitemap.findOne({
       _id: req.params.sitemapId,
       organizationId: req.workspace.organizationId,
+      workspaceId: req.workspace._id,
     }).lean();
 
     if (!sitemap) return res.status(404).json({ error: 'Sitemap not found' });

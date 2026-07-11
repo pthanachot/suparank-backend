@@ -44,6 +44,16 @@ async function resolveGatedOrg(req) {
     brandService.isSaasModeEntitled(orgId),
   ]);
   if (!flagLive || !entitled) return null;
+
+  // Phase 18 (DARK): a winding-down or suspended agency stops accepting NEW
+  // clients (existing clients keep access during grace). The lifecycle query
+  // only runs on the live+entitled path, so the dark path pays nothing. Treated
+  // as 404 (indistinguishable from not-available) — no signup, no plan display.
+  // Block only on an EXPLICIT non-active status: a missing field (legacy doc)
+  // defaults to active, and every real org defaults to 'active' via the schema.
+  const org = await Organization.findById(orgId).lean();
+  if (org?.lifecycleStatus && org.lifecycleStatus !== 'active') return null;
+
   return orgId;
 }
 

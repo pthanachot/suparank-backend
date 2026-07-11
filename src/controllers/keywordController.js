@@ -4,6 +4,18 @@ const KeywordDetail = require('../models/KeywordDetail');
 const KeywordResearchHistory = require('../models/KeywordResearchHistory');
 const { resolveCountry, fetchRelatedKeywords, fetchSerpResults, SUPPORTED_COUNTRIES } = require('../services/keywordService');
 const tierService = require('../services/tierService');
+const creditService = require('../services/creditService');
+const { resolveCredits } = require('../config/creditRules');
+
+// Phase 6: bill a keyword search at 1 credit per row DELIVERED (cap 50). Cache
+// hits deliver rows too, so they bill identically to fresh fetches — the user
+// gets the licensed data either way. Free = fixed bundle → 0 (resolveCredits).
+// preDeduct+settle via deductForRequest so the orphan-sweep can't refund it.
+async function chargeKeywordRows(req, rows) {
+  if (!req.creditContext?.deductionEnabled) return;
+  const credits = resolveCredits('keywordLookup', { tier: req.creditContext.tier, rows });
+  await creditService.deductForRequest(req, { credits, metadata: { rows } });
+}
 
 // Workspace resolved by permissions middleware (req.workspace).
 
@@ -59,6 +71,8 @@ async function searchKeywords(req, res) {
         await tierService.incrementQuota(req.tierQuota);
       }
 
+      await chargeKeywordRows(req, (cached.relatedKeywords || []).length);
+
       return res.json({
         seedMetrics: cached.seedMetrics,
         relatedKeywords: cached.relatedKeywords,
@@ -99,6 +113,8 @@ async function searchKeywords(req, res) {
     if (req.tierQuota) {
       await tierService.incrementQuota(req.tierQuota);
     }
+
+    await chargeKeywordRows(req, totalCount);
 
     return res.json({
       seedMetrics: seed,

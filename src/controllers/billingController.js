@@ -1,4 +1,5 @@
 const Stripe = require('stripe');
+const STRIPE_API_VERSION = require('../config/stripeApiVersion');
 const User = require('../models/User');
 const Organization = require('../models/Organization');
 const OrgMember = require('../models/OrgMember');
@@ -7,8 +8,24 @@ const { clearTierCache, getOrgTierConfig } = require('../services/tierService');
 const { applyLocksForOrg } = require('../services/downgradeService');
 const { getPlanFromPriceId, PRICE_TO_PLAN, EXTRA_SEAT_PRICES } = require('../config/stripePrices');
 const { CREDIT_PACKS, getPackById } = require('../config/creditPacks');
+const auditService = require('../services/auditService');
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: STRIPE_API_VERSION });
+
+// Phase 10: append-only audit row for owner cash actions. Fire-and-forget —
+// auditService.record never throws and must not block the billing response.
+function auditBilling(req, org, action, meta = null) {
+  auditService.record({
+    organizationId: org._id,
+    userId: req.user.userId,
+    actorEmail: req.user.email,
+    action,
+    resource: 'billing',
+    meta,
+    ip: req.ip,
+    impersonatedBy: req.user.impersonatedBy || null,
+  });
+}
 
 const APP_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 
@@ -323,6 +340,7 @@ const createCheckoutSession = async (req, res) => {
       },
     });
 
+    auditBilling(req, org, 'billing.checkout_started', { priceId, plan: PRICE_TO_PLAN[priceId] || null });
     res.json({ url: session.url, sessionId: session.id });
   } catch (error) {
     console.error('Create checkout session error:', error);
@@ -384,6 +402,7 @@ const createCustomerPortal = async (req, res) => {
 
     const session = await stripe.billingPortal.sessions.create(portalParams);
 
+    auditBilling(req, org, 'billing.portal_opened', { flow: flow || 'manage' });
     res.json({ url: session.url });
   } catch (error) {
     console.error('Create customer portal error:', error);
@@ -417,6 +436,7 @@ const revokeScheduledChange = async (req, res) => {
     // Release the schedule — keeps current plan, removes the pending change
     await stripe.subscriptionSchedules.release(stripeSub.schedule);
 
+    auditBilling(req, org, 'billing.plan_change_revoked');
     res.json({ message: 'Pending plan change revoked' });
   } catch (error) {
     console.error('Revoke scheduled change error:', error);
@@ -462,6 +482,7 @@ const cancelSubscription = async (req, res) => {
 
     clearTierCache();
 
+    auditBilling(req, org, 'billing.subscription_canceled', { cancelAtPeriodEnd: true });
     res.json({ message: 'Subscription will cancel at end of billing period' });
   } catch (error) {
     console.error('Cancel subscription error:', error);
@@ -511,6 +532,7 @@ const reactivateSubscription = async (req, res) => {
       console.error(`[downgradeService] reactivation lock error for org=${orgId}:`, err.message)
     );
 
+    auditBilling(req, org, 'billing.subscription_reactivated');
     res.json({ message: 'Subscription reactivated' });
   } catch (error) {
     console.error('Reactivate subscription error:', error);
@@ -626,15 +648,13 @@ const updateExtraSeats = async (req, res) => {
       });
     }
 
-    // If reducing seats, ensure we don't go below currently occupied extra seats
+    // If reducing seats, ensure we don't go below currently occupied extra seats.
+    // Phase 9: count EDITOR seats only (org-wide members + owner + pending
+    // org-wide invites) — free client viewers must not inflate seat occupancy.
     if (qty < (sub.purchasedExtraSeats || 0)) {
-      const memberCount = await OrgMember.countDocuments({
-        organizationId: orgId,
-        locked: { $ne: true },
-      });
-      const totalSeats = memberCount + 1; // +1 for owner
+      const { seatsUsed } = await require('../services/seatService').getSeatUsage(orgId);
       const baseSeats = config.maxSeats || 0;
-      const occupiedExtraSeats = Math.max(0, totalSeats - baseSeats);
+      const occupiedExtraSeats = Math.max(0, seatsUsed - baseSeats);
 
       if (qty < occupiedExtraSeats) {
         return res.status(400).json({
@@ -691,6 +711,7 @@ const updateExtraSeats = async (req, res) => {
       resourceId: sub.stripeSubscriptionId,
       meta: { extraSeats: qty, previousExtraSeats: prevSeats },
       ip: req.ip,
+      impersonatedBy: req.user.impersonatedBy || null,
     });
 
     res.json({
@@ -823,10 +844,91 @@ const createCreditPackCheckout = async (req, res) => {
       },
     });
 
+    auditBilling(req, org, 'billing.credit_pack_checkout', { creditPackId: pack.id, credits: pack.credits });
     res.json({ url: session.url, sessionId: session.id });
   } catch (error) {
     console.error('Create credit pack checkout error:', error);
     res.status(500).json({ error: 'Failed to create credit pack checkout' });
+  }
+};
+
+/**
+ * Notify an org's owner via a triggerable email template. Mirrors
+ * webhookController.notifyOrgOwner (kept local to avoid a controller↔controller
+ * import). Best-effort — never throws into the request path.
+ */
+async function notifyOwner(organizationId, triggerId, data) {
+  try {
+    const { getSettings } = require('../services/systemSettingsService');
+    if (getSettings().emailNotificationsEnabled === false) return;
+    const { applyCustomTemplate } = require('./emailPortalController');
+    const { sendEmail } = require('../utils/emailService');
+    const org = await Organization.findById(organizationId).lean();
+    const owner = org?.ownerId ? await User.findById(org.ownerId).lean() : null;
+    if (!owner?.email || owner.preferences?.emailNotifications === false) return;
+
+    const emailOptions = {
+      to: owner.email,
+      orgId: organizationId,
+      data: { userName: owner.profile?.name || 'there', ...data },
+    };
+    await applyCustomTemplate(triggerId, emailOptions, organizationId);
+    if (!emailOptions.subject) return; // template resolved to nothing — skip
+    await sendEmail(emailOptions);
+    console.log(`[email] ${triggerId} email sent to owner of org=${organizationId}`);
+  } catch (err) {
+    console.error(`[email] Failed to send ${triggerId} for org=${organizationId}:`, err.message);
+  }
+}
+
+/**
+ * POST /billing/request-topup — Phase 7. A non-owner member (Admin/Editor) asks
+ * the org owner to buy more credits. RBAC: billing.requestTopup = Admin/Editor
+ * ONLY (owners buy directly via billing.manage — validated here, not via rp
+ * middleware, matching the rest of billing). Notifies the owner with the
+ * requested amount + context.
+ */
+const requestTopup = async (req, res) => {
+  try {
+    const { orgId, amount, note } = req.body;
+    if (!orgId) return res.status(400).json({ error: 'orgId is required' });
+
+    const org = await Organization.findById(orgId).lean();
+    if (!org) return res.status(404).json({ error: 'Organization not found' });
+
+    // Owners don't "request" — they purchase directly.
+    if (org.ownerId.equals(req.user.userId)) {
+      return res.status(400).json({ error: 'As the owner you can purchase credits directly from billing.' });
+    }
+    // Must be an active Admin or Editor of this org.
+    const member = await OrgMember.findOne({
+      organizationId: orgId,
+      userId: req.user.userId,
+      status: 'active',
+    }).lean();
+    if (!member || (member.role !== 'admin' && member.role !== 'editor')) {
+      return res.status(403).json({ error: 'Only admins and editors can request a top-up.' });
+    }
+
+    const requester = await User.findById(req.user.userId).lean();
+    const requesterName = requester?.profile?.name || requester?.email || 'A team member';
+    // amount is free-form context (credits or $), not a charge — sanitize to a short string.
+    const amountStr = amount != null ? String(amount).slice(0, 40) : 'unspecified';
+    const noteStr = typeof note === 'string' ? note.slice(0, 500) : '';
+
+    await notifyOwner(orgId, 'topup_requested', {
+      requesterName,
+      requesterEmail: requester?.email || '',
+      amount: amountStr,
+      note: noteStr,
+      billingUrl: `${APP_URL}/settings/billing`,
+    });
+
+    auditBilling(req, org, 'billing.topup_requested', { amount: amountStr });
+    res.json({ success: true, message: 'Your top-up request was sent to the organization owner.' });
+  } catch (err) {
+    console.error('requestTopup error:', err.message);
+    res.status(500).json({ error: 'Failed to send top-up request' });
   }
 };
 
@@ -842,4 +944,5 @@ module.exports = {
   getPrices,
   getCreditPacks,
   createCreditPackCheckout,
+  requestTopup,
 };

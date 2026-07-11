@@ -73,6 +73,7 @@ async function record({
   resourceId = null,
   meta = null,
   ip = null,
+  impersonatedBy = null,
   dedupeMinutes = 0,
 }) {
   try {
@@ -103,6 +104,7 @@ async function record({
       resourceId: resourceId != null ? String(resourceId) : null,
       meta,
       ip,
+      impersonatedBy: impersonatedBy || null,
     });
   } catch (err) {
     console.error(`[audit] failed to record ${action}:`, err.message);
@@ -126,6 +128,7 @@ function fromReq(req, { action, resource, resourceId, meta, dedupeMinutes }) {
     resourceId,
     meta,
     ip: req.ip || null,
+    impersonatedBy: req.user?.impersonatedBy || null,
     dedupeMinutes,
   });
 }

@@ -86,6 +86,7 @@ const updateOrgBrand = async (req, res) => {
       organizationId: org._id,
       userId: req.user.userId,
       actorEmail: req.user.email,
+      impersonatedBy: req.user?.impersonatedBy || null,
       action: 'brand.update',
       resourceId: org._id,
       meta: { changed: Object.keys(validated.patch) },

@@ -88,6 +88,14 @@ const SYSTEM_TRIGGERS = [
     variables: ['userName', 'remainingCredits', 'planName', 'brandName'],
     triggerCount: 0,
   },
+  {
+    id: 'topup_requested',
+    name: 'Credit Top-Up Requested',
+    description: 'Sent to the org owner when an admin/editor requests a credit top-up',
+    category: 'billing',
+    variables: ['userName', 'requesterName', 'requesterEmail', 'amount', 'note', 'billingUrl', 'brandName'],
+    triggerCount: 0,
+  },
   // Feedback
   {
     id: 'feedback_submitted',
@@ -244,6 +252,23 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
   <p style="color:#555;font-size:16px;line-height:1.6;">Consider upgrading your plan to get more credits and continue using all features without interruption.</p>
 </div>`,
     variables: ['userName', 'remainingCredits', 'planName', 'brandName'],
+  },
+  topup_requested: {
+    subject: 'Credit top-up requested by {{requesterName}}',
+    html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;">
+  <h1 style="color:#111;font-size:24px;margin-bottom:16px;">Credit Top-Up Requested</h1>
+  <p style="color:#555;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
+  <p style="color:#555;font-size:16px;line-height:1.6;"><strong>{{requesterName}}</strong> ({{requesterEmail}}) has requested a credit top-up for your organization.</p>
+  <div style="background:#f5f5f5;border-radius:8px;padding:16px;margin:24px 0;">
+    <p style="color:#555;margin:4px 0;"><strong>Requested amount:</strong> {{amount}}</p>
+    <p style="color:#555;margin:4px 0;"><strong>Note:</strong> {{note}}</p>
+  </div>
+  <div style="text-align:center;margin:32px 0;">
+    <a href="{{billingUrl}}" style="background:#111;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:bold;display:inline-block;">Buy Credits</a>
+  </div>
+  <p style="color:#888;font-size:14px;">Only you (the owner) can purchase credits for the organization.</p>
+</div>`,
+    variables: ['userName', 'requesterName', 'requesterEmail', 'amount', 'note', 'billingUrl', 'brandName'],
   },
   feedback_submitted: {
     subject: '[{{brandName}} Feedback] {{stars}} — {{feature}}',

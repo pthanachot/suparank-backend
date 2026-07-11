@@ -4,6 +4,7 @@ const Organization = require('../models/Organization');
 const User = require('../models/User');
 const OrgMember = require('../models/OrgMember');
 const WorkspaceMember = require('../models/WorkspaceMember');
+const { resolveWorkspaceRole } = require('../middleware/permissions');
 const tierService = require('../services/tierService');
 const creditService = require('../services/creditService');
 const auditService = require('../services/auditService');
@@ -15,6 +16,7 @@ function auditWorkspace(req, organizationId, workspace, action, extraMeta = {}) 
     workspaceId: workspace._id,
     userId: req.user.userId,
     actorEmail: req.user.email,
+    impersonatedBy: req.user?.impersonatedBy || null,
     action,
     resourceId: workspace._id,
     meta: { name: workspace.name, ...extraMeta },
@@ -265,7 +267,15 @@ const updateWorkspace = async (req, res) => {
     if (!workspace) {
       return res.status(404).json({ error: 'Workspace not found' });
     }
-    if (name !== undefined) workspace.name = name.trim();
+    // Guard the type before .trim(): a `{name:null}` (or non-string) body
+    // previously passed the `!== undefined` check and threw on null.trim() → 500.
+    // Validate to a clean 400 instead. (name is required, so empty is rejected.)
+    if (name !== undefined) {
+      if (typeof name !== 'string' || !name.trim()) {
+        return res.status(400).json({ error: 'name must be a non-empty string' });
+      }
+      workspace.name = name.trim();
+    }
     if (color !== undefined) workspace.color = color;
     await workspace.save();
     auditWorkspace(req, workspace.organizationId, workspace, 'workspace.update');
@@ -394,14 +404,14 @@ const setActiveWorkspace = async (req, res) => {
 const getMembers = async (req, res) => {
   try {
     const { workspaceId } = req.params;
-    const workspace = await Workspace.findOne({
-      _id: workspaceId,
-      $or: [
-        { userId: req.user.userId },
-        { 'members.userId': req.user.userId },
-      ],
-    });
-    if (!workspace) {
+    const workspace = await Workspace.findById(workspaceId);
+    // F1/B1: gate on the modern OrgMember-based role resolution (the same core
+    // the rwr middleware uses) instead of the legacy `members[] OR userId`
+    // re-query, which locked out every org-scoped teammate. This route is keyed
+    // by _id (not workspaceNumber), so it can't use rwr directly — it shares
+    // rwr's logic via the extracted helper. 404 (not 403) on no-access
+    // preserves the prior contract (the old $or filter yielded "not found").
+    if (!workspace || !(await resolveWorkspaceRole(workspace, req.user.userId))) {
       return res.status(404).json({ error: 'Workspace not found' });
     }
     // For org workspaces, the real owner is Organization.ownerId (not workspace.userId which is the creator)
@@ -572,6 +582,16 @@ const getContentSummary = async (req, res) => {
     const { workspaceId } = req.params;
     const workspace = await Workspace.findById(workspaceId).lean();
     if (!workspace) return res.status(404).json({ error: 'Workspace not found' });
+
+    // Access control: without this, any authenticated user could read another
+    // tenant's content counts by _id (cross-tenant IDOR). Share the SAME
+    // resolution as rwr / getMembers via the extracted helper (F1/B1). The
+    // hand-rolled mirror here previously OMITTED the OrgMember-by-ownerId
+    // fallback, 404'ing a class of pre-multi-org teammates that every rwr
+    // route grants. 404 (not 403) on no-access preserves the IDOR contract.
+    if (!(await resolveWorkspaceRole(workspace, req.user.userId))) {
+      return res.status(404).json({ error: 'Workspace not found' });
+    }
 
     const counts = {};
     const items = [

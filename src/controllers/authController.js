@@ -358,21 +358,26 @@ const resendVerification = async (req, res) => {
       return res.json({ message: 'If the email exists and is unverified, a new link has been sent' });
     }
 
-    // Rate limit: 1 resend per 60s per email
-    const recentCode = await VerificationCode.findOne({
-      email: email.toLowerCase(),
-      type: 'email_verification',
-      lastSentAt: { $gt: new Date(Date.now() - 60 * 1000) },
-    });
-
-    if (recentCode) {
-      const elapsed = Math.floor((Date.now() - recentCode.lastSentAt.getTime()) / 1000);
-      const retryAfter = Math.max(60 - elapsed, 1);
-      return res.status(429).json({
-        error: `Please wait ${retryAfter} seconds before requesting a new code`,
-        code: 'rate_limited',
-        retryAfter,
-      });
+    // Rate limit: 1 resend per 60s per email. Previously this queried a
+    // VerificationCode row with type 'email_verification' — a type that is not
+    // in the model enum and is never written anywhere, so the query always
+    // returned null and the throttle NEVER fired (resend was unthrottled →
+    // email-abuse/token-churn risk). Derive last-sent from the token expiry
+    // already stored on the user doc (verificationExpires = issuedAt + 24h at
+    // every issuance site: email signup, this resend, and the userController
+    // email-change flow — keep those TTLs in sync with TOKEN_TTL_MS). No new
+    // rows, no schema change.
+    const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+    if (user.verificationExpires) {
+      const sinceLast = Date.now() - (new Date(user.verificationExpires).getTime() - TOKEN_TTL_MS);
+      if (sinceLast < 60 * 1000) {
+        const retryAfter = Math.max(60 - Math.floor(sinceLast / 1000), 1);
+        return res.status(429).json({
+          error: `Please wait ${retryAfter} seconds before requesting a new code`,
+          code: 'rate_limited',
+          retryAfter,
+        });
+      }
     }
 
     // Generate new token

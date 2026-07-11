@@ -17,10 +17,23 @@ const TIERS = [
     displayName: 'Free',
     monthlyPrice: 0,
     yearlyPrice: 0,
+    // v4.1 Table 1 — Free: fixed lifetime bundles (3 articles, 5 audits, 50 keywords,
+    // 5 one-off tracker checks), budget model preset, 0 monitors, 2 engines.
     maxArticlesPerMonth: 3,
     articleLimitType: 'lifetime',
     maxAiTrackerPromptsPerMonth: 5,
     aiTrackerPromptLimitType: 'lifetime',
+    // Phase 11 (kept at 1, deliberately): Table 1's "Monitors (alert rules)=0"
+    // for Free means NO automated/recurring monitoring. maxAiTrackerMonitors here
+    // is the tracker-INSTANCE cap (a DIFFERENT axis): setup/createMonitor block at
+    // `count >= limit`, so 0 would lock Free out of the AI Tracker entirely — its
+    // "5 one-off checks" can only live inside one tracker instance. So Free keeps 1
+    // instance to hold those manual checks. The "0 recurring monitoring" half is
+    // enforced separately in executeScan (step 2a): scheduled cron scans are
+    // ZERO-CREDIT, so the credit model does NOT gate them — instead the scan
+    // chokepoint UNSCHEDULES (nextScanAt=null) and skips any scheduled scan for a
+    // Free-tier org. Manual on-demand refreshes (force=true) still run. Net: Free
+    // gets 1 instance for 5 manual checks and 0 recurring scans — exactly Table 1.
     maxAiTrackerMonitors: 1,
     maxAiTrackerPlatforms: 2,
     aiTrackerRefreshInterval: 'weekly',
@@ -38,7 +51,13 @@ const TIERS = [
     maxCrawlPages: 100,
     maxSeats: 1,
     extraSeatPrice: 0,
-    creditsPerMonth: 300,
+    clientViewers: 0,
+    supportTier: 'docs',
+    // Phase 7: Free has NO monthly/recurring credit pool. Its in-editor AI is
+    // funded by a ONE-TIME 200-credit lifetime sample seeded at org bootstrap
+    // (creditRules.FREE_SAMPLE_POOL_CREDITS → user_free pool), separate from this
+    // field. creditsPerMonth stays 0 so nothing recurring is ever granted.
+    creditsPerMonth: 0,
     creditLimitType: 'lifetime',
     contentVersionHistoryDays: 7,
     custom: {
@@ -57,7 +76,9 @@ const TIERS = [
     tier: 'standard',
     displayName: 'Standard',
     monthlyPrice: 29,
-    yearlyPrice: 290,
+    yearlyPrice: 276,
+    // v4.1 Table 1 — Standard $29: 20 articles/mo, 25 prompts weekly, all 4 engines,
+    // 2 workspaces, 2 seats + 3 client viewers.
     maxArticlesPerMonth: 20,
     articleLimitType: 'monthly',
     maxAiTrackerPromptsPerMonth: 25,
@@ -78,6 +99,8 @@ const TIERS = [
     maxCrawlPages: 1000,
     maxSeats: 2,
     extraSeatPrice: 0,
+    clientViewers: 3,
+    supportTier: 'email24h',
     creditsPerMonth: 3000,
     creditLimitType: 'monthly',
     contentVersionHistoryDays: 30,
@@ -96,14 +119,16 @@ const TIERS = [
   {
     tier: 'professional',
     displayName: 'Professional',
-    monthlyPrice: 79,
-    yearlyPrice: 790,
+    monthlyPrice: 99,
+    yearlyPrice: 948,
+    // v4.1 Table 1 — Professional $99: 50 articles/mo, 30 prompts daily, all 4 engines,
+    // 5 voices/avatars, 5 workspaces, 5 seats (+$10) + 10 client viewers, 10 monitors.
     maxArticlesPerMonth: 50,
     articleLimitType: 'monthly',
-    maxAiTrackerPromptsPerMonth: 100,
+    maxAiTrackerPromptsPerMonth: 30,
     aiTrackerPromptLimitType: 'monthly',
-    maxAiTrackerMonitors: 5,
-    maxAiTrackerPlatforms: 5,
+    maxAiTrackerMonitors: 10,
+    maxAiTrackerPlatforms: 4,
     aiTrackerRefreshInterval: 'daily',
     maxKeywordLookupsPerMonth: 5000,
     keywordLimitType: 'monthly',
@@ -118,7 +143,9 @@ const TIERS = [
     maxCrawlPages: 5000,
     maxSeats: 5,
     extraSeatPrice: 10,
-    creditsPerMonth: 8000,
+    clientViewers: 10,
+    supportTier: 'priority12h',
+    creditsPerMonth: 10000, // Phase 7: Table-1 Pro allocation
     creditLimitType: 'monthly',
     contentVersionHistoryDays: 90,
     custom: {
@@ -137,13 +164,15 @@ const TIERS = [
     tier: 'agency',
     displayName: 'Agency',
     monthlyPrice: 299,
-    yearlyPrice: 2990,
-    maxArticlesPerMonth: null,  // unlimited
+    yearlyPrice: 2868,
+    // v4.1 Table 1 — Agency $299: 300 articles/mo, 100 pooled prompts daily, all 4
+    // engines, 10 workspaces, 15 seats (+$10) + unlimited client viewers, 25k crawl.
+    maxArticlesPerMonth: 300,
     articleLimitType: 'monthly',
-    maxAiTrackerPromptsPerMonth: 1000,
+    maxAiTrackerPromptsPerMonth: 100,
     aiTrackerPromptLimitType: 'monthly',
     maxAiTrackerMonitors: null,  // unlimited
-    maxAiTrackerPlatforms: 8,
+    maxAiTrackerPlatforms: 4,
     aiTrackerRefreshInterval: 'daily',
     maxKeywordLookupsPerMonth: 25000,
     keywordLimitType: 'monthly',
@@ -155,12 +184,14 @@ const TIERS = [
     maxSites: null,          // unlimited
     sitesSyncFrequency: 'daily',
     maxSitemaps: 50,
-    maxCrawlPages: 100000,
+    maxCrawlPages: 25000,
     maxSeats: 15,
-    extraSeatPrice: 15,
-    creditsPerMonth: 25000,
+    extraSeatPrice: 10,
+    clientViewers: null,     // unlimited
+    supportTier: 'slack',
+    creditsPerMonth: 30000, // Phase 7: Table-1 Agency allocation
     creditLimitType: 'monthly',
-    contentVersionHistoryDays: 180,
+    contentVersionHistoryDays: 365, // v4.1: 12 months
     custom: {
       // White-label entitlement — gates BrandConfig (custom branding),
       // and later tenant domains + per-tenant email (Phases 8-12).

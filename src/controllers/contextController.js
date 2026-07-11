@@ -93,22 +93,25 @@ async function resolveContentInternal(req, res) {
 }
 
 // ─── User-facing helper ──────────────────────────────────────────────
+// F1/B1: the user-facing context routes (context/list, context/read) run
+// behind the rwr middleware, so req.workspace already holds the
+// membership-resolved workspace. The old legacy `members[] OR userId`
+// re-query IGNORED it and 404'd every org-scoped teammate. Scope content to
+// the resolved workspace. (resolveContentInternal above is the internal-auth
+// path — no user scope — and deliberately keeps its own lookup.)
 async function resolveContentForUser(req, res) {
-  const { workspaceNumber, contentNumber } = req.params;
-  const workspace = await Workspace.findOne({
-    workspaceNumber: Number(workspaceNumber),
-    $or: [
-      { userId: req.user.userId },
-      { 'members.userId': req.user.userId },
-    ],
-  });
-  if (!workspace) {
-    res.status(404).json({ error: 'Workspace not found' });
-    return null;
-  }
-  const content = await Content.findByNumber(workspace._id, contentNumber);
+  const { contentNumber } = req.params;
+  const content = await Content.findByNumber(req.workspace._id, contentNumber);
   if (!content) {
     res.status(404).json({ error: 'Content not found' });
+    return null;
+  }
+  // B4: same lock gate as contentController.getContent — locked content leaks
+  // nothing and accepts no AI context ops, closing the context-route bypass.
+  // resolveContentInternal (the engine's internal-auth path) is intentionally
+  // left as-is: the user-facing route that STARTS an engine run is gated here.
+  if (content.locked) {
+    res.status(403).json({ error: 'This content is locked. Upgrade your plan to regain access.', locked: true });
     return null;
   }
   return content;

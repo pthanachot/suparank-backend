@@ -83,6 +83,17 @@ const siteSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    // Rec 7: last AI-crawler access audit (robots.txt verdicts + CDN probe)
+    // from the engine's /api/bot-access. Cached 7 days; shape is the engine's
+    // Report JSON, stored as-is.
+    botAccess: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
+    botAccessCheckedAt: {
+      type: Date,
+      default: null,
+    },
   },
   { timestamps: true }
 );

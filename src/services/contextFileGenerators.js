@@ -76,13 +76,54 @@ function buildResearchOutlineMd(content) {
     }
   }
 
-  // AI Answer Analysis
+  // AI Answer Analysis. The engine now emits the v2 AEO/citability shape
+  // {query_groups, recurring_concepts, dominant_format}; older content docs may
+  // still carry the legacy v1 shape {summary, recommendations}. Render v2 when
+  // present, else fall back to v1, so both regenerated and historical docs get
+  // this section (previously the v1-only read left it silently empty for v2).
   if (content.aiAnswerAnalysis) {
     const analysis = content.aiAnswerAnalysis;
-    if (analysis.summary || analysis.recommendations) {
+    const groups = Array.isArray(analysis.query_groups) ? analysis.query_groups : [];
+    const recurring = Array.isArray(analysis.recurring_concepts) ? analysis.recurring_concepts : [];
+    const hasV2 = groups.length > 0 || recurring.length > 0 || !!analysis.dominant_format;
+    const hasV1 = !!analysis.summary || (Array.isArray(analysis.recommendations) && analysis.recommendations.length > 0);
+
+    if (hasV2) {
+      lines.push('## AI Answer Analysis\n');
+      if (analysis.dominant_format) {
+        lines.push(`**Dominant answer format:** ${analysis.dominant_format}\n`);
+      }
+      // Phrases AI answers rely on, collected across query groups (dedup by text).
+      const seen = new Set();
+      const phrases = [];
+      for (const g of groups) {
+        const nlp = Array.isArray(g.nlp_phrases) ? g.nlp_phrases : [];
+        for (const p of nlp) {
+          const text = (p && p.phrase ? String(p.phrase) : '').trim();
+          if (!text || seen.has(text.toLowerCase())) continue;
+          seen.add(text.toLowerCase());
+          phrases.push(p.recurring ? `${text} (recurring)` : text);
+        }
+      }
+      if (phrases.length > 0) {
+        lines.push('**Key phrases AI answers rely on:**');
+        for (const p of phrases.slice(0, 20)) lines.push(`- ${p}`);
+        lines.push('');
+      }
+      if (recurring.length > 0) {
+        lines.push('**Recurring concepts to cover:**');
+        for (const rc of recurring) {
+          const text = (rc && rc.phrase ? String(rc.phrase) : '').trim();
+          if (!text) continue;
+          const seenIn = rc.seen_in ? ` — seen in ${rc.seen_in} answer(s)` : '';
+          lines.push(`- ${text}${seenIn}`);
+        }
+        lines.push('');
+      }
+    } else if (hasV1) {
       lines.push('## AI Answer Analysis\n');
       if (analysis.summary) lines.push(analysis.summary);
-      if (analysis.recommendations && Array.isArray(analysis.recommendations)) {
+      if (Array.isArray(analysis.recommendations)) {
         lines.push('\n**Recommendations:**');
         for (const rec of analysis.recommendations) {
           lines.push(`- ${rec}`);

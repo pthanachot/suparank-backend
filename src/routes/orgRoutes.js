@@ -7,6 +7,7 @@ const creditController = require('../controllers/creditController');
 const { authenticateToken } = require('../middleware/auth');
 const OrgMember = require('../models/OrgMember');
 const { rejectIfLocked } = require('../middleware/lockGuard');
+const denyImpersonation = require('../middleware/denyImpersonation');
 
 // All org routes require authentication
 router.use(authenticateToken);
@@ -50,6 +51,17 @@ router.post('/organizations/:orgId/domains/:domainId/verify', rfDomains, domainC
 router.put('/organizations/:orgId/domains/:domainId/primary', rfDomains, domainController.setPrimaryDomain);
 router.delete('/organizations/:orgId/domains/:domainId', rfDomains, domainController.deleteDomain);
 
+// Data export (Phase 18B) — full-org tar.gz for offboarding + GDPR portability.
+// Owner/org-admin only (enforced in the controller); gated dark behind dataExport.
+const exportController = require('../controllers/exportController');
+router.get('/organizations/:orgId/export', requireFeature('dataExport'), exportController.exportOrg);
+
+// Data erasure (Phase 18C, DARK) — hard-delete an entire org (owner-only,
+// name-confirmed in the controller) for account closure / GDPR right-to-erasure.
+const erasureController = require('../controllers/erasureController');
+// Org erasure is destructive account-seizure — forbidden while impersonating.
+router.delete('/organizations/:orgId/erase', denyImpersonation, requireFeature('dataErasure'), erasureController.eraseOrg);
+
 // White-label email — sender domain (Phase 11), behind the whiteLabelEmail flag
 const emailDomainController = require('../controllers/emailDomainController');
 const rfWlEmail = requireFeature('whiteLabelEmail');
@@ -82,7 +94,13 @@ router.post('/organizations/:orgId/agency-plans', rfSaas, agencyPlanController.c
 router.put('/organizations/:orgId/agency-plans/:planId', rfSaas, agencyPlanController.updatePlan);
 router.delete('/organizations/:orgId/agency-plans/:planId', rfSaas, agencyPlanController.deletePlan);
 
-router.post('/organizations/:orgId/transfer-ownership', orgMemberController.transferOwnership);
-router.post('/organizations/:orgId/leave', orgMemberController.leaveOrganization);
+// Phase 19 — agency console (read-only client roster + overview).
+const agencyConsoleController = require('../controllers/agencyConsoleController');
+router.get('/organizations/:orgId/console/roster', rfSaas, agencyConsoleController.getRoster);
+router.get('/organizations/:orgId/console/overview', rfSaas, agencyConsoleController.getOverview);
+
+// Ownership transfer is an account-seizure op — forbidden while impersonating.
+router.post('/organizations/:orgId/transfer-ownership', denyImpersonation, orgMemberController.transferOwnership);
+router.post('/organizations/:orgId/leave', denyImpersonation, orgMemberController.leaveOrganization);
 
 module.exports = router;

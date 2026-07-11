@@ -1,18 +1,45 @@
 const Content = require('../models/Content');
+const Workspace = require('../models/Workspace');
 const BrandVoice = require('../models/BrandVoice');
 const Avatar = require('../models/Avatar');
 const CreditTransaction = require('../models/CreditTransaction');
 const Plan = require('../models/Plan');
 const AgentUsageLog = require('../models/AgentUsageLog');
-const { blocksToMarkdown, stripHtml } = require('../services/blocksToMarkdown');
-const { markdownToBlocks } = require('../services/markdownToBlocks');
-const { benchmarkToContentBrief, buildAvailableLinks } = require('../services/benchmarkToContentBrief');
+const { blocksToMarkdown } = require('../services/blocksToMarkdown');
+const { benchmarkToContentBrief, buildAvailableLinks, buildAllowlistUrls } = require('../services/benchmarkToContentBrief');
 const { buildResearchOutlineMd, buildSeoTargetsMd, buildContentAuditMd } = require('../services/contextFileGenerators');
 const { mapEditsToPatches } = require('../services/mapEditsToPatches');
 const writingEngine = require('../services/writingEngine');
 const { toGoPlan } = require('../services/planSerializer');
 const imageStorage = require('../services/imageStorage');
 const creditService = require('../services/creditService');
+const { resolveCredits } = require('../config/creditRules');
+const { classifyAgentRun, isPlanArticleWrite } = require('../config/agentBilling');
+const UsageTracker = require('../models/UsageTracker');
+const UserUsageTracker = require('../models/UserUsageTracker');
+const costLedger = require('../services/costLedgerService');
+const tierService = require('../services/tierService');
+const { tierToPreset } = require('../config/modelPreset');
+
+/**
+ * Resolve the tier model preset for a request (Phase 4). Free → "budget"
+ * (writing-engine drops to flash-lite via the X-Model-Preset header); paid → ""
+ * (base models). Best-effort — any failure yields "" (base), never blocks the call.
+ */
+async function resolvePreset(req) {
+  const orgId = req?.creditContext?.orgId || null;
+  if (!orgId) return '';
+  try {
+    const tier = (await tierService.getOrgTierConfig(orgId))?.tier || '';
+    return tierToPreset(tier);
+  } catch { return ''; }
+}
+
+// Default writing-engine models per SSE source, used only when the engine's
+// usage event does not tag the serving model. Chat uses the `writer` role,
+// agent uses the `agent` role — both default to gemini-2.5-flash in models.json.
+// Phase 4 (tier-aware presets) will make the engine always tag the real model.
+const WRITING_ENGINE_DEFAULT_MODEL = 'google/gemini-2.5-flash';
 
 // ─── Session reuse map ───────────────────────────────────────
 // Maps contentId → { sessionId, lastUsed } for conversation memory.
@@ -21,7 +48,8 @@ const creditService = require('../services/creditService');
 const contentSessionMap = new Map();
 const SESSION_TTL_MS = 60 * 60 * 1000; // 1 hour
 
-// Clean up stale sessions every 10 minutes
+// Clean up stale sessions every 10 minutes. unref() so this housekeeping
+// timer never holds the process open (tests, graceful shutdown).
 setInterval(() => {
   const now = Date.now();
   for (const [key, entry] of contentSessionMap) {
@@ -29,7 +57,33 @@ setInterval(() => {
       contentSessionMap.delete(key);
     }
   }
-}, 10 * 60 * 1000);
+}, 10 * 60 * 1000).unref();
+
+// Record that `sessionId` is a live engine session for `contentId`. Keeps a
+// BOUNDED SET of recent sessionIds per content (not just the latest) alongside
+// the primary `sessionId` (used for reuse/resync) and `lastUsed` (used by the
+// sweep). The set lets the resume tenancy check accept a still-paused session
+// even after a concurrent setupSession (a second tab, image-gen, or a
+// non-reusing chat/agent run) mints a newer session for the SAME content —
+// otherwise answering the paused session would spuriously 409.
+function rememberSession(contentId, sessionId) {
+  const existing = contentSessionMap.get(contentId);
+  const sessionIds = existing?.sessionIds || new Set();
+  sessionIds.add(sessionId);
+  // Bound growth defensively; the whole entry is evicted by the TTL sweep.
+  while (sessionIds.size > 32) {
+    sessionIds.delete(sessionIds.values().next().value);
+  }
+  contentSessionMap.set(contentId, { sessionId, lastUsed: Date.now(), sessionIds });
+}
+
+// Resume tenancy: is `sessionId` one of the recent sessions bound to THIS
+// content? Rejects an arbitrary / other-content engine sessionId while
+// tolerating concurrent same-content session creation.
+function sessionBoundToContent(contentId, sessionId) {
+  const bound = contentSessionMap.get(contentId);
+  return !!bound && bound.sessionIds instanceof Set && bound.sessionIds.has(sessionId);
+}
 
 /**
  * Build a lightweight tap that scans SSE bytes for `usage` events and
@@ -42,6 +96,8 @@ function makeUsageTap() {
   let buffer = '';
   let inputTokens = 0;
   let outputTokens = 0;
+  let model = '';
+  let docWrites = 0;
   return {
     addChunk(buf) {
       buffer += buf.toString('utf8');
@@ -54,14 +110,30 @@ function makeUsageTap() {
         try {
           const ev = JSON.parse(data);
           if (ev && ev.type === 'usage' && ev.usage) {
-            inputTokens += Number(ev.usage.inputTokens) || 0;
-            outputTokens += Number(ev.usage.outputTokens) || 0;
+            // Go emits snake_case (input_tokens/output_tokens) — see
+            // writing-engine api.Usage json tags. Accept camelCase too for
+            // resilience. (Pre-fix this read only camelCase and silently
+            // captured 0 for every turn.)
+            inputTokens += Number(ev.usage.input_tokens ?? ev.usage.inputTokens) || 0;
+            outputTokens += Number(ev.usage.output_tokens ?? ev.usage.outputTokens) || 0;
+            // The engine tags the serving model on the usage event; keep the last.
+            if (ev.model) model = ev.model;
+          } else if (ev && ev.type === 'document_diff') {
+            // Phase 6 article gate: server-observed document writes. ONLY
+            // document_diff proves an APPLIED change (streaming_executor emits
+            // it on successful mutations; engine.go on the image pass).
+            // document_update means the doc-mutating tool ran but changed
+            // NOTHING (failed EditTool old_string, step-by-step SKIP/REJECT
+            // revert) — counting it charged 100 + an article slot for a
+            // byte-identical doc (review MAJOR-3). 'draft' is a frontend-legacy
+            // type the Go engine never emits.
+            docWrites++;
           }
         } catch { /* malformed event — skip */ }
       }
     },
     snapshot() {
-      return { inputTokens, outputTokens };
+      return { inputTokens, outputTokens, model, docWrites };
     },
   };
 }
@@ -70,7 +142,7 @@ function makeUsageTap() {
  * Persist the accumulated usage at stream end. Best-effort: a failed write
  * must NOT block the response that already went to the user.
  */
-function persistUsage(content, tap, source) {
+async function persistUsage(req, content, tap, source) {
   const totals = tap.snapshot();
   if (totals.inputTokens === 0 && totals.outputTokens === 0) return;
   AgentUsageLog.create({
@@ -85,6 +157,109 @@ function persistUsage(content, tap, source) {
     // Never throw past the SSE response — observability hygiene only.
     console.warn('[usage-tap] persist failed', err.message);
   });
+
+  // AI cost ledger (Phase 1): our real COGS for this chat/agent turn.
+  try {
+    const orgId = req?.creditContext?.orgId || null;
+    let tier = '';
+    if (orgId) {
+      try { tier = (await tierService.getOrgTierConfig(orgId))?.tier || ''; } catch { /* best-effort */ }
+    }
+    costLedger.record({
+      action: source, // 'chat' | 'agent'
+      model: totals.model || WRITING_ENGINE_DEFAULT_MODEL,
+      tokensIn: totals.inputTokens,
+      tokensOut: totals.outputTokens,
+      organizationId: orgId,
+      workspaceId: content.workspaceId,
+      userId: req?.user?.userId || null,
+      tier,
+      metadata: { contentId: content._id?.toString(), source },
+    });
+  } catch (e) {
+    console.warn('[costLedger] chat/agent skipped:', e.message);
+  }
+}
+
+// ─── Article count-gate (Phase 6, money#1) ───────────────────
+// "Regeneration consumes a slot on all tiers" (product decision). The FIRST
+// successful generation on a doc is covered by the content-creation counter;
+// every RE-generation decrements the article allowance (Free: 3 lifetime,
+// paid: monthly). Failed/aborted runs never count — the counter moves on
+// COMPLETION, alongside the credit settle.
+//
+// The 429 body copy below is user-facing: EditorChatBar renders `error`
+// verbatim in the chat, so this text and the UI block message agree by
+// construction. Keep it in sync with the pre-run warning copy in
+// EditorChatBar.tsx (Free auto-write confirm).
+
+async function checkArticleAllowance(req, content) {
+  const isFirstGen = !content.articleGeneratedAt;
+  const orgId = req.creditContext?.orgId || req.workspace?.organizationId || null;
+  if (!orgId) return { isFirstGen, blocked: false, quotaCtx: null };
+
+  const { tier, config } = await tierService.getOrgTierConfig(orgId);
+  const limit = config?.maxArticlesPerMonth;
+  const limitType = config?.articleLimitType || 'monthly';
+  const period = tierService.getPeriod(limitType);
+  const isUserLevel = !!(limitType === 'lifetime' && req.user?.userId);
+  const quotaCtx = { orgId, userId: req.user?.userId, counterKey: 'articlesCreated', period, isUserLevel };
+
+  // First generation on this doc: covered by the creation count — no check,
+  // no decrement (the completion handler stamps articleGeneratedAt instead).
+  if (isFirstGen || limit == null) return { isFirstGen, blocked: false, quotaCtx };
+
+  const used = isUserLevel
+    ? await UserUsageTracker.getCount(req.user.userId, 'articlesCreated')
+    : await UsageTracker.getCount(orgId, 'articlesCreated', period);
+
+  if (used >= limit) {
+    const isFree = tier === 'free';
+    return {
+      isFirstGen,
+      blocked: true,
+      payload: {
+        error: isFree
+          ? `You've used all ${limit} articles included in the free plan (regenerating an article uses a slot). Upgrade to keep writing — paid plans start at 20 articles per month.`
+          : `You've reached your plan's monthly article limit (${used} of ${limit} used — regenerations count too). Your allowance resets next billing cycle, or upgrade for a higher limit.`,
+        code: 'ARTICLE_LIMIT_REACHED',
+        quota: { used, limit, tier, limitKey: 'maxArticlesPerMonth', limitType },
+        upgradeUrl: '/pricing',
+      },
+    };
+  }
+  return { isFirstGen, blocked: false, quotaCtx };
+}
+
+/**
+ * On successful completion of a run that ACTUALLY wrote the document: stamp
+ * the generation (articleGeneratedAt + which plan produced it — each approved
+ * plan buys exactly one generation), and count the re-generation against the
+ * article allowance. First-gen stamps without counting (creation counted it).
+ */
+async function commitArticleGeneration(content, gate) {
+  try {
+    // Re-read the CURRENT plan state — the doc was loaded at request start and
+    // the run takes minutes; a plan approved/reopened mid-run would otherwise
+    // stamp a stale (or null) plan id, leaving the new plan's one-generation
+    // credit unconsumed and re-billable (review MINOR-8).
+    let cur = content;
+    try {
+      const fresh = await Content.findById(content._id).select('mode activePlanId').lean();
+      if (fresh) cur = fresh;
+    } catch { /* fall back to the request-time snapshot */ }
+    await Content.findByIdAndUpdate(content._id, {
+      $set: {
+        articleGeneratedAt: new Date(),
+        articleGeneratedPlanId: cur.mode === 'execute' ? (cur.activePlanId || null) : null,
+      },
+    });
+    if (!gate.isFirstGen && gate.quotaCtx) {
+      await tierService.incrementQuota(gate.quotaCtx);
+    }
+  } catch (e) {
+    console.error('[article-gate] commit failed (non-fatal):', e.message);
+  }
 }
 
 // Per-mode default tool allowlist for setupSession's pushMode call. Go's
@@ -104,6 +279,13 @@ async function resolveContent(req, res) {
   const content = await Content.findByNumber(req.workspace._id, contentNumber);
   if (!content) {
     res.status(404).json({ error: 'Content not found' });
+    return null;
+  }
+  // B4: locked content must not accept AI ops (chat/agent/image/inline-edit) or
+  // leak its data to the engine/LLM. Same gate as contentController.getContent,
+  // applied here BEFORE any session/credit work so a blocked run costs nothing.
+  if (content.locked) {
+    res.status(403).json({ error: 'This content is locked. Upgrade your plan to regain access.', locked: true });
     return null;
   }
   return content;
@@ -134,7 +316,7 @@ async function setupSession(content, { avatarId, reuseSession } = {}) {
   // Create new session if needed
   if (!sessionId) {
     sessionId = await writingEngine.createSession();
-    contentSessionMap.set(contentId, { sessionId, lastUsed: Date.now() });
+    rememberSession(contentId, sessionId);
   }
 
   // 2. Convert blocks → markdown and push document
@@ -156,7 +338,10 @@ async function setupSession(content, { avatarId, reuseSession } = {}) {
       content.workspaceId,
       content.styleReferenceContentNumber,
     );
-    if (ref && Array.isArray(ref.blocks) && ref.blocks.length > 0) {
+    // B4: never feed a LOCKED reference's text to the LLM — that would exfiltrate
+    // locked content via the style-reference channel (the primary doc is already
+    // gated at resolveContent; this closes the secondary read).
+    if (ref && !ref.locked && Array.isArray(ref.blocks) && ref.blocks.length > 0) {
       const refMd = blocksToMarkdown(ref.blocks);
       if (refMd.trim()) {
         const styleBlock =
@@ -175,11 +360,16 @@ async function setupSession(content, { avatarId, reuseSession } = {}) {
   // 3c. Internal-link inventory from the workspace's crawled sitemap pages
   // (non-fatal — the engine skips the links signal when this is absent).
   try {
+    const workspaceId = content.workspaceId || content.workspace;
     brief.availableLinks = await buildAvailableLinks(
-      content.workspaceId || content.workspace,
+      workspaceId,
       brief.targetKeyword,
       brief.secondaryKeywords,
     );
+    // R3: full crawled-URL allowlist for hallucination classification (top-30
+    // availableLinks feeds prompts; this feeds only the link verifier). Never
+    // rendered into a prompt — the engine reads it in AnalyzeLinks only.
+    brief.allowlistUrls = await buildAllowlistUrls(workspaceId);
   } catch (err) {
     console.error('availableLinks build failed (non-fatal):', err.message);
   }
@@ -252,6 +442,102 @@ async function setupSession(content, { avatarId, reuseSession } = {}) {
   await pushPlanModeContext(sessionId, content);
 
   return { sessionId, markdown };
+}
+
+/**
+ * Minimal session setup for the fast inline-edit path (R15 finding #2).
+ *
+ * The engine's InlineEdit only reads the pushed DOCUMENT to locate the selected
+ * text — it never uses the brief / brand-voice / context-files / plan-mode that
+ * full setupSession pushes (and ApplyInlineEdit persists to the engine's OWN
+ * store, not via CFS, so no CFS push is needed either). Doing the full setup per
+ * quick-action cost ~6-8 engine round-trips + 2-3 Mongo queries for nothing.
+ *
+ * Uses the SAME contentSessionMap as setupSession, so the session is shared with
+ * chat/agent: a prior full setup's brief/brand-voice persist in the session, and
+ * a fresh session simply doesn't need them for an inline edit. A later chat call
+ * reuses this session and runs the full setup itself.
+ */
+async function setupSessionLite(content) {
+  const contentId = content._id.toString();
+  let sessionId;
+
+  const existing = contentSessionMap.get(contentId);
+  let reused = false;
+  if (existing) {
+    existing.lastUsed = Date.now();
+    sessionId = existing.sessionId;
+    reused = true;
+  } else {
+    // Signal: session creation is sub-second; without it a hung engine holds
+    // the request on undici's ~300s default (first edit per content).
+    sessionId = await writingEngine.createSession(AbortSignal.timeout(10000));
+    rememberSession(contentId, sessionId);
+  }
+
+  // Push the current document so the engine can locate selectedText verbatim.
+  // Signal: same rationale — every hop in this fast path is now bounded.
+  const markdown = blocksToMarkdown(content.blocks || []);
+  if (markdown) {
+    try {
+      await writingEngine.pushDocument(sessionId, markdown, AbortSignal.timeout(15000));
+    } catch (err) {
+      // 13b: mirror generate-image's stale-session recovery. A REUSED session
+      // the engine no longer has (redeploy with a fresh store) 404s here;
+      // without a retry the poisoned map entry is re-pinned via lastUsed and
+      // every inline edit fails (falling back to chat) until reload. Drop the
+      // entry, recreate, and re-push ONCE. Non-404s (and first-session
+      // failures) propagate — the inline-edit handler 502s to the chat path.
+      if (!reused || err.status !== 404) throw err;
+      console.warn(`[inline-edit] engine session ${sessionId} gone (404) — recreating and retrying once`);
+      contentSessionMap.delete(contentId);
+      sessionId = await writingEngine.createSession(AbortSignal.timeout(10000));
+      rememberSession(contentId, sessionId);
+      await writingEngine.pushDocument(sessionId, markdown, AbortSignal.timeout(15000));
+    }
+  }
+  return { sessionId, markdown };
+}
+
+/**
+ * Image-only session setup (R2b). The engine's direct /generate-image route
+ * reads ONLY the session's image style — never the document, brief, brand
+ * voice, plan, or CFS config that full setupSession pushes (8+ engine
+ * round-trips + several Mongo queries per generation, all wasted).
+ *
+ * Same contentSessionMap as setupSession/setupSessionLite, so chat and image
+ * generation share one engine session. Style is always pushed (even empty)
+ * for the same reason as setupSession: a reused session should be CLEARED
+ * when the user removes the workspace style. Best-effort: on a transient
+ * push failure the engine keeps its previously persisted style for this
+ * generation (self-corrects on the next successful push).
+ */
+async function setupSessionImage(content) {
+  const contentId = content._id.toString();
+  let sessionId;
+
+  const existing = contentSessionMap.get(contentId);
+  if (existing) {
+    existing.lastUsed = Date.now();
+    sessionId = existing.sessionId;
+  } else {
+    // 11d: bound session creation (sub-second) so a hung engine can't hold the
+    // image path on undici's ~300s default — same rationale as setupSessionLite.
+    sessionId = await writingEngine.createSession(AbortSignal.timeout(10000));
+    rememberSession(contentId, sessionId);
+  }
+
+  try {
+    const workspaceId = content.workspaceId || content.workspace;
+    const brandVoice = await BrandVoice.findOne({ workspace: workspaceId, active: true }).lean();
+    // 11d: bound the style push too. Still best-effort (see the catch) — a
+    // transient/timed-out push leaves the engine's previously persisted style.
+    await writingEngine.pushImageStyle(sessionId, brandVoice?.imageStyle || '', AbortSignal.timeout(15000));
+  } catch (err) {
+    console.error('Image style push failed (non-fatal):', err.message);
+  }
+
+  return { sessionId };
 }
 
 /**
@@ -331,7 +617,15 @@ async function pushPlanModeContext(sessionId, content) {
   }
 
   if (failures.length > 0) {
-    console.warn('[setupSession] plan-mode push had failures', {
+    // CFS/config failures silently disable the plan-mode context tools (the
+    // engine's ListContext/ReadContext/etc. go unavailable), so surface those
+    // at error level — a misconfigured deployment must be greppable, not
+    // buried among warnings. Other push failures stay at warn.
+    const hasCfsFailure = failures.some(
+      (f) => f.step === 'cfsConfig' || f.step === 'pushCFSConfig',
+    );
+    const logFn = hasCfsFailure ? console.error : console.warn;
+    logFn('[setupSession] plan-mode push had failures', {
       sessionId,
       contentId: content._id,
       contentNumber: content.contentNumber,
@@ -367,7 +661,7 @@ const chat = async (req, res) => {
           req.creditContext.orgId, req.user.userId,
           req.creditContext.estimatedCredits,
           req.creditContext.featureKey,
-          { contentId: content._id.toString(), feature: 'aiChat' }
+          { contentId: content._id.toString(), feature: 'aiChat', workspaceId: req.creditContext.workspaceId }
         );
         creditTxId = result.transactionId;
       } catch (creditErr) {
@@ -389,8 +683,9 @@ const chat = async (req, res) => {
       abortCtrl.abort();
     });
 
-    // Start streaming request to the engine
-    const chatRes = await writingEngine.sendChatMessageStream(sessionId, prompt, abortCtrl.signal);
+    // Start streaming request to the engine (Phase 4: tier preset → model set)
+    const preset = await resolvePreset(req);
+    const chatRes = await writingEngine.sendChatMessageStream(sessionId, prompt, abortCtrl.signal, preset);
 
     // Set up SSE headers for the client
     res.writeHead(200, {
@@ -439,12 +734,21 @@ const chat = async (req, res) => {
       }
     }
 
-    // Stream completed — mark credits as settled
+    // Stream completed — settle to the ACTUAL chat cost. Table 2: ≤8K tokens = 1,
+    // above = 2. The gate reserved 2 (the max), so settle refunds 1 back on a
+    // small message; a large one settles at the full reserved 2.
     if (creditTxId) {
-      CreditTransaction.findByIdAndUpdate(creditTxId, { status: 'settled' }).catch(() => {});
+      const { inputTokens, outputTokens } = usageTap.snapshot();
+      const actual = resolveCredits('aiChatMessage', {
+        tier: req.creditContext?.tier,
+        tokens: (inputTokens || 0) + (outputTokens || 0),
+      });
+      creditService.settle(creditTxId, actual).catch((e) =>
+        console.error('[credit] chat settle failed:', e.message)
+      );
     }
 
-    persistUsage(content, usageTap, 'chat');
+    persistUsage(req, content, usageTap, 'chat');
     if (!clientDisconnected) res.end();
   } catch (err) {
     // Refund credits on error
@@ -468,6 +772,25 @@ const chat = async (req, res) => {
   }
 };
 
+// R9: clamp client-supplied agent budgets. The engine derives its turn budget
+// from maxIterations (MaxTurns = maxIter*3+10 freeform, maxIter+10 sequential),
+// so an uncapped value lets a single flat-priced (10-credit) request buy an
+// enormous turn budget. The 16 ceiling matches the highest value any real
+// slash command sends (/research, /facts), so legitimate commands are
+// unaffected; only abusive values are clamped. targetScore is bounded to a
+// sane band (the only value commands send is 80; default is 75).
+const AGENT_MAX_ITERATIONS = 16;
+const AGENT_TARGET_SCORE_MIN = 50;
+const AGENT_TARGET_SCORE_MAX = 90;
+function clampAgentBudget(maxIterations, targetScore) {
+  const iter = parseInt(maxIterations, 10) || 5;
+  const score = parseInt(targetScore, 10) || 75;
+  return {
+    safeIterations: Math.min(Math.max(iter, 1), AGENT_MAX_ITERATIONS),
+    safeTargetScore: Math.min(Math.max(score, AGENT_TARGET_SCORE_MIN), AGENT_TARGET_SCORE_MAX),
+  };
+}
+
 // ─────────────────────────────────────────────────────────────
 // POST /:workspaceNumber/content/:contentNumber/ai/agent
 // SSE streaming — agent writes/edits, streams progress
@@ -483,6 +806,36 @@ const agent = async (req, res) => {
       return res.status(400).json({ error: 'goal is required' });
     }
 
+    // Article count-gate (Phase 6): runs classified as articleGenerate consume
+    // the article allowance on RE-generation. Classification is content-aware:
+    // plan-execute runs under a not-yet-generated approved plan are the plan's
+    // article write (SERVER-side state — unspoofable), alongside the client-
+    // declared auto-write intent and unknown sequential commands. Check BEFORE
+    // any session/credit work so a blocked run does nothing. AT-1: the honest
+    // write path hard-blocks past the allowance regardless of credit balance;
+    // the finite-pool pricing is only the spoof backstop (AT-2). The slot is
+    // consumed at COMPLETION and only if the run actually wrote the document.
+    const billingAction = classifyAgentRun(req.body, content);
+    // SLOT enforcement is decoupled from the client-declared billing class
+    // (review BLOCKER-1): a spoofed mode/commandName can lower the PRICE — an
+    // accepted, pool-bounded floor — but must NEVER bypass the article
+    // allowance or the plan's one-generation stamp. isPlanArticleWrite reads
+    // only server-side content state, so any run under an unwritten approved
+    // plan is slot-gated no matter what the body claims.
+    // Known accepted limits: (a) the allowance check→increment is TOCTOU like
+    // the platform-wide requireQuota pattern — two concurrent re-gens can land
+    // used=limit+1 once, then block; (b) typed freeform rewrites on NON-plan
+    // docs bill inlineAction with no slot (intent is client-declared there) —
+    // bounded by the finite pools.
+    const slotGated = billingAction === 'articleGenerate' || isPlanArticleWrite(content);
+    let articleGate = null;
+    if (slotGated) {
+      articleGate = await checkArticleAllowance(req, content);
+      if (articleGate.blocked) {
+        return res.status(429).json(articleGate.payload);
+      }
+    }
+
     // Set up Writing Engine session (reuse for conversation memory in freeform mode)
     const isFreeform = !mode || mode === 'freeform';
     const { sessionId } = await setupSession(content, { avatarId, reuseSession: isFreeform });
@@ -494,7 +847,7 @@ const agent = async (req, res) => {
           req.creditContext.orgId, req.user.userId,
           req.creditContext.estimatedCredits,
           req.creditContext.featureKey,
-          { contentId: content._id.toString(), feature: 'aiAgent' }
+          { contentId: content._id.toString(), feature: 'aiAgent', workspaceId: req.creditContext.workspaceId }
         );
         creditTxId = result.transactionId;
       } catch (creditErr) {
@@ -518,8 +871,10 @@ const agent = async (req, res) => {
 
     // Start agent — returns a raw SSE response from the Writing Engine
     // mode: "freeform" (default, Claude Code-style) or "sequential" (legacy phases)
+    const agentPreset = await resolvePreset(req);
+    const { safeIterations, safeTargetScore } = clampAgentBudget(maxIterations, targetScore);
     const agentRes = await writingEngine.startAgent(
-      sessionId, goal, targetScore || 75, maxIterations || 5, abortCtrl.signal, allowedTools, mode || 'freeform'
+      sessionId, goal, safeTargetScore, safeIterations, abortCtrl.signal, allowedTools, mode || 'freeform', agentPreset
     );
 
     // Set up SSE headers for the client
@@ -561,8 +916,14 @@ const agent = async (req, res) => {
     } catch (streamErr) {
       if (clientDisconnected || abortCtrl.signal.aborted) {
         console.log('[agent-sse] stream aborted by client disconnect');
-        // Refund credits on client abort
-        if (creditTxId) {
+        // Refund ONLY when nothing was written (review BLOCKER-2): the doc
+        // edits stream to the client BEFORE completion, so "read until the
+        // final document_diff, then drop the connection" would otherwise yield
+        // a full article with a 100-credit refund and no slot — the count-gate
+        // defeated via abort. Once the run has written, treat it as delivered:
+        // fall through to settle + commit below.
+        const wroteBeforeAbort = usageTap.snapshot().docWrites > 0;
+        if (creditTxId && !wroteBeforeAbort) {
           creditService.refund(creditTxId).catch((e) =>
             console.error('[credit] agent abort refund failed:', e.message)
           );
@@ -573,12 +934,38 @@ const agent = async (req, res) => {
       }
     }
 
-    // Stream completed — mark credits as settled
+    // Stream completed — settle the deduction. Agent cost is fixed per mode
+    // (== the reserved estimate), so settle() refunds 0 — but it must be settle(),
+    // NOT a direct findByIdAndUpdate on the primary tx: a multi-pool deduction
+    // (e.g. 100 credits spanning subscription+general) creates sibling pending
+    // txs sharing a groupId; marking only the primary leaves the siblings
+    // 'pending' for the orphan-sweep to later REFUND — silently under-charging.
+    // settle() claims the whole group and fires the low-balance check.
+    // Did this run actually write the document? Server-observed from the SSE
+    // stream (document_diff/document_update/draft events) — an articleGenerate
+    // run that only talked (e.g. a question asked in execute mode before "write
+    // it") settles down to inlineAction cost and never consumes a slot.
+    const wroteDocument = usageTap.snapshot().docWrites > 0;
+
     if (creditTxId) {
-      CreditTransaction.findByIdAndUpdate(creditTxId, { status: 'settled' }).catch(() => {});
+      const reserved = req.creditContext?.estimatedCredits ?? 0;
+      const actual = (billingAction === 'articleGenerate' && !wroteDocument)
+        ? resolveCredits('inlineAction', { tier: req.creditContext?.tier })
+        : reserved;
+      creditService.settle(creditTxId, Math.min(actual, reserved)).catch((e) =>
+        console.error('[credit] agent settle failed:', e.message)
+      );
     }
 
-    persistUsage(content, usageTap, 'agent');
+    // Article count-gate: commit whenever the run ACTUALLY WROTE — including
+    // abort-after-write (the article was delivered; see BLOCKER-2 above). Pure
+    // no-write aborts and thrown errors (outer catch) never reach here — failed
+    // generations don't count.
+    if (articleGate && wroteDocument) {
+      await commitArticleGeneration(content, articleGate);
+    }
+
+    persistUsage(req, content, usageTap, 'agent');
     if (!clientDisconnected) res.end();
   } catch (err) {
     // Refund credits on error
@@ -601,257 +988,6 @@ const agent = async (req, res) => {
     res.end();
   }
 };
-
-/**
- * Carry forward UI-only metadata from old blocks to matching new blocks.
- * Preserves image width/align and re-inserts editor-only blocks (toc, cta)
- * that the LLM cannot produce.
- */
-function mergeUiMetadata(oldBlocks, newBlocks) {
-  const result = [...newBlocks];
-
-  // 1. Carry forward image width/align from old blocks to matching new blocks
-  for (const newB of result) {
-    if (newB.type === 'img' && newB.src) {
-      const oldB = oldBlocks.find(
-        (ob) => ob.type === 'img' && ob.src === newB.src,
-      );
-      if (oldB) {
-        if (oldB.width) newB.width = oldB.width;
-        if (oldB.align) newB.align = oldB.align;
-      }
-    }
-  }
-
-  // 2. Re-insert toc blocks (editor-only, LLM never produces them)
-  const tocBlocks = oldBlocks.filter((b) => b.type === 'toc');
-  if (tocBlocks.length > 0 && !result.some((b) => b.type === 'toc')) {
-    const h1Idx = result.findIndex((b) => b.type === 'h1');
-    const insertIdx = h1Idx >= 0 ? h1Idx + 1 : 0;
-    for (const toc of tocBlocks) {
-      result.splice(insertIdx, 0, { ...toc });
-    }
-  }
-
-  // 3. Re-insert cta blocks at their original relative position (end of doc)
-  const ctaBlocks = oldBlocks.filter((b) => b.type === 'cta');
-  if (ctaBlocks.length > 0 && !result.some((b) => b.type === 'cta')) {
-    for (const cta of ctaBlocks) {
-      result.push({ ...cta });
-    }
-  }
-
-  return result;
-}
-
-/**
- * Transform a Writing Engine agent event into a frontend-friendly format.
- * Converts document_diff events into block patches.
- */
-function transformAgentEvent(event, currentBlocks, lastMarkdown) {
-  switch (event.type) {
-    case 'document_diff':
-    case 'document_update': {
-      if (!event.documentContent) return event;
-
-      const newMarkdown = event.documentContent;
-      const hadContent = currentBlocks.length > 0 &&
-        currentBlocks.some((b) => b.text && b.text.trim().length > 0);
-
-      if (!hadContent) {
-        // Initial draft — send full blocks
-        const newBlocks = markdownToBlocks(newMarkdown);
-        return {
-          type: 'draft',
-          blocks: newBlocks,
-          _newBlocks: newBlocks,
-          _newMarkdown: newMarkdown,
-        };
-      }
-
-      // Edits — diff old blocks vs new blocks to produce patches
-      const newBlocks = markdownToBlocks(newMarkdown);
-      const patches = diffBlocksToPatches(currentBlocks, newBlocks);
-
-      if (patches.length > 0) {
-        // Apply patches to currentBlocks for tracking. Images carry src/alt
-        // on the patch instead of text, so merge those through when present.
-        const updatedBlocks = [...currentBlocks];
-        for (const p of patches) {
-          const idx = updatedBlocks.findIndex((b) => b.id === p.blockId);
-          if (idx !== -1) {
-            const merged = { ...updatedBlocks[idx], text: p.text };
-            if (p.src !== undefined) merged.src = p.src;
-            if (p.alt !== undefined) merged.alt = p.alt;
-            updatedBlocks[idx] = merged;
-          }
-        }
-        return {
-          type: 'patch',
-          patches,
-          _newBlocks: updatedBlocks,
-          _newMarkdown: newMarkdown,
-        };
-      }
-
-      // Fallback: full block replacement if structure changed (new sections added/removed)
-      // Carry forward UI-only metadata (width, align, toc, cta) from old blocks
-      const merged = mergeUiMetadata(currentBlocks, newBlocks);
-      return {
-        type: 'draft',
-        blocks: merged,
-        _newBlocks: merged,
-        _newMarkdown: newMarkdown,
-      };
-    }
-
-    case 'clarify_request':
-    case 'agent_progress':
-    case 'text_delta':
-    case 'thinking_delta':
-    case 'usage':
-    case 'complete':
-    case 'error':
-    case 'recovery':
-      return event;
-
-    default:
-      return event;
-  }
-}
-
-/**
- * Diff old blocks against new blocks to produce patches.
- * Uses content-based matching (not position) to handle insertions/deletions.
- *
- * Algorithm:
- * 1. Build a signature for each block: type + plain text
- * 2. Find LCS (Longest Common Subsequence) of old and new signatures
- * 3. Blocks in LCS are "unchanged" — preserve their IDs
- * 4. Blocks not in LCS on old side: deleted
- * 5. Blocks not in LCS on new side: inserted (no patch — triggers fallback)
- * 6. Matched blocks with different text: produce "replace" patches
- *
- * Returns patches only when all changes are in-place edits (no structural changes).
- * Returns empty array for insertions/deletions → caller falls back to full draft.
- *
- * @param {Array} oldBlocks - Original blocks from MongoDB
- * @param {Array} newBlocks - Blocks converted from Writing Engine's markdown
- * @returns {Array<{op: string, blockId: string, text: string}>}
- */
-function diffBlocksToPatches(oldBlocks, newBlocks) {
-  // Signature helper: for text blocks use stripped text; for img blocks use
-  // src+alt because .text is always empty on images. Without this, an image
-  // swap (![alt](oldUrl) → ![alt](newUrl)) would be silently "matched" and
-  // never emitted as a patch, so the UI would keep showing the old picture.
-  const sigOf = (b) => {
-    if (b.type === 'img') {
-      return 'img:' + (b.src || '') + '|' + (b.alt || '');
-    }
-    return b.type + ':' + stripHtml(b.text || '').trim();
-  };
-
-  // Build signatures
-  const oldSigs = oldBlocks.map(sigOf);
-  const newSigs = newBlocks.map(sigOf);
-
-  // If lengths differ significantly, it's a structural change → fallback to draft
-  if (Math.abs(oldBlocks.length - newBlocks.length) > 2) {
-    return [];
-  }
-
-  // Try simple position-based matching for blocks that share the same type
-  // This works for in-place edits (most common case from EditTool)
-  const patches = [];
-  let matched = 0;
-
-  if (oldBlocks.length === newBlocks.length) {
-    // Same structure — compare position by position
-    for (let i = 0; i < oldBlocks.length; i++) {
-      const oldB = oldBlocks[i];
-      const newB = newBlocks[i];
-
-      if (sigOf(oldB) === sigOf(newB)) {
-        matched++;
-      } else if (oldB.type === 'img' && newB.type === 'img') {
-        // Image swap — carry src/alt on the patch so the frontend can apply it.
-        patches.push({
-          op: 'replace',
-          blockId: oldB.id,
-          text: newB.text || '',
-          src: newB.src || '',
-          alt: newB.alt || '',
-        });
-      } else {
-        patches.push({
-          op: 'replace',
-          blockId: oldB.id,
-          text: newB.text,
-        });
-      }
-    }
-    // Only return patches if most blocks matched (>50%) — otherwise it's a rewrite
-    if (matched >= oldBlocks.length * 0.5) {
-      return patches;
-    }
-    return []; // too many changes — fallback to draft
-  }
-
-  // Different lengths → structural change (insertions or deletions)
-  // Find blocks in old that have exact matches in new (by signature)
-  for (let i = 0; i < oldBlocks.length; i++) {
-    if (newSigs.includes(oldSigs[i])) {
-      matched++;
-    }
-  }
-
-  // If most old blocks survived, we can produce targeted patches for the ones that changed
-  if (matched >= oldBlocks.length * 0.7) {
-    // Match each old block to the closest new block with same type
-    for (let i = 0; i < oldBlocks.length; i++) {
-      const oldB = oldBlocks[i];
-      const oldType = oldB.type;
-
-      // Find the new block with same type and identical signature
-      let bestMatch = -1;
-      for (let j = 0; j < newBlocks.length; j++) {
-        if (newBlocks[j].type === oldType && sigOf(newBlocks[j]) === sigOf(oldB)) {
-          bestMatch = j;
-          break;
-        }
-      }
-
-      if (bestMatch === -1) {
-        // Old block was modified — find the closest new block by type at similar position
-        for (let j = Math.max(0, i - 2); j < Math.min(newBlocks.length, i + 3); j++) {
-          if (newBlocks[j].type === oldType && sigOf(newBlocks[j]) !== sigOf(oldB)) {
-            const newB = newBlocks[j];
-            if (oldType === 'img') {
-              patches.push({
-                op: 'replace',
-                blockId: oldB.id,
-                text: newB.text || '',
-                src: newB.src || '',
-                alt: newB.alt || '',
-              });
-            } else {
-              patches.push({
-                op: 'replace',
-                blockId: oldB.id,
-                text: newB.text,
-              });
-            }
-            break;
-          }
-        }
-      }
-    }
-    return patches;
-  }
-
-  // Too much structural change — fallback to draft
-  return [];
-}
 
 /**
  * Extract edit pairs from two markdown versions by diffing lines.
@@ -972,14 +1108,49 @@ const generateImage = async (req, res) => {
     if (!description || typeof description !== 'string' || description.length < 5) {
       return res.status(400).json({ error: 'description is required (min 5 chars)' });
     }
+    // 11b: cap the description (byte length, matching the engine's Go len())
+    // before the engine round-trip. The engine now rejects >4096 bytes too;
+    // reject here so an oversized prompt never reaches the LLM.
+    if (Buffer.byteLength(description, 'utf8') > 4096) {
+      return res.status(400).json({ error: 'description too long (max 4096 bytes)' });
+    }
+    // Cap style too (byte-parity with the engine). The SVG path feeds it into
+    // the LLM prompt, so leaving it uncapped would be a bypass of the
+    // description cap. May be undefined/non-string — guard before measuring.
+    if (typeof style === 'string' && Buffer.byteLength(style, 'utf8') > 4096) {
+      return res.status(400).json({ error: 'style too long (max 4096 bytes)' });
+    }
 
-    const { sessionId } = await setupSession(content);
+    // R2b: image-only setup — the engine's /generate-image reads nothing from
+    // the session except the image style, so the full 8-push setupSession was
+    // pure overhead here.
+    const { sessionId } = await setupSessionImage(content);
 
-    const result = await writingEngine.generateImage(sessionId, {
+    const imageParams = {
       description,
       format: format || 'svg',
-      style: style || 'flat',
-    });
+      // R2b: no 'flat' default — empty lets the engine resolve the workspace
+      // image style for PNG (session > IMAGE_STYLE_PROMPT env); the engine
+      // still defaults SVG to "flat" (SVG never uses the workspace style,
+      // matching the chat-loop tool).
+      style: style || '',
+    };
+
+    let result;
+    try {
+      result = await writingEngine.generateImage(sessionId, imageParams);
+    } catch (err) {
+      // Stale mapping: the engine was redeployed with a fresh DB while our
+      // contentSessionMap still holds the old sessionId (its style push above
+      // failed silently too). Drop the entry and retry ONCE with a fresh
+      // session — without this, every retry re-pins the poisoned entry via
+      // lastUsed and image generation 404s forever.
+      if (err.status !== 404) throw err;
+      console.warn(`[generate-image] engine session ${sessionId} gone (404) — recreating and retrying once`);
+      contentSessionMap.delete(content._id.toString());
+      const retry = await setupSessionImage(content);
+      result = await writingEngine.generateImage(retry.sessionId, imageParams);
+    }
 
     // Upload generated image to B2 if available
     if (imageStorage.isEnabled()) {
@@ -1000,10 +1171,219 @@ const generateImage = async (req, res) => {
       }
     }
 
+    // AI cost ledger (Phase 1). PNG is billed flat per image. The engine now
+    // reports the resolved image model (models.json role), so we price from that
+    // instead of a hardcoded id that drifts when the model is reconfigured; the
+    // literal stays as a fallback for older engine builds. SVG is an LLM text
+    // call — the engine returns its usage + serving model in the response body,
+    // so we record real tokens. Detached so it never delays the JSON response.
+    void (async () => {
+      try {
+        const fmt = result.format || format || 'svg';
+        const isPng = fmt === 'png';
+        const orgId = req.creditContext?.orgId || null;
+        let tier = '';
+        if (orgId) tier = (await tierService.getOrgTierConfig(orgId))?.tier || '';
+        costLedger.record({
+          action: 'image',
+          model: isPng
+            ? (result.model || 'google/gemini-2.5-flash-image')
+            : (result.model || 'google/gemini-2.5-flash'),
+          images: isPng ? 1 : undefined,
+          tokensIn: isPng ? 0 : (result.usage?.input_tokens || 0),
+          tokensOut: isPng ? 0 : (result.usage?.output_tokens || 0),
+          organizationId: orgId,
+          workspaceId: content.workspaceId,
+          userId: req.user?.userId || null,
+          tier,
+          metadata: { contentId: content._id?.toString(), format: fmt },
+        });
+      } catch (e) {
+        console.warn('[costLedger] image skipped:', e.message);
+      }
+    })();
+
+    // Phase 6: finalize the flat image charge (10; Free draws from the 200 sample
+    // pool). preDeduct+settle so the orphan-sweep can't refund it. Best-effort —
+    // the image already generated and is being returned. Stock-image search is a
+    // separate zero-credit path; this endpoint is always the AI generator.
+    await creditService.deductForRequest(req, { metadata: { contentId: content._id?.toString() } });
+
     return res.json(result);
   } catch (err) {
     console.error('Image generation error:', err);
+    // N2: consistent with clarifyAnswer/planConfirm — a hung engine (the 11d
+    // createSession/pushImageStyle AbortSignals, or generateImage's own
+    // timeout, fired) is a 504, not a 500.
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      return res.status(504).json({ error: 'Engine timed out generating the image' });
+    }
     return res.status(500).json({ error: err.message || 'Image generation failed' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// POST /:workspaceNumber/content/:contentNumber/ai/inline-edit
+// R15: fast Cmd+K-style edit for the editor's quick actions (Rewrite / Expand /
+// Make Shorter / Improve Readability). ONE validation-model call — no agent
+// loop, no ~8K-token chat overhead. On ANY engine failure this returns non-200
+// so the client transparently falls back to the chat path. Feature/permission/
+// credit gates match chat (rc('aiChat', …)); the charge is settled to the SAME
+// aiChatMessage cost, so users pay the same as the prior chat-based path.
+// ─────────────────────────────────────────────────────────────
+const inlineEdit = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+
+    const { selectedText, instruction } = req.body || {};
+    if (!selectedText || typeof selectedText !== 'string' || !selectedText.trim()) {
+      return res.status(400).json({ error: 'selectedText is required' });
+    }
+    if (!instruction || typeof instruction !== 'string' || !instruction.trim()) {
+      return res.status(400).json({ error: 'instruction is required' });
+    }
+    // R3: input caps. The engine's inline path has a 2000-token output budget;
+    // a selection beyond ~6000 BYTES will truncate mid-sentence. Non-200 here
+    // makes the editor fall back to the chat path, which has no such budget —
+    // same UX, correct result. Byte length (not .length UTF-16 units) so this
+    // cap matches the engine's Go len() exactly — CJK text would otherwise
+    // pass here and waste the round-trip before the engine rejects it.
+    if (Buffer.byteLength(selectedText, 'utf8') > 6000) {
+      return res.status(422).json({ error: 'selection too large for inline edit' });
+    }
+    if (instruction.length > 2000) {
+      return res.status(400).json({ error: 'instruction too long' });
+    }
+
+    // Lean setup: reuse the shared session (1h contentSessionMap) and push ONLY
+    // the current document — the engine's InlineEdit needs nothing else (finding
+    // #2). Repeat quick-actions reuse the session; the doc re-push keeps the
+    // engine in sync so selectedText resolves verbatim.
+    const { sessionId } = await setupSessionLite(content);
+
+    let result;
+    try {
+      result = await writingEngine.inlineEdit(sessionId, { selectedText, instruction });
+    } catch (err) {
+      // Engine unreachable / timeout / 5xx → 502 so the client falls back to chat.
+      console.error('[inline-edit] engine call failed:', err.message);
+      return res.status(502).json({ error: 'inline edit failed' });
+    }
+
+    // Engine ran but produced no usable edit — e.g. selectedText not found in the
+    // document (unsaved editor edits), or the model returned the text unchanged.
+    // 422 → the client falls back to the chat path.
+    // AI cost ledger (Phase 1) — real tokens from the engine's FastUsage.
+    // Detached so it never delays the response; only recorded when the engine
+    // reported a serving model (else the registry would price it at 0).
+    const recordInlineEditCogs = (failed) => {
+      if (!result.usage?.model) return;
+      void (async () => {
+        try {
+          const orgId = req.creditContext?.orgId || null;
+          let tier = '';
+          if (orgId) tier = (await tierService.getOrgTierConfig(orgId))?.tier || '';
+          costLedger.record({
+            action: 'inlineEdit',
+            model: result.usage.model,
+            tokensIn: result.usage.input_tokens || 0,
+            tokensOut: result.usage.output_tokens || 0,
+            organizationId: orgId,
+            workspaceId: content.workspaceId,
+            userId: req.user?.userId || null,
+            tier,
+            metadata: { contentId: content._id?.toString(), ...(failed ? { failed: true } : {}) },
+          });
+        } catch (e) {
+          console.warn('[costLedger] inline-edit skipped:', e.message);
+        }
+      })();
+    };
+
+    if (result.error || !result.editedText) {
+      // R3: a failed call (truncation, sanitizer rejection) still burned real
+      // tokens — record the COGS so the ledger isn't blind to this routine
+      // path. The USER is not charged (charge-only-on-success unchanged).
+      recordInlineEditCogs(true);
+      return res.status(422).json({ error: result.error || 'no edit produced' });
+    }
+
+    // Charge ONLY on success. preDeduct + settle run as ONE cycle here so no
+    // pending tx is left for the orphan-sweep to later refund (which would
+    // silently undercharge). Settled to the SAME aiChatMessage cost the prior
+    // chat-based quick action paid: ≤8K tokens = 1, above = 2 (reserved 2, so a
+    // small edit refunds 1) — users pay exactly what they did before R15.
+    if (req.creditContext?.deductionEnabled) {
+      try {
+        const { transactionId } = await creditService.preDeduct(
+          req.creditContext.orgId, req.user.userId,
+          req.creditContext.estimatedCredits,
+          req.creditContext.featureKey,
+          { contentId: content._id.toString(), feature: 'aiInlineEdit', workspaceId: req.creditContext.workspaceId },
+        );
+        const reserved = req.creditContext.estimatedCredits ?? 0;
+        const tokens = (result.usage?.input_tokens || 0) + (result.usage?.output_tokens || 0);
+        const actual = resolveCredits('aiChatMessage', { tier: req.creditContext.tier, tokens });
+        creditService.settle(transactionId, Math.min(actual, reserved)).catch((e) =>
+          console.error('[credit] inline-edit settle failed:', e.message));
+      } catch (creditErr) {
+        // Balance vanished between the gate and the charge (rare). The edit
+        // already ran engine-side; surface 402 so the client can react.
+        return res.status(402).json({ error: creditErr.message, code: 'INSUFFICIENT_CREDITS' });
+      }
+    }
+
+    recordInlineEditCogs(false);
+
+    return res.json({ editedText: result.editedText });
+  } catch (err) {
+    console.error('[inline-edit] handler error:', err);
+    return res.status(500).json({ error: 'inline edit failed' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// POST /:workspaceNumber/content/:contentNumber/ai/rehost-image
+// R18: rehost a user-picked image-search result onto our own B2/CDN instead of
+// hotlinking the third-party server (matches the agent path). SSRF-hardened —
+// the URL is hostile input. When B2 is off (dev) we return the original URL
+// unchanged (rehosted:false) so behavior is identical to today. No credit gate
+// (no LLM cost). On any failure the client keeps the original URL.
+// ─────────────────────────────────────────────────────────────
+const rehostImage = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+
+    const { url } = req.body || {};
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({ error: 'url is required' });
+    }
+
+    // B2 off (dev) — no server-side fetch happens, so no SSRF surface; hand the
+    // original URL back unchanged (current hotlink behavior).
+    if (!imageStorage.isEnabled()) {
+      return res.json({ url, rehosted: false });
+    }
+
+    let rehostedUrl;
+    try {
+      rehostedUrl = await imageStorage.uploadFromExternalUrl(
+        url, content.workspaceId.toString(), content.contentNumber,
+      );
+    } catch (err) {
+      if (err instanceof imageStorage.UrlValidationError) {
+        return res.status(400).json({ error: err.message, code: 'INVALID_IMAGE_URL' });
+      }
+      console.error('[rehost-image] fetch/upload failed:', err.message);
+      return res.status(502).json({ error: 'rehost failed' });
+    }
+
+    return res.json({ url: rehostedUrl, rehosted: true });
+  } catch (err) {
+    console.error('[rehost-image] handler error:', err);
+    return res.status(500).json({ error: 'rehost failed' });
   }
 };
 
@@ -1048,11 +1428,30 @@ const clarifyAnswer = async (req, res) => {
     if (!sessionId || !answer) {
       return res.status(400).json({ error: 'sessionId and answer are required' });
     }
+    // Tenancy: the sessionId must be the one bound to THIS content's active
+    // session (contentSessionMap), resolved from the authenticated URL — a
+    // caller can't drive another content's resume loop with an arbitrary
+    // sessionId. Fail-closed: a server restart clears the map and orphans the
+    // in-memory engine session anyway, so 409 correctly tells the client to
+    // restart the chat.
+    const content = await resolveContent(req, res);
+    if (!content) return;
+    if (!sessionBoundToContent(content._id.toString(), sessionId)) {
+      return res.status(409).json({ error: 'Session does not match this content (it may have expired — restart the chat)' });
+    }
     const result = await writingEngine.submitClarifyAnswer(sessionId, answer);
     return res.json(result);
   } catch (err) {
     console.error('Clarify answer error:', err);
-    return res.status(500).json({ error: err.message || 'Failed to submit answer' });
+    // Same infrastructure/bug split as scoreTerms: a stuck engine (the 30s
+    // AbortSignal in submitClarifyAnswer fired) is a 504, not a 500.
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      return res.status(504).json({ error: 'Engine timed out submitting the answer' });
+    }
+    // Pass the engine's HTTP status through (e.g. 404 session gone, 409 wrong
+    // state) instead of flattening to 500; non-HTTP failures (engine
+    // unreachable) have no status and stay 500.
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to submit answer' });
   }
 };
 
@@ -1062,37 +1461,32 @@ const clarifyAnswer = async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 const planConfirm = async (req, res) => {
   try {
-    const { sessionId, action, selectedSteps, mode } = req.body;
+    const { sessionId, action, selectedSteps } = req.body;
     if (!sessionId || !action) {
       return res.status(400).json({ error: 'sessionId and action are required' });
+    }
+    // Tenancy: bind the sessionId to THIS content's active session (see
+    // clarifyAnswer). Especially important here — plan-confirm resumes the
+    // agent loop and spends credits.
+    const content = await resolveContent(req, res);
+    if (!content) return;
+    if (!sessionBoundToContent(content._id.toString(), sessionId)) {
+      return res.status(409).json({ error: 'Session does not match this content (it may have expired — restart the chat)' });
     }
     const result = await writingEngine.submitPlanConfirm(sessionId, {
       action,
       selectedSteps: selectedSteps || [],
-      mode: mode || 'auto',
     });
     return res.json(result);
   } catch (err) {
     console.error('Plan confirm error:', err);
-    return res.status(500).json({ error: err.message || 'Failed to submit plan confirm' });
-  }
-};
-
-// ─────────────────────────────────────────────────────────────
-// POST /:workspaceNumber/content/:contentNumber/ai/tool-confirm
-// Proxies the user's tool confirm response (step-by-step mode).
-// ─────────────────────────────────────────────────────────────
-const toolConfirm = async (req, res) => {
-  try {
-    const { sessionId, action } = req.body;
-    if (!sessionId || !action) {
-      return res.status(400).json({ error: 'sessionId and action are required' });
+    // 12b: symmetric with clarifyAnswer — a stuck engine (the 30s AbortSignal
+    // in submitPlanConfirm fired) is a 504, not a 500.
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      return res.status(504).json({ error: 'Engine timed out submitting the plan confirmation' });
     }
-    const result = await writingEngine.submitToolConfirm(sessionId, action);
-    return res.json(result);
-  } catch (err) {
-    console.error('Tool confirm error:', err);
-    return res.status(500).json({ error: err.message || 'Failed to submit tool confirm' });
+    // Pass the engine's HTTP status through instead of flattening to 500.
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to submit plan confirm' });
   }
 };
 
@@ -1140,11 +1534,14 @@ async function resyncBriefIfActive(contentId) {
     // the engine, so omitting this here would strip availableLinks from the
     // live session after every analysis re-run.
     try {
+      const workspaceId = content.workspaceId || content.workspace;
       brief.availableLinks = await buildAvailableLinks(
-        content.workspaceId || content.workspace,
+        workspaceId,
         brief.targetKeyword,
         brief.secondaryKeywords,
       );
+      // R3: keep the allowlist in sync too — pushBrief replaces the whole brief.
+      brief.allowlistUrls = await buildAllowlistUrls(workspaceId);
     } catch (err) {
       console.error('availableLinks rebuild failed (non-fatal):', err.message);
     }
@@ -1178,4 +1575,10 @@ async function resyncBriefIfActive(contentId) {
   }
 }
 
-module.exports = { chat, agent, generateImage, uploadImage, clarifyAnswer, planConfirm, toolConfirm, listSkills, resyncBriefIfActive };
+module.exports = { chat, agent, generateImage, inlineEdit, rehostImage, uploadImage, clarifyAnswer, planConfirm, listSkills, resyncBriefIfActive,
+  // Exported for test coverage (cost-ledger usage tap + Phase-4 preset resolver).
+  // Not part of the runtime API surface.
+  makeUsageTap, resolvePreset, clampAgentBudget,
+  checkArticleAllowance, commitArticleGeneration,
+  // Exported so tests can seed the content→session binding (resume tenancy).
+  contentSessionMap, rememberSession };

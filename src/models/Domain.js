@@ -30,7 +30,7 @@ const domainSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ['pending_dns', 'pending_ssl', 'active', 'failed'],
+      enum: ['pending_dns', 'pending_ssl', 'active', 'failed', 'suspended'],
       default: 'pending_dns',
     },
     statusDetail: { type: String, default: '' },

@@ -19,12 +19,14 @@ function auditOrg(req, org, action, resourceId, meta) {
     resourceId,
     meta,
     ip: req.ip,
+    impersonatedBy: req.user.impersonatedBy || null,
   });
 }
 const Subscription = require('../models/Subscription');
 const Role = require('../models/Role');
 const FeatureFlag = require('../models/FeatureFlag');
 const tierService = require('../services/tierService');
+const seatService = require('../services/seatService');
 const { ORG_CONFIG } = require('../scripts/configOrganization');
 
 // ─── Helper: resolve org + check caller is owner/admin ──────
@@ -51,12 +53,18 @@ async function resolveOrgWithAccess(req, res, requireOwnerOrAdmin = false) {
     return null;
   }
 
-  if (requireOwnerOrAdmin && !['admin'].includes(membership.role)) {
-    res.status(403).json({ error: 'Only organization owners or admins can perform this action' });
+  const scope = membership.accessScope || 'all';
+  if (requireOwnerOrAdmin && (membership.role !== 'admin' || scope === 'assigned')) {
+    // Org-wide owner/admin operations (invite, changeRole, remove, scope,
+    // workspace assignment, audit log) require FULL-org access. A workspace-
+    // scoped ('assigned') admin manages only their assigned workspaces — they
+    // must NOT run org-wide member/audit ops or self-escalate their own scope.
+    // Mirrors the explicit assigned-caller guards in listMembers/listAuditLog.
+    res.status(403).json({ error: 'Only organization owners or full-access admins can perform this action' });
     return null;
   }
 
-  return { org, callerRole: membership.role, accessScope: membership.accessScope || 'all' };
+  return { org, callerRole: membership.role, accessScope: scope };
 }
 
 // ─── LIST MEMBERS ────────────────────────────────────────────────
@@ -105,6 +113,26 @@ const listMembers = async (req, res) => {
     }
     // Owner takes 1 seat (implicit, not in OrgMember)
     const memberSlots = effectiveMaxSeats != null ? Math.max(0, effectiveMaxSeats - 1) : null;
+    const clientViewersCap = config?.clientViewers; // null/undefined = unlimited
+
+    // Phase 9: lock excess per SEAT CLASS, oldest-first (members are createdAt-
+    // asc), independently — editor seats (admin/editor) against maxSeats, client
+    // viewers (viewer/client) against clientViewers. Split by ROLE (who can edit),
+    // consistent with seatService + downgradeService.lockMembers, so a free client
+    // viewer never counts against an editor seat (and an assigned editor does).
+    const isViewer = (m) => !seatService.roleConsumesSeat(m.role);
+    const lockedIds = new Set();
+    let seatIdx = 0;
+    let viewerIdx = 0;
+    for (const m of members) {
+      if (isViewer(m)) {
+        if (clientViewersCap != null && viewerIdx >= clientViewersCap) lockedIds.add(m._id.toString());
+        viewerIdx++;
+      } else {
+        if (memberSlots != null && seatIdx >= memberSlots) lockedIds.add(m._id.toString());
+        seatIdx++;
+      }
+    }
 
     // Populate user info for each member
     const userIds = members.map((m) => m.userId);
@@ -117,13 +145,13 @@ const listMembers = async (req, res) => {
     }
 
     // Persist lock state to DB if it differs from computed state
-    if (memberSlots != null) {
+    {
       const toLock = [];
       const toUnlock = [];
-      for (let i = 0; i < members.length; i++) {
-        const shouldLock = i >= memberSlots;
-        if (shouldLock && !members[i].locked) toLock.push(members[i]._id);
-        if (!shouldLock && members[i].locked) toUnlock.push(members[i]._id);
+      for (const m of members) {
+        const shouldLock = lockedIds.has(m._id.toString());
+        if (shouldLock && !m.locked) toLock.push(m._id);
+        if (!shouldLock && m.locked) toUnlock.push(m._id);
       }
       if (toLock.length > 0) {
         await OrgMember.updateMany({ _id: { $in: toLock } }, { $set: { locked: true } });
@@ -133,9 +161,9 @@ const listMembers = async (req, res) => {
       }
     }
 
-    const enriched = members.map((m, idx) => {
+    const enriched = members.map((m) => {
       const u = userMap[m.userId.toString()];
-      const locked = memberSlots != null ? idx >= memberSlots : false;
+      const locked = lockedIds.has(m._id.toString());
       return {
         _id: m._id,
         userId: m.userId,
@@ -223,7 +251,7 @@ const inviteMember = async (req, res) => {
   try {
     const result = await resolveOrgWithAccess(req, res, true);
     if (!result) return;
-    const { org } = result;
+    const { org, callerRole } = result;
 
     const { email, role, workspaceIds } = req.body;
     const accessScope = req.body.accessScope === 'assigned' ? 'assigned' : 'all';
@@ -236,35 +264,50 @@ const inviteMember = async (req, res) => {
       return res.status(400).json({ error: `Role must be one of: ${validRoles.join(', ')}` });
     }
 
+    // Phase 10 — "Admin grants ≤ Editor": inviting an admin grants the admin role,
+    // so it is Owner-only, same as changeRole. A non-owner admin may invite
+    // editor/viewer/client but not another admin.
+    if (callerRole !== 'owner' && role === 'admin') {
+      return res.status(403).json({
+        error: 'Only the organization owner can grant the admin role.',
+        code: 'OWNER_ONLY',
+      });
+    }
+
     let grantedWorkspaces = null;
     if (accessScope === 'assigned') {
       grantedWorkspaces = await resolveOrgWorkspaces(res, org._id, workspaceIds);
       if (!grantedWorkspaces) return;
     }
 
-    // Check seat limit from TierConfig (base + purchased extra seats)
+    // v4.1 seat model (Phase 9): an admin/editor invite consumes an EDITOR SEAT
+    // (maxSeats + purchased extra); a viewer/client invite is a FREE CLIENT
+    // VIEWER (clientViewers cap) and does NOT consume a seat. The split is by
+    // ROLE (who can edit), NOT accessScope — an assigned workspace-editor is a
+    // seat, not a free viewer. Counts include pending invites (via seatService).
     const { config, tier } = await tierService.getOrgTierConfig(org._id);
-    if (config?.maxSeats != null) {
+    const { seatsUsed, viewersUsed } = await seatService.getSeatUsage(org._id);
+    if (!seatService.roleConsumesSeat(role)) {
+      // Free client viewer — separate cap (null = unlimited, e.g. Agency).
+      if (config?.clientViewers != null && viewersUsed >= config.clientViewers) {
+        return res.status(429).json({
+          error: `Your ${config.displayName || tier} plan allows ${config.clientViewers} client viewer(s).`,
+          code: 'QUOTA_EXCEEDED',
+          quota: { limit: config.clientViewers, used: viewersUsed, tier, limitKey: 'clientViewers' },
+        });
+      }
+    } else if (config?.maxSeats != null) {
       const sub = await Subscription.findOne({
         organizationId: org._id,
         status: { $in: ['active', 'trialing'] },
       }).lean();
       const extraSeats = sub?.purchasedExtraSeats || 0;
       const effectiveMaxSeats = config.maxSeats + extraSeats;
-
-      const memberCount = await OrgMember.countDocuments({ organizationId: org._id, locked: { $ne: true } });
-      // Pending invites reserve seats so accepting can't blow the limit
-      const pendingInviteCount = await Invite.countDocuments({
-        organizationId: org._id,
-        expiresAt: { $gt: new Date() },
-      });
-      // +1 because the org owner is not in OrgMember but counts as a seat
-      const totalSeats = memberCount + pendingInviteCount + 1;
-      if (totalSeats >= effectiveMaxSeats) {
+      if (seatsUsed >= effectiveMaxSeats) {
         return res.status(429).json({
           error: `Your ${config.displayName || tier} plan allows ${effectiveMaxSeats} seat(s).${extraSeats > 0 ? '' : ' Upgrade or purchase extra seats for more.'}`,
           code: 'QUOTA_EXCEEDED',
-          quota: { limit: effectiveMaxSeats, used: totalSeats, tier, limitKey: 'maxSeats' },
+          quota: { limit: effectiveMaxSeats, used: seatsUsed, tier, limitKey: 'maxSeats' },
         });
       }
     }
@@ -409,7 +452,7 @@ const changeRole = async (req, res) => {
   try {
     const result = await resolveOrgWithAccess(req, res, true);
     if (!result) return;
-    const { org } = result;
+    const { org, callerRole } = result;
 
     const { memberId } = req.params;
     const { role } = req.body;
@@ -425,6 +468,42 @@ const changeRole = async (req, res) => {
     });
     if (!member) {
       return res.status(404).json({ error: 'Member not found' });
+    }
+
+    // Phase 10 — "Admin grants ≤ Editor": ADMIN management is Owner-only. A
+    // non-owner admin may assign editor/viewer but must NOT grant the admin role
+    // (privilege escalation) nor modify an existing admin (incl. demoting a peer
+    // or the owner-appointed admin). Only the Owner administers admins.
+    if (callerRole !== 'owner' && (role === 'admin' || member.role === 'admin')) {
+      return res.status(403).json({
+        error: 'Only the organization owner can grant or modify the admin role.',
+        code: 'OWNER_ONLY',
+      });
+    }
+
+    // Phase 9: PROMOTING a free viewer/client to an editor seat consumes a seat —
+    // enforce the same cap as invite, else the seat limit is trivially bypassed
+    // (invite cheap as viewer → promote to editor for free). Only guard the
+    // viewer→seat transition; demotions and lateral seat changes are unaffected.
+    if (seatService.roleConsumesSeat(role) && !seatService.roleConsumesSeat(member.role) && !member.locked) {
+      const { config, tier } = await tierService.getOrgTierConfig(org._id);
+      if (config?.maxSeats != null) {
+        const sub = await Subscription.findOne({
+          organizationId: org._id,
+          status: { $in: ['active', 'trialing'] },
+        }).lean();
+        const effectiveMaxSeats = config.maxSeats + (sub?.purchasedExtraSeats || 0);
+        // seatsUsed excludes this member (still a viewer) — a full seat count
+        // means there's no room to promote them into.
+        const { seatsUsed } = await seatService.getSeatUsage(org._id);
+        if (seatsUsed >= effectiveMaxSeats) {
+          return res.status(429).json({
+            error: `Your ${config.displayName || tier} plan allows ${effectiveMaxSeats} seat(s). Purchase an extra seat or free one before promoting.`,
+            code: 'QUOTA_EXCEEDED',
+            quota: { limit: effectiveMaxSeats, used: seatsUsed, tier, limitKey: 'maxSeats' },
+          });
+        }
+      }
     }
 
     member.role = role;
@@ -445,17 +524,29 @@ const removeMember = async (req, res) => {
   try {
     const result = await resolveOrgWithAccess(req, res, true);
     if (!result) return;
-    const { org } = result;
+    const { org, callerRole } = result;
 
     const { memberId } = req.params;
 
-    const member = await OrgMember.findOneAndDelete({
+    const member = await OrgMember.findOne({
       _id: memberId,
       organizationId: org._id,
     });
     if (!member) {
       return res.status(404).json({ error: 'Member not found' });
     }
+
+    // Phase 10 — "only the Owner administers admins": removing an admin is a
+    // strictly-more-destructive form of modifying one, so a non-owner admin may
+    // not remove an admin peer (mirrors the changeRole guard).
+    if (callerRole !== 'owner' && member.role === 'admin') {
+      return res.status(403).json({
+        error: 'Only the organization owner can remove an admin.',
+        code: 'OWNER_ONLY',
+      });
+    }
+
+    await member.deleteOne();
 
     // Remove any per-workspace grants along with the membership
     await WorkspaceMember.deleteMany({
@@ -506,7 +597,7 @@ const updateMemberScope = async (req, res) => {
   try {
     const result = await resolveOrgWithAccess(req, res, true);
     if (!result) return;
-    const { org } = result;
+    const { org, callerRole } = result;
 
     const { memberId } = req.params;
     const { accessScope } = req.body;
@@ -517,6 +608,16 @@ const updateMemberScope = async (req, res) => {
     const member = await OrgMember.findOne({ _id: memberId, organizationId: org._id });
     if (!member) {
       return res.status(404).json({ error: 'Member not found' });
+    }
+
+    // Phase 10 — "only the Owner administers admins": re-scoping an admin is
+    // modifying an admin. Critically, flipping an assigned admin to 'all' would
+    // undo the assigned-admin isolation guard — so it is Owner-only.
+    if (callerRole !== 'owner' && member.role === 'admin') {
+      return res.status(403).json({
+        error: 'Only the organization owner can change an admin\'s access scope.',
+        code: 'OWNER_ONLY',
+      });
     }
 
     member.accessScope = accessScope;
@@ -541,12 +642,22 @@ const setMemberWorkspaces = async (req, res) => {
   try {
     const result = await resolveOrgWithAccess(req, res, true);
     if (!result) return;
-    const { org } = result;
+    const { org, callerRole } = result;
 
     const { memberId } = req.params;
     const { assignments } = req.body;
     if (!Array.isArray(assignments)) {
       return res.status(400).json({ error: 'assignments must be an array' });
+    }
+    // Phase 10 — "Admin grants ≤ Editor" at workspace scope too: a per-workspace
+    // 'admin' grant makes the member resolve as workspaceRole 'admin' there
+    // (unlocking admin-tier actions), so granting it is Owner-only — mirrors the
+    // changeRole/inviteMember guard, which would otherwise be bypassable here.
+    if (callerRole !== 'owner' && assignments.some((a) => a?.role === 'admin')) {
+      return res.status(403).json({
+        error: 'Only the organization owner can grant the admin role.',
+        code: 'OWNER_ONLY',
+      });
     }
     for (const a of assignments) {
       if (!a?.workspaceId || !WORKSPACE_ROLES.includes(a.role)) {
@@ -561,6 +672,19 @@ const setMemberWorkspaces = async (req, res) => {
       return res.status(404).json({ error: 'Member not found' });
     }
 
+    // Phase 10 — "only the Owner administers admins": setting an admin's workspace
+    // grants IS modifying an admin. Without this, a non-owner admin could pass an
+    // empty/viewer-only assignment list for an assigned-scope admin target — the
+    // guard above only inspects the assignments, not the target — and the seat sync
+    // below would demote OrgMember.role admin→viewer while deleteMany strips every
+    // grant, locking the admin peer out. Owner-only, mirroring the sibling handlers.
+    if (callerRole !== 'owner' && member.role === 'admin') {
+      return res.status(403).json({
+        error: 'Only the organization owner can change an admin\'s workspace assignments.',
+        code: 'OWNER_ONLY',
+      });
+    }
+
     if (assignments.length > 0) {
       const valid = await resolveOrgWorkspaces(
         res,
@@ -568,6 +692,41 @@ const setMemberWorkspaces = async (req, res) => {
         assignments.map((a) => a.workspaceId)
       );
       if (!valid) return;
+    }
+
+    // Phase 9: an assigned member's SEAT CLASS follows their workspace grants —
+    // any admin/editor grant makes them edit-capable (an editor seat); all
+    // view-only grants (viewer/client) keep them a free client viewer. Keep
+    // OrgMember.role in sync so seat counting stays accurate, and enforce the
+    // seat cap when this PROMOTES a free member into a seat — otherwise the seat
+    // limit is bypassable by assigning a cheap viewer an editor workspace role.
+    let syncedRole = member.role;
+    if ((member.accessScope || 'all') === 'assigned') {
+      const grantsEdit = assignments.some((a) => seatService.roleConsumesSeat(a.role));
+      const wasSeat = seatService.roleConsumesSeat(member.role);
+      if (grantsEdit && !wasSeat) {
+        if (!member.locked) {
+          const { config, tier } = await tierService.getOrgTierConfig(org._id);
+          if (config?.maxSeats != null) {
+            const sub = await Subscription.findOne({
+              organizationId: org._id,
+              status: { $in: ['active', 'trialing'] },
+            }).lean();
+            const effectiveMaxSeats = config.maxSeats + (sub?.purchasedExtraSeats || 0);
+            const { seatsUsed } = await seatService.getSeatUsage(org._id);
+            if (seatsUsed >= effectiveMaxSeats) {
+              return res.status(429).json({
+                error: `Your ${config.displayName || tier} plan allows ${effectiveMaxSeats} seat(s). Purchase an extra seat or free one first.`,
+                code: 'QUOTA_EXCEEDED',
+                quota: { limit: effectiveMaxSeats, used: seatsUsed, tier, limitKey: 'maxSeats' },
+              });
+            }
+          }
+        }
+        syncedRole = 'editor';
+      } else if (!grantsEdit && wasSeat) {
+        syncedRole = 'viewer'; // no longer edit-capable → frees the seat
+      }
     }
 
     // Replace-all: upsert the given grants, remove the rest
@@ -590,6 +749,13 @@ const setMemberWorkspaces = async (req, res) => {
         },
         { upsert: true }
       );
+    }
+
+    // Persist the synced seat class (see above) so OrgMember.role tracks the
+    // member's effective edit capability for seat counting.
+    if (syncedRole !== member.role) {
+      member.role = syncedRole;
+      await member.save();
     }
 
     auditOrg(req, org, 'member.set_workspaces', member.userId, {

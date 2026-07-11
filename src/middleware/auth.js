@@ -52,6 +52,9 @@ const authenticateToken = (req, res, next) => {
         roles: decoded.roles,
         sessionId: decoded.sessionId,
         tokenVersion: decoded.tokenVersion,
+        // Present ONLY on an impersonation token (Phase 19B). Propagated so
+        // validateAdmin can hard-block impersonated sessions from admin routes.
+        impersonatedBy: decoded.impersonatedBy || null,
       };
 
       // Fire-and-forget last active update

@@ -36,9 +36,16 @@ async function _resolveAndAuthorize(req, res) {
     const membership = await OrgMember.findOne({
       organizationId: orgId,
       userId: req.user.userId,
+      status: 'active',
     }).lean();
     if (!membership) {
       res.status(403).json({ error: 'Not a member of this organization' });
+      return null;
+    }
+    // Phase 7 RBAC: credits.viewBalance = Editor+ (Owner/Admin/Editor). A viewer
+    // or external client must NOT see the org's credit balance / billing history.
+    if (membership.role !== 'admin' && membership.role !== 'editor') {
+      res.status(403).json({ error: 'You do not have access to credit balances for this organization.' });
       return null;
     }
   }

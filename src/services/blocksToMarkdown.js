@@ -100,7 +100,9 @@ function blocksToMarkdown(blocks) {
             lines.push('| ' + headers.map(() => '---').join(' | ') + ' |');
             if (rows) {
               rows.forEach((row) => {
-                lines.push('| ' + row.join(' | ') + ' |');
+                // Guard null/non-array rows — Mongoose can persist a null slot in
+                // a [[String]] array, which would otherwise throw on .join.
+                lines.push('| ' + (Array.isArray(row) ? row : []).join(' | ') + ' |');
               });
             }
           }

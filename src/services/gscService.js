@@ -496,6 +496,35 @@ async function getKeywordPosition(orgId, siteUrl, keyword, dateRange = '28d', op
   return position;
 }
 
+/**
+ * getKeywordStats (Rec 14) — like getKeywordPosition, but returns the full
+ * row: { position, clicks, impressions } (all null when the keyword has no
+ * data). Additive sibling; getKeywordPosition is unchanged. Cached like the
+ * rest of this service.
+ */
+async function getKeywordStats(orgId, siteUrl, keyword, dateRange = '28d') {
+  const cacheKey = `kwstats:${orgId}:${siteUrl}:${keyword}:${dateRange}`;
+  const cached = cacheGet(cacheKey);
+  if (cached !== null) return cached;
+
+  const { startDate, endDate } = parseDateRange(dateRange);
+  const data = await querySearchAnalytics(orgId, siteUrl, {
+    startDate,
+    endDate,
+    dimensions: ['query'],
+    rowLimit: 1,
+    dimensionFilterGroups: [{
+      filters: [{ dimension: 'query', operator: 'equals', expression: keyword }],
+    }],
+  });
+  const row = (data.rows || [])[0];
+  const stats = row
+    ? { position: +row.position.toFixed(1), clicks: row.clicks ?? null, impressions: row.impressions ?? null }
+    : { position: null, clicks: null, impressions: null };
+  if (row) cacheSet(cacheKey, stats);
+  return stats;
+}
+
 async function refreshSiteStats(siteId) {
   const site = await Site.findById(siteId);
   if (!site) return;
@@ -582,5 +611,6 @@ module.exports = {
   getStrikingDistance,
   rankStrikingDistance,
   getKeywordPosition,
+  getKeywordStats,
   refreshSiteStats,
 };

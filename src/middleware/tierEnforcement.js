@@ -16,7 +16,9 @@
 const Organization = require('../models/Organization');
 const UsageTracker = require('../models/UsageTracker');
 const UserUsageTracker = require('../models/UserUsageTracker');
+const WorkspaceUsageTracker = require('../models/WorkspaceUsageTracker');
 const tierService = require('../services/tierService');
+const { resolveWorkspacePlanLimits } = require('../services/workspaceQuotaService');
 
 // ─── Resolve org from workspace (handles legacy null organizationId) ─
 
@@ -74,10 +76,36 @@ function requireQuota(counterKey, tierLimitKey, tierLimitTypeKey) {
         activeTier = 'free';
       }
 
+      // ── Phase 17 (DARK): per-workspace ceiling from the client's AgencyPlan.
+      // Independent of and ADDITIONAL to the org ceiling below. resolveWorkspacePlanLimits
+      // returns null unless saasMode is live AND this workspace has an active
+      // ClientSubscription, so with the flag dark this whole block is inert and
+      // everything below is byte-identical to pre-P17. Enforced even when the ORG
+      // limit is unlimited (agency tier) — a client's plan can be stricter.
+      let wsQuota = {};
+      const wsLimits = await resolveWorkspacePlanLimits(req.workspace._id);
+      if (wsLimits) {
+        const wsPeriod = tierService.getPeriod('monthly'); // AgencyPlan limits are monthly
+        const wsLimit = wsLimits[tierLimitKey];
+        if (wsLimit != null) {
+          const wsUsed = await WorkspaceUsageTracker.getCount(req.workspace._id, counterKey, wsPeriod);
+          if (wsUsed >= wsLimit) {
+            return res.status(429).json({
+              error: 'Client plan limit reached for this workspace',
+              code: 'QUOTA_EXCEEDED',
+              quota: { limit: wsLimit, used: wsUsed, scope: 'workspace', limitKey: tierLimitKey, limitType: 'monthly' },
+            });
+          }
+        }
+        // Count this workspace's usage after success (also when the plan's limit
+        // for THIS counter is unlimited — keeps the per-workspace counter honest).
+        wsQuota = { workspaceId: req.workspace._id, workspacePeriod: wsPeriod };
+      }
+
       const limit = activeConfig[tierLimitKey];
       // null/undefined = unlimited
       if (limit == null) {
-        req.tierQuota = { orgId, userId: req.user?.userId, counterKey, period: null, isUserLevel: false };
+        req.tierQuota = { orgId, userId: req.user?.userId, counterKey, period: null, isUserLevel: false, ...wsQuota };
         return next();
       }
 
@@ -111,7 +139,7 @@ function requireQuota(counterKey, tierLimitKey, tierLimitTypeKey) {
       }
 
       // Attach context so controller can increment after success
-      req.tierQuota = { orgId, userId: req.user?.userId, counterKey, period, limit, used, isUserLevel: !!isUserLevel };
+      req.tierQuota = { orgId, userId: req.user?.userId, counterKey, period, limit, used, isUserLevel: !!isUserLevel, ...wsQuota };
       return next();
     } catch (err) {
       console.error('[requireQuota]', err.message);

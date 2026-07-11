@@ -51,6 +51,42 @@ const organizationSchema = new mongoose.Schema(
     connectPayoutsEnabled: { type: Boolean, default: false },
     connectDetailsSubmitted: { type: Boolean, default: false },
     connectOnboardedAt: { type: Date, default: null },
+
+    // ─── Tenant lifecycle (Phase 18) ────────────────────────────────
+    // Agency offboarding state machine (see services/lifecycleService.js). An org
+    // only ever leaves 'active' when saasMode is LIVE and the agency loses its
+    // white-label/SaaS entitlement while holding live client assets. With the
+    // flag dark this stays 'active' for every org, so all lifecycle gates are
+    // inert and behaviour is byte-identical to pre-Phase-18.
+    //   active        → normal.
+    //   winding_down  → entitlement lost; 30-day grace. New client signups
+    //                   blocked; agency can still recover by re-subscribing.
+    //   suspended     → grace expired; domains torn down, brand reverted, client
+    //                   workspaces locked, client subs cancelled. Data retained
+    //                   (90 days) for export/restore, then purge-eligible (Ph 18C).
+    //   suspending    → transient claim held while teardown runs (recover cannot
+    //                   touch it, so a re-subscribe can't strand torn-down infra);
+    //                   re-driven by the cron if a crash interrupts teardown.
+    //   restoring     → transient claim held while a suspended tenant is brought
+    //                   back (Phase 18D). Re-run restore to re-drive a crashed one
+    //                   (an hourly sweep resumes stale ones).
+    //   purging       → transient claim held while the retention purge deletes a
+    //                   suspended org's client workspaces (Phase 18C). Claimed
+    //                   BEFORE any delete so a concurrent restore (which claims
+    //                   'suspended') can't win mid-purge; restore/purge claims
+    //                   exclude each other's transient state → fully serialised.
+    lifecycleStatus: {
+      type: String,
+      enum: ['active', 'winding_down', 'suspending', 'suspended', 'restoring', 'purging'],
+      default: 'active',
+      index: true,
+    },
+    lifecycleReason: { type: String, default: null },
+    windDownStartedAt: { type: Date, default: null },
+    suspendAt: { type: Date, default: null },   // grace deadline (windDownStartedAt + GRACE_DAYS)
+    suspendedAt: { type: Date, default: null },
+    purgeAt: { type: Date, default: null },     // retention deadline (suspendedAt + RETENTION_DAYS); Phase 18C
+    purgedAt: { type: Date, default: null },    // when the suspended org's client workspaces were purged (Phase 18C)
   },
   { timestamps: true }
 );

@@ -16,10 +16,28 @@ function benchmarkToContentBrief(content) {
   const recommendedOutline = content.recommendedOutline || {};
   const keywords = benchmark.keywords || content.targetKeywords || [];
 
+  // Rec 15: fold applied GSC striking-distance queries into the secondary
+  // keywords so the whole scoring loop (gauge, term counts, agent feedback)
+  // optimizes for the queries the user chose to Apply. Deduped against the
+  // existing secondaries (case-insensitive), at most 5 applied queries added.
+  const secondaryKeywords = keywords.slice(1);
+  const seenSecondary = new Set(secondaryKeywords.map((k) => String(k).toLowerCase()));
+  const appliedGscQueries = Array.isArray(content.appliedGscQueries) ? content.appliedGscQueries : [];
+  let addedApplied = 0;
+  for (const q of appliedGscQueries) {
+    if (addedApplied >= 5) break;
+    const key = String(q || '').toLowerCase();
+    if (q && !seenSecondary.has(key)) {
+      seenSecondary.add(key);
+      secondaryKeywords.push(q);
+      addedApplied += 1;
+    }
+  }
+
   const brief = {
     // Core targeting
     targetKeyword: keywords[0] || '',
-    secondaryKeywords: keywords.slice(1),
+    secondaryKeywords,
     targetDensity: benchmark.avgKeywordDensity || 1.5,
     searchIntent: intent.primary || 'informational',
 
@@ -73,6 +91,13 @@ function benchmarkToContentBrief(content) {
       docFrequency: s.docFrequency || 0,
       docPercent: s.docPercent || 0,
     })),
+
+    // AEO/citability (R5): carry the AI-answer analysis to the engine
+    // STRUCTURALLY, not just as prose in research-outline.md. Inner keys are
+    // snake_case and passed through verbatim — the engine's citability port and
+    // the frontend citability ring both consume this exact shape, so do not
+    // transform the keys here. null when the content has no analysis.
+    aiAnswerAnalysis: content.aiAnswerAnalysis || null,
   };
 
   return brief;
@@ -213,8 +238,73 @@ function mapContentType(intent) {
 // re-stem every page title on every message. Crawled pages change rarely —
 // a short TTL keeps sessions fresh without the per-message cost.
 const linksCache = new Map(); // key: `${workspaceId}|${targetKeyword}` → { links, at }
+// pagesCache is keyed by workspaceId ALONE — the deduped crawled-page set is
+// keyword-independent, so buildAvailableLinks (per-keyword) and buildAllowlistUrls
+// (keyword-agnostic, R3) share one fetch instead of hitting Mongo twice per
+// setupSession.
+const pagesCache = new Map(); // key: `${workspaceId}` → { pages, at }
 const LINKS_CACHE_TTL_MS = 5 * 60 * 1000;
 const LINKS_CACHE_MAX = 200;
+
+/**
+ * Fetch the workspace's deduped, linkable crawled pages (non-removed, 200/null
+ * status) once and cache them. Shared by buildAvailableLinks and
+ * buildAllowlistUrls so they don't each re-query Mongo on every message.
+ *
+ * NOTE: titleless pages are INCLUDED here — the allowlist (R3) is defined as
+ * every real crawled URL regardless of title, so a titleless-but-real page is
+ * not falsely flagged as hallucinated. buildAvailableLinks (which needs a title
+ * for anchor text) skips titleless pages itself; the dedup below prefers a
+ * titled row over a titleless duplicate so that path is byte-identical to the
+ * pre-R3 DB-level title filter.
+ * @returns {Promise<Array<{url, title, depth, priority, updatedAt}>>}
+ */
+async function fetchCrawledPages(workspaceId) {
+  if (!workspaceId) return [];
+  const key = String(workspaceId);
+  const cached = pagesCache.get(key);
+  if (cached && Date.now() - cached.at < LINKS_CACHE_TTL_MS) {
+    return cached.pages;
+  }
+  // Lazy requires keep this module dependency-light for its sync default export.
+  const Sitemap = require('../models/Sitemap');
+  const CrawlPage = require('../models/CrawlPage');
+
+  const sitemaps = await Sitemap.find({ workspaceId, crawlCompletedAt: { $ne: null } })
+    .sort({ crawlCompletedAt: -1 })
+    .select('_id')
+    .limit(5)
+    .lean();
+  if (sitemaps.length === 0) {
+    pagesCachePut(key, []);
+    return [];
+  }
+
+  const raw = await CrawlPage.find({
+    sitemapId: { $in: sitemaps.map((s) => s._id) },
+    diffStatus: { $ne: 'removed' },
+    $or: [{ statusCode: 200 }, { statusCode: null }, { statusCode: { $exists: false } }],
+  })
+    .select('url title depth priority updatedAt')
+    .lean();
+
+  // Dedupe by url across sitemaps. Prefer a titled row over a titleless
+  // duplicate of the same URL so buildAvailableLinks (which drops titleless)
+  // still sees the titled version — matching the old DB-level title filter.
+  const byUrl = new Map();
+  for (const p of raw) {
+    if (!p.url) continue;
+    const existing = byUrl.get(p.url);
+    if (!existing) {
+      byUrl.set(p.url, p);
+    } else if ((!existing.title || existing.title === '') && p.title) {
+      byUrl.set(p.url, p); // upgrade titleless → titled (Map keeps original position)
+    }
+  }
+  const pages = Array.from(byUrl.values());
+  pagesCachePut(key, pages);
+  return pages;
+}
 
 async function buildAvailableLinks(workspaceId, targetKeyword, secondaryKeywords = [], { limit = 30 } = {}) {
   if (!workspaceId) return [];
@@ -229,29 +319,9 @@ async function buildAvailableLinks(workspaceId, targetKeyword, secondaryKeywords
     // by any of them must not poison the cache.
     return cached.links.map((l) => ({ ...l }));
   }
-  // Lazy requires keep this module dependency-light for its sync default export.
-  const Sitemap = require('../models/Sitemap');
-  const CrawlPage = require('../models/CrawlPage');
   const { stem, tokenize } = require('./stemmer');
 
-  const sitemaps = await Sitemap.find({ workspaceId, crawlCompletedAt: { $ne: null } })
-    .sort({ crawlCompletedAt: -1 })
-    .select('_id')
-    .limit(5)
-    .lean();
-  if (sitemaps.length === 0) {
-    cachePut(cacheKey, []);
-    return [];
-  }
-
-  const pages = await CrawlPage.find({
-    sitemapId: { $in: sitemaps.map((s) => s._id) },
-    diffStatus: { $ne: 'removed' },
-    title: { $nin: [null, ''] },
-    $or: [{ statusCode: 200 }, { statusCode: null }, { statusCode: { $exists: false } }],
-  })
-    .select('url title depth priority updatedAt')
-    .lean();
+  const pages = await fetchCrawledPages(workspaceId);
   if (pages.length === 0) {
     cachePut(cacheKey, []);
     return [];
@@ -265,11 +335,11 @@ async function buildAvailableLinks(workspaceId, targetKeyword, secondaryKeywords
   );
 
   const scored = [];
-  const seenUrls = new Set();
   for (const page of pages) {
-    if (seenUrls.has(page.url)) continue; // dedupe across sitemaps
-    seenUrls.add(page.url);
-
+    // Titleless pages are kept in the shared fetch for the allowlist, but the
+    // top-30 inventory needs a title (anchor text + relevance stemming), so
+    // skip them here — matches the pre-R3 DB-level `title` filter.
+    if (!page.title) continue;
     let slugText = '';
     try {
       slugText = decodeURIComponent(new URL(page.url).pathname).replace(/[-_/]+/g, ' ');
@@ -302,6 +372,36 @@ async function buildAvailableLinks(workspaceId, targetKeyword, secondaryKeywords
 }
 
 /**
+ * Build the FULL crawled-URL allowlist (R3) for hallucination classification —
+ * every non-removed 200/null crawled URL, deduped, capped at 2000. Unlike
+ * buildAvailableLinks (top-30, feeds prompts + suggestions), this list is used
+ * ONLY to verify inserted links and is NEVER rendered into a prompt. Pushed to
+ * the engine as brief.allowlistUrls and returned to the editor via
+ * /available-links so the Go engine and the frontend ring classify identically.
+ * @returns {Promise<string[]>}
+ */
+async function buildAllowlistUrls(workspaceId, { cap = 2000 } = {}) {
+  if (!workspaceId) return [];
+  const pages = await fetchCrawledPages(workspaceId);
+  const urls = [];
+  for (const p of pages) {
+    if (!p.url) continue;
+    urls.push(p.url); // already deduped by fetchCrawledPages
+    if (urls.length >= cap) break;
+  }
+  // Silent truncation would make the extra pages look "covered" when they'd
+  // still be flagged as hallucinated. Log it so a site that outgrows the cap
+  // is visible (the fix would be raising cap + the engine's 1MB brief limit).
+  if (pages.length > cap) {
+    console.warn(
+      `[buildAllowlistUrls] workspace ${workspaceId}: ${pages.length} crawled pages exceed the ${cap} allowlist cap — ` +
+      `${pages.length - cap} URLs excluded and may be false-flagged as hallucinated links.`,
+    );
+  }
+  return urls;
+}
+
+/**
  * Drop every cached link inventory for a workspace — called when a sitemap
  * crawl completes so fresh pages appear immediately instead of after the TTL.
  */
@@ -311,6 +411,9 @@ function invalidateLinksCache(workspaceId) {
   for (const key of linksCache.keys()) {
     if (key.startsWith(prefix)) linksCache.delete(key);
   }
+  // Also drop the shared page set so buildAllowlistUrls / buildAvailableLinks
+  // both see fresh crawl results immediately after a crawl completes.
+  pagesCache.delete(String(workspaceId));
 }
 
 function cachePut(key, links) {
@@ -322,4 +425,12 @@ function cachePut(key, links) {
   linksCache.set(key, { links, at: Date.now() });
 }
 
-module.exports = { benchmarkToContentBrief, buildAvailableLinks, invalidateLinksCache };
+function pagesCachePut(key, pages) {
+  if (pagesCache.size >= LINKS_CACHE_MAX) {
+    const first = pagesCache.keys().next().value;
+    if (first !== undefined) pagesCache.delete(first);
+  }
+  pagesCache.set(key, { pages, at: Date.now() });
+}
+
+module.exports = { benchmarkToContentBrief, buildAvailableLinks, buildAllowlistUrls, invalidateLinksCache };

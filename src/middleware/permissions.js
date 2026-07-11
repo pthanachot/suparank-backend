@@ -80,6 +80,72 @@ function _meetsMinimumPlan(userPlanId, minimumPlan) {
 // 6. Sets req.workspace + req.workspaceRole, or 403
 //
 
+// resolveWorkspaceRole(workspace, userId) — the role-resolution CORE of
+// resolveWorkspaceWithRole, given an ALREADY-FETCHED workspace document.
+// Returns the role string ('owner' | org/ws role | 'editor') or null when the
+// user has no access. Extracted (F1/B1) so routes NOT keyed by workspaceNumber
+// — notably workspaceController.getMembers, keyed by workspace _id — can share
+// the SAME modern OrgMember-based resolution instead of the legacy
+// `members[] OR userId` re-query, which locked out every org-scoped teammate
+// (modern membership lives in OrgMember, not the embedded members[] array).
+async function resolveWorkspaceRole(workspace, userId) {
+  // Org-based workspaces: org role takes priority over ws.userId (creator)
+  // because ownership can be transferred, making the creator a non-owner.
+  if (workspace.organizationId) {
+    const org = await Organization.findById(workspace.organizationId).lean();
+    if (org) {
+      // Org owner = workspace owner
+      if (org.ownerId.equals(userId)) {
+        return 'owner';
+      }
+      const membership = await OrgMember.findMembershipByOrg(
+        workspace.organizationId,
+        userId
+      );
+      if (membership) {
+        if (membership.accessScope === 'assigned') {
+          // Scoped member: role comes from the per-workspace grant. No grant
+          // for this workspace = no access — deliberately do NOT fall through
+          // to the legacy paths below, which could silently widen a scoped
+          // member's access.
+          const wsMembership = await WorkspaceMember.findMembership(
+            workspace._id,
+            userId
+          );
+          return wsMembership ? wsMembership.role : null;
+        }
+        // accessScope 'all' (default): org-wide role, legacy behavior
+        return membership.role;
+      }
+    }
+  }
+
+  // Personal workspace (no org): creator is always owner
+  if (!workspace.organizationId && workspace.userId.equals(userId)) {
+    return 'owner';
+  }
+
+  // Fallback: OrgMember by ownerId (pre-multi-org records, non-org workspaces only)
+  if (!workspace.organizationId) {
+    const membership = await OrgMember.findMembership(
+      workspace.userId, // ownerId
+      userId
+    );
+    if (membership) {
+      return membership.role;
+    }
+  }
+
+  // Legacy fallback: Workspace.members[] (pre-migration).
+  // Safe to remove after running migrateWorkspaceMembers.js on all environments.
+  const isLegacyMember = workspace.members?.some((m) => m.userId.equals(userId));
+  if (isLegacyMember) {
+    return 'editor';
+  }
+
+  return null;
+}
+
 const resolveWorkspaceWithRole = async (req, res, next) => {
   try {
     const { workspaceNumber } = req.params;
@@ -95,83 +161,46 @@ const resolveWorkspaceWithRole = async (req, res, next) => {
       return res.status(404).json({ error: 'Workspace not found' });
     }
 
-    // Org-based workspaces: org role takes priority over ws.userId (creator)
-    // because ownership can be transferred, making the creator a non-owner.
-    if (workspace.organizationId) {
-      const org = await Organization.findById(workspace.organizationId).lean();
-      if (org) {
-        // Org owner = workspace owner
-        if (org.ownerId.equals(req.user.userId)) {
-          req.workspace = workspace;
-          req.workspaceRole = 'owner';
-          return next();
-        }
-        const membership = await OrgMember.findMembershipByOrg(
-          workspace.organizationId,
-          req.user.userId
-        );
-        if (membership) {
-          if (membership.accessScope === 'assigned') {
-            // Scoped member: role comes from the per-workspace grant.
-            // No grant for this workspace = no access — deliberately do
-            // NOT fall through to the legacy paths below, which could
-            // silently widen a scoped member's access.
-            const wsMembership = await WorkspaceMember.findMembership(
-              workspace._id,
-              req.user.userId
-            );
-            if (wsMembership) {
-              req.workspace = workspace;
-              req.workspaceRole = wsMembership.role;
-              return next();
-            }
-            return res
-              .status(403)
-              .json({ error: 'You do not have access to this workspace' });
-          }
-          // accessScope 'all' (default): org-wide role, legacy behavior
-          req.workspace = workspace;
-          req.workspaceRole = membership.role;
-          return next();
-        }
+    const role = await resolveWorkspaceRole(workspace, req.user.userId);
+    if (role === null) {
+      return res
+        .status(403)
+        .json({ error: 'You do not have access to this workspace' });
+    }
+
+    // B4: a locked workspace is inaccessible until it's restored. There are two
+    // independent locks, BOTH of which the Workspace model documents as required-
+    // clear for access. Checked AFTER role resolution (a non-member still gets a
+    // generic "no access" and never learns the lock state) and EXEMPTING DELETE —
+    // mirroring lockGuard's "delete a locked resource to free a slot" rule — so a
+    // member can still erase/clean up a locked workspace; every other method blocks.
+    if (req.method !== 'DELETE') {
+      // Downgrade lock (downgradeService owns it): the org's tier dropped below
+      // what this workspace needs. Cleared by upgrading the plan.
+      if (workspace.locked) {
+        return res.status(403).json({
+          error: 'This workspace is locked. Upgrade your plan to regain access.',
+          code: 'WORKSPACE_LOCKED',
+          locked: true,
+        });
+      }
+      // Client-billing lock (Phase 16): the agency-billed ClientSubscription went
+      // past_due/canceled. Cleared automatically by the Connect webhook when the
+      // client pays (reactivation never routes through here); the agency oversees
+      // it via the org-keyed console, not by entering the workspace. Distinct code
+      // so the FE can show a billing CTA rather than an upgrade CTA.
+      if (workspace.clientLocked) {
+        return res.status(403).json({
+          error: 'This workspace is suspended pending payment. Contact your agency to restore access.',
+          code: 'WORKSPACE_CLIENT_LOCKED',
+          locked: true,
+        });
       }
     }
 
-    // Personal workspace (no org): creator is always owner
-    if (!workspace.organizationId && workspace.userId.equals(req.user.userId)) {
-      req.workspace = workspace;
-      req.workspaceRole = 'owner';
-      return next();
-    }
-
-    // Fallback: OrgMember by ownerId (pre-multi-org records, non-org workspaces only)
-    if (!workspace.organizationId) {
-      const membership = await OrgMember.findMembership(
-        workspace.userId, // ownerId
-        req.user.userId // userId
-      );
-
-      if (membership) {
-        req.workspace = workspace;
-        req.workspaceRole = membership.role;
-        return next();
-      }
-    }
-
-    // Legacy fallback: Workspace.members[] (pre-migration).
-    // Safe to remove after running migrateWorkspaceMembers.js on all environments.
-    const isLegacyMember = workspace.members?.some((m) =>
-      m.userId.equals(req.user.userId)
-    );
-    if (isLegacyMember) {
-      req.workspace = workspace;
-      req.workspaceRole = 'editor';
-      return next();
-    }
-
-    return res
-      .status(403)
-      .json({ error: 'You do not have access to this workspace' });
+    req.workspace = workspace;
+    req.workspaceRole = role;
+    return next();
   } catch (err) {
     console.error('[resolveWorkspaceWithRole]', err.message);
     return res.status(500).json({ error: 'Failed to resolve workspace' });
@@ -328,6 +357,7 @@ function requireFeature(featureKey) {
 
 module.exports = {
   resolveWorkspaceWithRole,
+  resolveWorkspaceRole,
   requirePermission,
   requireFeature,
   clearPermissionCache,

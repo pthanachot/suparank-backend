@@ -152,6 +152,14 @@ const contentSchema = new mongoose.Schema(
       dateRange: { type: String, default: '' },
       snapshotAt: { type: Date, default: null },
     },
+    // The live URL where this content is published (set at export or in content
+    // settings). Enables GSC "decay" opportunities (Rec 15): declining Search
+    // Console pages are matched to content by normalized publishedUrl.
+    publishedUrl: { type: String, default: '' },
+    // GSC striking-distance queries the user chose to optimize for via the
+    // Opportunities "Apply" action. Merged (deduped, capped) into the writing
+    // brief's secondaryKeywords so the whole scoring loop targets them.
+    appliedGscQueries: { type: [String], default: [] },
     country: { type: String, default: '' },
     device: { type: String, enum: ['desktop', 'mobile', ''], default: '' },
     score: { type: Number, default: 0, min: 0, max: 100 },
@@ -209,13 +217,33 @@ const contentSchema = new mongoose.Schema(
       default: 'idle',
     },
     analysisError: { type: String, default: '' },
-    analysisWarnings: { type: [String], default: [] },
+    // Per-URL competitor-crawl failures surfaced by the engine's /analyze
+    // (SSRF rejection, timeout, 4xx, empty body) — these explain WHY a
+    // requested competitor page is absent from the benchmark.
+    crawlErrors: {
+      type: [{ url: { type: String, default: '' }, reason: { type: String, default: '' }, _id: false }],
+      default: [],
+    },
     analyzedAt: Date,
 
     benchmark: {
       type: mongoose.Schema.Types.Mixed,
       default: null,
     },
+
+    // Rec 10: weekly drift-sweep flag — set when the SERP for this content's
+    // keywords has shifted materially since analysis ({ at, overlap,
+    // newCompetitors }). Cleared by runAnalysis on successful re-analysis.
+    driftDetected: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
+    // Rec 11: prompts this content opted into tracking via "Track this
+    // keyword" (primary keyword + up to 2 fanout queries). Non-empty =
+    // tracking enabled; the prompts live on the workspace's AiTracker and are
+    // scanned by the existing scheduler — this array only links content →
+    // prompts for the editor's trend display.
+    trackedPrompts: { type: [String], default: [] },
     intent: {
       type: mongoose.Schema.Types.Mixed,
       default: null,
@@ -287,6 +315,17 @@ const contentSchema = new mongoose.Schema(
       ref: 'Plan',
       default: null,
     },
+
+    // Phase 6 (article count-gate): set on the first successful full-article
+    // generation on this doc. The FIRST generation doesn't decrement the article
+    // allowance (content creation already counted it); every RE-generation after
+    // this is set consumes a slot — see aiController article-gate.
+    articleGeneratedAt: { type: Date, default: null },
+    // Which approved plan produced the current article (null for Auto-write
+    // outside plan mode). Each approved plan buys ONE article generation:
+    // execute-mode runs under a plan whose id differs from this stamp classify
+    // as the plan's article write (agentBilling.isPlanArticleWrite).
+    articleGeneratedPlanId: { type: mongoose.Schema.Types.ObjectId, ref: 'Plan', default: null },
   },
   { timestamps: true }
 );

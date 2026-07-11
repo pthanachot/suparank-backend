@@ -87,6 +87,9 @@ beforeEach(() => {
   domainService.resolveOrgByHost = async () => 'org-1';
   domainService.resolveBaseUrl = async () => 'https://agency.com';
   brandService.getBrandForOrg = async () => ({ brand: { productName: 'Acme' } });
+  // Phase 18: resolveGatedOrg now reads the org's lifecycleStatus to block new
+  // client signups for a winding-down/suspended agency. Default: active.
+  Organization.findById = () => ({ lean: async () => ({ _id: 'org-1', lifecycleStatus: 'active', stripeConnectAccountId: 'acct_1', connectChargesEnabled: true }) });
 });
 
 // ── Client checkout ────────────────────────────────────────────
@@ -94,6 +97,13 @@ beforeEach(() => {
 describe('client checkout — gating + validation', () => {
   it('404s when saasMode is not live (no leak)', async () => {
     flagService.isFlagLive = async () => false;
+    const r = res();
+    await clientCheckout.createClientCheckout({ headers: { 'x-tenant-host': 'agency.com' }, body: { planId: 'p', workspaceId: 'w', email: 'a@b.co' } }, r);
+    assert.equal(r.statusCode, 404);
+  });
+
+  it('404s (no leak) when the agency is winding down — new client signups blocked (Phase 18)', async () => {
+    Organization.findById = () => ({ lean: async () => ({ _id: 'org-1', lifecycleStatus: 'winding_down' }) });
     const r = res();
     await clientCheckout.createClientCheckout({ headers: { 'x-tenant-host': 'agency.com' }, body: { planId: 'p', workspaceId: 'w', email: 'a@b.co' } }, r);
     assert.equal(r.statusCode, 404);

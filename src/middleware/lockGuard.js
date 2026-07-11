@@ -27,13 +27,25 @@ function rejectIfLocked(Model, idResolver) {
       } else {
         const id = req.params[idResolver];
         if (!id) return next(); // No ID param — skip check
-        doc = await Model.findById(id).select('locked').lean();
+        // clientLocked is Workspace-only (Content lacks the field → undefined,
+        // harmless). Selecting it lets the :workspaceId routes (updateWorkspace,
+        // setActiveWorkspace) enforce the billing lock consistently with rwr.
+        doc = await Model.findById(id).select('locked clientLocked').lean();
       }
 
-      if (doc && doc.locked) {
+      if (doc && (doc.locked || doc.clientLocked)) {
+        // A billing-only lock (clientLocked, no downgrade lock) gets the billing
+        // contract so the FE can show a "contact your agency" CTA; the downgrade
+        // lock keeps the existing RESOURCE_LOCKED / upgrade contract.
+        const billingOnly = doc.clientLocked && !doc.locked;
         return res.status(403).json({
-          error: 'This resource is locked. Upgrade your plan to unlock it.',
-          code: 'RESOURCE_LOCKED',
+          error: billingOnly
+            ? 'This workspace is suspended pending payment. Contact your agency to restore access.'
+            : 'This resource is locked. Upgrade your plan to unlock it.',
+          code: billingOnly ? 'WORKSPACE_CLIENT_LOCKED' : 'RESOURCE_LOCKED',
+          // Same field the read gate (contentController.getContent) uses, so
+          // both lock gates speak the one contract the editor understands.
+          locked: true,
         });
       }
 

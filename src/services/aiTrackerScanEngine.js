@@ -6,12 +6,35 @@
  * engine/internal/aisearch/chatgpt.go and gemini.go.
  */
 
+const costLedger = require('./costLedgerService');
+
 const PLATFORMS = [
   { id: 'chatgpt', name: 'ChatGPT' },
   { id: 'gemini', name: 'Gemini' },
   { id: 'claude', name: 'Claude' },
   { id: 'perplexity', name: 'Perplexity' },
 ];
+
+/**
+ * Record one tracker LLM call to the AI cost ledger (Phase 1). ctx is threaded
+ * from executeScan → runScan → the per-engine calls; when absent (e.g. a direct
+ * unit-test call) this is a no-op. Best-effort — never throws.
+ */
+function recordTrackerCost(ctx, { model, engine, step, tokensIn = 0, tokensOut = 0 }) {
+  if (!ctx) return;
+  costLedger.record({
+    action: 'tracker_scan',
+    model,
+    tokensIn,
+    tokensOut,
+    organizationId: ctx.organizationId || null,
+    workspaceId: ctx.workspaceId || null,
+    userId: ctx.userId || null,
+    tier: ctx.tier || '',
+    byok: ctx.byok || false,
+    metadata: { trackerId: ctx.trackerId, engine, step },
+  });
+}
 
 /**
  * Retry a function with exponential backoff.
@@ -42,7 +65,7 @@ async function withRetry(fn, maxRetries = 2) {
  * @param {string} query - The prompt to search
  * @returns {Promise<{ answer: string, citations: string[] }>}
  */
-async function searchChatGPT(query) {
+async function searchChatGPT(query, ctx) {
   const apiKey = process.env.CHATGPT_API_KEY;
   if (!apiKey) throw new Error('CHATGPT_API_KEY not configured');
 
@@ -50,16 +73,16 @@ async function searchChatGPT(query) {
 
   // Try Responses API first (returns real fanout queries), fall back to Chat Completions
   try {
-    const result = await _searchChatGPTResponses(query, apiKey, systemPrompt);
+    const result = await _searchChatGPTResponses(query, apiKey, systemPrompt, ctx);
     return result;
   } catch (responsesErr) {
     console.warn(`[chatgpt] Responses API failed, falling back to Chat Completions: ${responsesErr.message}`);
-    return _searchChatGPTCompletions(query, apiKey, systemPrompt);
+    return _searchChatGPTCompletions(query, apiKey, systemPrompt, ctx);
   }
 }
 
 /** ChatGPT via Responses API — returns real web_search_call fanout queries */
-async function _searchChatGPTResponses(query, apiKey, systemPrompt) {
+async function _searchChatGPTResponses(query, apiKey, systemPrompt, ctx) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 90000);
 
@@ -141,6 +164,12 @@ async function _searchChatGPTResponses(query, apiKey, systemPrompt) {
       }
     }
 
+    // Record before the empty-answer throw — an empty response was still billed.
+    recordTrackerCost(ctx, {
+      model: 'gpt-4o-mini', engine: 'chatgpt', step: 'search',
+      tokensIn: data.usage?.input_tokens || 0, tokensOut: data.usage?.output_tokens || 0,
+    });
+
     if (!answer || answer.trim().length === 0) {
       throw new Error('ChatGPT Responses API returned empty response');
     }
@@ -154,7 +183,7 @@ async function _searchChatGPTResponses(query, apiKey, systemPrompt) {
 }
 
 /** ChatGPT via Chat Completions API — fallback when Responses API fails (no fanout queries) */
-async function _searchChatGPTCompletions(query, apiKey, systemPrompt) {
+async function _searchChatGPTCompletions(query, apiKey, systemPrompt, ctx) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 90000);
 
@@ -210,10 +239,15 @@ async function _searchChatGPTCompletions(query, apiKey, systemPrompt) {
       }
     }
 
+    // Record before the empty-answer throw — an empty response was still billed.
+    recordTrackerCost(ctx, {
+      model: 'gpt-4o-mini-search-preview', engine: 'chatgpt', step: 'search',
+      tokensIn: data.usage?.prompt_tokens || 0, tokensOut: data.usage?.completion_tokens || 0,
+    });
+
     if (!answer || answer.trim().length === 0) {
       throw new Error('ChatGPT Chat Completions returned empty response');
     }
-
     console.log(`[chatgpt-completions-fallback] query_len=${query.length} answer_len=${answer.length} citations=${citations.length}`);
     // F11-02: explicit `fanoutUnavailable` flag so the UI can distinguish
     // "ChatGPT didn't search" (legitimately empty) from "we couldn't capture
@@ -233,7 +267,7 @@ async function _searchChatGPTCompletions(query, apiKey, systemPrompt) {
  * @param {string} query - The prompt to search
  * @returns {Promise<{ answer: string, citations: string[] }>}
  */
-async function searchGemini(query) {
+async function searchGemini(query, ctx) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY not configured');
 
@@ -324,10 +358,15 @@ async function searchGemini(query) {
       groundingSupports = candidate.groundingMetadata?.groundingSupports || [];
     }
 
+    // Record before the empty-answer throw — an empty response was still billed.
+    recordTrackerCost(ctx, {
+      model: 'gemini-2.5-flash-lite', engine: 'gemini', step: 'search',
+      tokensIn: data.usageMetadata?.promptTokenCount || 0, tokensOut: data.usageMetadata?.candidatesTokenCount || 0,
+    });
+
     if (!answer || answer.trim().length === 0) {
       throw new Error('Gemini returned empty response');
     }
-
     console.log(`[gemini] query_len=${query.length} answer_len=${answer.length} citations=${citations.length} fanout=${fanoutQueries.length}`);
     return { answer, citations, fanoutQueries, groundingSupports, groundingChunks, chunkUrls };
   } finally {
@@ -342,7 +381,7 @@ async function searchGemini(query) {
  * @param {string} query - The prompt to search
  * @returns {Promise<{ answer: string, citations: string[] }>}
  */
-async function searchPerplexity(query) {
+async function searchPerplexity(query, ctx) {
   const apiKey = process.env.PERPLEXITY_API_KEY;
   if (!apiKey) throw new Error('PERPLEXITY_API_KEY not configured');
 
@@ -392,6 +431,12 @@ async function searchPerplexity(query) {
       }
     }
 
+    // Record before the empty-answer throw — an empty response was still billed.
+    recordTrackerCost(ctx, {
+      model: 'sonar', engine: 'perplexity', step: 'search',
+      tokensIn: data.usage?.prompt_tokens || 0, tokensOut: data.usage?.completion_tokens || 0,
+    });
+
     if (!answer || answer.trim().length === 0) {
       throw new Error('Perplexity returned empty response');
     }
@@ -401,7 +446,6 @@ async function searchPerplexity(query) {
     const fanoutQueries = Array.isArray(data.related_questions)
       ? [...new Set(data.related_questions.filter((q) => typeof q === 'string' && q.trim()))]
       : [];
-
     console.log(`[perplexity] query_len=${query.length} answer_len=${answer.length} citations=${citations.length} fanout=${fanoutQueries.length}`);
     return { answer, citations, fanoutQueries };
   } finally {
@@ -416,7 +460,7 @@ async function searchPerplexity(query) {
  * @param {string} query - The prompt to search
  * @returns {Promise<{ answer: string, citations: string[] }>}
  */
-async function searchClaude(query) {
+async function searchClaude(query, ctx) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY not configured');
 
@@ -437,11 +481,12 @@ async function searchClaude(query) {
         system: 'You MUST search the web thoroughly for current information before answering. Perform MULTIPLE web searches covering different aspects of the question — search for specific brands, products, comparisons, rankings, and recent news separately. For EVERY claim or fact, cite the source immediately after it using markdown link format: [domain.com](full_url). Example: "Google holds 90% market share [mangools.com](https://mangools.com/blog/search-engines/)." NEVER list sources at the end. NEVER use numbered references like [1] or [2]. Always inline the citation right after the statement it supports. Answer directly and comprehensively. NEVER ask clarifying questions, follow-up questions, or ask what the user means. If the query is ambiguous, interpret it broadly and answer all reasonable interpretations. Do not answer from memory alone — always search first.',
         messages: [{ role: 'user', content: query }],
         // max_uses limits how many web searches Claude can perform per call.
-        // Anthropic bills per search invocation. The F4 B6 credit pre-deduct
-        // formula (prompts × platforms × 4) assumes ~1 search per call; setting
-        // this to 10 silently amplified per-prompt cost up to 10×. Capping at 3
-        // preserves Claude's ability to cross-reference while bounding cost.
-        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }],
+        // Anthropic bills per search invocation (~$0.01 each). The F4 B6 credit
+        // pre-deduct formula (prompts × platforms × 4) assumes ~1 search/call, so
+        // we cap at 1 (Phase 3 cost-optimization) to keep the real web-search cost
+        // aligned with what we already charge. The system prompt still pushes for
+        // a thorough single search covering multiple facets of the query.
+        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 1 }],
       }),
       signal: controller.signal,
     });
@@ -513,6 +558,12 @@ async function searchClaude(query) {
         }
       }
     }
+
+    // Record before the empty-answer throw — an empty response was still billed.
+    recordTrackerCost(ctx, {
+      model: 'claude-haiku-4-5-20251001', engine: 'claude', step: 'search',
+      tokensIn: data.usage?.input_tokens || 0, tokensOut: data.usage?.output_tokens || 0,
+    });
 
     if (!answer || answer.trim().length === 0) {
       throw new Error('Claude returned empty response');
@@ -910,8 +961,11 @@ function sanitizeForAnalyzer(text) {
   return cleaned;
 }
 
-async function analyzeResponse(aiResponse, query, targetBrand, domain) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+async function analyzeResponse(aiResponse, query, targetBrand, domain, ctx) {
+  // Phase 3: the analyzer runs on Kimi K2 (moonshotai/kimi-k2-0905) via OpenRouter
+  // — stronger structured extraction than Haiku 4.5 at ~40% lower cost
+  // ($0.60/$2.50 vs $1/$5 per Mtok). Same model family the content audit uses.
+  const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey || !aiResponse) {
     return _fallbackAnalysis(aiResponse, targetBrand, domain);
   }
@@ -955,16 +1009,16 @@ Return ONLY valid JSON, no other text. Example:
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 60000);
     try {
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
+      const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
         headers: {
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
+          'Authorization': `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: 'claude-haiku-4-5-20251001',
+          model: 'moonshotai/kimi-k2-0905',
           max_tokens: 1024,
+          temperature: 0, // deterministic structured extraction
           messages: [{ role: 'user', content: userPrompt }],
         }),
         signal: controller.signal,
@@ -997,10 +1051,15 @@ Return ONLY valid JSON, no other text. Example:
 
       data = await res.json();
       clearTimeout(timeout);
-      // F3-16: surface max_tokens truncation. Claude cutting off mid-JSON is the
+      recordTrackerCost(ctx, {
+        model: 'moonshotai/kimi-k2-0905', engine: 'kimi', step: 'analyze',
+        tokensIn: data.usage?.prompt_tokens || 0, tokensOut: data.usage?.completion_tokens || 0,
+      });
+      // F3-16: surface max_tokens truncation. The model cutting off mid-JSON is the
       // most common cause of "parse error → fallback" — without this log,
-      // operators can't tell whether to raise max_tokens.
-      if (data?.stop_reason === 'max_tokens') {
+      // operators can't tell whether to raise max_tokens. (OpenRouter/OpenAI shape:
+      // finish_reason 'length' == Anthropic stop_reason 'max_tokens'.)
+      if (data?.choices?.[0]?.finish_reason === 'length') {
         console.warn(`[ai-tracker] analyzeResponse hit max_tokens — output likely truncated; raise the limit if parse errors follow`);
       }
       break; // success
@@ -1020,7 +1079,7 @@ Return ONLY valid JSON, no other text. Example:
   // Hoisted so the outer catch can include the raw text in the parse-error log.
   let rawText;
   try {
-    rawText = data.content?.[0]?.text?.trim();
+    rawText = data.choices?.[0]?.message?.content?.trim();
     if (!rawText) return _fallbackAnalysis(aiResponse, targetBrand, domain);
 
     // Parse — strip markdown code fences if present. Single regex with optional
@@ -1367,11 +1426,11 @@ function getAvailablePlatforms() {
 /**
  * Call the appropriate platform's search function.
  */
-async function searchPlatform(platformId, query) {
-  if (platformId === 'chatgpt') return searchChatGPT(query);
-  if (platformId === 'gemini') return searchGemini(query);
-  if (platformId === 'claude') return searchClaude(query);
-  if (platformId === 'perplexity') return searchPerplexity(query);
+async function searchPlatform(platformId, query, ctx) {
+  if (platformId === 'chatgpt') return searchChatGPT(query, ctx);
+  if (platformId === 'gemini') return searchGemini(query, ctx);
+  if (platformId === 'claude') return searchClaude(query, ctx);
+  if (platformId === 'perplexity') return searchPerplexity(query, ctx);
   throw new Error(`Unknown platform: ${platformId}`);
 }
 
@@ -1385,7 +1444,7 @@ async function searchPlatform(platformId, query) {
  * @param {Function} onProgress - async callback(progressPercent, platformStatuses)
  * @returns {Promise<{ results: Array, competitorResults: Array }>}
  */
-async function runScan(tracker, prompts, competitors, onProgress) {
+async function runScan(tracker, prompts, competitors, onProgress, ctx) {
   let availablePlatforms = getAvailablePlatforms();
 
   // Filter to only the platforms configured on this tracker (defaultModels)
@@ -1471,7 +1530,7 @@ async function runScan(tracker, prompts, competitors, onProgress) {
 
     try {
       // Step 1: Search platform
-      const result = await withRetry(() => searchPlatform(platform.id, prompt.prompt));
+      const result = await withRetry(() => searchPlatform(platform.id, prompt.prompt, ctx));
       let answer = result.answer;
       const fanoutQueries = result.fanoutQueries || [];
 
@@ -1498,7 +1557,7 @@ async function runScan(tracker, prompts, competitors, onProgress) {
       }
 
       // Step 3: Unified analysis
-      const analysis = await analyzeResponse(answer, prompt.prompt, brandName, tracker.domain);
+      const analysis = await analyzeResponse(answer, prompt.prompt, brandName, tracker.domain, ctx);
 
       const extractorWords = [
         ...(analysis.brandRanking || []).map(b => b.brandName),
@@ -1721,4 +1780,5 @@ module.exports = {
   sanitizeForAnalyzer,
   _fallbackAnalysis,
   deduplicateBrands,
+  analyzeResponse, // Phase 3: exercises the Kimi/OpenRouter analyzer parse path
 };

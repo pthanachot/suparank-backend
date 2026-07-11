@@ -1,8 +1,11 @@
 const Content = require('../models/Content');
-const { scoreContent } = require('../services/scorer');
+const Workspace = require('../models/Workspace');
+const Site = require('../models/Site');
 const tierService = require('../services/tierService');
-
-const ENGINE_URL = process.env.ENGINE_URL || 'http://localhost:8090';
+const costLedger = require('../services/costLedgerService');
+const creditService = require('../services/creditService');
+const { tierToPreset } = require('../config/modelPreset');
+const { engineFetch } = require('../services/analysisEngine');
 
 // Workspace resolved by permissions middleware (req.workspace).
 // This helper finds the content within that workspace.
@@ -11,6 +14,13 @@ async function resolveContent(req, res) {
   const content = await Content.findByNumber(req.workspace._id, contentNumber);
   if (!content) {
     res.status(404).json({ error: 'Content not found' });
+    return null;
+  }
+  // B4: locked content must not accept analysis/scoring ops or leak its data to
+  // the engine/LLM. Same gate as contentController.getContent — closes the
+  // analysis-route bypass (analyze/reanalyze/score-terms/import-url/etc.).
+  if (content.locked) {
+    res.status(403).json({ error: 'This content is locked. Upgrade your plan to regain access.', locked: true });
     return null;
   }
   return content;
@@ -179,6 +189,18 @@ function curateAiFormatData(raw) {
   };
 }
 
+// Map engine citation_appearance (snake_case) → camelCase for the frontend.
+function curateCitationAppearance(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((c) => ({
+    domain: c.domain || '',
+    appearances: c.appearances || 0,
+    samples: c.samples || 0,
+    rate: c.rate || 0,
+    exampleUrls: c.example_urls || [],
+  }));
+}
+
 // Curate recommended outline from engine
 function curateRecommendedOutline(raw) {
   if (!raw) return null;
@@ -234,7 +256,7 @@ function termsToSnakeCase(terms) {
 
 // ─── RUN ANALYSIS (background) ─────────────────────────────────
 
-async function runAnalysis(contentId) {
+async function runAnalysis(contentId, opts = {}) {
   try {
     const content = await Content.findById(contentId);
     if (!content) return;
@@ -251,14 +273,27 @@ async function runAnalysis(contentId) {
       $set: { analysisStatus: 'analyzing', analysisError: '' },
     });
 
+    // Phase 4: resolve the org tier once → model preset for the engine pipeline
+    // (Free → "budget" = flash-lite everywhere; paid → base). Reused below for
+    // the analyze/outline X-Model-Preset header and for tagging the cost-ledger rows.
+    let orgId = null;
+    let tier = '';
+    try {
+      const wsTier = await Workspace.findById(content.workspaceId).select('organizationId').lean();
+      orgId = wsTier?.organizationId || null;
+      if (orgId) {
+        const resolved = await tierService.getOrgTierConfig(orgId);
+        tier = resolved?.tier || '';
+      }
+    } catch { /* best-effort — model selection falls back to base */ }
+    const preset = tierToPreset(tier);
+
     // Step 1: Discover (SERP data, related searches, PAA, volumes)
     let discoverData = {};
     try {
-      const discoverRes = await fetch(`${ENGINE_URL}/api/discover`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keywords }),
-        signal: AbortSignal.timeout(60000),
+      const discoverRes = await engineFetch('/api/discover', {
+        body: { keywords },
+        timeoutMs: 60000,
       });
       if (discoverRes.ok) {
         discoverData = await discoverRes.json();
@@ -280,16 +315,66 @@ async function runAnalysis(contentId) {
       if (selectedUrls.length > 0) {
         analyzeBody.selected_urls = selectedUrls;
       }
-      const analyzeRes = await fetch(`${ENGINE_URL}/api/analyze`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(analyzeBody),
-        signal: AbortSignal.timeout(330000), // 5.5 min — slightly above engine's 5-min context
+      // preset (if any) rides the X-Model-Preset header — the engine ignores a
+      // body `preset` field.
+      const analyzeRes = await engineFetch('/api/analyze', {
+        body: analyzeBody,
+        preset,
+        timeoutMs: 330000, // 5.5 min — slightly above engine's 5-min context
       });
       if (analyzeRes.ok) {
         analyzeData = await analyzeRes.json();
         contentBrief = analyzeData.content_brief || {};
         competitorPages = analyzeData.competitor_pages || [];
+
+        // AI cost ledger (Phase 1): the Go engine returns a per-LLM-call
+        // breakdown as pipeline_steps (step, model, prompt/completion tokens).
+        // Record one row per call with the real model id + tokens. The engine
+        // sends NO per-call cost (it has no pricing table), so each row is
+        // priced from the backend model registry — a backend-ESTIMATED COGS,
+        // not the engine's actual OpenRouter-billed amount. The `s.cost > 0`
+        // override below is honored only if a future engine build starts
+        // sending a cost. Fallback: pipeline_cost is a dormant aggregate path
+        // for a hypothetical build that emits a lump cost but no steps; the
+        // current engine emits neither, so that branch stays inert.
+        try {
+          const steps = Array.isArray(analyzeData.pipeline_steps) ? analyzeData.pipeline_steps : [];
+          const pipelineCost = Number(contentBrief.pipeline_cost) || 0;
+          if (steps.length > 0 || pipelineCost > 0) {
+            // orgId + tier resolved once at the top of runAnalysis (Phase 4).
+            const base = {
+              action: 'analyze',
+              organizationId: orgId,
+              workspaceId: content.workspaceId,
+              tier,
+            };
+            if (steps.length > 0) {
+              for (const s of steps) {
+                // Trust the engine's cost only when it actually priced the call
+                // (its own table can miss a model → cost 0). Otherwise leave the
+                // override off so registry token pricing + unknownModel apply.
+                const engineCost = Number(s.cost);
+                costLedger.record({
+                  ...base,
+                  model: s.model,
+                  tokensIn: s.prompt_tokens || 0,
+                  tokensOut: s.completion_tokens || 0,
+                  ...(Number.isFinite(engineCost) && engineCost > 0 && { costUsdOverride: engineCost }),
+                  metadata: { contentId: content._id?.toString(), step: s.step },
+                });
+              }
+            } else {
+              costLedger.record({
+                ...base,
+                model: 'engine-pipeline',
+                costUsdOverride: pipelineCost,
+                metadata: { contentId: content._id?.toString(), keywords: keywords?.length || 0, aggregate: true },
+              });
+            }
+          }
+        } catch (e) {
+          console.warn('[costLedger] analyze skipped:', e.message);
+        }
       } else {
         const errBody = await analyzeRes.text();
         throw new Error(`Engine returned ${analyzeRes.status}: ${errBody}`);
@@ -308,6 +393,10 @@ async function runAnalysis(contentId) {
       prompt: c.prompt || '',
       answer: c.answer || '',
       citations: c.citations || [],
+      // Per-fanout citations are intentionally not persisted here: the Rec 3
+      // appearance-rate signal already aggregates them engine-side and is
+      // delivered via aiFormatData.citationAppearance. Add `citations: f.citations`
+      // here if a future feature needs per-fanout sources round-tripped.
       fanout_queries: (c.fanout_queries || []).map((f) => ({
         query: f.query || '',
         answer: f.answer || '',
@@ -324,10 +413,18 @@ async function runAnalysis(contentId) {
       console.log(`[analysis] received AI answer analysis with ${(aiAnswerAnalysis.query_groups || []).length} query groups`);
     }
 
-    // Engine warnings (degraded pipeline steps)
-    const analysisWarnings = analyzeData.warnings || [];
-    if (analysisWarnings.length > 0) {
-      console.log(`[analysis] engine warnings: ${analysisWarnings.join('; ')}`);
+
+    // Per-URL crawl failures (SSRF block, timeout, 4xx, empty body). The engine
+    // surfaces these so an operator can see WHY a requested competitor page is
+    // missing from the benchmark; previously they were silently dropped.
+    const crawlErrors = (Array.isArray(analyzeData.crawl_errors) ? analyzeData.crawl_errors : [])
+      .map((e) => ({ url: e?.url || '', reason: e?.reason || '' }))
+      .filter((e) => e.url || e.reason);
+    if (crawlErrors.length > 0) {
+      console.warn(
+        `[analysis] ${crawlErrors.length} crawl error(s): ` +
+          crawlErrors.map((e) => `${e.url} → ${e.reason}`).join('; ')
+      );
     }
 
     // Steps 3+4: Run AI Format Recommend + Recommend Outline in PARALLEL
@@ -336,11 +433,9 @@ async function runAnalysis(contentId) {
 
     const [formatResult, outlineResult] = await Promise.allSettled([
       // Step 3: AI Format Recommend
-      fetch(`${ENGINE_URL}/api/ai-format-recommend`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keywords }),
-        signal: AbortSignal.timeout(60000),
+      engineFetch('/api/ai-format-recommend', {
+        body: { keywords },
+        timeoutMs: 60000,
       }).then(async (res) => {
         if (res.ok) {
           const data = await res.json();
@@ -350,10 +445,9 @@ async function runAnalysis(contentId) {
         return null;
       }),
       // Step 4: Recommend Outline
-      fetch(`${ENGINE_URL}/api/recommend-outline`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      engineFetch('/api/recommend-outline', {
+        preset,
+        body: {
           keyword: keywords[0],
           competitor_pages: competitorPages,
           people_also_ask: discoverData.people_also_ask || [],
@@ -361,8 +455,8 @@ async function runAnalysis(contentId) {
           structure: contentBrief.structure || [],
           terms: (contentBrief.terms || []).slice(0, 15),
           ai_conversations: aiConversations,
-        }),
-        signal: AbortSignal.timeout(60000),
+        },
+        timeoutMs: 60000,
       }).then(async (res) => {
         if (res.ok) {
           const data = await res.json();
@@ -385,11 +479,32 @@ async function runAnalysis(contentId) {
       console.error('[analysis] recommend-outline failed (non-fatal):', outlineResult.reason?.message);
     }
 
+    // Rec 3: the citation appearance-rate signal rides the analyze response's
+    // `ai_analysis.citation_appearance` — the fanout-enriched path where an AI
+    // answer's cited domains are sampled across the parent + fan-out queries.
+    // NOTE: the current writing-engine `/analyze` does NOT run that citation
+    // sampling (it generates a single simulated answer with no real citations),
+    // so `ai_analysis` is absent and this resolves to []. The read is kept as a
+    // forward-compatible passthrough for a future citation-sampling producer;
+    // it is intentionally NOT synthesized from empty data. Until that pipeline
+    // exists, aiFormatData.citationAppearance simply stays unset (the frontend
+    // field is optional). Do not "fix" this by fabricating appearance rows.
+    const curatedAiFormat = aiFormatData ? curateAiFormatData(aiFormatData) : null;
+    const citationAppearance = curateCitationAppearance(analyzeData.ai_analysis?.citation_appearance);
+    // Attach only when the format payload exists — never persist a partial
+    // aiFormatData missing its required-shape fields. If ai-format-recommend
+    // failed (curatedAiFormat null), the AI section is degraded anyway and we
+    // keep aiFormatData honestly null rather than a citationAppearance-only stub.
+    if (curatedAiFormat && citationAppearance.length > 0) {
+      curatedAiFormat.citationAppearance = citationAppearance;
+    }
+
     // Step 5: Save curated results to DB
     const updates = {
       analysisStatus: 'ready',
       analysisError: '',
       analyzedAt: new Date(),
+      driftDetected: null, // Rec 10: a fresh analysis clears any drift flag
       benchmark: curateBenchmark(contentBrief),
       intent: contentBrief.intent || null,
       competitors: curateCompetitors(candidates),
@@ -397,7 +512,7 @@ async function runAnalysis(contentId) {
       relatedSearches: discoverData.related_searches || [],
       peopleAlsoAsk: discoverData.people_also_ask || [],
       keywordVolumes: discoverData.keyword_volumes || [],
-      aiFormatData: aiFormatData ? curateAiFormatData(aiFormatData) : null,
+      aiFormatData: curatedAiFormat,
       competitorPages: competitorPages.map((p) => ({
         url: p.url || '',
         title: p.title || '',
@@ -411,11 +526,40 @@ async function runAnalysis(contentId) {
       recommendedOutline: curateRecommendedOutline(recommendedOutline),
       aiConversations,
       aiAnswerAnalysis,
-      analysisWarnings,
+      crawlErrors,
     };
 
     await Content.findByIdAndUpdate(contentId, { $set: updates });
     console.log(`[analysis] completed for content ${contentId}`);
+
+    // Rec 14: snapshot the outcome baseline at every successful (re)analysis —
+    // the first analysis captures "before", each reanalysis an "after" point.
+    // Best-effort: an outcome hiccup must never fail the analysis itself.
+    try {
+      const outcomeService = require('../services/outcomeService');
+      const snapDoc = await Content.findById(contentId)
+        .select('score targetKeywords trackedPrompts workspaceId publishedUrl').lean();
+      if (snapDoc) await outcomeService.snapshotContent(snapDoc, { source: 'reanalyze' });
+    } catch (e) {
+      console.error('[analysis] outcome snapshot failed (non-fatal):', e.message);
+    }
+
+    // Phase 6: charge re-score (10) ONLY on a fully successful re-analysis. This
+    // line is reached only when the whole pipeline succeeded — every failure path
+    // (no keywords, engine unreachable, parse error) returns/throws early to
+    // 'failed' above and never gets here, so an outage or a zero-keyword re-run
+    // is NOT billed (review MAJOR: the prior charge-at-trigger billed those).
+    // opts.bill is set only by reanalyze; the free initial /analyze passes nothing.
+    // chargeAction re-resolves tier/flag + affordability and is orphan-sweep safe.
+    if (opts.bill) {
+      const charge = await creditService.chargeAction(opts.bill.action, {
+        orgId,
+        userId: opts.bill.userId,
+        workspaceId: content.workspaceId,
+        metadata: { contentId: contentId.toString(), reScore: true },
+      });
+      console.log(`[analysis] re-score charged ${charge.deducted} (${charge.reason}) for ${contentId}`);
+    }
 
     // Phase 2 / Task #100: push the freshly-computed brief into any
     // engine session currently open for this content. Lazy-require avoids
@@ -474,6 +618,21 @@ const getBenchmark = async (req, res) => {
     const content = await resolveContent(req, res);
     if (!content) return;
 
+    // Rec 11: keyword-tracking trend (additive — key absent when the content
+    // isn't tracking, so untracked responses stay byte-identical). Series
+    // failures degrade to an empty series, never break the benchmark.
+    let tracking;
+    if (Array.isArray(content.trackedPrompts) && content.trackedPrompts.length > 0) {
+      try {
+        const { getScanSeriesForPrompts } = require('../services/trackerSeriesService');
+        const { series, lastScanAt } = await getScanSeriesForPrompts(req.workspace._id, content.trackedPrompts, 30);
+        tracking = { enabled: true, prompts: content.trackedPrompts, lastScanAt, series };
+      } catch (e) {
+        console.error('getBenchmark tracking series failed:', e.message);
+        tracking = { enabled: true, prompts: content.trackedPrompts, lastScanAt: null, series: [] };
+      }
+    }
+
     res.json({
       analysisStatus: content.analysisStatus,
       analysisError: content.analysisError || '',
@@ -490,7 +649,8 @@ const getBenchmark = async (req, res) => {
       recommendedOutline: content.recommendedOutline || null,
       aiConversations: content.aiConversations || [],
       aiAnswerAnalysis: content.aiAnswerAnalysis || null,
-      analysisWarnings: content.analysisWarnings || [],
+      driftDetected: content.driftDetected || null, // Rec 10
+      ...(tracking ? { tracking } : {}), // Rec 11 (additive)
     });
   } catch (err) {
     console.error('getBenchmark error:', err.message);
@@ -513,8 +673,17 @@ const reanalyze = async (req, res) => {
       $set: { analysisStatus: 'pending', analysisError: '' },
     });
 
-    // Fire-and-forget
-    runAnalysis(content._id);
+    // Track audit usage before starting re-analysis (re-analysis consumes the
+    // same monthly audit pool as first analysis — mirrors triggerAnalysis).
+    if (req.tierQuota) {
+      await tierService.incrementQuota(req.tierQuota);
+    }
+
+    // Fire-and-forget. Phase 6: re-score (10) is charged INSIDE runAnalysis, on
+    // success only (see its success hook) — NOT here at trigger — so an engine
+    // outage or a zero-keyword content never bills. The rc('reScore') route gate
+    // already ran the pre-flight 402, so the user had the credits when they asked.
+    runAnalysis(content._id, { bill: { action: 'reScore', userId: req.user?.userId } });
 
     res.json({ analysisStatus: 'pending', message: 'Re-analysis started' });
   } catch (err) {
@@ -525,33 +694,12 @@ const reanalyze = async (req, res) => {
 
 // ─── POST /:contentNumber/score — compute score from saved benchmark ───
 
-const computeScore = async (req, res) => {
-  try {
-    const content = await resolveContent(req, res);
-    if (!content) return;
-
-    const { htmlContent } = req.body;
-    if (!htmlContent) {
-      return res.status(400).json({ error: 'htmlContent is required' });
-    }
-
-    if (!content.benchmark) {
-      return res.status(400).json({ error: 'No benchmark data. Run analysis first.' });
-    }
-
-    const keyword = (content.targetKeywords && content.targetKeywords[0]) || '';
-    const result = scoreContent(htmlContent, keyword, content.benchmark, content.intent, content.aiFormatData);
-
-    // Update the stored score on the content document
-    await Content.findByIdAndUpdate(content._id, { $set: { score: result.overallScore } });
-
-    res.json({ score: result });
-  } catch (err) {
-    console.error('computeScore error:', err.message);
-    res.status(500).json({ error: 'Failed to compute score' });
-  }
-};
-
+// Rec 13 Phase B: fetch engine-canonical NLP term counts for scoring. The
+// engine counts with the exact tokenizer/stemmer that built the benchmark
+// usage ranges (the JS stemmer diverges on inflections and CJK boundaries —
+// see tests/fixtures/scoring/DIVERGENCE.md). Returns a lowercased-term →
+// count map, or null on ANY failure so callers fall back to the unchanged
+// internal counting.
 // ─── POST /:contentNumber/score-terms — engine-canonical term counting ───
 // Proxies to the Go engine's /api/score so term counts use the exact
 // tokenizer/stemmer that built the benchmark usage ranges. The editor's
@@ -575,15 +723,13 @@ const scoreTerms = async (req, res) => {
       return res.status(400).json({ error: 'maximum 500 terms' });
     }
 
-    const engineRes = await fetch(`${ENGINE_URL}/api/score`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    const engineRes = await engineFetch('/api/score', {
+      body: {
         keyword: (content.targetKeywords && content.targetKeywords[0]) || '',
         content: draftText,
         terms,
-      }),
-      signal: AbortSignal.timeout(15000), // scoring is sub-second; don't hang on a stuck engine
+      },
+      timeoutMs: 15000, // scoring is sub-second; don't hang on a stuck engine
     });
     if (!engineRes.ok) {
       const text = await engineRes.text();
@@ -623,12 +769,10 @@ const importUrl = async (req, res) => {
       return res.status(400).json({ error: 'url is required' });
     }
 
-    const engineRes = await fetch(`${ENGINE_URL}/api/fetch-page`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: url.trim() }),
+    const engineRes = await engineFetch('/api/fetch-page', {
+      body: { url: url.trim() },
       // Scrappey fallback for protected pages can take a while.
-      signal: AbortSignal.timeout(95000),
+      timeoutMs: 95000,
     });
     const body = await engineRes.text();
     if (!engineRes.ok) {
@@ -637,7 +781,11 @@ const importUrl = async (req, res) => {
       console.error('importUrl engine error:', engineRes.status, body.slice(0, 200));
       return res.status(engineRes.status === 400 ? 400 : 502).json({ error: message });
     }
-    res.json(JSON.parse(body));
+    // Parse BEFORE charging so a non-JSON 2xx body throws (→ 500) without billing
+    // (review MINOR). Phase 6: charge import (5, Scrappey infra) on success only.
+    const parsed = JSON.parse(body);
+    await creditService.deductForRequest(req, { metadata: { contentId: content._id.toString() } });
+    res.json(parsed);
   } catch (err) {
     if (err.name === 'TimeoutError' || err.name === 'AbortError') {
       console.error('importUrl: engine timed out');
@@ -680,15 +828,13 @@ const internalLinks = async (req, res) => {
       return res.json({ suggestions: [], count: 0, reason: 'no_sitemap' });
     }
 
-    const engineRes = await fetch(`${ENGINE_URL}/api/internal-links`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    const engineRes = await engineFetch('/api/internal-links', {
+      body: {
         sections,
         links: links.map((l) => ({ url: l.url, title: l.title, relevance: l.relevance })),
         max_suggestions: max_suggestions || undefined,
-      }),
-      signal: AbortSignal.timeout(20000),
+      },
+      timeoutMs: 20000,
     });
     const body = await engineRes.text();
     if (!engineRes.ok) {
@@ -697,7 +843,12 @@ const internalLinks = async (req, res) => {
       console.error('internalLinks engine error:', engineRes.status, body.slice(0, 200));
       return res.status(engineRes.status === 400 ? 400 : 502).json({ error: message });
     }
-    res.json(JSON.parse(body));
+    // Parse BEFORE charging so a non-JSON 2xx body throws (→ 500) without billing
+    // (review MINOR). Phase 6: charge the internal-link run (10, infra) only when
+    // the engine actually ran — the no-sitemap early return above bills nothing.
+    const parsed = JSON.parse(body);
+    await creditService.deductForRequest(req, { metadata: { contentId: content._id.toString() } });
+    res.json(parsed);
   } catch (err) {
     if (err.name === 'TimeoutError' || err.name === 'AbortError') {
       return res.status(504).json({ error: 'Internal-link suggestion timed out' });
@@ -722,18 +873,16 @@ const readabilityCheck = async (req, res) => {
       return res.status(400).json({ error: 'keyword and contentText are required' });
     }
 
-    const engineRes = await fetch(`${ENGINE_URL}/api/readability-check`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    const engineRes = await engineFetch('/api/readability-check', {
+      body: {
         keyword,
         content: contentText,
         headings: headings || [],
         ai_answers: aiAnswers || [],
         intent: intent || '',
         archetype: archetype || '',
-      }),
-      signal: AbortSignal.timeout(60000),
+      },
+      timeoutMs: 60000,
     });
 
     if (!engineRes.ok) {
@@ -773,10 +922,20 @@ const regenerateOutline = async (req, res) => {
       h4s: p.h4s || [],
     }));
 
-    const outlineRes = await fetch(`${ENGINE_URL}/api/recommend-outline`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    // Phase 4: Free tier → budget model for the regenerated outline too (parity
+    // with runAnalysis; otherwise this live Free path leaks base-model COGS).
+    let preset = '';
+    try {
+      const wsTier = await Workspace.findById(content.workspaceId).select('organizationId').lean();
+      if (wsTier?.organizationId) {
+        const tier = (await tierService.getOrgTierConfig(wsTier.organizationId))?.tier || '';
+        preset = tierToPreset(tier);
+      }
+    } catch { /* best-effort — falls back to base */ }
+
+    const outlineRes = await engineFetch('/api/recommend-outline', {
+      preset,
+      body: {
         keyword,
         competitor_pages: competitorPages,
         people_also_ask: (content.peopleAlsoAsk || []).slice(0, 5),
@@ -784,8 +943,8 @@ const regenerateOutline = async (req, res) => {
         structure: structureToSnakeCase((content.contentBrief && content.contentBrief.structure) || []),
         terms: termsToSnakeCase(((content.contentBrief && content.contentBrief.terms) || []).slice(0, 15)),
         ai_conversations: (content.aiConversations || []).slice(0, 3),
-      }),
-      signal: AbortSignal.timeout(30000),
+      },
+      timeoutMs: 30000,
     });
 
     if (!outlineRes.ok) {
@@ -796,6 +955,11 @@ const regenerateOutline = async (req, res) => {
 
     const raw = await outlineRes.json();
     const curated = curateRecommendedOutline(raw);
+
+    // Phase 6: charge brief/outline (20) only on a successful regeneration. The
+    // mandatory initial /analyze is NOT charged (product decision) — this
+    // discretionary re-run is. Free draws from the 200 sample pool.
+    await creditService.deductForRequest(req, { metadata: { contentId: content._id.toString() } });
 
     // Persist to DB
     await Content.findByIdAndUpdate(content._id, { $set: { recommendedOutline: curated } });
@@ -808,4 +972,107 @@ const regenerateOutline = async (req, res) => {
   }
 };
 
-module.exports = { triggerAnalysis, getBenchmark, reanalyze, runAnalysis, computeScore, scoreTerms, importUrl, internalLinks, readabilityCheck, regenerateOutline };
+// ─── GET /:workspaceNumber/site/bot-access — AI crawler access audit (Rec 7) ───
+// Deterministic robots.txt + CDN dual-UA check via the engine. The report is
+// cached on the Site for 7 days; ?refresh=1 forces a live re-check.
+const BOT_ACCESS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Curate the engine's snake_case bot-access report into the camelCase shape
+// the rest of the API returns. Presentation-only: the raw engine report is what
+// we persist on the Site (storage stays engine-native), so this runs at the
+// output boundary for BOTH the fresh and cached paths — no migration of
+// previously cached reports is needed.
+function curateBotAccess(report) {
+  if (!report) return null;
+  return {
+    robotsUrl: report.robots_url,
+    robotsStatus: report.robots_status,
+    verdicts: (report.verdicts || []).map((v) => ({
+      bot: v.bot,
+      allowed: v.allowed,
+      source: v.source,
+    })),
+    ...(report.cdn_block && {
+      cdnBlock: {
+        normalStatus: report.cdn_block.normal_status,
+        botUaStatus: report.cdn_block.bot_ua_status,
+        blocked: report.cdn_block.blocked,
+      },
+    }),
+    guidance: report.guidance || [],
+  };
+}
+
+const getBotAccess = async (req, res) => {
+  try {
+    const site = await Site.findOne({ workspaceId: req.workspace._id, url: { $nin: [null, ''] } });
+    if (!site) return res.status(404).json({ error: 'No site configured for this workspace' });
+
+    const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    if (!refresh && site.botAccess && site.botAccessCheckedAt
+        && (Date.now() - new Date(site.botAccessCheckedAt).getTime()) < BOT_ACCESS_TTL_MS) {
+      return res.json({ botAccess: curateBotAccess(site.botAccess), checkedAt: site.botAccessCheckedAt, cached: true });
+    }
+
+    const engineRes = await engineFetch('/api/bot-access', {
+      body: { url: site.url },
+      timeoutMs: 25000, // engine worst case ≈20s (robots 10s + parallel probes 10s) + headroom
+    });
+    if (!engineRes.ok) {
+      const text = await engineRes.text();
+      console.error('getBotAccess engine error:', engineRes.status, text.slice(0, 200));
+      return res.status(engineRes.status === 400 ? 400 : 502).json({ error: 'Bot access check unavailable' });
+    }
+    const report = await engineRes.json();
+
+    site.botAccess = report;
+    site.botAccessCheckedAt = new Date();
+    site.markModified('botAccess'); // Mixed path — be explicit
+    await site.save();
+
+    res.json({ botAccess: curateBotAccess(report), checkedAt: site.botAccessCheckedAt, cached: false });
+  } catch (err) {
+    // Same infrastructure/bug split as scoreTerms: stuck engine → 504,
+    // unreachable engine → 502, anything else → 500.
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      console.error('getBotAccess: engine timed out');
+      return res.status(504).json({ error: 'Bot access check timed out' });
+    }
+    if (err instanceof TypeError) {
+      console.error('getBotAccess: engine unreachable:', err.message);
+      return res.status(502).json({ error: 'Bot access check unavailable' });
+    }
+    console.error('getBotAccess error:', err.message);
+    res.status(500).json({ error: 'Failed to check bot access' });
+  }
+};
+
+// ─── GET /:workspaceNumber/content/:contentNumber/outcomes (Rec 14) ─────────
+// Time-ordered outcome snapshots + first-vs-latest deltas for the editor's
+// Results panel. Read-only Mongo query — no engine/GSC calls at request time.
+const getOutcomes = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+
+    const outcomeService = require('../services/outcomeService');
+    const series = await outcomeService.getOutcomeSeries(content._id, 180);
+    res.json({ series, delta: outcomeService.computeDelta(series) });
+  } catch (err) {
+    console.error('getOutcomes error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch outcomes' });
+  }
+};
+
+module.exports = {
+  triggerAnalysis, getBenchmark, reanalyze, runAnalysis, scoreTerms, importUrl,
+  internalLinks, readabilityCheck, regenerateOutline, curateCitationAppearance,
+  getBotAccess, getOutcomes,
+  // Exported for the camelCase-boundary invariant test (tests/curationCamelCase.test.js).
+  // These map engine snake_case → the API's camelCase contract; a forgotten
+  // remap is exactly the bot-access leak the test guards against.
+  _curators: {
+    curateBenchmark, curateCompetitors, curateContentBrief, curateAiFormatData,
+    curateCitationAppearance, curateRecommendedOutline, curateBotAccess,
+  },
+};

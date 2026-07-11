@@ -1,5 +1,7 @@
 const AiTracker = require('../models/AiTracker');
 const AiTrackerPrompt = require('../models/AiTrackerPrompt');
+const Content = require('../models/Content');
+const Site = require('../models/Site');
 const AiTrackerCompetitor = require('../models/AiTrackerCompetitor');
 const AiTrackerScan = require('../models/AiTrackerScan');
 const Workspace = require('../models/Workspace');
@@ -7,8 +9,11 @@ const User = require('../models/User');
 const { runScan, PLATFORMS, normalizeBrandKey, isSameBrand, getAvailablePlatformIdsSilent, urlMatchesDomain, extractBrand } = require('../services/aiTrackerScanEngine');
 const UsageTracker = require('../models/UsageTracker');
 const UserUsageTracker = require('../models/UserUsageTracker');
+const WorkspaceUsageTracker = require('../models/WorkspaceUsageTracker');
 const tierService = require('../services/tierService');
+const workspaceQuotaService = require('../services/workspaceQuotaService');
 const creditService = require('../services/creditService');
+const { resolveCredits } = require('../config/creditRules');
 const { sendEmail } = require('../utils/emailService');
 const { applyCustomTemplate } = require('./emailPortalController');
 
@@ -1135,7 +1140,38 @@ async function recoverStuckScans(workspaceId) {
 // BACKGROUND SCAN EXECUTION (fire-and-forget)
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function executeScan(trackerId, userId = null, { force = false } = {}) {
+/**
+ * Phase 8 — clamp a monitor's engine list to the tier's per-scan engine cap
+ * (maxAiTrackerPlatforms: 2 Free / 4 paid). Pure; returns the same array when no
+ * clamp is needed (null/absent cap, or already within cap). Enforced at scan
+ * time so a downgrade that left a monitor over-provisioned can't keep querying
+ * extra engines.
+ */
+function clampEnginesToTier(models, maxEngines) {
+  if (!Array.isArray(models) || !maxEngines || models.length <= maxEngines) return models;
+  return models.slice(0, maxEngines);
+}
+
+/**
+ * Phase 8 — did a scan actually produce engine results? A prompt that was dropped
+ * (locked mid-scan) or whose per-prompt models no longer overlap the tier's
+ * engines yields no platform rows. Used to decide whether a flat single-refresh
+ * is billable (no work → full refund).
+ */
+function scanProducedResults(results) {
+  return Array.isArray(results) && results.some((r) => r.platforms && r.platforms.length > 0);
+}
+
+async function executeScan(trackerId, userId = null, { force = false, promptIds = null, costAction = 'trackerRefreshAll', bill = true } = {}) {
+  // promptIds  → restrict this run to specific prompts (Phase 8 single on-demand
+  //              refresh). Implies force semantics for those prompts.
+  // costAction → which credit-cost entry funds an on-demand run: 'trackerRefreshAll'
+  //              (5 × n, refresh-all) or 'trackerRefreshSingle' (flat 5, one prompt).
+  // bill       → false when the caller's org has deductions disabled (unmetered /
+  //              BYOK); the on-demand charge is then skipped. Cron (force=false)
+  //              never bills regardless. Default true (safe: only an explicit
+  //              disable suppresses the charge).
+  const singlePrompt = Array.isArray(promptIds) && promptIds.length > 0;
   let creditTxId = null;
   let orgId = null;
   let scanDocId = null; // hoisted so Phase H can mark the AiTrackerScan failed
@@ -1172,6 +1208,52 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
     const ws = await Workspace.findById(tracker.workspaceId);
     orgId = ws?.organizationId?.toString() || null;
 
+    // ── 2a. Phase 11 — Table 1: only a PAID org gets recurring monitoring.
+    //        Scheduled scans (cron, force=false, not a single on-demand refresh)
+    //        are ZERO-CREDIT (see step 4), so the credit model does NOT gate them
+    //        — a tracker with no paying org would otherwise be re-scanned every
+    //        week for free, forever, once its nextScanAt is set. Gate it here at
+    //        the single scan chokepoint: UNSCHEDULE (nextScanAt=null) and skip a
+    //        scheduled scan when there is no funding source — i.e. an org-less
+    //        (personal) workspace, or a Free-tier org. Manual one-off checks
+    //        (force=true) run through the on-demand path and are unaffected.
+    //        Fail-open: on a tier-lookup error for a real org we proceed rather
+    //        than silently unscheduling a paid tracker.
+    if (!force && !singlePrompt) {
+      let denyRecurring = false;
+      if (!orgId) {
+        denyRecurring = true; // no org ⇒ no subscription/credits fund recurring scans
+      } else {
+        try {
+          const { tier } = await tierService.getOrgTierConfig(orgId);
+          if (tier === 'free') denyRecurring = true;
+        } catch (e) {
+          console.warn(`[ai-tracker-scan] recurring-scan gate lookup failed for tracker ${trackerId}:`, e.message);
+        }
+      }
+      if (denyRecurring) {
+        await AiTracker.findByIdAndUpdate(trackerId, {
+          $set: { scanStatus: 'ready', scanProgress: 0, nextScanAt: null },
+        });
+        return;
+      }
+    }
+
+    // ── 2b. Phase 8 — enforce the per-tier ENGINE cap at scan time.
+    // maxAiTrackerPlatforms (2 Free / 4 paid) is checked at monitor create/update,
+    // but a downgrade can leave a monitor configured with more engines than the
+    // new tier allows. Clamp the in-memory defaultModels for THIS run (not
+    // persisted — the monitor keeps its config; it just won't query the extras
+    // while on a lower tier). Best-effort: on lookup error, scan as configured.
+    if (orgId && Array.isArray(tracker.defaultModels) && tracker.defaultModels.length > 0) {
+      try {
+        const { config } = await tierService.getOrgTierConfig(orgId);
+        tracker.defaultModels = clampEnginesToTier(tracker.defaultModels, config?.maxAiTrackerPlatforms);
+      } catch (e) {
+        console.warn(`[ai-tracker-scan] engine-cap lookup failed for tracker ${trackerId}:`, e.message);
+      }
+    }
+
     // ── 3. Load prompts & platforms to estimate credit cost (skip inactive + locked prompts)
     // F4-15: the prior `.limit(500)` was a silent truncation. Capped at tier
     // level via maxAiTrackerPromptsPerMonitor at addPrompt time; bounded query
@@ -1203,6 +1285,13 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
     // F20-04: `let` because the re-fetch at step 6 may filter out prompts
     // that became locked between the credit estimate and scan start.
     let prompts = force ? allActivePrompts : allActivePrompts.filter(isDuePrompt);
+    // Phase 8 single refresh: restrict to the requested prompt(s) and treat them
+    // as due (reset their cooldown timer), ignoring all others this run.
+    if (singlePrompt) {
+      const wanted = new Set(promptIds.map((id) => id.toString()));
+      prompts = allActivePrompts.filter((p) => wanted.has(p._id.toString()));
+      prompts.forEach((p) => duePromptIds.add(p._id.toString()));
+    }
 
     const platformCount = tracker.defaultModels?.length || 0;
     const promptCount = prompts.length;
@@ -1227,14 +1316,18 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
       return;
     }
 
-    // ── 4. Pre-deduct estimated credits (1 credit per 50 words, ~200 words per answer)
-    //       Estimate = prompts × platforms × 4 credits, minimum 1
-    if (orgId && platformCount > 0 && promptCount > 0) {
-      const estimatedCredits = Math.max(1, promptCount * platformCount * 4);
+    // ── 4. Pre-deduct credits — ONLY for on-demand refresh (force=true).
+    //       Scheduled / in-allowance scans (cron path, force=false) are
+    //       ZERO-CREDIT per v4.1 (zero-credit list). On-demand refresh-all costs
+    //       5 × active prompts (Table 2) — a fixed per-prompt price, no longer
+    //       the old word-based estimate. Reconciled at settle to prompts actually
+    //       scanned (F20-04 may drop some locked between estimate and scan).
+    if ((force || singlePrompt) && bill && orgId && platformCount > 0 && promptCount > 0) {
+      const estimatedCredits = resolveCredits(costAction, { activePrompts: promptCount });
       try {
         const { transactionId } = await creditService.preDeduct(
           orgId, userId, estimatedCredits,
-          'aiTracker', { feature: 'aiTrackerScan', trackerId: trackerId.toString(), estimatedCredits }
+          'aiTrackerScan', { feature: 'aiTrackerScan', trackerId: trackerId.toString(), estimatedCredits, workspaceId: tracker.workspaceId?.toString() }
         );
         creditTxId = transactionId;
       } catch (creditErr) {
@@ -1274,6 +1367,20 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
     }
 
     // ── 6. Run the scan engine
+    // Cost-ledger context (Phase 1): threaded into the scan engine so every
+    // per-engine search + analyzer call records its real COGS. Best-effort tier.
+    let scanTier = '';
+    if (orgId) {
+      try { scanTier = (await tierService.getOrgTierConfig(orgId))?.tier || ''; } catch { /* best-effort */ }
+    }
+    const costCtx = {
+      organizationId: orgId,
+      workspaceId: tracker.workspaceId,
+      userId,
+      tier: scanTier,
+      trackerId: trackerId?.toString(),
+    };
+
     const { results, competitorResults, detectedBrands, totalAnswerWords, availablePlatformIds } = await runScan(
       tracker,
       prompts,
@@ -1282,15 +1389,28 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
         await AiTracker.findByIdAndUpdate(trackerId, {
           $set: { scanProgress: progress, platformStatuses },
         });
-      }
+      },
+      costCtx
     );
 
-    // ── 7. Settle credits with actual word count
+    // ── 7. Settle credits — refresh-all is a fixed 5 × active-prompts cost;
+    //       reconcile to the prompts actually scanned so any dropped by F20-04
+    //       (locked mid-scan) are refunded.
     if (creditTxId) {
       try {
-        const actualCredits = Math.max(1, creditService.wordsToCredits(totalAnswerWords));
+        let actualCredits;
+        if (costAction === 'trackerRefreshSingle') {
+          // Flat 5 — but bill it ONLY if the prompt actually produced platform
+          // results. If it was dropped (locked mid-scan → prompts=[]) or scanned
+          // nothing (its per-prompt models no longer overlap the tier's engines),
+          // settle 0 → full refund. Without this, the flat cost silently defeats
+          // the F20-04 refund that refresh-all gets via its 5×0 reconciliation.
+          actualCredits = scanProducedResults(results) ? resolveCredits('trackerRefreshSingle') : 0;
+        } else {
+          actualCredits = resolveCredits(costAction, { activePrompts: prompts.length });
+        }
         await creditService.settle(creditTxId, actualCredits);
-        console.log(`[ai-tracker-scan] settled credits for tracker ${trackerId}: estimated ${promptCount * platformCount * 4}, actual ${actualCredits} (${totalAnswerWords} words)`);
+        console.log(`[ai-tracker-scan] settled ${costAction} credits for tracker ${trackerId}: actual ${actualCredits} (${prompts.length} prompt(s))`);
         creditTxId = null; // Mark as settled so outer catch doesn't double-refund
       } catch (settleErr) {
         console.error(`[ai-tracker-scan] settle failed for tracker ${trackerId}, refunding:`, settleErr.message);
@@ -1342,7 +1462,14 @@ async function executeScan(trackerId, userId = null, { force = false } = {}) {
     for (const p of promptsToResetTimer) {
       const freqMs = ((FREQ_DAYS[p.frequency] || 7) / timeScale) * 24 * 60 * 60 * 1000;
       let newLastScannedAt;
-      if (p.lastScannedAt && p.lastScannedAt <= scanStart) {
+      if (singlePrompt) {
+        // Manual on-demand single refresh: the prompt was scanned NOW. Anchor its
+        // cadence to `now` — do NOT jump to the fixed-rate interval boundary, which
+        // for a not-yet-due prompt (elapsed < interval → intervals=max(1,0)=1)
+        // would push lastScannedAt into the FUTURE, skip its next scheduled scan,
+        // and render a future "last checked" date on the dashboard.
+        newLastScannedAt = now;
+      } else if (p.lastScannedAt && p.lastScannedAt <= scanStart) {
         // Fixed-rate: jump to the most recent interval boundary before scanStart.
         // This prevents drift AND handles catch-up when multiple intervals have passed.
         const elapsed = scanStart.getTime() - p.lastScannedAt.getTime();
@@ -2062,6 +2189,14 @@ Examples for suparank.com (SEO/AI visibility tool):
       }
     }
 
+    // Phase 6: charge prompt-research (10) ONLY when real AI research was
+    // delivered. The no-API-key path and the both-LLM-calls-failed path both
+    // fall back to buildDefaultSuggestions (deterministic, no model spend) —
+    // those deliver no AI value, so they never bill. Finalized (preDeduct+settle)
+    // so the orphan-sweep can't refund it.
+    if (valid.length > 0) {
+      await creditService.deductForRequest(req);
+    }
     res.json({ suggestions: valid.length > 0 ? valid : buildDefaultSuggestions(domainTrimmed) });
   } catch (err) {
     console.error('suggestPrompts error:', err.message);
@@ -2166,6 +2301,44 @@ const setup = async (req, res) => {
             code: 'QUOTA_EXCEEDED',
             quota: { limit: config.maxAiTrackerPromptsPerMonth, used, tier, limitKey: 'maxAiTrackerPromptsPerMonth' },
           });
+        }
+      }
+
+      // Phase 17 (DARK): ALSO enforce the client-billed workspace's OWN plan cap
+      // on prompts. Bulk create (setup / createMonitor) skips the rq() workspace
+      // ceiling the single-prompt routes get, so without this a client could
+      // exceed the prompt allocation the agency sold them (bounded only by the
+      // org's wholesale cap above). Mirrors the org increment-then-rollback.
+      // resolveWorkspacePlanLimits returns null unless saasMode is live AND this
+      // workspace is client-billed → fully inert on the live/non-SaaS path.
+      if (promptCount > 0) {
+        const wsLimits = await workspaceQuotaService.resolveWorkspacePlanLimits(workspace._id);
+        if (wsLimits) {
+          const wsPeriod = tierService.getPeriod('monthly');
+          const wsDoc = await WorkspaceUsageTracker.increment(workspace._id, 'aiTrackerPromptsCreated', wsPeriod, promptCount);
+          const wsNewTotal = wsDoc?.aiTrackerPromptsCreated ?? promptCount;
+          // Chain onto the org rollback; self-nulls so it stays single-shot even
+          // if a later failure path invokes it more than once.
+          const orgRollback = promptQuotaRollback;
+          promptQuotaRollback = async () => {
+            promptQuotaRollback = null;
+            if (orgRollback) await orgRollback();
+            try {
+              await WorkspaceUsageTracker.increment(workspace._id, 'aiTrackerPromptsCreated', wsPeriod, -promptCount);
+            } catch (rbErr) {
+              console.error('[ai-tracker] workspace prompt quota rollback failed:', rbErr.message);
+            }
+          };
+          const wsLimit = wsLimits.maxAiTrackerPromptsPerMonth;
+          if (wsLimit != null && wsNewTotal > wsLimit) {
+            await promptQuotaRollback();
+            const used = wsNewTotal - promptCount;
+            return res.status(429).json({
+              error: `This workspace's plan allows ${wsLimit} AI Tracker prompt${wsLimit !== 1 ? 's' : ''} per month (${used} used, ${promptCount} requested)`,
+              code: 'QUOTA_EXCEEDED',
+              quota: { limit: wsLimit, used, scope: 'workspace', limitKey: 'maxAiTrackerPromptsPerMonth' },
+            });
+          }
         }
       }
 
@@ -2373,8 +2546,10 @@ const triggerScan = async (req, res) => {
         active: { $ne: false },
         locked: { $ne: true },
       });
-      const platforms = tracker.defaultModels?.length || 0;
-      const estimatedCredits = Math.max(1, prompts * platforms * 4);
+      // Phase 6: on-demand refresh-all = 5 × active prompts (Table 2), matching
+      // executeScan's deduction. Was the old prompts×platforms×4 word model,
+      // which over-estimated and false-402'd scans the user could afford.
+      const estimatedCredits = Math.max(1, resolveCredits('trackerRefreshAll', { activePrompts: prompts }));
       const canPay = await creditService.canAfford(req.creditContext.orgId, estimatedCredits, req.user?.userId);
       if (!canPay) {
         return res.status(402).json({
@@ -2392,7 +2567,7 @@ const triggerScan = async (req, res) => {
 
     // executeScan handles its own errors via Phase H; the .catch here only
     // catches a synchronous throw before the first await (essentially never).
-    executeScan(tracker._id, req.user?.userId, { force: true }).catch((err) => {
+    executeScan(tracker._id, req.user?.userId, { force: true, bill: req.creditContext?.deductionEnabled !== false }).catch((err) => {
       console.error('[ai-tracker-scan] manual scan kickoff failed:', err.message);
     });
 
@@ -2400,6 +2575,76 @@ const triggerScan = async (req, res) => {
   } catch (err) {
     console.error('triggerScan error:', err.message);
     res.status(500).json({ error: 'Failed to trigger scan' });
+  }
+};
+
+// ─── POST /:workspaceNumber/ai-tracker[/monitors/:monitorId]/prompts/:promptId/refresh ───
+//
+// Phase 8 — on-demand SINGLE-prompt refresh (Editor+, 5 credits flat via
+// trackerRefreshSingle). Distinct from refresh-all (triggerScan, Admin+, 5×n).
+// Re-runs one prompt across the monitor's engines; deduct/settle happens inside
+// executeScan (shared credit machinery). Async like triggerScan — client polls
+// scan status.
+const refreshPrompt = async (req, res) => {
+  try {
+    const workspace = req.workspace;
+    const { promptId } = req.params;
+
+    const prompt = await AiTrackerPrompt.findById(promptId);
+    if (!prompt) {
+      return res.status(404).json({ error: 'Prompt not found' });
+    }
+    // Resolve the owning tracker and verify it lives in THIS workspace (the
+    // promptId is user-supplied — never trust it to be in-scope).
+    const tracker = await AiTracker.findById(prompt.trackerId);
+    if (!tracker || tracker.workspaceId.toString() !== workspace._id.toString()) {
+      return res.status(404).json({ error: 'Prompt not found' });
+    }
+    // If a monitorId is in the path, it must match the prompt's tracker.
+    if (req.params.monitorId && req.params.monitorId !== tracker._id.toString()) {
+      return res.status(404).json({ error: 'Prompt not found' });
+    }
+    // Can't refresh a locked (downgrade) or inactive prompt.
+    if (prompt.locked) {
+      return res.status(403).json({ error: 'This prompt is locked. Upgrade to re-enable it.' });
+    }
+    if (prompt.active === false) {
+      return res.status(400).json({ error: 'This prompt is paused. Re-activate it before refreshing.' });
+    }
+
+    await recoverStuckScans(tracker.workspaceId);
+
+    if (tracker.scanStatus === 'pending' || tracker.scanStatus === 'scanning') {
+      return res.status(409).json({ error: 'A scan is already in progress' });
+    }
+
+    // Pre-check affordability so we can 402 immediately (actual deduction is in
+    // executeScan). Single refresh is a flat 5 credits (one prompt).
+    if (req.creditContext?.deductionEnabled) {
+      const estimatedCredits = resolveCredits('trackerRefreshSingle');
+      const canPay = await creditService.canAfford(req.creditContext.orgId, estimatedCredits, req.user?.userId);
+      if (!canPay) {
+        return res.status(402).json({ error: 'Insufficient credits', code: 'INSUFFICIENT_CREDITS', estimatedCredits });
+      }
+    }
+
+    await AiTracker.findByIdAndUpdate(tracker._id, {
+      $set: { scanStatus: 'pending', scanProgress: 0, scanError: null },
+    });
+
+    executeScan(tracker._id, req.user?.userId, {
+      force: true,
+      promptIds: [prompt._id.toString()],
+      costAction: 'trackerRefreshSingle',
+      bill: req.creditContext?.deductionEnabled !== false,
+    }).catch((err) => {
+      console.error('[ai-tracker-scan] single-prompt refresh kickoff failed:', err.message);
+    });
+
+    res.json({ scanStatus: 'pending', refreshing: prompt._id.toString() });
+  } catch (err) {
+    console.error('refreshPrompt error:', err.message);
+    res.status(500).json({ error: 'Failed to refresh prompt' });
   }
 };
 
@@ -2912,6 +3157,44 @@ const createMonitor = async (req, res) => {
         }
       }
 
+      // Phase 17 (DARK): ALSO enforce the client-billed workspace's OWN plan cap
+      // on prompts. Bulk create (setup / createMonitor) skips the rq() workspace
+      // ceiling the single-prompt routes get, so without this a client could
+      // exceed the prompt allocation the agency sold them (bounded only by the
+      // org's wholesale cap above). Mirrors the org increment-then-rollback.
+      // resolveWorkspacePlanLimits returns null unless saasMode is live AND this
+      // workspace is client-billed → fully inert on the live/non-SaaS path.
+      if (promptCount > 0) {
+        const wsLimits = await workspaceQuotaService.resolveWorkspacePlanLimits(workspace._id);
+        if (wsLimits) {
+          const wsPeriod = tierService.getPeriod('monthly');
+          const wsDoc = await WorkspaceUsageTracker.increment(workspace._id, 'aiTrackerPromptsCreated', wsPeriod, promptCount);
+          const wsNewTotal = wsDoc?.aiTrackerPromptsCreated ?? promptCount;
+          // Chain onto the org rollback; self-nulls so it stays single-shot even
+          // if a later failure path invokes it more than once.
+          const orgRollback = promptQuotaRollback;
+          promptQuotaRollback = async () => {
+            promptQuotaRollback = null;
+            if (orgRollback) await orgRollback();
+            try {
+              await WorkspaceUsageTracker.increment(workspace._id, 'aiTrackerPromptsCreated', wsPeriod, -promptCount);
+            } catch (rbErr) {
+              console.error('[ai-tracker] workspace prompt quota rollback failed:', rbErr.message);
+            }
+          };
+          const wsLimit = wsLimits.maxAiTrackerPromptsPerMonth;
+          if (wsLimit != null && wsNewTotal > wsLimit) {
+            await promptQuotaRollback();
+            const used = wsNewTotal - promptCount;
+            return res.status(429).json({
+              error: `This workspace's plan allows ${wsLimit} AI Tracker prompt${wsLimit !== 1 ? 's' : ''} per month (${used} used, ${promptCount} requested)`,
+              code: 'QUOTA_EXCEEDED',
+              quota: { limit: wsLimit, used, scope: 'workspace', limitKey: 'maxAiTrackerPromptsPerMonth' },
+            });
+          }
+        }
+      }
+
       // Validate platform count
       const maxPlatforms = config?.maxAiTrackerPlatforms ?? validPlatformIds.length;
       if (Array.isArray(platforms) && platforms.length > 0) {
@@ -3184,8 +3467,9 @@ const triggerMonitorScan = async (req, res) => {
         active: { $ne: false },
         locked: { $ne: true },
       });
-      const platforms = tracker.defaultModels?.length || 0;
-      const estimatedCredits = Math.max(1, prompts * platforms * 4);
+      // Phase 6: on-demand refresh-all = 5 × active prompts (Table 2), matching
+      // executeScan's deduction (was the old prompts×platforms×4 word model).
+      const estimatedCredits = Math.max(1, resolveCredits('trackerRefreshAll', { activePrompts: prompts }));
       const canPay = await creditService.canAfford(req.creditContext.orgId, estimatedCredits, req.user?.userId);
       if (!canPay) {
         return res.status(402).json({
@@ -3202,7 +3486,7 @@ const triggerMonitorScan = async (req, res) => {
     });
     // executeScan handles its own errors via Phase H; the .catch here only
     // catches a synchronous throw before the first await (essentially never).
-    executeScan(tracker._id, req.user?.userId, { force: true }).catch((err) => {
+    executeScan(tracker._id, req.user?.userId, { force: true, bill: req.creditContext?.deductionEnabled !== false }).catch((err) => {
       console.error('[ai-tracker-scan] manual monitor-scan kickoff failed:', err.message);
     });
 
@@ -3612,6 +3896,141 @@ const getScanDetails = async (req, res) => {
   }
 };
 
+// ─── Rec 11: "Track this keyword" — content-scoped opt-in tracking ─────────
+// Links a content's primary keyword (+ up to 2 stored fanout queries) to the
+// workspace's AiTracker as ordinary prompts. The existing daily scheduler and
+// per-scan credit deduction then apply unchanged — this endpoint only adds
+// prompts (quota-gated like addPrompt; scans bill at scan time, not here).
+// Idempotent: a second click returns current state, adds nothing.
+const trackContentKeyword = async (req, res) => {
+  try {
+    const workspace = req.workspace;
+    const content = await Content.findByNumber(workspace._id, req.params.contentNumber);
+    if (!content) return res.status(404).json({ error: 'Content not found' });
+    // B4: same lock gate as getContent — no keyword tracking on locked content
+    // (it mutates content.trackedPrompts and consumes tracker quota).
+    if (content.locked) return res.status(403).json({ error: 'This content is locked. Upgrade your plan to regain access.', locked: true });
+
+    // Idempotency: already tracking → report state, no mutation, no quota.
+    if (Array.isArray(content.trackedPrompts) && content.trackedPrompts.length > 0) {
+      return res.json({
+        enabled: true,
+        prompts: content.trackedPrompts,
+        created: 0,
+        alreadyTracking: true,
+        estimatedCreditsPerScan: resolveCredits('trackerRefreshAll', { activePrompts: content.trackedPrompts.length }),
+        frequency: 'Weekly',
+      });
+    }
+
+    // Prompts: primary target keyword + up to 2 fanout queries from the
+    // stored conversations (dedup, cap 3 — each prompt costs per-scan credits;
+    // v1 stays conservative).
+    const primary = ((content.targetKeywords || [])[0] || '').trim();
+    if (!primary) return res.status(400).json({ error: 'Content has no target keyword to track' });
+    const prompts = [primary];
+    for (const conv of content.aiConversations || []) {
+      for (const fq of conv.fanout_queries || []) {
+        const q = String(fq.query || '').trim();
+        if (q && q.length <= 500 && !prompts.some((p) => p.toLowerCase() === q.toLowerCase())) {
+          prompts.push(q);
+        }
+        if (prompts.length >= 3) break;
+      }
+      if (prompts.length >= 3) break;
+    }
+
+    // Resolve the workspace tracker; create a minimal one when absent (domain
+    // comes from the workspace's site — the tracker needs it for brand/mention
+    // detection, so without a site the user must run tracker setup first).
+    let tracker = await AiTracker.findOne({ workspaceId: workspace._id });
+    if (!tracker) {
+      const site = await Site.findOne({ workspaceId: workspace._id, url: { $nin: [null, ''] } }).lean();
+      let domain = null;
+      if (site) {
+        try { domain = new URL(site.url).hostname.replace(/^www\./, ''); } catch { domain = null; }
+      }
+      if (!domain) {
+        return res.status(409).json({
+          error: 'Set up AI Tracker (or add your site) before tracking keywords',
+          code: 'TRACKER_SETUP_REQUIRED',
+        });
+      }
+      tracker = await AiTracker.create({ workspaceId: workspace._id, domain });
+    }
+
+    // Set semantics against existing prompts (never 409 like addPrompt —
+    // an already-tracked prompt just doesn't need creating).
+    const existing = await AiTrackerPrompt.find({ trackerId: tracker._id }).select('prompt').lean();
+    const existingSet = new Set(existing.map((p) => String(p.prompt).trim().toLowerCase()));
+    const toCreate = prompts.filter((p) => !existingSet.has(p.toLowerCase()));
+
+    // Exact monthly-quota accounting: rq pre-validated room for ONE creation,
+    // but this endpoint may create up to 3 prompts. req.tierQuota carries
+    // {limit, used} only when a finite limit applies — guard the whole batch.
+    // Absent limit (unlimited) or absent tierQuota (rq failed open) → skip,
+    // preserving rq's own semantics.
+    if (toCreate.length > 0 && req.tierQuota?.limit != null
+        && req.tierQuota.used + toCreate.length > req.tierQuota.limit) {
+      return res.status(429).json({
+        error: 'Tracking these prompts would exceed your plan\'s monthly prompt limit',
+        code: 'QUOTA_EXCEEDED',
+        quota: { limit: req.tierQuota.limit, used: req.tierQuota.used, requested: toCreate.length },
+      });
+    }
+
+    // Per-monitor active-prompt cap (mirrors addPrompt's F4-15 check).
+    let tierInfo = null;
+    if (workspace.organizationId) tierInfo = await tierService.getOrgTierConfig(workspace.organizationId);
+    if (toCreate.length > 0 && tierInfo?.config?.maxAiTrackerPromptsPerMonitor != null) {
+      const cap = tierInfo.config.maxAiTrackerPromptsPerMonitor;
+      const active = await AiTrackerPrompt.countDocuments({
+        trackerId: tracker._id, active: { $ne: false }, locked: { $ne: true },
+      });
+      if (active + toCreate.length > cap) {
+        return res.status(429).json({
+          error: `Your ${tierInfo.tier} plan allows up to ${cap} active prompts per monitor`,
+          code: 'PROMPT_CAP_REACHED',
+          quota: { limit: cap, used: active, tier: tierInfo.tier, limitKey: 'maxAiTrackerPromptsPerMonitor' },
+        });
+      }
+    }
+
+    // createdOnPlan — same derivation as addPrompt (F5-01 semantics).
+    let createdOnPlan = 'free';
+    if (req.tierQuota?.isUserLevel) createdOnPlan = 'free';
+    else if (tierInfo) createdOnPlan = tierInfo.tier === 'free' ? 'free' : 'paid';
+
+    for (const p of toCreate) {
+      await AiTrackerPrompt.create({ trackerId: tracker._id, prompt: p, createdOnPlan });
+      // One quota bump per created prompt — mirrors addPrompt's accounting.
+      if (req.tierQuota) await tierService.incrementQuota(req.tierQuota);
+    }
+
+    // Kick the scheduler (F19-04 idiom): idle/never-scanned trackers are not
+    // selected by the cron until scanStatus is ready and nextScanAt is due.
+    if (toCreate.length > 0) {
+      const kick = { nextScanAt: new Date() };
+      if (tracker.scanStatus === 'idle') kick.scanStatus = 'ready';
+      await AiTracker.updateOne({ _id: tracker._id }, { $set: kick });
+    }
+
+    content.trackedPrompts = prompts;
+    await content.save();
+
+    res.json({
+      enabled: true,
+      prompts,
+      created: toCreate.length,
+      estimatedCreditsPerScan: resolveCredits('trackerRefreshAll', { activePrompts: prompts.length }),
+      frequency: 'Weekly',
+    });
+  } catch (err) {
+    console.error('trackContentKeyword error:', err.message);
+    res.status(500).json({ error: 'Failed to track keyword' });
+  }
+};
+
 module.exports = {
   // Legacy single-monitor
   getTracker,
@@ -3620,7 +4039,9 @@ module.exports = {
   setup,
   getScanStatus,
   triggerScan,
+  refreshPrompt,
   addPrompt,
+  trackContentKeyword,
   updatePrompt,
   removePrompt,
   bulkDeletePrompts,
@@ -3651,4 +4072,4 @@ module.exports = {
 };
 
 // Exported for F4-17 regression tests only — not part of the runtime API.
-module.exports.__test = { htmlEscape, computeMetrics, computeTrendData, computeChanges };
+module.exports.__test = { htmlEscape, computeMetrics, computeTrendData, computeChanges, clampEnginesToTier, scanProducedResults };

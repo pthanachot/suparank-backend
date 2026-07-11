@@ -200,6 +200,7 @@ const updateOrganization = async (req, res) => {
         resourceId: org._id,
         meta: { name: org.name, changed },
         ip: req.ip,
+        impersonatedBy: req.user.impersonatedBy || null,
       });
     }
     res.json({ organization: org.toObject() });
@@ -263,6 +264,21 @@ const deleteOrganization = async (req, res) => {
     await OrgMember.deleteMany({ organizationId: org._id });
     await Subscription.deleteMany({ organizationId: org._id });
     await org.deleteOne();
+
+    // Phase 10: record the deletion AFTER the cascade succeeds (only on the
+    // success path — a failed cascade must not leave a spurious "deleted" row).
+    // AuditLog is not part of the cascade, so the row survives and TTL-expires on
+    // its own schedule — a durable "who deleted this org" trail.
+    require('../services/auditService').record({
+      organizationId: org._id,
+      userId: req.user.userId,
+      actorEmail: req.user.email,
+      action: 'org.delete',
+      resource: 'org',
+      resourceId: org._id,
+      ip: req.ip,
+      impersonatedBy: req.user.impersonatedBy || null,
+    });
 
     res.json({ message: 'Organization deleted' });
   } catch (error) {

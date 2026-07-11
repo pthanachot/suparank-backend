@@ -117,7 +117,7 @@ const FLAGS = [
     enabled: true,
     implemented: true,
     conditions: {
-      // Tier limit: free=1 seat, standard=2, pro=5 (+$10/seat), agency=15 (+$15/seat).
+      // Tier limit: free=1 seat, standard=2, pro=5 (+$10/seat), agency=15 (+$10/seat).
       custom: { tierLimitKey: 'maxSeats' },
     },
   },
@@ -295,6 +295,11 @@ const FLAGS = [
     //
     // While off: Stripe Connect onboarding + client-rebilling APIs return
     // 404 'coming soon', and no agency-managed subscriptions are created.
+    //
+    // PHASE 18 ORDER: launch `dataExport` BEFORE (or with) this flag. The
+    // offboarding retention promise ("data retained 90 days for export") is
+    // unfulfillable if the export routes still 404 when the first agency winds
+    // down. `dataErasure` (the destructive tail) goes LAST.
     key: 'saasMode',
     displayName: 'SaaS Mode',
     description: 'SaaS mode — agencies rebill their own clients via Stripe Connect.',
@@ -303,6 +308,38 @@ const FLAGS = [
     conditions: {
       custom: {},
     },
+  },
+  {
+    // Phase 18B — per-workspace / per-org data export (tar.gz) for offboarding +
+    // GDPR portability. Ships dark; flip implemented:true to launch. No plan gate
+    // (GDPR portability is universal); access is enforced per-route (workspace
+    // read access / org owner-admin).
+    key: 'dataExport',
+    displayName: 'Data Export',
+    description: 'Download a workspace or org as a tar.gz archive (content, reports, tracker history).',
+    enabled: true,
+    implemented: false,
+    conditions: {},
+  },
+  {
+    // Phase 18C — hard data erasure (client right-to-erasure / account closure) +
+    // the automated retention purge of suspended agencies' client workspaces.
+    // Ships dark; flip implemented:true to launch. Irreversible; the manual routes
+    // enforce owner/admin + a name-match confirmation, and the AUTO-PURGE cron
+    // gates on this flag AND saasMode. No plan gate (erasure is universal).
+    //
+    // ⚠ FLIPPING THIS LIVE IS RETROACTIVELY DESTRUCTIVE: every suspended org
+    // whose purgeAt has ALREADY elapsed (accumulated while this flag was dark)
+    // becomes purge-eligible at the next 03:45 UTC cron. The run is capped
+    // (MAX_PURGES_PER_RUN) so the backlog drains over nights, but before
+    // flipping, check `db.organizations.count({lifecycleStatus:'suspended',
+    // purgeAt:{$lte:new Date()}})` and warn/export as needed.
+    key: 'dataErasure',
+    displayName: 'Data Erasure',
+    description: 'Permanently delete a workspace or organization, and auto-purge suspended tenants past retention.',
+    enabled: true,
+    implemented: false,
+    conditions: {},
   },
   {
     key: 'advancedAnalytics',

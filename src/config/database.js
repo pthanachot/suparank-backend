@@ -26,6 +26,11 @@ const connectDB = async () => {
     const AiTracker = require('../models/AiTracker');
     await AiTracker.syncIndexes();
     console.log('[db] AiTracker indexes synced');
+    // Rec 14: the unique {contentId, date} index IS the one-snapshot-per-day
+    // guarantee — sync explicitly rather than relying on autoIndex.
+    const ContentOutcome = require('../models/ContentOutcome');
+    await ContentOutcome.syncIndexes();
+    console.log('[db] ContentOutcome indexes synced');
 
     return conn;
   } catch (error) {

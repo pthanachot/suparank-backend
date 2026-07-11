@@ -8,29 +8,11 @@ const feedbackController = require('../controllers/feedbackController');
 const adminSettingsController = require('../controllers/adminSettingsController');
 const adminSessionsController = require('../controllers/adminSessionsController');
 const adminBackupsController = require('../controllers/adminBackupsController');
-const { getSettings } = require('../services/systemSettingsService');
+const platformAdminController = require('../controllers/platformAdminController');
 
-// ─── Admin email validation middleware ──────────────────────
-// Admin = union of the ADMIN_EMAILS env var (locked safety floor) and the
-// DB-managed SystemSettings.adminEmails list (editable in the dashboard).
-// Reads the settings cache — synchronous, no DB hit on the request path.
-// Deliberately ignores req.user.roles: JWT claims are stale until re-login.
-
-function validateAdmin(req, res, next) {
-  const envAdmins = (process.env.ADMIN_EMAILS || '')
-    .split(',')
-    .map((e) => e.trim().toLowerCase())
-    .filter(Boolean);
-  const dbAdmins = (getSettings().adminEmails || []).map((e) => String(e).toLowerCase());
-
-  const userEmail = req.user?.email?.toLowerCase();
-
-  if (!userEmail || (!envAdmins.includes(userEmail) && !dbAdmins.includes(userEmail))) {
-    return res.status(403).json({ error: 'Admin access required' });
-  }
-
-  next();
-}
+// Admin gate (union of ADMIN_EMAILS env + SystemSettings.adminEmails; also blocks
+// impersonated sessions). See middleware/validateAdmin.
+const validateAdmin = require('../middleware/validateAdmin');
 
 // All admin routes require auth + admin email check
 const adminMiddleware = [authenticateToken, validateAdmin];
@@ -97,5 +79,13 @@ router.put('/brand-configs/:orgId', adminMiddleware, brandController.adminUpdate
 router.get('/feedback', adminMiddleware, feedbackController.getFeedbackList);
 router.get('/feedback/stats', adminMiddleware, feedbackController.getFeedbackStats);
 router.put('/feedback/:id', adminMiddleware, feedbackController.updateFeedback);
+
+// ─── Platform admin: tenant fleet + health board + impersonation (Phase 19B) ──
+// Impersonation endpoints self-gate behind IMPERSONATION_ENABLED (dark default).
+router.get('/tenants', adminMiddleware, platformAdminController.getTenants);
+router.get('/health-board', adminMiddleware, platformAdminController.getHealthBoard);
+router.get('/impersonations', adminMiddleware, platformAdminController.listImpersonations);
+router.post('/organizations/:orgId/impersonate', adminMiddleware, platformAdminController.startImpersonation);
+router.post('/impersonate/:sessionId/stop', adminMiddleware, platformAdminController.stopImpersonation);
 
 module.exports = router;

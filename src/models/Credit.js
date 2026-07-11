@@ -41,6 +41,15 @@ const creditSchema = new mongoose.Schema(
       default: null,
       // When subscription credits were last granted.
     },
+    creditPeriodKey: {
+      type: String,
+      default: null,
+      // Phase 7: idempotency marker for the monthly subscription grant ("YYYY-MM",
+      // UTC). grantMonthlyCreditsIfDue only grants when this !== the current month,
+      // so a monthly-cycle webhook and the monthly cron can't both grant in the
+      // same month (whichever runs first sets it; the other is a no-op). Reset to
+      // null on cancel/expire so a resubscribe re-grants.
+    },
     lowBalanceNotifiedAt: {
       type: Date,
       default: null,

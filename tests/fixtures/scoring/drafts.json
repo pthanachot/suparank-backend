@@ -1,0 +1,535 @@
+[
+  {
+    "name": "empty-short",
+    "title": "Untitled draft",
+    "html": "<p>A very short note about sending messages to customers. Marketing teams keep asking how to reach subscribers at the right moment without manual effort.</p>",
+    "markdown": "A very short note about sending messages to customers. Marketing teams keep asking how to reach subscribers at the right moment without manual effort.",
+    "blocks": [
+      {
+        "id": "b0",
+        "type": "p",
+        "text": "A very short note about sending messages to customers. Marketing teams keep asking how to reach subscribers at the right moment without manual effort."
+      }
+    ],
+    "text": "A very short note about sending messages to customers. Marketing teams keep asking how to reach subscribers at the right moment without manual effort."
+  },
+  {
+    "name": "balanced-long",
+    "title": "Email Automation: The Complete Guide",
+    "html": "<h1>Email Automation: The Complete Guide</h1>\n<p>Email automation lets you automate campaigns end to end. This guide to email automation covers every automation workflow, from your first drip campaign to advanced ai assistance. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.</p>\n<h2>Why email automation matters</h2>\n<p>Teams that automate follow-ups see better open rate numbers and fewer unsubscribe events. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.</p>\n<h2>Building your first automation workflow</h2>\n<p>Start your automation workflow with a welcome series. A drip campaign warms up new signups gradually. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.</p>\n<h3>Drip campaign timing</h3>\n<p>Space each drip campaign message three days apart, then automate the cadence. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.</p>\n<h2>Subscriber segmentation strategies</h2>\n<p>Subscriber segmentation splits your list by behavior. Good subscriber segmentation improves every open rate you track. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.</p>\n<ul><li>Segment by signup source</li><li>Segment by purchase history</li><li>Automate re-engagement for cold subscribers</li></ul>\n<h2>Using ai to optimize send times</h2>\n<p>Modern ai models predict the best hour to send. Let ai adjust timing per subscriber while you automate the rest. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.</p>\n<h2>Email deliverability and welcome series</h2>\n<p>Deliverability keeps your email automation out of spam. A welcome sequence builds sender reputation early. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.</p>\n<table><tr><th>Metric</th><th>Target</th></tr><tr><td>Open rate</td><td>25%</td></tr><tr><td>Unsubscribe</td><td><0.5%</td></tr></table>\n<h2>Measuring open rate and unsubscribe trends</h2>\n<p>Watch open rate weekly; a rising unsubscribe count means fatigue. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.</p>\n<img src=\"https://example.com/dashboard.png\" alt=\"email automation dashboard\">\n<img src=\"https://example.com/flow.png\" alt=\"automation workflow chart\">\n<img src=\"https://example.com/report.png\" alt=\"open rate report\">\n<p><a href=\"/blog/welcome-series\">welcome series guide</a> and <a href=\"/blog/segmentation\">segmentation playbook</a> and <a href=\"/blog/deliverability\">deliverability basics</a> and <a href=\"/pricing\">pricing</a> and <a href=\"https://mailchimp.com/resources\">Mailchimp resources</a> and <a href=\"https://hubspot.com/research\">HubSpot research</a> and <a href=\"https://litmus.com/blog\">Litmus blog</a></p>\n<h3>What is email automation?</h3><p>Email automation sends the right message automatically based on subscriber behavior.</p>\n<p>Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment. Consistent testing separates guesswork from evidence and compounds small wins into real growth.</p>",
+    "markdown": "# Email Automation: The Complete Guide\n\nEmail automation lets you automate campaigns end to end. This guide to email automation covers every automation workflow, from your first drip campaign to advanced ai assistance. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\n## Why email automation matters\n\nTeams that automate follow-ups see better open rate numbers and fewer unsubscribe events. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.\n\n## Building your first automation workflow\n\nStart your automation workflow with a welcome series. A drip campaign warms up new signups gradually. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.\n\n### Drip campaign timing\n\nSpace each drip campaign message three days apart, then automate the cadence. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\n## Subscriber segmentation strategies\n\nSubscriber segmentation splits your list by behavior. Good subscriber segmentation improves every open rate you track. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.\n\n- Segment by signup source\n- Segment by purchase history\n- Automate re-engagement for cold subscribers\n\n## Using ai to optimize send times\n\nModern ai models predict the best hour to send. Let ai adjust timing per subscriber while you automate the rest. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.\n\n## Email deliverability and welcome series\n\nDeliverability keeps your email automation out of spam. A welcome sequence builds sender reputation early. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.\n\n| Metric | Target |\n| --- | --- |\n| Open rate | 25% |\n| Unsubscribe | <0.5% |\n\n## Measuring open rate and unsubscribe trends\n\nWatch open rate weekly; a rising unsubscribe count means fatigue. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.\n\n![email automation dashboard](https://example.com/dashboard.png)\n\n![automation workflow chart](https://example.com/flow.png)\n\n![open rate report](https://example.com/report.png)\n\n[welcome series guide](/blog/welcome-series) and [segmentation playbook](/blog/segmentation) and [deliverability basics](/blog/deliverability) and [pricing](/pricing) and [Mailchimp resources](https://mailchimp.com/resources) and [HubSpot research](https://hubspot.com/research) and [Litmus blog](https://litmus.com/blog)\n\n### What is email automation?\n\nEmail automation sends the right message automatically based on subscriber behavior.\n\nMarketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment. Consistent testing separates guesswork from evidence and compounds small wins into real growth.",
+    "blocks": [
+      {
+        "id": "b0",
+        "type": "h1",
+        "text": "Email Automation: The Complete Guide"
+      },
+      {
+        "id": "b1",
+        "type": "p",
+        "text": "Email automation lets you automate campaigns end to end. This guide to email automation covers every automation workflow, from your first drip campaign to advanced ai assistance. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+      },
+      {
+        "id": "b2",
+        "type": "h2",
+        "text": "Why email automation matters"
+      },
+      {
+        "id": "b3",
+        "type": "p",
+        "text": "Teams that automate follow-ups see better open rate numbers and fewer unsubscribe events. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment."
+      },
+      {
+        "id": "b4",
+        "type": "h2",
+        "text": "Building your first automation workflow"
+      },
+      {
+        "id": "b5",
+        "type": "p",
+        "text": "Start your automation workflow with a welcome series. A drip campaign warms up new signups gradually. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment."
+      },
+      {
+        "id": "b6",
+        "type": "h3",
+        "text": "Drip campaign timing"
+      },
+      {
+        "id": "b7",
+        "type": "p",
+        "text": "Space each drip campaign message three days apart, then automate the cadence. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+      },
+      {
+        "id": "b8",
+        "type": "h2",
+        "text": "Subscriber segmentation strategies"
+      },
+      {
+        "id": "b9",
+        "type": "p",
+        "text": "Subscriber segmentation splits your list by behavior. Good subscriber segmentation improves every open rate you track. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment."
+      },
+      {
+        "id": "b10",
+        "type": "li",
+        "text": "Segment by signup source"
+      },
+      {
+        "id": "b11",
+        "type": "li",
+        "text": "Segment by purchase history"
+      },
+      {
+        "id": "b12",
+        "type": "li",
+        "text": "Automate re-engagement for cold subscribers"
+      },
+      {
+        "id": "b13",
+        "type": "h2",
+        "text": "Using ai to optimize send times"
+      },
+      {
+        "id": "b14",
+        "type": "p",
+        "text": "Modern ai models predict the best hour to send. Let ai adjust timing per subscriber while you automate the rest. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment."
+      },
+      {
+        "id": "b15",
+        "type": "h2",
+        "text": "Email deliverability and welcome series"
+      },
+      {
+        "id": "b16",
+        "type": "p",
+        "text": "Deliverability keeps your email automation out of spam. A welcome sequence builds sender reputation early. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment."
+      },
+      {
+        "id": "b17",
+        "type": "table",
+        "text": "",
+        "tableData": {
+          "headers": [
+            "Metric",
+            "Target"
+          ],
+          "rows": [
+            [
+              "Open rate",
+              "25%"
+            ],
+            [
+              "Unsubscribe",
+              "<0.5%"
+            ]
+          ]
+        }
+      },
+      {
+        "id": "b18",
+        "type": "h2",
+        "text": "Measuring open rate and unsubscribe trends"
+      },
+      {
+        "id": "b19",
+        "type": "p",
+        "text": "Watch open rate weekly; a rising unsubscribe count means fatigue. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment."
+      },
+      {
+        "id": "b20",
+        "type": "img",
+        "text": "",
+        "src": "https://example.com/dashboard.png",
+        "alt": "email automation dashboard"
+      },
+      {
+        "id": "b21",
+        "type": "img",
+        "text": "",
+        "src": "https://example.com/flow.png",
+        "alt": "automation workflow chart"
+      },
+      {
+        "id": "b22",
+        "type": "img",
+        "text": "",
+        "src": "https://example.com/report.png",
+        "alt": "open rate report"
+      },
+      {
+        "id": "b23",
+        "type": "p",
+        "text": "<a href=\"/blog/welcome-series\">welcome series guide</a> and <a href=\"/blog/segmentation\">segmentation playbook</a> and <a href=\"/blog/deliverability\">deliverability basics</a> and <a href=\"/pricing\">pricing</a> and <a href=\"https://mailchimp.com/resources\">Mailchimp resources</a> and <a href=\"https://hubspot.com/research\">HubSpot research</a> and <a href=\"https://litmus.com/blog\">Litmus blog</a>"
+      },
+      {
+        "id": "b24",
+        "type": "faq",
+        "text": "",
+        "faqItems": [
+          {
+            "question": "What is email automation?",
+            "answer": "Email automation sends the right message automatically based on subscriber behavior."
+          }
+        ]
+      },
+      {
+        "id": "b25",
+        "type": "p",
+        "text": "Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment. Consistent testing separates guesswork from evidence and compounds small wins into real growth."
+      }
+    ],
+    "text": "Email Automation: The Complete Guide\n\nEmail automation lets you automate campaigns end to end. This guide to email automation covers every automation workflow, from your first drip campaign to advanced ai assistance. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\nWhy email automation matters\n\nTeams that automate follow-ups see better open rate numbers and fewer unsubscribe events. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.\n\nBuilding your first automation workflow\n\nStart your automation workflow with a welcome series. A drip campaign warms up new signups gradually. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.\n\nDrip campaign timing\n\nSpace each drip campaign message three days apart, then automate the cadence. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\nSubscriber segmentation strategies\n\nSubscriber segmentation splits your list by behavior. Good subscriber segmentation improves every open rate you track. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.\n\nSegment by signup source\nSegment by purchase history\nAutomate re-engagement for cold subscribers\n\nUsing ai to optimize send times\n\nModern ai models predict the best hour to send. Let ai adjust timing per subscriber while you automate the rest. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.\n\nEmail deliverability and welcome series\n\nDeliverability keeps your email automation out of spam. A welcome sequence builds sender reputation early. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.\n\nMetric Target\nOpen rate 25%\nUnsubscribe <0.5%\n\nMeasuring open rate and unsubscribe trends\n\nWatch open rate weekly; a rising unsubscribe count means fatigue. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.\n\nwelcome series guide and segmentation playbook and deliverability basics and pricing and Mailchimp resources and HubSpot research and Litmus blog\n\nWhat is email automation?\nEmail automation sends the right message automatically based on subscriber behavior.\n\nMarketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment. Consistent testing separates guesswork from evidence and compounds small wins into real growth."
+  },
+  {
+    "name": "inflected-forms",
+    "title": "Automations for modern teams",
+    "html": "<h1>Automations for modern teams</h1>\n<p>Automations changed how we message customers. Automated sequences and automating routine sends free up hours. Our automations handle email automation basics without effort. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.</p>\n<h2>Automated drip campaigns</h2>\n<p>We automated our drip campaign last year. Automating the second drip campaign doubled replies. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.</p>\n<h2>Automating subscriber segmentation</h2>\n<p>Automated subscriber segmentation beats manual tagging. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.</p>",
+    "markdown": "# Automations for modern teams\n\nAutomations changed how we message customers. Automated sequences and automating routine sends free up hours. Our automations handle email automation basics without effort. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\n## Automated drip campaigns\n\nWe automated our drip campaign last year. Automating the second drip campaign doubled replies. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\n## Automating subscriber segmentation\n\nAutomated subscriber segmentation beats manual tagging. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.",
+    "blocks": [
+      {
+        "id": "b0",
+        "type": "h1",
+        "text": "Automations for modern teams"
+      },
+      {
+        "id": "b1",
+        "type": "p",
+        "text": "Automations changed how we message customers. Automated sequences and automating routine sends free up hours. Our automations handle email automation basics without effort. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+      },
+      {
+        "id": "b2",
+        "type": "h2",
+        "text": "Automated drip campaigns"
+      },
+      {
+        "id": "b3",
+        "type": "p",
+        "text": "We automated our drip campaign last year. Automating the second drip campaign doubled replies. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+      },
+      {
+        "id": "b4",
+        "type": "h2",
+        "text": "Automating subscriber segmentation"
+      },
+      {
+        "id": "b5",
+        "type": "p",
+        "text": "Automated subscriber segmentation beats manual tagging. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+      }
+    ],
+    "text": "Automations for modern teams\n\nAutomations changed how we message customers. Automated sequences and automating routine sends free up hours. Our automations handle email automation basics without effort. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\nAutomated drip campaigns\n\nWe automated our drip campaign last year. Automating the second drip campaign doubled replies. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\nAutomating subscriber segmentation\n\nAutomated subscriber segmentation beats manual tagging. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+  },
+  {
+    "name": "short-term-trap",
+    "title": "Maintain your list like an airline maintains planes",
+    "html": "<h1>Maintain your list like an airline maintains planes</h1>\n<p>To maintain deliverability you must maintain hygiene. Airlines maintain aircraft on strict schedules; likewise, maintain your list monthly. Brainstorm the maintenance plan with your team, maintain focus, and remain patient. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.</p>\n<h2>Where ai actually helps</h2>\n<p>Real ai helps score engagement. Use ai sparingly. A third mention: ai. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.</p>\n<p>Maintain momentum. The airline metaphor remains apt: maintained lists retain and sustain engagement. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.</p>",
+    "markdown": "# Maintain your list like an airline maintains planes\n\nTo maintain deliverability you must maintain hygiene. Airlines maintain aircraft on strict schedules; likewise, maintain your list monthly. Brainstorm the maintenance plan with your team, maintain focus, and remain patient. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\n## Where ai actually helps\n\nReal ai helps score engagement. Use ai sparingly. A third mention: ai. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\nMaintain momentum. The airline metaphor remains apt: maintained lists retain and sustain engagement. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.",
+    "blocks": [
+      {
+        "id": "b0",
+        "type": "h1",
+        "text": "Maintain your list like an airline maintains planes"
+      },
+      {
+        "id": "b1",
+        "type": "p",
+        "text": "To maintain deliverability you must maintain hygiene. Airlines maintain aircraft on strict schedules; likewise, maintain your list monthly. Brainstorm the maintenance plan with your team, maintain focus, and remain patient. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+      },
+      {
+        "id": "b2",
+        "type": "h2",
+        "text": "Where ai actually helps"
+      },
+      {
+        "id": "b3",
+        "type": "p",
+        "text": "Real ai helps score engagement. Use ai sparingly. A third mention: ai. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+      },
+      {
+        "id": "b4",
+        "type": "p",
+        "text": "Maintain momentum. The airline metaphor remains apt: maintained lists retain and sustain engagement. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+      }
+    ],
+    "text": "Maintain your list like an airline maintains planes\n\nTo maintain deliverability you must maintain hygiene. Airlines maintain aircraft on strict schedules; likewise, maintain your list monthly. Brainstorm the maintenance plan with your team, maintain focus, and remain patient. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\nWhere ai actually helps\n\nReal ai helps score engagement. Use ai sparingly. A third mention: ai. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\nMaintain momentum. The airline metaphor remains apt: maintained lists retain and sustain engagement. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+  },
+  {
+    "name": "unicode-headings",
+    "title": "Guía de email automation 🚀",
+    "html": "<h1>Guía de email automation 🚀</h1>\n<p>La email automation moderna incluye flujos avanzados. メール自動化 (email automation) は重要です。 Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.</p>\n<h2>Séquences détaillées — drip campaign</h2>\n<p>Une drip campaign bien conçue améliore l'open rate. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.</p>\n<h2>購読者のsubscriber segmentation</h2>\n<p>Subscriber segmentation works in every language. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.</p>",
+    "markdown": "# Guía de email automation 🚀\n\nLa email automation moderna incluye flujos avanzados. メール自動化 (email automation) は重要です。 Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\n## Séquences détaillées — drip campaign\n\nUne drip campaign bien conçue améliore l'open rate. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\n## 購読者のsubscriber segmentation\n\nSubscriber segmentation works in every language. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.",
+    "blocks": [
+      {
+        "id": "b0",
+        "type": "h1",
+        "text": "Guía de email automation 🚀"
+      },
+      {
+        "id": "b1",
+        "type": "p",
+        "text": "La email automation moderna incluye flujos avanzados. メール自動化 (email automation) は重要です。 Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+      },
+      {
+        "id": "b2",
+        "type": "h2",
+        "text": "Séquences détaillées — drip campaign"
+      },
+      {
+        "id": "b3",
+        "type": "p",
+        "text": "Une drip campaign bien conçue améliore l'open rate. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+      },
+      {
+        "id": "b4",
+        "type": "h2",
+        "text": "購読者のsubscriber segmentation"
+      },
+      {
+        "id": "b5",
+        "type": "p",
+        "text": "Subscriber segmentation works in every language. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+      }
+    ],
+    "text": "Guía de email automation 🚀\n\nLa email automation moderna incluye flujos avanzados. メール自動化 (email automation) は重要です。 Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\nSéquences détaillées — drip campaign\n\nUne drip campaign bien conçue améliore l'open rate. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\n購読者のsubscriber segmentation\n\nSubscriber segmentation works in every language. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+  },
+  {
+    "name": "tables-heavy",
+    "title": "Email automation benchmarks in tables",
+    "html": "<h1>Email automation benchmarks in tables</h1>\n<p>Email automation results, tabulated. Marketing teams keep asking how to reach subscribers at the right moment without manual effort.</p>\n<table><tr><th>Automation workflow</th><th>Open rate</th><th>Unsubscribe</th></tr><tr><td>Welcome</td><td>32%</td><td>0.2%</td></tr><tr><td>Drip campaign</td><td>27%</td><td>0.3%</td></tr><tr><td>Win-back</td><td>19%</td><td>0.6%</td></tr></table>\n<p>Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.</p>\n<table><tr><th>Tool</th><th>ai features</th></tr><tr><td>Tool A</td><td>send-time ai</td></tr><tr><td>Tool B</td><td>subject-line ai</td></tr></table>\n<p>Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.</p>",
+    "markdown": "# Email automation benchmarks in tables\n\nEmail automation results, tabulated. Marketing teams keep asking how to reach subscribers at the right moment without manual effort.\n\n| Automation workflow | Open rate | Unsubscribe |\n| --- | --- | --- |\n| Welcome | 32% | 0.2% |\n| Drip campaign | 27% | 0.3% |\n| Win-back | 19% | 0.6% |\n\nMarketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\n| Tool | ai features |\n| --- | --- |\n| Tool A | send-time ai |\n| Tool B | subject-line ai |\n\nMarketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.",
+    "blocks": [
+      {
+        "id": "b0",
+        "type": "h1",
+        "text": "Email automation benchmarks in tables"
+      },
+      {
+        "id": "b1",
+        "type": "p",
+        "text": "Email automation results, tabulated. Marketing teams keep asking how to reach subscribers at the right moment without manual effort."
+      },
+      {
+        "id": "b2",
+        "type": "table",
+        "text": "",
+        "tableData": {
+          "headers": [
+            "Automation workflow",
+            "Open rate",
+            "Unsubscribe"
+          ],
+          "rows": [
+            [
+              "Welcome",
+              "32%",
+              "0.2%"
+            ],
+            [
+              "Drip campaign",
+              "27%",
+              "0.3%"
+            ],
+            [
+              "Win-back",
+              "19%",
+              "0.6%"
+            ]
+          ]
+        }
+      },
+      {
+        "id": "b3",
+        "type": "p",
+        "text": "Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+      },
+      {
+        "id": "b4",
+        "type": "table",
+        "text": "",
+        "tableData": {
+          "headers": [
+            "Tool",
+            "ai features"
+          ],
+          "rows": [
+            [
+              "Tool A",
+              "send-time ai"
+            ],
+            [
+              "Tool B",
+              "subject-line ai"
+            ]
+          ]
+        }
+      },
+      {
+        "id": "b5",
+        "type": "p",
+        "text": "Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+      }
+    ],
+    "text": "Email automation benchmarks in tables\n\nEmail automation results, tabulated. Marketing teams keep asking how to reach subscribers at the right moment without manual effort.\n\nAutomation workflow Open rate Unsubscribe\nWelcome 32% 0.2%\nDrip campaign 27% 0.3%\nWin-back 19% 0.6%\n\nMarketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\nTool ai features\nTool A send-time ai\nTool B subject-line ai\n\nMarketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+  },
+  {
+    "name": "faq-heavy",
+    "title": "Email automation FAQ",
+    "html": "<h1>Email automation FAQ</h1>\n<p>Everything people ask about email automation. Marketing teams keep asking how to reach subscribers at the right moment without manual effort.</p>\n<h3>What is email automation?</h3><p>Sending messages automatically based on triggers and schedules.</p><h3>How do I start an automation workflow?</h3><p>Begin with a welcome series, then add a drip campaign.</p><h3>Does subscriber segmentation matter?</h3><p>Yes — segmented sends lift open rate significantly.</p><h3>How does ai fit in?</h3><p>ai predicts send times and drafts subject lines.</p><h3>How do I reduce unsubscribe rates?</h3><p>Send less, target better, and automate preference centers.</p>",
+    "markdown": "# Email automation FAQ\n\nEverything people ask about email automation. Marketing teams keep asking how to reach subscribers at the right moment without manual effort.\n\n### What is email automation?\n\nSending messages automatically based on triggers and schedules.\n\n### How do I start an automation workflow?\n\nBegin with a welcome series, then add a drip campaign.\n\n### Does subscriber segmentation matter?\n\nYes — segmented sends lift open rate significantly.\n\n### How does ai fit in?\n\nai predicts send times and drafts subject lines.\n\n### How do I reduce unsubscribe rates?\n\nSend less, target better, and automate preference centers.",
+    "blocks": [
+      {
+        "id": "b0",
+        "type": "h1",
+        "text": "Email automation FAQ"
+      },
+      {
+        "id": "b1",
+        "type": "p",
+        "text": "Everything people ask about email automation. Marketing teams keep asking how to reach subscribers at the right moment without manual effort."
+      },
+      {
+        "id": "b2",
+        "type": "faq",
+        "text": "",
+        "faqItems": [
+          {
+            "question": "What is email automation?",
+            "answer": "Sending messages automatically based on triggers and schedules."
+          },
+          {
+            "question": "How do I start an automation workflow?",
+            "answer": "Begin with a welcome series, then add a drip campaign."
+          },
+          {
+            "question": "Does subscriber segmentation matter?",
+            "answer": "Yes — segmented sends lift open rate significantly."
+          },
+          {
+            "question": "How does ai fit in?",
+            "answer": "ai predicts send times and drafts subject lines."
+          },
+          {
+            "question": "How do I reduce unsubscribe rates?",
+            "answer": "Send less, target better, and automate preference centers."
+          }
+        ]
+      }
+    ],
+    "text": "Email automation FAQ\n\nEverything people ask about email automation. Marketing teams keep asking how to reach subscribers at the right moment without manual effort.\n\nWhat is email automation?\nSending messages automatically based on triggers and schedules.\nHow do I start an automation workflow?\nBegin with a welcome series, then add a drip campaign.\nDoes subscriber segmentation matter?\nYes — segmented sends lift open rate significantly.\nHow does ai fit in?\nai predicts send times and drafts subject lines.\nHow do I reduce unsubscribe rates?\nSend less, target better, and automate preference centers."
+  },
+  {
+    "name": "keyword-stuffed",
+    "title": "email automation email automation email automation",
+    "html": "<h1>Email automation email automation guide to email automation</h1>\n<p>Email automation email automation email automation. Best email automation for email automation users who love email automation. Email automation with email automation on top. Marketing teams keep asking how to reach subscribers at the right moment without manual effort.</p>\n<h2>More email automation</h2>\n<p>Email automation, email automation, and yet more email automation. Try email automation today with email automation experts. Marketing teams keep asking how to reach subscribers at the right moment without manual effort.</p>",
+    "markdown": "# Email automation email automation guide to email automation\n\nEmail automation email automation email automation. Best email automation for email automation users who love email automation. Email automation with email automation on top. Marketing teams keep asking how to reach subscribers at the right moment without manual effort.\n\n## More email automation\n\nEmail automation, email automation, and yet more email automation. Try email automation today with email automation experts. Marketing teams keep asking how to reach subscribers at the right moment without manual effort.",
+    "blocks": [
+      {
+        "id": "b0",
+        "type": "h1",
+        "text": "Email automation email automation guide to email automation"
+      },
+      {
+        "id": "b1",
+        "type": "p",
+        "text": "Email automation email automation email automation. Best email automation for email automation users who love email automation. Email automation with email automation on top. Marketing teams keep asking how to reach subscribers at the right moment without manual effort."
+      },
+      {
+        "id": "b2",
+        "type": "h2",
+        "text": "More email automation"
+      },
+      {
+        "id": "b3",
+        "type": "p",
+        "text": "Email automation, email automation, and yet more email automation. Try email automation today with email automation experts. Marketing teams keep asking how to reach subscribers at the right moment without manual effort."
+      }
+    ],
+    "text": "Email automation email automation guide to email automation\n\nEmail automation email automation email automation. Best email automation for email automation users who love email automation. Email automation with email automation on top. Marketing teams keep asking how to reach subscribers at the right moment without manual effort.\n\nMore email automation\n\nEmail automation, email automation, and yet more email automation. Try email automation today with email automation experts. Marketing teams keep asking how to reach subscribers at the right moment without manual effort."
+  },
+  {
+    "name": "overused-terms",
+    "title": "Drip campaign obsession",
+    "html": "<h1>Drip campaign obsession</h1>\n<p>Drip campaign one. Drip campaign two. Drip campaign three. Drip campaign four. Drip campaign five. Drip campaign six. Drip campaign seven. Drip campaign eight. A drip campaign for every drip campaign. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.</p>\n<h2>Email automation appears once</h2>\n<p>Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.</p>",
+    "markdown": "# Drip campaign obsession\n\nDrip campaign one. Drip campaign two. Drip campaign three. Drip campaign four. Drip campaign five. Drip campaign six. Drip campaign seven. Drip campaign eight. A drip campaign for every drip campaign. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\n## Email automation appears once\n\nMarketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment.",
+    "blocks": [
+      {
+        "id": "b0",
+        "type": "h1",
+        "text": "Drip campaign obsession"
+      },
+      {
+        "id": "b1",
+        "type": "p",
+        "text": "Drip campaign one. Drip campaign two. Drip campaign three. Drip campaign four. Drip campaign five. Drip campaign six. Drip campaign seven. Drip campaign eight. A drip campaign for every drip campaign. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+      },
+      {
+        "id": "b2",
+        "type": "h2",
+        "text": "Email automation appears once"
+      },
+      {
+        "id": "b3",
+        "type": "p",
+        "text": "Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment."
+      }
+    ],
+    "text": "Drip campaign obsession\n\nDrip campaign one. Drip campaign two. Drip campaign three. Drip campaign four. Drip campaign five. Drip campaign six. Drip campaign seven. Drip campaign eight. A drip campaign for every drip campaign. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\nEmail automation appears once\n\nMarketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy. Measuring engagement over several weeks reveals which messages resonate with each audience segment."
+  },
+  {
+    "name": "links-images",
+    "title": "Email automation resources",
+    "html": "<h1>Email automation resources</h1>\n<p>A resource list for email automation and automation workflow fans. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.</p>\n<img src=\"https://example.com/a.png\" alt=\"automation chart\">\n<img src=\"https://example.com/b.png\" alt=\"workflow\">\n<img src=\"https://example.com/c.png\" alt=\"metrics\">\n<img src=\"https://example.com/d.png\" alt=\"extra\">\n<p><a href=\"/guides/one\">guide one</a> and <a href=\"/guides/two\">guide two</a> and <a href=\"/guides/three\">guide three</a> and <a href=\"/guides/four\">guide four</a> and <a href=\"/guides/five\">guide five</a> and <a href=\"https://external-one.com\">external one</a> and <a href=\"https://external-two.com\">external two</a></p>\n<p>Open rate and unsubscribe metrics belong in every report. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.</p>",
+    "markdown": "# Email automation resources\n\nA resource list for email automation and automation workflow fans. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\n![automation chart](https://example.com/a.png)\n\n![workflow](https://example.com/b.png)\n\n![metrics](https://example.com/c.png)\n\n![extra](https://example.com/d.png)\n\n[guide one](/guides/one) and [guide two](/guides/two) and [guide three](/guides/three) and [guide four](/guides/four) and [guide five](/guides/five) and [external one](https://external-one.com) and [external two](https://external-two.com)\n\nOpen rate and unsubscribe metrics belong in every report. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.",
+    "blocks": [
+      {
+        "id": "b0",
+        "type": "h1",
+        "text": "Email automation resources"
+      },
+      {
+        "id": "b1",
+        "type": "p",
+        "text": "A resource list for email automation and automation workflow fans. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+      },
+      {
+        "id": "b2",
+        "type": "img",
+        "text": "",
+        "src": "https://example.com/a.png",
+        "alt": "automation chart"
+      },
+      {
+        "id": "b3",
+        "type": "img",
+        "text": "",
+        "src": "https://example.com/b.png",
+        "alt": "workflow"
+      },
+      {
+        "id": "b4",
+        "type": "img",
+        "text": "",
+        "src": "https://example.com/c.png",
+        "alt": "metrics"
+      },
+      {
+        "id": "b5",
+        "type": "img",
+        "text": "",
+        "src": "https://example.com/d.png",
+        "alt": "extra"
+      },
+      {
+        "id": "b6",
+        "type": "p",
+        "text": "<a href=\"/guides/one\">guide one</a> and <a href=\"/guides/two\">guide two</a> and <a href=\"/guides/three\">guide three</a> and <a href=\"/guides/four\">guide four</a> and <a href=\"/guides/five\">guide five</a> and <a href=\"https://external-one.com\">external one</a> and <a href=\"https://external-two.com\">external two</a>"
+      },
+      {
+        "id": "b7",
+        "type": "p",
+        "text": "Open rate and unsubscribe metrics belong in every report. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+      }
+    ],
+    "text": "Email automation resources\n\nA resource list for email automation and automation workflow fans. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy.\n\nguide one and guide two and guide three and guide four and guide five and external one and external two\n\nOpen rate and unsubscribe metrics belong in every report. Marketing teams keep asking how to reach subscribers at the right moment without manual effort. A well designed sequence delivers the right message while the team focuses on strategy."
+  }
+]

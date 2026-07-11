@@ -10,6 +10,11 @@ const writingEngine = require('../services/writingEngine');
 const crypto = require('crypto');
 const tierService = require('../services/tierService');
 const creditService = require('../services/creditService');
+const costLedger = require('../services/costLedgerService');
+
+// /api/rewrite runs on the writing-engine's `compact` role (models.json).
+// The usage SSE event carries the actual serving model; this is the fallback.
+const REWRITE_DEFAULT_MODEL = 'google/gemini-2.5-flash-lite';
 
 // Workspace resolved by permissions middleware (req.workspace).
 
@@ -184,18 +189,60 @@ RULES:
     'X-Accel-Buffering': 'no',
   });
 
-  // Pipe SSE stream from Writing Engine directly to client
+  // Pipe SSE stream from Writing Engine directly to client, observing the
+  // engine's `usage` event in flight for the AI cost ledger (read-only tap —
+  // raw bytes still reach the client unchanged).
   const reader = apiRes.body.getReader();
+  const decoder = new TextDecoder();
+  let tapBuffer = '';
+  let usage = null;
+  let servingModel = '';
 
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       res.write(Buffer.from(value));
+      tapBuffer += decoder.decode(value, { stream: true });
+      const lines = tapBuffer.split('\n');
+      tapBuffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const payload = line.slice(6).trim();
+        if (!payload || payload === '[DONE]' || payload[0] !== '{') continue;
+        try {
+          const ev = JSON.parse(payload);
+          if (ev.type === 'usage' && ev.usage) {
+            usage = ev.usage;
+            if (ev.model) servingModel = ev.model;
+          }
+        } catch { /* malformed event — skip */ }
+      }
     }
   } catch (streamErr) {
-    if (!clientDisconnected && !abortCtrl.signal.aborted) throw streamErr;
+    if (!clientDisconnected && !abortCtrl.signal.aborted) {
+      // Headers are already sent — rethrowing would leave the client's SSE
+      // connection hanging (the caller can only res.json before headers).
+      // Emit an SSE error event and close, mirroring streamAudit.
+      console.error('[brand-voice] rewrite stream failed mid-flight:', streamErr.message);
+      res.write(`data: ${JSON.stringify({ type: 'error', message: streamErr.message })}\n\n`);
+      res.end();
+      return;
+    }
   }
+
+  if (usage) {
+    costLedger.recordForWorkspace({
+      action: 'voice_test',
+      model: servingModel || REWRITE_DEFAULT_MODEL,
+      tokensIn: usage.input_tokens || 0,
+      tokensOut: usage.output_tokens || 0,
+      workspaceId: req.workspace?._id,
+      organizationId: req.creditContext?.orgId,
+      userId: req.user?.userId,
+    });
+  }
+
   res.end();
 }
 
@@ -220,13 +267,21 @@ RULES:
 - Output ONLY the text. Nothing else.`;
 }
 
-/** Read an SSE stream and collect the full text. */
-async function collectStreamText(response) {
+/**
+ * Read an SSE stream and collect the full text.
+ *
+ * When costCtx ({ action, workspaceId, userId?, organizationId?, metadata? })
+ * is provided, the stream's `usage` event (forwarded by the engine's /rewrite
+ * handler) is recorded to the AI cost ledger — fire-and-forget.
+ */
+async function collectStreamText(response, costCtx = null) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
   let text = '';
   let streamError = null;
+  let usage = null;
+  let servingModel = '';
 
   while (true) {
     const { done, value } = await reader.read();
@@ -242,6 +297,9 @@ async function collectStreamText(response) {
         const parsed = JSON.parse(payload);
         if (parsed.type === 'text_delta' && typeof parsed.textDelta === 'string') {
           text += parsed.textDelta;
+        } else if (parsed.type === 'usage' && parsed.usage) {
+          usage = parsed.usage;
+          if (parsed.model) servingModel = parsed.model;
         } else if (parsed.type === 'error') {
           streamError = parsed.message || 'Unknown stream error';
           console.error('[brand-voice] SSE stream error:', streamError);
@@ -249,6 +307,20 @@ async function collectStreamText(response) {
       } catch { /* skip */ }
     }
   }
+
+  if (costCtx && usage) {
+    costLedger.recordForWorkspace({
+      action: costCtx.action,
+      model: servingModel || REWRITE_DEFAULT_MODEL,
+      tokensIn: usage.input_tokens || 0,
+      tokensOut: usage.output_tokens || 0,
+      workspaceId: costCtx.workspaceId,
+      organizationId: costCtx.organizationId,
+      userId: costCtx.userId,
+      metadata: costCtx.metadata || {},
+    });
+  }
+
   if (!text && streamError) {
     throw new Error(`Writing Engine stream error: ${streamError}`);
   }
@@ -259,7 +331,7 @@ async function collectStreamText(response) {
  * Run a single generation via Writing Engine /api/rewrite (no session, no tools).
  * Returns the generated text or '' on failure.
  */
-async function generateOnePreview(markdownContent, userMessage, signal) {
+async function generateOnePreview(markdownContent, userMessage, signal, costCtx = null) {
   const t0 = Date.now();
   const response = await fetch(`${writingEngine.WRITING_ENGINE_URL}/api/rewrite`, {
     method: 'POST',
@@ -279,7 +351,7 @@ async function generateOnePreview(markdownContent, userMessage, signal) {
     throw new Error(`Rewrite API error (${response.status}): ${errText}`);
   }
   console.log(`[brand-voice]   rewrite API responded: ${Date.now() - t0}ms`);
-  const text = await collectStreamText(response);
+  const text = await collectStreamText(response, costCtx);
   console.log(`[brand-voice]   collected: ${Date.now() - t0}ms (${text.length} chars)`);
   return text;
 }
@@ -321,6 +393,13 @@ async function generateAvatarPreviews(avatar, brandVoice) {
   const compMessage = `Rewrite the following generic text in your voice and style. Keep the same core message.\n\n"${GENERIC_TEXT}"`;
   const sampMessage = 'Write a short opening paragraph (2-3 sentences) for an article about why most teams fail at project management. Use your voice, style, and opening approach.';
 
+  // Cost-ledger context shared by all preview generations in this run.
+  const costCtx = {
+    action: 'avatar_preview',
+    workspaceId: avatar.workspace,
+    metadata: { avatarId: avatar._id?.toString() },
+  };
+
   const abortCtrl = new AbortController();
   const startTime = Date.now();
   const timeout = setTimeout(() => {
@@ -334,13 +413,13 @@ async function generateAvatarPreviews(avatar, brandVoice) {
     let sampText = '';
 
     try {
-      compText = await generateOnePreview(markdownContent, compMessage, abortCtrl.signal);
+      compText = await generateOnePreview(markdownContent, compMessage, abortCtrl.signal, costCtx);
     } catch (err) {
       console.error('[brand-voice] Comparison generation failed:', err.message);
     }
 
     try {
-      sampText = await generateOnePreview(markdownContent, sampMessage, abortCtrl.signal);
+      sampText = await generateOnePreview(markdownContent, sampMessage, abortCtrl.signal, costCtx);
     } catch (err) {
       console.error('[brand-voice] Sample generation failed:', err.message);
     }
@@ -351,14 +430,14 @@ async function generateAvatarPreviews(avatar, brandVoice) {
     if (compText && !sampText) {
       console.log('[brand-voice] Retrying sample generation...');
       try {
-        sampText = await generateOnePreview(markdownContent, sampMessage, abortCtrl.signal);
+        sampText = await generateOnePreview(markdownContent, sampMessage, abortCtrl.signal, costCtx);
       } catch (err) {
         console.error('[brand-voice] Sample retry failed:', err.message);
       }
     } else if (sampText && !compText) {
       console.log('[brand-voice] Retrying comparison generation...');
       try {
-        compText = await generateOnePreview(markdownContent, compMessage, abortCtrl.signal);
+        compText = await generateOnePreview(markdownContent, compMessage, abortCtrl.signal, costCtx);
       } catch (err) {
         console.error('[brand-voice] Comparison retry failed:', err.message);
       }
@@ -494,6 +573,20 @@ const saveBrandVoice = async (req, res) => {
       return res.status(404).json({ error: 'Brand voice not found' });
     }
 
+    // Parity with the by-id route's rejectIfLocked(BrandVoice,'brandVoiceId')
+    // middleware: the base active-voice PUT has no :brandVoiceId param, so that
+    // middleware can't run and a locked-but-active voice was editable here but
+    // not via /voices/:id. Enforce the same downgrade lock in-controller for the
+    // base path (the by-id path is already guarded upstream). Mirrors the
+    // guard's exact 403 contract so the FE sees one lock shape.
+    if (!brandVoiceId && brandVoice.locked) {
+      return res.status(403).json({
+        error: 'This resource is locked. Upgrade your plan to unlock it.',
+        code: 'RESOURCE_LOCKED',
+        locked: true,
+      });
+    }
+
     // Upload brand_voice.md to B2. The .md is an archival copy — the engine
     // reads brandVoice.content from Mongo at session setup — so a failed or
     // unconfigured B2 must not fail the save (envs without B2 keys couldn't
@@ -556,23 +649,15 @@ const testBrandVoice = async (req, res) => {
       return res.status(400).json({ error: 'Save your brand voice settings first' });
     }
 
-    // Deduct credits (fixed cost: 3 credits for ~150 words)
-    if (req.creditContext?.deductionEnabled) {
-      try {
-        await creditService.preDeduct(
-          req.creditContext.orgId, req.user.userId, 3,
-          req.creditContext.featureKey, { feature: 'brandVoiceTest' }
-        );
-      } catch (creditErr) {
-        return res.status(402).json({
-          error: creditErr.message,
-          code: 'INSUFFICIENT_CREDITS',
-        });
-      }
-    }
-
     await recordTestUsage(req.user.userId);
+    // Charge the test-preview (2) AFTER a successful rewrite stream (review MAJOR:
+    // charging before meant a Writing-Engine failure billed the user for nothing).
+    // A pre-stream engine error throws out of streamRewriteResponse → the catch
+    // returns 500 and this line never runs. deductForRequest finalizes (preDeduct
+    // +settle) so the 30-min orphan-sweep can't refund it. The gate already ran
+    // the pre-flight 402, so the post-hoc deduct is essentially always affordable.
     await streamRewriteResponse(req, res, brandVoice.content, input);
+    await creditService.deductForRequest(req);
   } catch (err) {
     if (!res.headersSent) {
       console.error('testBrandVoice error:', err.message);
@@ -603,8 +688,8 @@ const createAvatar = async (req, res) => {
   try {
     const workspace = req.workspace;
 
-    const { name, emoji, role, experience, tagline, traits, writingQuirks,
-            toneOverrides, vocabulary, openingStyle, sample } = req.body;
+    const { name, emoji, avatarIconId, role, experience, tagline, traits, writingQuirks,
+            toneOverrides, vocabulary, openingStyle, sample, background } = req.body;
 
     if (!name || typeof name !== 'string') {
       return res.status(400).json({ error: 'name is required' });
@@ -639,8 +724,8 @@ const createAvatar = async (req, res) => {
       workspace: workspace._id,
       createdBy: req.user.userId,
       name: name.trim(),
-      emoji, role, experience, tagline, traits, writingQuirks,
-      toneOverrides, vocabulary, openingStyle, sample,
+      emoji, avatarIconId, role, experience, tagline, traits, writingQuirks,
+      toneOverrides, vocabulary, openingStyle, sample, background,
       createdOnPlan,
     };
 
@@ -704,7 +789,7 @@ const updateAvatar = async (req, res) => {
       return res.status(404).json({ error: 'Avatar not found' });
     }
 
-    const allowed = ['name', 'emoji', 'role', 'experience', 'tagline', 'traits',
+    const allowed = ['name', 'emoji', 'avatarIconId', 'role', 'experience', 'tagline', 'traits',
                      'writingQuirks', 'toneOverrides', 'vocabulary', 'openingStyle', 'sample', 'background'];
     for (const key of allowed) {
       if (req.body[key] !== undefined) {
@@ -743,10 +828,41 @@ const updateAvatar = async (req, res) => {
 
     // Fire-and-forget: generate preview texts in the background
     if (!rateLimited) {
-      const brandVoice = await BrandVoice.findOne({ workspace: workspace._id, active: true }).lean();
-      const result = await generateAvatarPreviews(avatar, brandVoice);
-      await avatar.save();
-      console.log(`[brand-voice] Background generation finished: ${result}`);
+      // Phase 6: the preview regen is the REAL avatar AI spend (2 /rewrite calls)
+      // — bill avatarCreate (10) here, NOT on createAvatar (which does no AI). The
+      // field edits above already saved and are NEVER blocked on credits.
+      //
+      // Charge POST-success only (review MAJOR): a pre-check gates whether we run
+      // the paid AI at all (never generate free for an org that can't pay), then
+      // we charge ONLY when generateAvatarPreviews returns 'success'. A 'failed'
+      // /'rate_limited' regen bills nothing — and since the internal regen counter
+      // advances only on success, a retry after an outage is free-to-attempt, not
+      // re-charged (the prior charge-first path billed 10 per failed retry).
+      const affordable = await creditService.canAffordAction('avatarCreate', {
+        orgId: workspace.organizationId,
+        userId: req.user.userId,
+      });
+      if (!affordable.ok) {
+        avatar.previewsGenerating = false;
+        avatar.previewsStale = true;
+        await avatar.save();
+        console.log(`[brand-voice] Preview regen skipped — ${affordable.reason} (avatar ${avatar._id})`);
+      } else {
+        const brandVoice = await BrandVoice.findOne({ workspace: workspace._id, active: true }).lean();
+        const result = await generateAvatarPreviews(avatar, brandVoice);
+        await avatar.save();
+        if (result === 'success') {
+          const charge = await creditService.chargeAction('avatarCreate', {
+            orgId: workspace.organizationId,
+            userId: req.user.userId,
+            workspaceId: workspace._id,
+            metadata: { avatarId: avatar._id.toString() },
+          });
+          console.log(`[brand-voice] previews generated (charged ${charge.deducted}, ${charge.reason})`);
+        } else {
+          console.log(`[brand-voice] previews ${result} — not charged (avatar ${avatar._id})`);
+        }
+      }
     }
   } catch (err) {
     if (!res.headersSent && handleMongooseError(res, err)) return;
@@ -849,23 +965,11 @@ const testAvatar = async (req, res) => {
       ? brandVoice.content + '\n\n---\n\n' + avatar.content
       : avatar.content;
 
-    // Deduct credits (fixed cost: 3 credits for ~150 words)
-    if (req.creditContext?.deductionEnabled) {
-      try {
-        await creditService.preDeduct(
-          req.creditContext.orgId, req.user.userId, 3,
-          req.creditContext.featureKey, { feature: 'avatarTest', avatarId }
-        );
-      } catch (creditErr) {
-        return res.status(402).json({
-          error: creditErr.message,
-          code: 'INSUFFICIENT_CREDITS',
-        });
-      }
-    }
-
     await recordTestUsage(req.user.userId);
+    // Charge (2) AFTER a successful stream — see testBrandVoice. A pre-stream
+    // engine failure throws and skips the charge; finalize with preDeduct+settle.
     await streamRewriteResponse(req, res, combinedContent, input);
+    await creditService.deductForRequest(req, { metadata: { avatarId } });
   } catch (err) {
     if (!res.headersSent && handleMongooseError(res, err)) return;
     if (!res.headersSent) {
@@ -955,7 +1059,12 @@ Provide a concise style summary (max 200 words) that can be used to replicate th
           throw new Error(`Rewrite API error (${response.status})`);
         }
 
-        const fullText = await collectStreamText(response);
+        const fullText = await collectStreamText(response, {
+          action: 'voice_extraction',
+          workspaceId: workspace._id,
+          userId: req.user?.userId,
+          metadata: { avatarId, source: 'file_upload' },
+        });
         console.log(`[brand-voice] summarization via /api/rewrite: ${Date.now() - t0}ms (${fullText.length} chars)`);
 
         // Update upload record
@@ -1234,7 +1343,12 @@ Provide a concise style summary (max 200 words) that can be used to replicate th
           throw new Error(`Rewrite API error (${response.status})`);
         }
 
-        const fullText = await collectStreamText(response);
+        const fullText = await collectStreamText(response, {
+          action: 'voice_extraction',
+          workspaceId: workspace._id,
+          userId: req.user?.userId,
+          metadata: { avatarId, source: 'google_doc' },
+        });
         console.log(`[brand-voice] Google Doc summarization via /api/rewrite: ${Date.now() - t0}ms (${fullText.length} chars)`);
 
         await Avatar.findOneAndUpdate(
@@ -1474,4 +1588,6 @@ module.exports = {
   deleteAvatarImage,
   getTestRateLimit,
   importGoogleDoc,
+  // Exported for test coverage (cost-ledger usage tap). Not part of the runtime API surface.
+  collectStreamText,
 };

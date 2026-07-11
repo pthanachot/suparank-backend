@@ -1,0 +1,172 @@
+{
+  "keyword": "email automation",
+  "benchmark": {
+    "keywords": [
+      "email automation"
+    ],
+    "pageCount": 10,
+    "avgWordCount": 1200,
+    "minWordCount": 800,
+    "maxWordCount": 2000,
+    "avgH2Count": 6,
+    "avgH3Count": 4,
+    "avgImages": 3,
+    "avgInternalLinks": 4,
+    "avgExternalLinks": 3,
+    "avgListCount": 2,
+    "avgTableCount": 1,
+    "avgFaqCount": 1,
+    "avgParagraphs": 18,
+    "avgSentenceLength": 16,
+    "avgReadingLevel": 9,
+    "avgKeywordDensity": 1.2,
+    "keywordInH2Rate": 0.7,
+    "keywordInFirst100Rate": 0.8,
+    "topNlpTerms": [
+      {
+        "term": "email automation",
+        "category": "headings",
+        "count": 40,
+        "docFrequency": 9,
+        "prominence": "heading",
+        "usageRange": {
+          "min": 3,
+          "recommended": 6,
+          "max": 12
+        }
+      },
+      {
+        "term": "automation workflow",
+        "category": "nlp",
+        "count": 20,
+        "docFrequency": 7,
+        "prominence": "body",
+        "usageRange": {
+          "min": 2,
+          "recommended": 4,
+          "max": 8
+        }
+      },
+      {
+        "term": "drip campaign",
+        "category": "nlp",
+        "count": 18,
+        "docFrequency": 7,
+        "prominence": "body",
+        "usageRange": {
+          "min": 2,
+          "recommended": 3,
+          "max": 6
+        }
+      },
+      {
+        "term": "ai",
+        "category": "nlp",
+        "count": 15,
+        "docFrequency": 6,
+        "prominence": "body",
+        "usageRange": {
+          "min": 2,
+          "recommended": 4,
+          "max": 9
+        }
+      },
+      {
+        "term": "automate",
+        "category": "nlp",
+        "count": 14,
+        "docFrequency": 6,
+        "prominence": "body",
+        "usageRange": {
+          "min": 2,
+          "recommended": 4,
+          "max": 8
+        }
+      },
+      {
+        "term": "subscriber segmentation",
+        "category": "nlp",
+        "count": 10,
+        "docFrequency": 5,
+        "prominence": "body",
+        "usageRange": {
+          "min": 1,
+          "recommended": 2,
+          "max": 5
+        }
+      },
+      {
+        "term": "open rate",
+        "category": "nlp",
+        "count": 12,
+        "docFrequency": 6,
+        "prominence": "body",
+        "usageRange": {
+          "min": 1,
+          "recommended": 3,
+          "max": 6
+        }
+      },
+      {
+        "term": "unsubscribe",
+        "category": "nlp",
+        "count": 8,
+        "docFrequency": 4,
+        "prominence": "body",
+        "usageRange": {
+          "min": 1,
+          "recommended": 2,
+          "max": 4
+        }
+      }
+    ],
+    "topicClusters": [
+      {
+        "topic": "Setup",
+        "terms": [
+          "automation workflow",
+          "drip campaign"
+        ],
+        "importance": 1,
+        "docFrequency": 7
+      },
+      {
+        "topic": "Metrics",
+        "terms": [
+          "open rate",
+          "unsubscribe"
+        ],
+        "importance": 0.8,
+        "docFrequency": 6
+      },
+      {
+        "topic": "Audience",
+        "terms": [
+          "subscriber segmentation"
+        ],
+        "importance": 0.6,
+        "docFrequency": 5
+      }
+    ],
+    "subtopics": [
+      {
+        "label": "deliverability",
+        "stemmedForm": "deliver",
+        "variants": [
+          "email deliverability"
+        ],
+        "docFrequency": 5,
+        "docPercent": 50
+      },
+      {
+        "label": "welcome series",
+        "stemmedForm": "welcom seri",
+        "variants": [
+          "welcome sequence"
+        ],
+        "docFrequency": 4,
+        "docPercent": 40
+      }
+    ]
+  }
+}

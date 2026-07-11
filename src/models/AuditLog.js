@@ -42,6 +42,16 @@ const auditLogSchema = new mongoose.Schema(
     resourceId: { type: String, default: null },
     meta: { type: mongoose.Schema.Types.Mixed, default: null }, // small display context only
     ip: { type: String, default: null },
+    // Phase 19B: set when the actor was a platform admin acting through an
+    // impersonation ("login as") session. null for ordinary actions. Keeps the
+    // trail honest — `userId`/`actorEmail` still name the impersonated owner
+    // (so the row reads correctly in their activity view), but this field
+    // attributes the action to the real admin who performed it.
+    impersonatedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
   },
   { timestamps: { createdAt: true, updatedAt: false } }
 );

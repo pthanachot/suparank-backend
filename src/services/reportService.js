@@ -241,6 +241,7 @@ async function generateSnapshot(workspaceId, period) {
     content: null,
     tracker: null,
     gsc: null,
+    outcomes: null,
   };
   const sourceErrors = [];
 
@@ -259,6 +260,15 @@ async function generateSnapshot(workspaceId, period) {
     data.gsc = await _aggregateGsc(workspaceId);
   } catch (err) {
     sourceErrors.push({ source: 'gsc', error: err.message });
+  }
+  // Rec 14: per-content before/after deltas for contents with ≥2 outcome
+  // snapshots ≥14 days apart (namespace require so tests can stub it).
+  try {
+    const outcomeService = require('./outcomeService');
+    const rows = await outcomeService.getReportDeltas(workspaceId);
+    data.outcomes = rows.length > 0 ? { deltas: rows } : null;
+  } catch (err) {
+    sourceErrors.push({ source: 'outcomes', error: err.message });
   }
 
   if (sourceErrors.length > 0) data.sourceErrors = sourceErrors;

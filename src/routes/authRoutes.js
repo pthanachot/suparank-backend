@@ -2,18 +2,20 @@ const express = require('express');
 const router = express.Router();
 const authController = require('../controllers/authController');
 const { authenticateToken } = require('../middleware/auth');
+const validateBody = require('../middleware/validateBody');
+const v = require('../validators/authValidators');
 
 // Public routes
-router.post('/email-signup', authController.emailSignup);
-router.post('/email-login', authController.emailLogin);
-router.post('/google-auth', authController.googleAuth);
-router.post('/refresh-token', authController.refreshToken);
-router.post('/verify-email', authController.verifyEmail);
-router.post('/resend-verification', authController.resendVerification);
-router.post('/send-verification-code', authController.sendVerificationCode);
-router.post('/forgot-password', authController.forgotPassword);
-router.post('/verify-reset-code', authController.verifyResetCode);
-router.post('/reset-password', authController.resetPassword);
+router.post('/email-signup', validateBody(v.emailSignupSchema), authController.emailSignup);
+router.post('/email-login', validateBody(v.emailLoginSchema), authController.emailLogin);
+router.post('/google-auth', validateBody(v.googleAuthSchema), authController.googleAuth);
+router.post('/refresh-token', validateBody(v.refreshTokenSchema), authController.refreshToken);
+router.post('/verify-email', validateBody(v.verifyEmailSchema), authController.verifyEmail);
+router.post('/resend-verification', validateBody(v.emailOnlySchema), authController.resendVerification);
+router.post('/send-verification-code', validateBody(v.sendVerificationCodeSchema), authController.sendVerificationCode);
+router.post('/forgot-password', validateBody(v.emailOnlySchema), authController.forgotPassword);
+router.post('/verify-reset-code', validateBody(v.verifyResetCodeSchema), authController.verifyResetCode);
+router.post('/reset-password', validateBody(v.resetPasswordSchema), authController.resetPassword);
 router.get('/validate-reset-token', authController.validateResetToken);
 
 // Protected routes

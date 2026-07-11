@@ -13,6 +13,7 @@ const Subscription = require('../models/Subscription');
 const TierConfig = require('../models/TierConfig');
 const UsageTracker = require('../models/UsageTracker');
 const UserUsageTracker = require('../models/UserUsageTracker');
+const WorkspaceUsageTracker = require('../models/WorkspaceUsageTracker');
 
 // ─── Cache (5 min TTL, shared with this module only) ────────────
 
@@ -128,6 +129,17 @@ async function incrementQuota(tierQuota) {
     await UserUsageTracker.increment(tierQuota.userId, tierQuota.counterKey);
   } else if (tierQuota.orgId && tierQuota.period) {
     await UsageTracker.increment(tierQuota.orgId, tierQuota.counterKey, tierQuota.period);
+  }
+  // Phase 17 (dark): also count against the client-billed workspace's OWN
+  // ceiling. workspaceId/workspacePeriod are set by requireQuota only when
+  // saasMode is live AND the workspace has an active ClientSubscription — absent
+  // otherwise, making this a no-op on the live (non-SaaS) path.
+  if (tierQuota.workspaceId && tierQuota.workspacePeriod) {
+    await WorkspaceUsageTracker.increment(
+      tierQuota.workspaceId,
+      tierQuota.counterKey,
+      tierQuota.workspacePeriod
+    );
   }
 }
 

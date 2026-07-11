@@ -1,0 +1,1112 @@
+{
+  "generatedAt": "2026-07-09T21:44:33.278Z",
+  "runner": "backend/scorer.js",
+  "engineChecked": false,
+  "drafts": [
+    {
+      "name": "empty-short",
+      "overallScore": 3,
+      "signals": {
+        "Word Count": {
+          "yourValue": 24,
+          "score": 2,
+          "status": "poor"
+        },
+        "H2 Headings": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "H3 Headings": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Keyword in Title": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in H1": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in H2": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in First 100": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword Density": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Images": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Internal Links": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "External Links": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Lists": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Tables": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "FAQ": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Reading Level": {
+          "yourValue": 9.9,
+          "score": 100,
+          "status": "good"
+        },
+        "NLP Term Coverage": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Topic Coverage": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Subtopic Coverage": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        }
+      },
+      "nlpCounts": {
+        "email automation": 0,
+        "automation workflow": 0,
+        "drip campaign": 0,
+        "ai": 0,
+        "automate": 0,
+        "subscriber segmentation": 0,
+        "open rate": 0,
+        "unsubscribe": 0
+      }
+    },
+    {
+      "name": "balanced-long",
+      "overallScore": 84,
+      "signals": {
+        "Word Count": {
+          "yourValue": 585,
+          "score": 58,
+          "status": "needs_work"
+        },
+        "H2 Headings": {
+          "yourValue": 6,
+          "score": 100,
+          "status": "good"
+        },
+        "H3 Headings": {
+          "yourValue": 2,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword in Title": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in H1": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword in H2": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword in First 100": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword Density": {
+          "yourValue": 1.2,
+          "score": 100,
+          "status": "good"
+        },
+        "Images": {
+          "yourValue": 3,
+          "score": 100,
+          "status": "good"
+        },
+        "Internal Links": {
+          "yourValue": 4,
+          "score": 100,
+          "status": "good"
+        },
+        "External Links": {
+          "yourValue": 3,
+          "score": 100,
+          "status": "good"
+        },
+        "Lists": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "Tables": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "FAQ": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Reading Level": {
+          "yourValue": 12.8,
+          "score": 76,
+          "status": "needs_work"
+        },
+        "NLP Term Coverage": {
+          "yourValue": 93.8,
+          "score": 100,
+          "status": "good"
+        },
+        "Topic Coverage": {
+          "yourValue": 100,
+          "score": 100,
+          "status": "good"
+        },
+        "Subtopic Coverage": {
+          "yourValue": 100,
+          "score": 100,
+          "status": "good"
+        },
+        "Term Prominence": {
+          "yourValue": 100,
+          "score": 100,
+          "status": "good"
+        }
+      },
+      "nlpCounts": {
+        "email automation": 7,
+        "automation workflow": 3,
+        "drip campaign": 4,
+        "ai": 4,
+        "automate": 16,
+        "subscriber segmentation": 3,
+        "open rate": 5,
+        "unsubscribe": 4
+      }
+    },
+    {
+      "name": "inflected-forms",
+      "overallScore": 32,
+      "signals": {
+        "Word Count": {
+          "yourValue": 140,
+          "score": 12,
+          "status": "poor"
+        },
+        "H2 Headings": {
+          "yourValue": 2,
+          "score": 47,
+          "status": "needs_work"
+        },
+        "H3 Headings": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Keyword in Title": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in H1": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in H2": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in First 100": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword Density": {
+          "yourValue": 0.71,
+          "score": 100,
+          "status": "good"
+        },
+        "Images": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Internal Links": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "External Links": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Lists": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Tables": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "FAQ": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Reading Level": {
+          "yourValue": 12.1,
+          "score": 90,
+          "status": "needs_work"
+        },
+        "NLP Term Coverage": {
+          "yourValue": 41.3,
+          "score": 58,
+          "status": "needs_work"
+        },
+        "Topic Coverage": {
+          "yourValue": 66.7,
+          "score": 87,
+          "status": "needs_work"
+        },
+        "Subtopic Coverage": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Term Prominence": {
+          "yourValue": 100,
+          "score": 100,
+          "status": "good"
+        }
+      },
+      "nlpCounts": {
+        "email automation": 1,
+        "automation workflow": 0,
+        "drip campaign": 3,
+        "ai": 0,
+        "automate": 11,
+        "subscriber segmentation": 2,
+        "open rate": 0,
+        "unsubscribe": 0
+      }
+    },
+    {
+      "name": "short-term-trap",
+      "overallScore": 18,
+      "signals": {
+        "Word Count": {
+          "yourValue": 154,
+          "score": 13,
+          "status": "poor"
+        },
+        "H2 Headings": {
+          "yourValue": 1,
+          "score": 17,
+          "status": "poor"
+        },
+        "H3 Headings": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Keyword in Title": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in H1": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in H2": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in First 100": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword Density": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Images": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Internal Links": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "External Links": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Lists": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Tables": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "FAQ": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Reading Level": {
+          "yourValue": 10.9,
+          "score": 100,
+          "status": "good"
+        },
+        "NLP Term Coverage": {
+          "yourValue": 12.5,
+          "score": 15,
+          "status": "poor"
+        },
+        "Topic Coverage": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Subtopic Coverage": {
+          "yourValue": 50,
+          "score": 65,
+          "status": "needs_work"
+        },
+        "Term Prominence": {
+          "yourValue": 100,
+          "score": 100,
+          "status": "good"
+        }
+      },
+      "nlpCounts": {
+        "email automation": 0,
+        "automation workflow": 0,
+        "drip campaign": 0,
+        "ai": 4,
+        "automate": 0,
+        "subscriber segmentation": 0,
+        "open rate": 0,
+        "unsubscribe": 0
+      }
+    },
+    {
+      "name": "unicode-headings",
+      "overallScore": 37,
+      "signals": {
+        "Word Count": {
+          "yourValue": 124,
+          "score": 10,
+          "status": "poor"
+        },
+        "H2 Headings": {
+          "yourValue": 2,
+          "score": 47,
+          "status": "needs_work"
+        },
+        "H3 Headings": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Keyword in Title": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in H1": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword in H2": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in First 100": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword Density": {
+          "yourValue": 2.42,
+          "score": 0,
+          "status": "poor"
+        },
+        "Images": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Internal Links": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "External Links": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Lists": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Tables": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "FAQ": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Reading Level": {
+          "yourValue": 12.3,
+          "score": 87,
+          "status": "needs_work"
+        },
+        "NLP Term Coverage": {
+          "yourValue": 62.5,
+          "score": 70,
+          "status": "needs_work"
+        },
+        "Topic Coverage": {
+          "yourValue": 100,
+          "score": 100,
+          "status": "good"
+        },
+        "Subtopic Coverage": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Term Prominence": {
+          "yourValue": 100,
+          "score": 100,
+          "status": "good"
+        }
+      },
+      "nlpCounts": {
+        "email automation": 3,
+        "automation workflow": 0,
+        "drip campaign": 2,
+        "ai": 0,
+        "automate": 3,
+        "subscriber segmentation": 2,
+        "open rate": 1,
+        "unsubscribe": 0
+      }
+    },
+    {
+      "name": "tables-heavy",
+      "overallScore": 42,
+      "signals": {
+        "Word Count": {
+          "yourValue": 108,
+          "score": 9,
+          "status": "poor"
+        },
+        "H2 Headings": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "H3 Headings": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Keyword in Title": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in H1": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword in H2": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in First 100": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword Density": {
+          "yourValue": 1.85,
+          "score": 91,
+          "status": "needs_work"
+        },
+        "Images": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Internal Links": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "External Links": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Lists": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Tables": {
+          "yourValue": 2,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "FAQ": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Reading Level": {
+          "yourValue": 10.6,
+          "score": 100,
+          "status": "good"
+        },
+        "NLP Term Coverage": {
+          "yourValue": 68.8,
+          "score": 96,
+          "status": "needs_work"
+        },
+        "Topic Coverage": {
+          "yourValue": 66.7,
+          "score": 87,
+          "status": "needs_work"
+        },
+        "Subtopic Coverage": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Term Prominence": {
+          "yourValue": 100,
+          "score": 100,
+          "status": "good"
+        }
+      },
+      "nlpCounts": {
+        "email automation": 2,
+        "automation workflow": 1,
+        "drip campaign": 1,
+        "ai": 3,
+        "automate": 3,
+        "subscriber segmentation": 0,
+        "open rate": 1,
+        "unsubscribe": 1
+      }
+    },
+    {
+      "name": "faq-heavy",
+      "overallScore": 44,
+      "signals": {
+        "Word Count": {
+          "yourValue": 92,
+          "score": 8,
+          "status": "poor"
+        },
+        "H2 Headings": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "H3 Headings": {
+          "yourValue": 5,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword in Title": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in H1": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword in H2": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in First 100": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword Density": {
+          "yourValue": 3.26,
+          "score": 0,
+          "status": "poor"
+        },
+        "Images": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Internal Links": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "External Links": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Lists": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Tables": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "FAQ": {
+          "yourValue": 5,
+          "score": 0,
+          "status": "poor"
+        },
+        "Reading Level": {
+          "yourValue": 9.1,
+          "score": 100,
+          "status": "good"
+        },
+        "NLP Term Coverage": {
+          "yourValue": 87.5,
+          "score": 70,
+          "status": "needs_work"
+        },
+        "Topic Coverage": {
+          "yourValue": 100,
+          "score": 100,
+          "status": "good"
+        },
+        "Subtopic Coverage": {
+          "yourValue": 50,
+          "score": 65,
+          "status": "needs_work"
+        },
+        "Term Prominence": {
+          "yourValue": 100,
+          "score": 100,
+          "status": "good"
+        }
+      },
+      "nlpCounts": {
+        "email automation": 3,
+        "automation workflow": 1,
+        "drip campaign": 1,
+        "ai": 2,
+        "automate": 6,
+        "subscriber segmentation": 1,
+        "open rate": 1,
+        "unsubscribe": 1
+      }
+    },
+    {
+      "name": "keyword-stuffed",
+      "overallScore": 26,
+      "signals": {
+        "Word Count": {
+          "yourValue": 82,
+          "score": 7,
+          "status": "poor"
+        },
+        "H2 Headings": {
+          "yourValue": 1,
+          "score": 17,
+          "status": "poor"
+        },
+        "H3 Headings": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Keyword in Title": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in H1": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword in H2": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword in First 100": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword Density": {
+          "yourValue": 20.73,
+          "score": 0,
+          "status": "poor"
+        },
+        "Images": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Internal Links": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "External Links": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Lists": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Tables": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "FAQ": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Reading Level": {
+          "yourValue": 12.6,
+          "score": 80,
+          "status": "needs_work"
+        },
+        "NLP Term Coverage": {
+          "yourValue": 15.4,
+          "score": 18,
+          "status": "poor"
+        },
+        "Topic Coverage": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Subtopic Coverage": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Term Prominence": {
+          "yourValue": 100,
+          "score": 100,
+          "status": "good"
+        }
+      },
+      "nlpCounts": {
+        "email automation": 17,
+        "automation workflow": 0,
+        "drip campaign": 0,
+        "ai": 0,
+        "automate": 17,
+        "subscriber segmentation": 0,
+        "open rate": 0,
+        "unsubscribe": 0
+      }
+    },
+    {
+      "name": "overused-terms",
+      "overallScore": 27,
+      "signals": {
+        "Word Count": {
+          "yourValue": 109,
+          "score": 9,
+          "status": "poor"
+        },
+        "H2 Headings": {
+          "yourValue": 1,
+          "score": 17,
+          "status": "poor"
+        },
+        "H3 Headings": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Keyword in Title": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in H1": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in H2": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword in First 100": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword Density": {
+          "yourValue": 0.92,
+          "score": 100,
+          "status": "good"
+        },
+        "Images": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Internal Links": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "External Links": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Lists": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Tables": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "FAQ": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Reading Level": {
+          "yourValue": 9.6,
+          "score": 100,
+          "status": "good"
+        },
+        "NLP Term Coverage": {
+          "yourValue": 19.8,
+          "score": 24,
+          "status": "poor"
+        },
+        "Topic Coverage": {
+          "yourValue": 33.3,
+          "score": 37,
+          "status": "poor"
+        },
+        "Subtopic Coverage": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Term Prominence": {
+          "yourValue": 100,
+          "score": 100,
+          "status": "good"
+        }
+      },
+      "nlpCounts": {
+        "email automation": 1,
+        "automation workflow": 0,
+        "drip campaign": 11,
+        "ai": 0,
+        "automate": 1,
+        "subscriber segmentation": 0,
+        "open rate": 0,
+        "unsubscribe": 0
+      }
+    },
+    {
+      "name": "links-images",
+      "overallScore": 45,
+      "signals": {
+        "Word Count": {
+          "yourValue": 100,
+          "score": 8,
+          "status": "poor"
+        },
+        "H2 Headings": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "H3 Headings": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Keyword in Title": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in H1": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword in H2": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Keyword in First 100": {
+          "yourValue": 1,
+          "score": 100,
+          "status": "good"
+        },
+        "Keyword Density": {
+          "yourValue": 2,
+          "score": 67,
+          "status": "needs_work"
+        },
+        "Images": {
+          "yourValue": 4,
+          "score": 100,
+          "status": "good"
+        },
+        "Internal Links": {
+          "yourValue": 5,
+          "score": 100,
+          "status": "good"
+        },
+        "External Links": {
+          "yourValue": 2,
+          "score": 100,
+          "status": "good"
+        },
+        "Lists": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Tables": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "FAQ": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "needs_work"
+        },
+        "Reading Level": {
+          "yourValue": 11.5,
+          "score": 100,
+          "status": "good"
+        },
+        "NLP Term Coverage": {
+          "yourValue": 50,
+          "score": 70,
+          "status": "needs_work"
+        },
+        "Topic Coverage": {
+          "yourValue": 66.7,
+          "score": 87,
+          "status": "needs_work"
+        },
+        "Subtopic Coverage": {
+          "yourValue": 0,
+          "score": 0,
+          "status": "poor"
+        },
+        "Term Prominence": {
+          "yourValue": 100,
+          "score": 100,
+          "status": "good"
+        }
+      },
+      "nlpCounts": {
+        "email automation": 2,
+        "automation workflow": 1,
+        "drip campaign": 0,
+        "ai": 0,
+        "automate": 3,
+        "subscriber segmentation": 0,
+        "open rate": 1,
+        "unsubscribe": 1
+      }
+    }
+  ]
+}

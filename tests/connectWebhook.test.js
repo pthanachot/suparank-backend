@@ -53,7 +53,9 @@ const real = {
   csExists: ClientSubscription.exists,
   wsFindOne: Workspace.findOne,
   wsUpdate: Workspace.findByIdAndUpdate,
+  wsFindById: Workspace.findById,
   orgFindOne: Organization.findOne,
+  orgFindById: Organization.findById,
   audit: auditService.record,
 };
 after(() => {
@@ -64,7 +66,9 @@ after(() => {
   ClientSubscription.exists = real.csExists;
   Workspace.findOne = real.wsFindOne;
   Workspace.findByIdAndUpdate = real.wsUpdate;
+  Workspace.findById = real.wsFindById;
   Organization.findOne = real.orgFindOne;
+  Organization.findById = real.orgFindById;
   auditService.record = real.audit;
 });
 
@@ -76,6 +80,7 @@ let ownedWs; // Map workspaceId -> organizationId (ownership)
 let wsLocks; // Map workspaceId -> boolean (latest clientLocked)
 let orgSaved;
 let auditCalls;
+let orgLifecycle; // lifecycleStatus returned by the reconcile lock's org lookup
 
 function res() {
   return { statusCode: 200, body: null, status(c) { this.statusCode = c; return this; }, json(b) { this.body = b; return this; } };
@@ -89,6 +94,7 @@ beforeEach(() => {
   wsLocks = {};
   orgSaved = [];
   auditCalls = [];
+  orgLifecycle = 'active';
   stripeState.retrieveThrows = false;
   stripeState.retrievedSub = { status: 'active', current_period_end: 1893456000, customer: 'cus_1', cancel_at_period_end: false };
 
@@ -125,6 +131,9 @@ beforeEach(() => {
     }),
   });
   Workspace.findByIdAndUpdate = async (id, update) => { wsLocks[String(id)] = update.clientLocked === true; return {}; };
+  // reconcileWorkspaceLock's lifecycle guard: workspace → org (active by default)
+  Workspace.findById = (id) => ({ select: () => ({ lean: async () => ({ _id: id, organizationId: ownedWs.get(String(id)) || 'org_1' }) }) });
+  Organization.findById = () => ({ select: () => ({ lean: async () => ({ lifecycleStatus: orgLifecycle }) }) });
 
   Organization.findOne = async () => ({ connectChargesEnabled: false, connectOnboardedAt: null, save: async function () { orgSaved.push({ ...this }); } });
   auditService.record = (e) => auditCalls.push(e);

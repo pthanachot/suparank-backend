@@ -91,7 +91,18 @@ const tierConfigSchema = new mongoose.Schema(
 
     // ── Seats (organization members) ──
     maxSeats: { type: Number, default: 1 },
-    extraSeatPrice: { type: Number, default: 0 }, // USD per extra seat per month
+    extraSeatPrice: { type: Number, default: 0 }, // USD per extra seat per month ($10 on Pro/Agency)
+    // Free (read-only, white-label) client viewer seats. null = unlimited (Agency).
+    clientViewers: { type: Number, default: 0 },
+
+    // ── Support (v4.1 Table 1) ──
+    // docs → Free · email24h → Standard · priority12h (real priority queue) → Pro
+    // · slack (+ onboarding) → Agency.
+    supportTier: {
+      type: String,
+      enum: ['docs', 'email24h', 'priority12h', 'slack'],
+      default: 'docs',
+    },
 
     // ── Credits ──
     creditsPerMonth: { type: Number, default: null },
@@ -103,6 +114,13 @@ const tierConfigSchema = new mongoose.Schema(
 
     // ── Content Version History ──
     contentVersionHistoryDays: { type: Number, default: 7 }, // how many days of revision history to keep
+
+    // ── Multi-run AI-search sampling (Rec 12) ──
+    // When true, analyses run each AI engine 3× and report citation appearance
+    // RATES instead of one-shot citations. Roughly triples AI-search spend per
+    // analysis (never the LLM pipeline), hence default false everywhere;
+    // enable per-tier deliberately.
+    multiSample: { type: Boolean, default: false },
 
     // ── Future extensibility ──
     custom: {

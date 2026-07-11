@@ -51,6 +51,7 @@ function _audit(req, org, action, resourceId, meta) {
     organizationId: org._id,
     userId: req.user.userId,
     actorEmail: req.user.email,
+    impersonatedBy: req.user?.impersonatedBy || null,
     action,
     resourceId,
     meta,

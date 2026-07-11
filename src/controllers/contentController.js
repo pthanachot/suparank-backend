@@ -5,6 +5,8 @@ const imageStorage = require('../services/imageStorage');
 const auditService = require('../services/auditService');
 const creditService = require('../services/creditService');
 const tierService = require('../services/tierService');
+const { pruneVersions } = require('../services/versionRetention');
+const costLedger = require('../services/costLedgerService');
 
 // Workspace is resolved by the permissions middleware (resolveWorkspaceWithRole)
 // and available as req.workspace.
@@ -79,6 +81,14 @@ const createContent = async (req, res) => {
       }
     }
 
+    // Phase 11: enforce the tier's version-retention window on save (org-scoped
+    // only — personal workspaces keep the count-cap-only behaviour).
+    let retainedVersions = versions || [];
+    if (orgId && Array.isArray(retainedVersions) && retainedVersions.length > 1) {
+      const { config } = await tierService.getOrgTierConfig(orgId);
+      retainedVersions = pruneVersions(retainedVersions, config?.contentVersionHistoryDays);
+    }
+
     const content = await Content.create({
       userId: req.user.userId,
       workspaceId: workspace._id,
@@ -99,7 +109,7 @@ const createContent = async (req, res) => {
       status,
       folder,
       platform,
-      versions: versions || [],
+      versions: retainedVersions,
       createdOnPlan,
     });
 
@@ -136,7 +146,7 @@ const updateContent = async (req, res) => {
     const allowedFields = [
       'title', 'slug', 'description', 'blocks', 'targetKeywords',
       'country', 'device', 'score', 'wordCount', 'status', 'folder', 'platform',
-      'versions', 'publishedAt', 'scheduledAt',
+      'versions', 'publishedAt', 'scheduledAt', 'publishedUrl',
       'contentType', 'contentContext', 'targetWordCount', 'writingMode',
       'styleReferenceContentNumber',
     ];
@@ -146,6 +156,18 @@ const updateContent = async (req, res) => {
       if (req.body[field] !== undefined) {
         updates[field] = req.body[field];
       }
+    }
+
+    // Phase 11: enforce the tier's version-retention window on save (org-scoped
+    // only). The client sends the whole versions array each save, so re-trimming
+    // here makes the advertised 7/30/90/365-day window real without a cron.
+    if (
+      workspace.organizationId &&
+      Array.isArray(updates.versions) &&
+      updates.versions.length > 1
+    ) {
+      const { config } = await tierService.getOrgTierConfig(workspace.organizationId);
+      updates.versions = pruneVersions(updates.versions, config?.contentVersionHistoryDays);
     }
 
     // Upload any remaining base64/temp-URL images to B2 before saving
@@ -519,6 +541,9 @@ async function streamAudit(req, res, { prompt, contentHash, contentId, dbField, 
         model: 'moonshotai/kimi-k2-0905',
         temperature: 0,
         stream: true,
+        // include_usage → OpenRouter emits a final chunk carrying token counts
+        // (empty choices), which we tap for the AI cost ledger below.
+        stream_options: { include_usage: true },
         messages: [{ role: 'user', content: prompt }],
       }),
       signal: abortCtrl.signal,
@@ -547,6 +572,7 @@ async function streamAudit(req, res, { prompt, contentHash, contentId, dbField, 
   let sseBuffer = '';
   let fullContent = '';
   let emittedCount = 0;
+  let usage = null; // OpenRouter final-chunk token counts (include_usage)
 
   try {
     while (true) {
@@ -564,6 +590,8 @@ async function streamAudit(req, res, { prompt, contentHash, contentId, dbField, 
 
         try {
           const event = JSON.parse(data);
+          // Final usage chunk (choices empty). Capture for the cost ledger.
+          if (event.usage) usage = event.usage;
           const delta = event.choices?.[0]?.delta?.content || '';
           if (delta) {
             fullContent += delta;
@@ -592,6 +620,30 @@ async function streamAudit(req, res, { prompt, contentHash, contentId, dbField, 
     }
     return;
   }
+
+  // AI cost ledger (Phase 1): record this audit's real COGS. Placed BEFORE the
+  // parse so a billed-but-unparseable response still lands in the ledger (the
+  // tokens were spent either way). Detached — never delays the SSE response.
+  void (async () => {
+    try {
+      const orgId = req.creditContext?.orgId || tierQuota?.orgId || null;
+      let tier = '';
+      if (orgId) tier = (await tierService.getOrgTierConfig(orgId))?.tier || '';
+      costLedger.record({
+        action: 'audit',
+        model: 'moonshotai/kimi-k2-0905',
+        tokensIn: usage?.prompt_tokens || 0,
+        tokensOut: usage?.completion_tokens || 0,
+        organizationId: orgId,
+        workspaceId: req.workspace?._id || null,
+        userId: req.user?.userId || null,
+        tier,
+        metadata: { contentId: contentId?.toString(), dbField },
+      });
+    } catch (e) {
+      console.warn('[costLedger] audit skipped:', e.message);
+    }
+  })();
 
   // Parse final result
   const cleaned = fullContent.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
@@ -631,21 +683,13 @@ async function streamAudit(req, res, { prompt, contentHash, contentId, dbField, 
     console.error(`[${dbField}] DB save error:`, e.message);
   }
 
-  // Deduct credits based on actual output word count
-  if (req.creditContext?.deductionEnabled) {
-    try {
-      const wordCount = fullContent.trim().split(/\s+/).filter(Boolean).length;
-      const credits = creditService.wordsToCredits(wordCount);
-      if (credits > 0) {
-        await creditService.preDeduct(
-          req.creditContext.orgId, req.user.userId, credits,
-          req.creditContext.featureKey, { contentId: contentId.toString(), wordCount, feature: req.creditContext.featureKey }
-        );
-      }
-    } catch (creditErr) {
-      console.error(`[${dbField}] credit deduction failed (non-fatal):`, creditErr.message);
-    }
-  }
+  // Deduct the flat audit cost. Phase 6: audits bill the Table-2 fixed price
+  // (5 credits; Free fixed-bundle = 0, count-gated) — NOT the old word-based
+  // cost. The gate already resolved the amount into creditContext.estimatedCredits
+  // (via resolveCredits('contentAudit', {tier})). deductForRequest finalizes the
+  // charge (preDeduct + settle) so the 30-min orphan-sweep can't refund it — a
+  // bare preDeduct left the tx 'pending' and the sweep silently made audits free.
+  await creditService.deductForRequest(req, { metadata: { contentId: contentId?.toString() } });
 
   // Emit final complete event
   if (!clientDisconnected) {
@@ -663,6 +707,9 @@ const runAudit = async (req, res) => {
       contentNumber: Number(req.params.contentNumber),
     });
     if (!content) return res.status(404).json({ error: 'Content not found' });
+    // B4: same lock gate as getContent — a locked doc must not be audited
+    // (leaks its data to the LLM and burns credits).
+    if (content.locked) return res.status(403).json({ error: 'This content is locked. Upgrade your plan to regain access.', locked: true });
 
     const contentHash = computeContentHash(content.blocks);
 
@@ -755,6 +802,9 @@ const runWritingQualityAudit = async (req, res) => {
       contentNumber: Number(req.params.contentNumber),
     });
     if (!content) return res.status(404).json({ error: 'Content not found' });
+    // B4: same lock gate as getContent — no writing-quality audit on locked
+    // content (leaks its data to the LLM and burns credits).
+    if (content.locked) return res.status(403).json({ error: 'This content is locked. Upgrade your plan to regain access.', locked: true });
 
     const contentHash = computeContentHash(content.blocks);
 
@@ -805,14 +855,18 @@ const getAvailableLinks = async (req, res) => {
       return res.status(403).json({ error: 'This content is locked. Upgrade your plan to regain access.', locked: true });
     }
 
-    const { benchmarkToContentBrief, buildAvailableLinks } = require('../services/benchmarkToContentBrief');
+    const { benchmarkToContentBrief, buildAvailableLinks, buildAllowlistUrls } = require('../services/benchmarkToContentBrief');
     const brief = benchmarkToContentBrief(content);
+    const workspaceId = content.workspaceId || workspace._id;
     const links = await buildAvailableLinks(
-      content.workspaceId || workspace._id,
+      workspaceId,
       brief.targetKeyword,
       brief.secondaryKeywords,
     );
-    res.json({ links });
+    // R3: the editor's Internal Links ring classifies against the full crawled
+    // set (top-30 `links` is only for display/suggestions), matching the engine.
+    const allowlistUrls = await buildAllowlistUrls(workspaceId);
+    res.json({ links, allowlistUrls });
   } catch (err) {
     console.error('getAvailableLinks error:', err.message);
     res.status(500).json({ error: 'Failed to load available links' });
@@ -873,4 +927,6 @@ const getMovement = async (req, res) => {
   }
 };
 
-module.exports = { listContents, getContent, getAvailableLinks, getMovement, createContent, updateContent, deleteContent, addComment, updateComment, deleteComment, runAudit, runWritingQualityAudit };
+module.exports = { listContents, getContent, getAvailableLinks, getMovement, createContent, updateContent, deleteContent, addComment, updateComment, deleteComment, runAudit, runWritingQualityAudit,
+  // Exported for test coverage (cost-ledger usage capture). Not part of the runtime API surface.
+  streamAudit };

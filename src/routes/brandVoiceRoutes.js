@@ -41,42 +41,52 @@ const imageUpload = multer({
 router.use(authenticateToken);
 
 const { resolveWorkspaceWithRole: rwr, requirePermission: rp } = require('../middleware/permissions');
+// Phase 10: granular v4 policy gate is authoritative on brandVoice.manage
+// (Admin+, credit-spending). CI route-scan guard matches `requirePermission('...')`.
+const { requirePermission } = require('../middleware/permissions.policy');
 const { requireCredits: rc } = require('../middleware/creditGate');
+const { resolveCredits } = require('../config/creditRules');
 const Avatar = require('../models/Avatar');
+
+// Phase 6: test previews bill 2 (re-costed from a hardcoded 3) via the cost
+// table so Option B / deduction flags apply consistently. Controllers finalize
+// the charge with creditService.deductForRequest (preDeduct+settle).
+const estBvTest = (_req, { tier }) => resolveCredits('brandVoiceTest', { tier });
+const estAvatarTest = (_req, { tier }) => resolveCredits('avatarTest', { tier });
 const { rejectIfLocked } = require('../middleware/lockGuard');
 
 const BrandVoice = require('../models/BrandVoice');
 
 // Brand voice (single active)
 router.get('/:workspaceNumber/brand-voice', rwr, rp('brandVoice', 'read'), brandVoiceController.getBrandVoice);
-router.put('/:workspaceNumber/brand-voice', rwr, rp('brandVoice', 'manage'), brandVoiceController.saveBrandVoice);
-router.post('/:workspaceNumber/brand-voice/test', rwr, rp('brandVoice', 'manage'), rc('brandVoiceTest', 3), brandVoiceController.testBrandVoice);
+router.put('/:workspaceNumber/brand-voice', rwr, requirePermission('brandVoice.manage'), brandVoiceController.saveBrandVoice);
+router.post('/:workspaceNumber/brand-voice/test', rwr, requirePermission('brandVoice.manage'), rc('brandVoiceTest', estBvTest), brandVoiceController.testBrandVoice);
 router.get('/:workspaceNumber/brand-voice/rate-limit', rwr, rp('brandVoice', 'read'), brandVoiceController.getTestRateLimit);
 
 // Brand voice CRUD (multiple voices per workspace)
 router.get('/:workspaceNumber/brand-voice/voices', rwr, rp('brandVoice', 'read'), brandVoiceController.listBrandVoices);
-router.post('/:workspaceNumber/brand-voice/voices', rwr, rp('brandVoice', 'manage'), brandVoiceController.createBrandVoice);
-router.put('/:workspaceNumber/brand-voice/voices/:brandVoiceId', rwr, rp('brandVoice', 'manage'), rejectIfLocked(BrandVoice, 'brandVoiceId'), brandVoiceController.saveBrandVoice);
-router.delete('/:workspaceNumber/brand-voice/voices/:brandVoiceId', rwr, rp('brandVoice', 'manage'), brandVoiceController.deleteBrandVoice);
-router.patch('/:workspaceNumber/brand-voice/voices/:brandVoiceId/toggle', rwr, rp('brandVoice', 'manage'), rejectIfLocked(BrandVoice, 'brandVoiceId'), brandVoiceController.toggleBrandVoice);
+router.post('/:workspaceNumber/brand-voice/voices', rwr, requirePermission('brandVoice.manage'), brandVoiceController.createBrandVoice);
+router.put('/:workspaceNumber/brand-voice/voices/:brandVoiceId', rwr, requirePermission('brandVoice.manage'), rejectIfLocked(BrandVoice, 'brandVoiceId'), brandVoiceController.saveBrandVoice);
+router.delete('/:workspaceNumber/brand-voice/voices/:brandVoiceId', rwr, requirePermission('brandVoice.manage'), brandVoiceController.deleteBrandVoice);
+router.patch('/:workspaceNumber/brand-voice/voices/:brandVoiceId/toggle', rwr, requirePermission('brandVoice.manage'), rejectIfLocked(BrandVoice, 'brandVoiceId'), brandVoiceController.toggleBrandVoice);
 
 // Avatars
 router.get('/:workspaceNumber/brand-voice/avatars', rwr, rp('brandVoice', 'read'), brandVoiceController.listAvatars);
 router.get('/:workspaceNumber/brand-voice/avatars/:avatarId', rwr, rp('brandVoice', 'read'), brandVoiceController.getAvatar);
-router.post('/:workspaceNumber/brand-voice/avatars', rwr, rp('brandVoice', 'manage'), brandVoiceController.createAvatar);
-router.put('/:workspaceNumber/brand-voice/avatars/:avatarId', rwr, rp('brandVoice', 'manage'), rejectIfLocked(Avatar, 'avatarId'), brandVoiceController.updateAvatar);
-router.delete('/:workspaceNumber/brand-voice/avatars/:avatarId', rwr, rp('brandVoice', 'manage'), brandVoiceController.deleteAvatar);
-router.patch('/:workspaceNumber/brand-voice/avatars/:avatarId/toggle', rwr, rp('brandVoice', 'manage'), rejectIfLocked(Avatar, 'avatarId'), brandVoiceController.toggleAvatar);
-router.post('/:workspaceNumber/brand-voice/avatars/:avatarId/test', rwr, rp('brandVoice', 'manage'), rc('avatarTest', 3), brandVoiceController.testAvatar);
+router.post('/:workspaceNumber/brand-voice/avatars', rwr, requirePermission('brandVoice.manage'), brandVoiceController.createAvatar);
+router.put('/:workspaceNumber/brand-voice/avatars/:avatarId', rwr, requirePermission('brandVoice.manage'), rejectIfLocked(Avatar, 'avatarId'), brandVoiceController.updateAvatar);
+router.delete('/:workspaceNumber/brand-voice/avatars/:avatarId', rwr, requirePermission('brandVoice.manage'), brandVoiceController.deleteAvatar);
+router.patch('/:workspaceNumber/brand-voice/avatars/:avatarId/toggle', rwr, requirePermission('brandVoice.manage'), rejectIfLocked(Avatar, 'avatarId'), brandVoiceController.toggleAvatar);
+router.post('/:workspaceNumber/brand-voice/avatars/:avatarId/test', rwr, requirePermission('brandVoice.manage'), rc('avatarTest', estAvatarTest), brandVoiceController.testAvatar);
 
 // Google Doc URL import
-router.post('/:workspaceNumber/brand-voice/avatars/:avatarId/import-url', rwr, rp('brandVoice', 'manage'), brandVoiceController.importGoogleDoc);
+router.post('/:workspaceNumber/brand-voice/avatars/:avatarId/import-url', rwr, requirePermission('brandVoice.manage'), brandVoiceController.importGoogleDoc);
 
 // Avatar file uploads (with multer error handling)
 router.post(
   '/:workspaceNumber/brand-voice/avatars/:avatarId/upload',
   rwr,
-  rp('brandVoice', 'manage'),
+  requirePermission('brandVoice.manage'),
   (req, res, next) => {
     upload.single('file')(req, res, (err) => {
       if (err) {
@@ -93,7 +103,7 @@ router.post(
 router.delete(
   '/:workspaceNumber/brand-voice/avatars/:avatarId/upload/:uploadId',
   rwr,
-  rp('brandVoice', 'manage'),
+  requirePermission('brandVoice.manage'),
   brandVoiceController.deleteAvatarUpload
 );
 
@@ -101,7 +111,7 @@ router.delete(
 router.post(
   '/:workspaceNumber/brand-voice/avatars/:avatarId/image',
   rwr,
-  rp('brandVoice', 'manage'),
+  requirePermission('brandVoice.manage'),
   (req, res, next) => {
     imageUpload.single('image')(req, res, (err) => {
       if (err) {
@@ -118,7 +128,7 @@ router.post(
 router.delete(
   '/:workspaceNumber/brand-voice/avatars/:avatarId/image',
   rwr,
-  rp('brandVoice', 'manage'),
+  requirePermission('brandVoice.manage'),
   brandVoiceController.deleteAvatarImage
 );
 

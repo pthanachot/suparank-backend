@@ -1,4 +1,5 @@
 const Stripe = require('stripe');
+const STRIPE_API_VERSION = require('../config/stripeApiVersion');
 const User = require('../models/User');
 const Organization = require('../models/Organization');
 const Subscription = require('../models/Subscription');
@@ -9,7 +10,9 @@ const Workspace = require('../models/Workspace');
 const CreditTransaction = require('../models/CreditTransaction');
 const { clearTierCache, getOrgTierConfig, getTierConfig } = require('../services/tierService');
 const { applyLocksForOrg } = require('../services/downgradeService');
+const lifecycleService = require('../services/lifecycleService');
 const creditService = require('../services/creditService');
+const trackerScheduleService = require('../services/trackerScheduleService');
 const { getPlanFromPriceId, EXTRA_SEAT_PRICE_SET } = require('../config/stripePrices');
 const { getPackById } = require('../config/creditPacks');
 const { applyCustomTemplate } = require('./emailPortalController');
@@ -17,7 +20,7 @@ const { sendEmail } = require('../utils/emailService');
 const { getSettings } = require('../services/systemSettingsService');
 const auditService = require('../services/auditService');
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: STRIPE_API_VERSION });
 
 // Convert Stripe Unix timestamps (seconds) to Date objects
 function parseStripeDate(ts) {
@@ -214,13 +217,15 @@ async function handleCheckoutCompleted(session) {
     console.error(`[downgradeService] checkout lock error for org=${organizationId}:`, err.message)
   );
 
-  // Grant subscription credits for new plan
+  // Grant subscription credits for the new plan. Phase 7: use the idempotent
+  // monthly grant (rollover 0 for a brand-new subscriber) so the expiry is the
+  // monthly rollover window — not the Stripe period end (a year out on annual
+  // plans) — and a redelivered checkout event can't re-grant the same month.
   try {
     const { config } = await getOrgTierConfig(organizationId);
     if (config?.creditsPerMonth) {
-      const periodEnd = parseStripeDate(subItem?.current_period_end || stripeSub.current_period_end);
-      await creditService.grantSubscriptionCredits(organizationId, config.creditsPerMonth, periodEnd || null);
-      console.log(`[credits] Granted ${config.creditsPerMonth} credits for org=${organizationId}`);
+      const r = await creditService.grantMonthlyCreditsIfDue(organizationId, config.creditsPerMonth);
+      console.log(`[credits] Checkout grant org=${organizationId}: ${r.granted ? r.amount : r.reason}`);
     }
   } catch (err) {
     console.error(`[credits] Failed to grant on checkout for org=${organizationId}:`, err.message);
@@ -402,6 +407,23 @@ async function handleSubscriptionUpdated(stripeSub) {
     applyLocksForOrg(sub.organizationId).catch((err) =>
       console.error(`[downgradeService] subscription update lock error for org=${sub.organizationId}:`, err.message)
     );
+    // Phase 18 (DARK): re-evaluate tenant lifecycle from the new entitlement —
+    // start wind-down if the agency lost saasMode, or recover if it came back.
+    // Inert unless saasMode is live.
+    lifecycleService.reconcile(sub.organizationId).catch((err) =>
+      console.error(`[lifecycle] reconcile error for org=${sub.organizationId}:`, err.message)
+    );
+    // Phase 11 review follow-up: once the org is active on a PAID tier, re-arm any
+    // trackers the Free-tier scan gate unscheduled (nextScanAt=null) so automated
+    // scans resume without a manual refresh. Idempotent + fire-and-forget (a
+    // scheduling side-effect must never fail the billing webhook).
+    const activePaid = (sub.status === 'active' || sub.status === 'trialing')
+      && sub.planId && sub.planId.split('-')[0] !== 'free';
+    if (activePaid) {
+      trackerScheduleService.rearmTrackersForOrg(sub.organizationId).catch((err) =>
+        console.error(`[tracker] re-arm error for org=${sub.organizationId}:`, err.message)
+      );
+    }
   }
 
   // Handle credit pro-rating on plan change
@@ -469,6 +491,11 @@ async function handleSubscriptionDeleted(stripeSub) {
   // Lock excess resources — org falls back to free tier
   applyLocksForOrg(sub.organizationId).catch((err) =>
     console.error(`[downgradeService] subscription delete lock error for org=${sub.organizationId}:`, err.message)
+  );
+  // Phase 18 (DARK): agency lost its subscription entirely → start wind-down if
+  // it has live client assets. Inert unless saasMode is live.
+  lifecycleService.reconcile(sub.organizationId).catch((err) =>
+    console.error(`[lifecycle] reconcile error for org=${sub.organizationId}:`, err.message)
   );
 
   // Expire remaining subscription credits
@@ -563,15 +590,23 @@ async function handlePaymentSucceeded(invoice) {
   });
   await sub.save();
 
-  // Grant credits on subscription renewal (not initial checkout)
+  // Grant credits on subscription renewal (not initial checkout). Phase 7:
+  // ROLL OVER instead of expire+replace — grantMonthlyCreditsIfDue carries up to
+  // one month's unused credits into the new period (idempotent per calendar month
+  // so the monthly cron never double-grants the same renewal). For a MONTHLY plan
+  // this fires each cycle; a YEARLY plan renews here once/year and the cron fills
+  // the other 11 months.
   if (invoice.billing_reason === 'subscription_cycle') {
     try {
       const { config } = await getOrgTierConfig(sub.organizationId);
       if (config?.creditsPerMonth) {
-        await creditService.expireSubscriptionCredits(sub.organizationId);
-        const newPeriodEnd = parseStripeDate(invoice.lines?.data?.[0]?.period?.end);
-        await creditService.grantSubscriptionCredits(sub.organizationId, config.creditsPerMonth, newPeriodEnd || null);
-        console.log(`[credits] Renewed ${config.creditsPerMonth} credits for org=${sub.organizationId}`);
+        // Expiry is the monthly rollover window computed inside the service — NOT
+        // the invoice period end (which for a yearly plan is a year out).
+        const r = await creditService.grantMonthlyCreditsIfDue(
+          sub.organizationId,
+          config.creditsPerMonth,
+        );
+        console.log(`[credits] Renewal grant org=${sub.organizationId}: ${r.granted ? `${r.amount} (+${r.rolledOver} rollover)` : r.reason}`);
       }
     } catch (err) {
       console.error(`[credits] Failed to renew credits for org=${sub.organizationId}:`, err.message);

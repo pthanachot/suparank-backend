@@ -20,8 +20,9 @@
 
 const Stripe = require('stripe');
 
-// Pinned to the API version bundled with stripe@20.4.x (types/apiVersion.d.ts).
-const STRIPE_API_VERSION = '2026-02-25.clover';
+// Pinned Stripe API version — single source shared with every other `new Stripe()`
+// in the app (legacy controllers + cutover scripts) via config/stripeApiVersion.
+const STRIPE_API_VERSION = require('../config/stripeApiVersion');
 
 // Platform Stripe instance. The Stripe constructor THROWS when the key is
 // missing, so fall back to a harmless placeholder to keep module import (and

@@ -56,6 +56,7 @@ const agencyPlanSchema = new mongoose.Schema(
       maxArticlesPerMonth: { type: Number, default: null },
       maxAiTrackerPromptsPerMonth: { type: Number, default: null },
       maxKeywordLookupsPerMonth: { type: Number, default: null },
+      maxAuditsPerMonth: { type: Number, default: null },
       creditsPerMonth: { type: Number, default: null },
       maxSeats: { type: Number, default: null },
     },

@@ -10,7 +10,20 @@
  * 5. Session is discarded
  */
 
+// The writing engine (agentic chat/agent/plan, /api/session/*) is a SEPARATE
+// app from the analysis engine (ENGINE_URL, /api/analyze etc.). Resolve only
+// WRITING_ENGINE_URL — never fall back to ENGINE_URL, or a split-host deploy
+// would send session traffic to the analysis engine.
 const WRITING_ENGINE_URL = process.env.WRITING_ENGINE_URL || 'http://localhost:8090';
+
+// Bound for the quick config-push / metadata calls below (createSession,
+// pushDocument, pushBrief, …). Without a deadline a hung engine holds the
+// request open for undici's ~300s default, stacking up requests. Streaming
+// helpers (sendChatMessageStream, startAgent) are intentionally exempt — they
+// run for minutes and are bounded only by the caller's disconnect signal.
+const ENGINE_PUSH_TIMEOUT_MS = 30000;
+// fast-plan invokes the LLM, so it needs more headroom than a pure config push.
+const ENGINE_FAST_PLAN_TIMEOUT_MS = 60000;
 
 /**
  * Standard headers for engine calls. The engine authenticates callers with
@@ -35,7 +48,7 @@ async function createSession(signal) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session`, {
     method: 'POST',
     headers: engineHeaders(),
-    signal,
+    signal: signal ?? AbortSignal.timeout(ENGINE_PUSH_TIMEOUT_MS),
   });
   if (!res.ok) {
     throw new Error(`Writing Engine: create session failed (${res.status})`);
@@ -54,10 +67,12 @@ async function pushDocument(sessionId, markdownContent, signal) {
     method: 'POST',
     headers: engineHeaders(),
     body: JSON.stringify({ content: markdownContent }),
-    signal,
+    signal: signal ?? AbortSignal.timeout(ENGINE_PUSH_TIMEOUT_MS),
   });
   if (!res.ok) {
-    throw new Error(`Writing Engine: push document failed (${res.status})`);
+    const err = new Error(`Writing Engine: push document failed (${res.status})`);
+    err.status = res.status; // 13b: lets setupSessionLite retry once on a stale-session 404
+    throw err;
   }
 }
 
@@ -72,6 +87,7 @@ async function pushBrief(sessionId, brief) {
     method: 'POST',
     headers: engineHeaders(),
     body: JSON.stringify(brief),
+    signal: AbortSignal.timeout(ENGINE_PUSH_TIMEOUT_MS),
   });
   if (!res.ok) {
     throw new Error(`Writing Engine: push brief failed (${res.status})`);
@@ -89,6 +105,7 @@ async function pushBrandVoice(sessionId, markdownContent) {
     method: 'POST',
     headers: engineHeaders(),
     body: JSON.stringify({ content: markdownContent }),
+    signal: AbortSignal.timeout(ENGINE_PUSH_TIMEOUT_MS),
   });
   if (!res.ok) {
     throw new Error(`Writing Engine: push brand voice failed (${res.status})`);
@@ -105,12 +122,15 @@ async function pushBrandVoice(sessionId, markdownContent) {
  *
  * @param {string} sessionId
  * @param {string} style - preset name (e.g. "editorial") or custom prompt; '' clears
+ * @param {AbortSignal} [signal] - 11d: bounds the push so a hung engine can't
+ *        hold the image-setup path on undici's ~300s default
  */
-async function pushImageStyle(sessionId, style) {
+async function pushImageStyle(sessionId, style, signal) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/image-style`, {
     method: 'POST',
     headers: engineHeaders(),
     body: JSON.stringify({ style: style || '' }),
+    signal: signal ?? AbortSignal.timeout(ENGINE_PUSH_TIMEOUT_MS),
   });
   if (!res.ok) {
     throw new Error(`Writing Engine: push image style failed (${res.status})`);
@@ -131,10 +151,10 @@ async function pushImageStyle(sessionId, style) {
  * @param {AbortSignal} [signal] - optional signal to abort the stream when the client disconnects
  * @returns {Promise<Response>} The raw fetch response (SSE stream)
  */
-async function sendChatMessageStream(sessionId, prompt, signal) {
+async function sendChatMessageStream(sessionId, prompt, signal, preset) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/chat`, {
     method: 'POST',
-    headers: engineHeaders(),
+    headers: engineHeaders(preset ? { 'X-Model-Preset': preset } : {}),
     body: JSON.stringify({ prompt }),
     signal,
   });
@@ -157,7 +177,7 @@ async function sendChatMessageStream(sessionId, prompt, signal) {
  * @param {string[]} [allowedTools] - restrict agent to only these tools (e.g. ["EditTool"])
  * @returns {Promise<Response>} The raw fetch response (SSE stream)
  */
-async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5, signal, allowedTools, mode) {
+async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5, signal, allowedTools, mode, preset) {
   const payload = { goal, targetScore, maxIterations };
   if (allowedTools?.length > 0) {
     payload.allowedTools = allowedTools;
@@ -167,7 +187,7 @@ async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5, 
   }
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/agent`, {
     method: 'POST',
-    headers: engineHeaders(),
+    headers: engineHeaders(preset ? { 'X-Model-Preset': preset } : {}),
     body: JSON.stringify(payload),
     signal,
   });
@@ -196,7 +216,44 @@ async function generateImage(sessionId, { description, format, style }) {
   });
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Writing Engine: image generation failed (${res.status}): ${body}`);
+    const err = new Error(`Writing Engine: image generation failed (${res.status}): ${body}`);
+    // R2b: the engine now requires the session (404 on unknown id). Carry the
+    // status so the controller can drop a stale contentSessionMap entry
+    // (engine redeployed with a fresh DB) and retry with a new session.
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+/**
+ * R15: Cmd+K-style inline edit — the fast, single-call path for the editor's
+ * quick actions (Rewrite/Expand/Shorten/Readability). Non-streaming: the engine
+ * runs one validation-model pass and returns the replacement text.
+ *
+ * The engine requires selectedText to exist verbatim in the session document
+ * (push it first via pushDocument/setupSession) and returns
+ * { originalText, editedText, applied, diff, error? }.
+ *
+ * @param {string} sessionId
+ * @param {{ selectedText: string, instruction: string, context?: string }} params
+ * @returns {Promise<{ originalText: string, editedText: string, applied: boolean, error?: string }>}
+ */
+async function inlineEdit(sessionId, { selectedText, instruction, context }) {
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/inline-edit`, {
+    method: 'POST',
+    headers: engineHeaders(),
+    body: JSON.stringify({ selectedText, instruction, context }),
+    // 20s > the engine's 15s LLM client timeout, so on a slow model the
+    // engine's own cleaner error (→ 422 → chat fallback) usually wins the
+    // race instead of an abort here surfacing as a generic 502. (Was 15s ==
+    // 15s, a coin flip.) Not a hard guarantee: the engine also spends time on
+    // the DB apply + webhook after the model call.
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Writing Engine: inline edit failed (${res.status}): ${body}`);
   }
   return res.json();
 }
@@ -226,6 +283,7 @@ async function pushMode(sessionId, mode, allowedTools) {
     method: 'POST',
     headers: engineHeaders(),
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(ENGINE_PUSH_TIMEOUT_MS),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -248,6 +306,7 @@ async function pushPlan(sessionId, plan) {
     method: 'POST',
     headers: engineHeaders(),
     body: payload,
+    signal: AbortSignal.timeout(ENGINE_PUSH_TIMEOUT_MS),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -266,6 +325,7 @@ async function pushCFSConfig(sessionId, { baseUrl, apiKey, workspaceNumber, cont
     method: 'POST',
     headers: engineHeaders(),
     body: JSON.stringify({ baseUrl, apiKey, workspaceNumber, contentNumber }),
+    signal: AbortSignal.timeout(ENGINE_PUSH_TIMEOUT_MS),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -284,6 +344,7 @@ async function generateFastPlan(sessionId, { brief, outline, indexSummary }) {
     method: 'POST',
     headers: engineHeaders(),
     body: JSON.stringify({ brief, outline, indexSummary }),
+    signal: AbortSignal.timeout(ENGINE_FAST_PLAN_TIMEOUT_MS),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -300,6 +361,7 @@ async function listSkills() {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/skills`, {
     method: 'GET',
     headers: engineHeaders({ Accept: 'application/json' }),
+    signal: AbortSignal.timeout(ENGINE_PUSH_TIMEOUT_MS),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -321,10 +383,16 @@ async function submitClarifyAnswer(sessionId, answer) {
     method: 'POST',
     headers: engineHeaders(),
     body: JSON.stringify({ answer }),
+    // Depositing the answer into the engine's clarify channel is sub-second;
+    // without a signal a hung engine holds this request on undici's ~300s
+    // default and the user's modal spinner with it.
+    signal: AbortSignal.timeout(30000),
   });
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Writing Engine: clarify answer failed (${res.status}): ${body}`);
+    const err = new Error(`Writing Engine: clarify answer failed (${res.status}): ${body}`);
+    err.status = res.status; // let the controller pass the engine status through
+    throw err;
   }
   return res.json();
 }
@@ -342,6 +410,7 @@ async function pushContextFiles(sessionId, files) {
     method: 'POST',
     headers: engineHeaders(),
     body: JSON.stringify({ files }),
+    signal: AbortSignal.timeout(ENGINE_PUSH_TIMEOUT_MS),
   });
   if (!res.ok) {
     throw new Error(`Writing Engine: push context files failed (${res.status})`);
@@ -352,42 +421,45 @@ async function pushContextFiles(sessionId, files) {
  * Submit the user's plan confirmation response.
  *
  * @param {string} sessionId - Go engine session ID
- * @param {Object} response - { action: "confirm"|"retry"|"reject", selectedSteps: string[], mode: "auto"|"step-by-step" }
+ * @param {Object} response - { action: "confirm"|"retry"|"reject", selectedSteps: string[] }
  */
 async function submitPlanConfirm(sessionId, response) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/plan-confirm`, {
     method: 'POST',
     headers: engineHeaders(),
     body: JSON.stringify(response),
+    // 12b: mirror submitClarifyAnswer — resuming the agent loop past the
+    // confirm is sub-second on the engine's side, so bound the hop instead of
+    // letting a hung engine hold the request (and the user's modal) on
+    // undici's ~300s default. The controller maps the TimeoutError to 504.
+    signal: AbortSignal.timeout(30000),
   });
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Writing Engine: plan confirm failed (${res.status}): ${body}`);
+    const err = new Error(`Writing Engine: plan confirm failed (${res.status}): ${body}`);
+    err.status = res.status; // let the controller pass the engine status through
+    throw err;
   }
   return res.json();
 }
 
-/**
- * Submit the user's tool confirm response (step-by-step mode).
- *
- * @param {string} sessionId - Go engine session ID
- * @param {string} action - "apply", "skip", or "retry"
- */
-async function submitToolConfirm(sessionId, action) {
-  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/tool-confirm`, {
-    method: 'POST',
-    headers: engineHeaders(),
-    body: JSON.stringify({ action }),
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Writing Engine: tool confirm failed (${res.status}): ${body}`);
+// E8: liveness probe for /health. Non-fatal by design — the caller reports the
+// result as informational and never flips its own status on engine-down. Tightly
+// timed so a slow/hung engine can't stall the (frequently polled) health check.
+async function checkEngineHealth() {
+  try {
+    const res = await fetch(`${WRITING_ENGINE_URL}/health`, {
+      signal: AbortSignal.timeout(1500),
+    });
+    return res.ok ? 'ok' : 'unhealthy';
+  } catch {
+    return 'unreachable';
   }
-  return res.json();
 }
 
 module.exports = {
   createSession,
+  checkEngineHealth,
   pushDocument,
   pushBrief,
   pushBrandVoice,
@@ -400,10 +472,10 @@ module.exports = {
   sendChatMessageStream,
   startAgent,
   generateImage,
+  inlineEdit,
   submitClarifyAnswer,
   pushContextFiles,
   submitPlanConfirm,
-  submitToolConfirm,
   WRITING_ENGINE_URL,
   engineHeaders,
 };

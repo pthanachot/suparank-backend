@@ -29,12 +29,59 @@ const BrandVoiceTestLog = require('../models/BrandVoiceTestLog');
 const Avatar = require('../models/Avatar');
 const BrandVoice = require('../models/BrandVoice');
 const creditService = require('../services/creditService');
+const tierService = require('../services/tierService');
 const Stripe = require('stripe');
+const STRIPE_API_VERSION = require('../config/stripeApiVersion');
+const tailRiskService = require('../services/tailRiskService');
+const { isAdminEmail } = require('../utils/adminEmails');
+
+// ─── Canonical MRR pricing (Phase 11) ───────────────────────────
+// Single source of truth for admin revenue: prices come from the tier config
+// (configTiers → TierConfig monthlyPrice/yearlyPrice/extraSeatPrice), NOT stale
+// inline maps. Normalises the pro→professional legacy alias so BOTH real Stripe
+// subs (planId 'pro-*') and admin-overridden orgs ('professional-*') price at
+// their TRUE tier. Yearly bills at yearlyPrice/12; purchased extra editor seats
+// add extraSeatPrice each. Free / unknown plan → 0.
+const MRR_TIERS = ['standard', 'professional', 'agency'];
+
+async function loadTierPriceMap() {
+  const configs = await Promise.all(MRR_TIERS.map((t) => tierService.getTierConfig(t)));
+  const map = {};
+  MRR_TIERS.forEach((t, i) => {
+    map[t] = configs[i] || null;
+    // A null config here (TierConfig not synced / lookup failure) makes every sub
+    // on that tier price at $0 — surface it rather than silently under-reporting MRR.
+    if (!configs[i]) console.warn(`[admin] MRR: no TierConfig for '${t}' — subs on this tier will price at $0`);
+  });
+  return map;
+}
+
+function subMonthlyRevenue(sub, priceMap) {
+  if (!sub?.planId || sub.planId === 'free') return 0;
+  const [rawTier, billing] = sub.planId.split('-');
+  const tier = rawTier === 'pro' ? 'professional' : rawTier; // normalise legacy alias
+  const cfg = priceMap[tier];
+  if (!cfg) return 0;
+  let mrr = billing === 'yearly'
+    ? Math.round((cfg.yearlyPrice || 0) / 12)
+    : (cfg.monthlyPrice || 0);
+  const extra = sub.purchasedExtraSeats || 0;
+  if (extra > 0) mrr += extra * (cfg.extraSeatPrice || 0);
+  return mrr;
+}
 
 // ─── User lookup (for frontend admin auth verification) ─────
 
 const userLookup = async (req, res) => {
   try {
+    // Phase 19B: an impersonation session must never be reported as admin — even
+    // the frontend shell. Unlike the real admin data routes (adminMiddleware →
+    // validateAdmin), this route is authenticateToken-only, so it enforces the
+    // impersonation block itself.
+    if (req.user?.impersonatedBy) {
+      return res.status(403).json({ valid: false, error: 'Admin access required' });
+    }
+
     const user = await User.findById(req.user.userId).select('userId email roles status');
 
     if (!user) {
@@ -45,12 +92,8 @@ const userLookup = async (req, res) => {
       return res.status(403).json({ valid: false, error: 'User account not active' });
     }
 
-    // Check admin email list — union of env var and DB-managed settings list
-    const { getSettings } = require('../services/systemSettingsService');
-    const adminEmails = (process.env.ADMIN_EMAILS || '').split(',').map((e) => e.trim().toLowerCase());
-    const dbAdminEmails = (getSettings().adminEmails || []).map((e) => String(e).toLowerCase());
-    const isAdmin =
-      adminEmails.includes(user.email.toLowerCase()) || dbAdminEmails.includes(user.email.toLowerCase());
+    // Admin email = union of env + DB-managed list (single source of truth).
+    const isAdmin = isAdminEmail(user.email);
 
     // Also check roles array
     const hasAdminRole =
@@ -91,6 +134,7 @@ const getDashboardStats = async (req, res) => {
       activeSubscriptions,
       totalWorkspaces,
       totalContent,
+      tailRiskOrgs,
     ] = await Promise.all([
       User.countDocuments(),
       User.countDocuments({ createdAt: { $gte: thirtyDaysAgo } }),
@@ -98,22 +142,27 @@ const getDashboardStats = async (req, res) => {
       Subscription.countDocuments({ status: { $in: ['active', 'trialing'] } }),
       Workspace.countDocuments(),
       Content.countDocuments(),
+      // Phase 14: >200-articles/mo negative-margin tail cohort (watchable tile).
+      // Non-fatal: a telemetry tile must never 500 the whole dashboard — but log
+      // the failure so a broken query is observable, not a permanent silent 0.
+      tailRiskService.countHighVolumeOrgs().catch((e) => {
+        console.error('[admin] tailRisk cohort query failed:', e.message);
+        return 0;
+      }),
     ]);
 
-    // Revenue estimate from active subscriptions
+    // Revenue estimate from active subscriptions — priced from the canonical
+    // tier config (fixes the pre-v4.1 bug where real 'pro-*' subs matched no
+    // branch → Pro counted as $0, and Pro/Agency were mis-priced at $79/$199).
     const subscriptions = await Subscription.find({
       status: { $in: ['active', 'trialing'] },
     })
-      .select('planId')
+      .select('planId purchasedExtraSeats')
       .lean();
 
+    const priceMap = await loadTierPriceMap();
     let monthlyRevenue = 0;
-    for (const sub of subscriptions) {
-      const plan = sub.planId || '';
-      if (plan.includes('standard')) monthlyRevenue += 29;
-      else if (plan.includes('professional')) monthlyRevenue += 79;
-      else if (plan.includes('agency')) monthlyRevenue += 199;
-    }
+    for (const sub of subscriptions) monthlyRevenue += subMonthlyRevenue(sub, priceMap);
 
     // Credit stats
     const creditTxs = await CreditTransaction.countDocuments({
@@ -129,6 +178,7 @@ const getDashboardStats = async (req, res) => {
       totalContent,
       monthlyRevenue,
       creditTransactions: creditTxs,
+      tailRiskOrgs,
     });
   } catch (error) {
     console.error('[admin] getDashboardStats error:', error.message);
@@ -278,7 +328,18 @@ const getSubscriptions = async (req, res) => {
 
     const filter = {};
     if (status !== 'all') filter.status = status;
-    if (plan !== 'all') filter.planId = { $regex: `^${plan}`, $options: 'i' };
+    if (plan !== 'all') {
+      // 'professional' subs are stored with BOTH the legacy `pro-*` and the
+      // newer `professional-*` planId prefixes (stripeCatalog: the professional
+      // tier's canonical prefix is `pro-*`; Subscription.js enum lists both).
+      // The old `^${plan}` regex matched only `professional-*`, hiding every
+      // real Stripe `pro-*` Professional customer from the admin list. Match
+      // both aliases for that tier; every other plan keeps the original prefix
+      // match unchanged (no `pro` bleed — no other tier planId starts with "pro").
+      filter.planId = (plan === 'professional' || plan === 'pro')
+        ? { $regex: '^(pro|professional)', $options: 'i' }
+        : { $regex: `^${plan}`, $options: 'i' };
+    }
 
     // Build sort
     const sortField = ['createdAt', 'currentPeriodEnd', 'planId'].includes(sortBy) ? sortBy : 'createdAt';
@@ -706,7 +767,7 @@ const updateSubscription = async (req, res) => {
       // Stripe is the source of truth: call it first, persist only on success.
       // Credits expiry, usage reset, and customer email are owned by the
       // webhook handlers (subscription.updated / subscription.deleted).
-      const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+      const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: STRIPE_API_VERSION });
       try {
         if (action === 'cancel_at_period_end') {
           await stripe.subscriptions.update(sub.stripeSubscriptionId, {
@@ -996,7 +1057,7 @@ const resetOrgToFree = async (req, res) => {
     // 1. Cancel Stripe subscription immediately
     if (oldSub?.stripeSubscriptionId) {
       try {
-        const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+        const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: STRIPE_API_VERSION });
         await stripe.subscriptions.cancel(oldSub.stripeSubscriptionId);
         summary.stripeCanceled = true;
         console.log(`[admin] Stripe subscription ${oldSub.stripeSubscriptionId} canceled for org ${orgId} (reset to free)`);
@@ -1056,10 +1117,15 @@ const resetOrgToFree = async (req, res) => {
 
 // ─── Arbitrary plan override (DB only, no billing effect) ────
 
+// Canonical plan ids are `pro-*` (see stripePrices.js — real Stripe subs use
+// these). `professional-*` is accepted as a legacy alias so existing overrides
+// don't break; both resolve to the same tier/price via subMonthlyRevenue's
+// pro→professional normalisation.
 const VALID_PLAN_IDS = [
   'free',
   'standard-monthly', 'standard-yearly',
-  'professional-monthly', 'professional-yearly',
+  'pro-monthly', 'pro-yearly',
+  'professional-monthly', 'professional-yearly', // legacy alias, still accepted
   'agency-monthly', 'agency-yearly',
 ];
 
@@ -1122,16 +1188,10 @@ const overrideOrgPlan = async (req, res) => {
 
 // ─── Subscription stats ─────────────────────────────────────
 
-const PLAN_MONTHLY_PRICES = {
-  standard: 29,
-  professional: 79,
-  pro: 79, // legacy alias
-  agency: 199,
-};
-
 const getSubscriptionStats = async (req, res) => {
   try {
-    const subscriptions = await Subscription.find().select('planId status').lean();
+    const subscriptions = await Subscription.find().select('planId status purchasedExtraSeats').lean();
+    const priceMap = await loadTierPriceMap();
 
     let activeCount = 0;
     let pastDueCount = 0;
@@ -1151,13 +1211,9 @@ const getSubscriptionStats = async (req, res) => {
         planDistribution[sub.planId] = (planDistribution[sub.planId] || 0) + 1;
       }
 
-      // MRR from active/trialing subs
+      // MRR from active/trialing subs — canonical tier pricing (see helper).
       if (sub.status === 'active' || sub.status === 'trialing') {
-        const tier = sub.planId?.split('-')[0];
-        const billing = sub.planId?.split('-')[1];
-        const base = PLAN_MONTHLY_PRICES[tier] || 0;
-        // Yearly plans: annual price = monthly×10, so MRR = annual/12
-        monthlyRevenue += billing === 'yearly' ? Math.round((base * 10) / 12) : base;
+        monthlyRevenue += subMonthlyRevenue(sub, priceMap);
       }
     }
 
@@ -1596,7 +1652,7 @@ async function cascadeDeleteOrganization(orgId) {
   const sub = await Subscription.findOne({ organizationId: orgId }).lean();
   if (sub?.stripeSubscriptionId) {
     try {
-      const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+      const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: STRIPE_API_VERSION });
       await stripe.subscriptions.cancel(sub.stripeSubscriptionId);
       counts.stripeSubscriptionCanceled = true;
       console.log(`[admin] Stripe subscription ${sub.stripeSubscriptionId} canceled for org ${orgId}`);

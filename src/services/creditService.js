@@ -22,7 +22,10 @@ const Credit = require('../models/Credit');
 const UserCredit = require('../models/UserCredit');
 const CreditTransaction = require('../models/CreditTransaction');
 const UsageTracker = require('../models/UsageTracker');
+const WorkspaceUsageTracker = require('../models/WorkspaceUsageTracker');
 const tierService = require('./tierService');
+const workspaceQuotaService = require('./workspaceQuotaService');
+const { resolveCredits } = require('../config/creditRules');
 
 // ─── Helpers ─────────────────────────────────────────────────
 
@@ -191,6 +194,22 @@ async function preDeduct(orgId, userId, amount, feature, metadata = {}) {
   // logTransaction call produced a different timestamp.
   const groupId = crypto.randomUUID();
 
+  // Phase 17 (DARK): resolve client-billing BEFORE the transaction (read-only
+  // reference data, not session-bound). Returns null unless saasMode is live AND
+  // metadata.workspaceId names a client-billed workspace — so with the flag dark
+  // wsBilled is always null and every branch below is byte-identical to pre-P17.
+  let wsBilled = null;
+  if (metadata.workspaceId) {
+    const limits = await workspaceQuotaService.resolveWorkspacePlanLimits(metadata.workspaceId);
+    if (limits) {
+      wsBilled = {
+        workspaceId: metadata.workspaceId,
+        creditsLimit: limits.creditsPerMonth ?? null, // null = unlimited on the plan
+        period: tierService.getPeriod('monthly'),
+      };
+    }
+  }
+
   for (let attempt = 0; attempt < MAX_TX_RETRIES; attempt++) {
     const session = await mongoose.startSession();
     try {
@@ -211,12 +230,29 @@ async function preDeduct(orgId, userId, amount, feature, metadata = {}) {
         subEffective = 0;
       }
 
-      // Three-way split: subscription → org purchased → user free (personal credits last)
+      // Phase 17 (DARK): hard-cap a client-billed workspace at its plan's monthly
+      // credit allocation. Checked INSIDE the txn against the committed counter so
+      // concurrent generations can't race past the cap. Throws → callers already
+      // map preDeduct errors to 402. Inert when wsBilled is null (flag dark).
+      if (wsBilled?.creditsLimit != null) {
+        const wsRow = await WorkspaceUsageTracker.findOne(
+          { workspaceId: wsBilled.workspaceId, period: wsBilled.period }
+        ).session(session);
+        const wsUsed = wsRow?.creditsUsed || 0;
+        if (wsUsed + amount > wsBilled.creditsLimit) {
+          throw new Error('Insufficient credits: client plan monthly limit reached');
+        }
+      }
+
+      // Three-way split: subscription → org purchased → user free (personal
+      // credits last). B1: a client-billed workspace draws ONLY from the agency's
+      // org pool — never a member's personal free credits (the agency is billing
+      // a client for this work), so user_free is excluded from the overflow.
       const fromSubscription = Math.min(subEffective, amount);
       let remaining = amount - fromSubscription;
       const fromOrgGeneral = Math.min(orgGeneralAvail, remaining);
       remaining -= fromOrgGeneral;
-      const fromUserFree = Math.min(userFreeAvail, remaining);
+      const fromUserFree = wsBilled ? 0 : Math.min(userFreeAvail, remaining);
       const totalDeducted = fromSubscription + fromUserFree + fromOrgGeneral;
 
       if (totalDeducted < amount) {
@@ -263,6 +299,16 @@ async function preDeduct(orgId, userId, amount, feature, metadata = {}) {
         { upsert: true, new: true, setDefaultsOnInsert: true, session }
       );
 
+      // Phase 17 (DARK): mirror the consumption onto the client-billed workspace's
+      // own counter, in the SAME transaction, so the monthly cap stays accurate.
+      if (wsBilled) {
+        await WorkspaceUsageTracker.findOneAndUpdate(
+          { workspaceId: wsBilled.workspaceId, period: wsBilled.period },
+          { $inc: { creditsUsed: totalDeducted } },
+          { upsert: true, new: true, setDefaultsOnInsert: true, session }
+        );
+      }
+
       await session.commitTransaction();
       session.endSession();
 
@@ -280,6 +326,12 @@ async function preDeduct(orgId, userId, amount, feature, metadata = {}) {
         }
       };
 
+      // Carry the workspace period on each pooled tx so settle/refund can mirror
+      // the reversal onto the workspace counter (only present when client-billed).
+      const logMeta = wsBilled
+        ? { ...metadata, feature, estimatedTotal: amount, groupId, wsBilledPeriod: wsBilled.period }
+        : { ...metadata, feature, estimatedTotal: amount, groupId };
+
       if (fromSubscription > 0) {
         const tx = await safeLog({
           orgId,
@@ -288,7 +340,7 @@ async function preDeduct(orgId, userId, amount, feature, metadata = {}) {
           amount: -fromSubscription,
           pool: 'subscription',
           description: `${feature}: ${amount} credits`,
-          metadata: { ...metadata, feature, estimatedTotal: amount, groupId },
+          metadata: logMeta,
           balanceAfter: subEffective - fromSubscription,
           status: 'pending',
         });
@@ -303,7 +355,7 @@ async function preDeduct(orgId, userId, amount, feature, metadata = {}) {
           amount: -fromUserFree,
           pool: 'user_free',
           description: `${feature}: ${amount} credits`,
-          metadata: { ...metadata, feature, estimatedTotal: amount, groupId },
+          metadata: logMeta,
           balanceAfter: userFreeAvail - fromUserFree,
           status: 'pending',
         });
@@ -318,7 +370,7 @@ async function preDeduct(orgId, userId, amount, feature, metadata = {}) {
           amount: -fromOrgGeneral,
           pool: 'general',
           description: `${feature}: ${amount} credits`,
-          metadata: { ...metadata, feature, estimatedTotal: amount, groupId },
+          metadata: logMeta,
           balanceAfter: orgGeneralAvail - fromOrgGeneral,
           status: 'pending',
         });
@@ -478,7 +530,9 @@ async function settle(transactionId, actualAmount) {
   let refundRemaining = Math.max(0, totalDeducted - actualAmount);
 
   if (refundRemaining > 0) {
-    // Refund in reverse deduction order: user free → org purchased → subscription
+    // Refund POOLS in reverse deduction order: user free → org purchased →
+    // subscription. Bounded by what was actually recorded (a dropped tx log
+    // can't be refunded to its pool — see the counter note below).
     const refundOrder = [...relatedTxs].sort((a, b) => {
       const order = { user_free: 0, general: 1, subscription: 2 };
       return (order[a.pool] ?? 9) - (order[b.pool] ?? 9);
@@ -490,14 +544,32 @@ async function settle(transactionId, actualAmount) {
       await _refundToPool(rtx, amt);
       refundRemaining -= amt;
     }
+  }
 
-    // Decrement UsageTracker for the refunded total
-    const totalRefunded = Math.max(0, totalDeducted - actualAmount);
+  // Correct the usage counters by the TRUE over-charge (estimate − actual), based
+  // on the authoritative deducted amount captured at preDeduct time — NOT the sum
+  // of the persisted pool txs. preDeduct always deducts exactly `estimatedTotal`
+  // (it throws if the pools can't cover it) and increments the counters by that
+  // in-transaction, but the pool tx logs are best-effort: a dropped log would make
+  // a persisted-sum-based reversal short (or skip it entirely when the dropped tx
+  // was the excess), permanently over-counting creditsUsed against both the org
+  // tier and the workspace cap. Basing the counter reversal on estimatedTotal is
+  // exact in the normal case and self-healing when a log is lost. (Legacy txs
+  // without the marker fall back to the persisted total.)
+  const authDeducted = tx.metadata?.estimatedTotal ?? totalDeducted;
+  const counterRefund = Math.max(0, authDeducted - actualAmount);
+  if (counterRefund > 0) {
     if (tx.organizationId) {
       const { config } = await tierService.getOrgTierConfig(tx.organizationId);
-      const limitType = config?.creditLimitType || 'monthly';
-      const period = tierService.getPeriod(limitType);
-      await UsageTracker.increment(tx.organizationId, 'creditsUsed', period, -totalRefunded);
+      const period = tierService.getPeriod(config?.creditLimitType || 'monthly');
+      await UsageTracker.increment(tx.organizationId, 'creditsUsed', period, -counterRefund);
+    }
+    // Phase 17 (DARK): mirror onto the client-billed workspace counter (present
+    // only when preDeduct tagged the group as client-billed).
+    const wsId = tx.metadata?.workspaceId;
+    const wsPeriod = tx.metadata?.wsBilledPeriod;
+    if (wsId && wsPeriod) {
+      await WorkspaceUsageTracker.increment(wsId, 'creditsUsed', wsPeriod, -counterRefund);
     }
   }
 
@@ -560,12 +632,23 @@ async function refund(transactionId) {
     totalRefunded += amt;
   }
 
-  if (totalRefunded > 0 && tx.organizationId) {
-    // Decrement UsageTracker for the refunded amount
+  // Fully reverse the usage counters by the AUTHORITATIVE deducted amount captured
+  // at preDeduct time — not the persisted pool sum — so a dropped best-effort tx
+  // log can't leave creditsUsed over-counted against the org tier or workspace cap.
+  // Normal case: authDeducted === totalRefunded (identical to before). Legacy txs
+  // without the marker fall back to the persisted sum.
+  const authDeducted = tx.metadata?.estimatedTotal ?? totalRefunded;
+  if (authDeducted > 0 && tx.organizationId) {
     const { config } = await tierService.getOrgTierConfig(tx.organizationId);
-    const limitType = config?.creditLimitType || 'monthly';
-    const period = tierService.getPeriod(limitType);
-    await UsageTracker.increment(tx.organizationId, 'creditsUsed', period, -totalRefunded);
+    const period = tierService.getPeriod(config?.creditLimitType || 'monthly');
+    await UsageTracker.increment(tx.organizationId, 'creditsUsed', period, -authDeducted);
+
+    // Phase 17 (DARK): mirror on the client-billed workspace counter.
+    const wsId = tx.metadata?.workspaceId;
+    const wsPeriod = tx.metadata?.wsBilledPeriod;
+    if (wsId && wsPeriod) {
+      await WorkspaceUsageTracker.increment(wsId, 'creditsUsed', wsPeriod, -authDeducted);
+    }
   }
 
   // Mark all claimed transactions as refunded
@@ -586,9 +669,14 @@ async function refund(transactionId) {
 async function grantSubscriptionCredits(orgId, amount, expiresAt) {
   const credit = await getOrCreateCredit(orgId);
 
+  const now = new Date();
   credit.subscriptionCredits = amount;
   credit.subscriptionCreditsExpireAt = expiresAt || null;
-  credit.lastResetAt = new Date();
+  credit.lastResetAt = now;
+  // Phase 7: stamp the current month so the monthly cron / renewal path won't
+  // ALSO grant this month (this REPLACE grant is used by initial checkout +
+  // plan-change; the recurring path is grantMonthlyCreditsIfDue).
+  credit.creditPeriodKey = monthKey(now);
   credit.lowBalanceNotifiedAt = null; // re-arm the credits_low notification
   await credit.save();
 
@@ -705,6 +793,120 @@ async function grantGeneralCreditsIdempotent(orgId, amount, description, opts = 
 /**
  * Expire remaining subscription credits (on cancellation or before renewal).
  */
+/**
+ * Calendar-month key ("YYYY-MM", UTC) — the monthly-grant idempotency bucket.
+ * UTC so the boundary is deterministic regardless of server timezone.
+ */
+function monthKey(date) {
+  const d = date instanceof Date ? date : new Date(date);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+/**
+ * Phase 7 — grant the monthly subscription allocation with ONE-MONTH ROLLOVER,
+ * idempotent per calendar month. This is the recurring grant path (renewal
+ * webhook + monthly cron); it makes yearly plans still grant every month.
+ *
+ * Rollover ("increment-with-expiry, not replace"): unused subscription credits
+ * carry into the new month, CAPPED at one month's allocation, and take the new
+ * period's expiry — so at most `amount` rolls over and it lives one more month.
+ *   newBalance = min(currentUnexpired, amount) + amount        (≤ 2× amount)
+ *
+ * Idempotency + concurrency: an aggregation-pipeline `findOneAndUpdate` filtered
+ * on `creditPeriodKey !== thisMonth` both (a) computes the rollover from the
+ * CURRENT in-DB balance atomically — so a concurrent deduction is never lost to
+ * a stale read — and (b) lets only ONE caller win per month (a racing
+ * webhook+cron: the loser's filter misses). Returns { granted, ... }.
+ *
+ * Expiry is a ~1-month rollover window computed from `now` (start of the month
+ * AFTER next, UTC) — NOT the Stripe billing-period end. This is what keeps a
+ * YEARLY plan's credits expiring monthly instead of hoarding a year's worth: the
+ * monthly grant cadence, not the invoice cadence, drives expiry. (The rollover
+ * CAP — min(old, amount) — is the hard bound on the balance regardless.)
+ *
+ * @param {string} orgId
+ * @param {number} amount     the tier's creditsPerMonth
+ * @param {object} [opts]
+ *   @param {Date}   [opts.now]        injectable clock (tests / cron); default new Date()
+ *   @param {Date}   [opts.expiresAt]  override the computed rollover expiry (tests)
+ */
+async function grantMonthlyCreditsIfDue(orgId, amount, opts = {}) {
+  if (!amount || amount <= 0) return { granted: false, reason: 'zero_amount' };
+  const now = opts.now || new Date();
+  // Start of the month after next → gives this month + one rollover month before
+  // expiry, with a safe buffer so the NEXT monthly grant still sees these credits
+  // as unexpired and can roll them over (a tighter "start of next month" would
+  // expire them at the exact moment of the next grant).
+  const expiresAt = opts.expiresAt !== undefined
+    ? opts.expiresAt
+    : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 2, 1));
+  const periodKey = monthKey(now);
+
+  await getOrCreateCredit(orgId); // ensure the doc exists for the update below
+
+  // {new:false} → returns the PRE-update doc (or null if the filter missed, i.e.
+  // already granted this month). The $set pipeline computes the rollover in-DB.
+  const pre = await Credit.findOneAndUpdate(
+    { organizationId: orgId, creditPeriodKey: { $ne: periodKey } },
+    [
+      {
+        $set: {
+          subscriptionCredits: {
+            $add: [
+              amount,
+              {
+                $min: [
+                  amount,
+                  {
+                    // current balance, but 0 if it already expired
+                    $cond: [
+                      {
+                        $or: [
+                          { $eq: [{ $ifNull: ['$subscriptionCreditsExpireAt', null] }, null] },
+                          { $gt: ['$subscriptionCreditsExpireAt', now] },
+                        ],
+                      },
+                      { $ifNull: ['$subscriptionCredits', 0] },
+                      0,
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+          subscriptionCreditsExpireAt: expiresAt,
+          lastResetAt: now,
+          creditPeriodKey: periodKey,
+          lowBalanceNotifiedAt: null,
+        },
+      },
+    ],
+    { new: false }
+  );
+
+  if (!pre) return { granted: false, reason: 'already_granted', period: periodKey };
+
+  // Mirror the pipeline math in JS for the ledger entry + return value.
+  const priorUnexpired = (!pre.subscriptionCreditsExpireAt || pre.subscriptionCreditsExpireAt > now)
+    ? (pre.subscriptionCredits || 0)
+    : 0;
+  const rolledOver = Math.min(priorUnexpired, amount);
+  const balanceAfter = rolledOver + amount;
+
+  await CreditTransaction.logTransaction({
+    orgId,
+    type: 'subscription_grant',
+    amount,
+    pool: 'subscription',
+    description: `Monthly credits granted (${periodKey}${rolledOver ? `, +${rolledOver} rolled over` : ''})`,
+    metadata: { period: periodKey, rolledOver, expiresAt },
+    balanceAfter,
+  }).catch((e) => console.error('[creditService] monthly grant log failed:', e.message));
+
+  console.log(`[creditService] Monthly grant ${amount} (+${rolledOver} rollover) for org ${orgId} [${periodKey}]`);
+  return { granted: true, amount, rolledOver, balanceAfter, period: periodKey };
+}
+
 async function expireSubscriptionCredits(orgId) {
   const credit = await getOrCreateCredit(orgId);
   const expired = credit.subscriptionCredits;
@@ -713,6 +915,9 @@ async function expireSubscriptionCredits(orgId) {
 
   credit.subscriptionCredits = 0;
   credit.subscriptionCreditsExpireAt = null;
+  // Phase 7: clear the monthly-grant idempotency marker so a resubscribe in the
+  // same calendar month re-grants (grantMonthlyCreditsIfDue keys on this).
+  credit.creditPeriodKey = null;
   await credit.save();
 
   await CreditTransaction.logTransaction({
@@ -784,8 +989,151 @@ async function maybeNotifyLowBalance(orgId) {
   }
 }
 
+/**
+ * Finalized post-success deduction for request/response actions (Phase 6).
+ *
+ * WHY preDeduct + settle (not a bare preDeduct): preDeduct lands the tx in
+ * `status: 'pending'`. The 30-min orphan-sweep (index.js) refunds ANY pending
+ * tx it finds — it can't know the operation actually succeeded — so a bare
+ * preDeduct is silently reversed after 30 min, making the action free. settle()
+ * with actual == reserved refunds 0 and transitions the group to 'settled',
+ * putting it out of the sweep's reach.
+ *
+ * Best-effort by design: the operation already ran and its result was delivered,
+ * so a deduction failure (balance moved since the pre-flight gate, DB blip) must
+ * NOT throw back into the response path. It logs and returns { deducted: 0 }.
+ * The requireCredits gate's pre-flight 402 makes the insufficient case rare.
+ *
+ * @param {object} req  request carrying req.creditContext (from requireCredits)
+ * @param {object} [opts]
+ * @param {number} [opts.credits]  override amount for variable-cost actions
+ *   (e.g. keyword lookup priced per delivered row); defaults to the
+ *   gate-resolved req.creditContext.estimatedCredits.
+ * @param {object} [opts.metadata]  extra tx metadata (merged into feature meta)
+ * @returns {Promise<{deducted:number, error?:string}>}
+ */
+async function deductForRequest(req, { credits, metadata = {} } = {}) {
+  const cc = req?.creditContext;
+  if (!cc?.deductionEnabled) return { deducted: 0 };
+  const amount = credits != null ? credits : cc.estimatedCredits;
+  if (!amount || amount <= 0) return { deducted: 0 };
+  try {
+    const { transactionId } = await preDeduct(
+      cc.orgId,
+      cc.userId || req.user?.userId,
+      amount,
+      cc.featureKey,
+      { feature: cc.featureKey, workspaceId: cc.workspaceId, ...metadata }
+    );
+    // Finalize immediately so the orphan-sweep can't refund it. A null tx id
+    // means preDeduct short-circuited on amount<=0 (already handled above).
+    if (transactionId) await settle(transactionId, amount);
+    return { deducted: amount };
+  } catch (e) {
+    console.error('[credit] deductForRequest failed (non-fatal):', e.message);
+    return { deducted: 0, error: e.message };
+  }
+}
+
+/**
+ * Post-hoc finalized charge for an action that runs OUTSIDE a requireCredits
+ * gate — e.g. fire-and-forget background AI (avatar preview regen) that must not
+ * block the foreground request (the avatar's field edits already saved). Resolves
+ * the org tier + deduction flag itself, checks affordability, then preDeduct +
+ * settle (orphan-sweep safe).
+ *
+ * Returns { deducted, charged, reason }:
+ *  - charged:true  → caller SHOULD proceed with the AI work. Either credits were
+ *    deducted, or deduction is legitimately off for this org/feature (no org,
+ *    flag disabled, zero cost) — those must not block the work.
+ *  - charged:false → caller should SKIP the AI work: the org can't afford it, so
+ *    running it would be free. Lets the caller degrade gracefully (mark stale).
+ *
+ * @param {string} action  key in creditCosts
+ * @param {object} p
+ *   @param {string} p.orgId
+ *   @param {string} [p.userId]
+ *   @param {string} [p.workspaceId]
+ *   @param {object} [p.ctx]       extra resolveCredits context (rows, tokens…)
+ *   @param {object} [p.metadata]  extra tx metadata
+ */
+async function chargeAction(action, { orgId, userId, workspaceId, ctx = {}, metadata = {} } = {}) {
+  if (!orgId) return { deducted: 0, charged: true, reason: 'no_org' };
+  let config; let tier;
+  try {
+    ({ config, tier } = await tierService.getOrgTierConfig(orgId));
+  } catch (e) {
+    // Can't resolve tier → don't hold the AI work hostage to a lookup blip.
+    return { deducted: 0, charged: true, reason: 'tier_lookup_failed' };
+  }
+  if (!config || !isFeatureEnabled(config, action)) {
+    return { deducted: 0, charged: true, reason: 'disabled' };
+  }
+  let amount;
+  try {
+    amount = resolveCredits(action, { tier, ...ctx });
+  } catch (e) {
+    // Inactive/unknown action → fail OPEN (never charge a wrong amount).
+    console.error('[credit] chargeAction resolve failed (non-fatal):', e.message);
+    return { deducted: 0, charged: true, reason: 'resolve_failed' };
+  }
+  if (!amount || amount <= 0) return { deducted: 0, charged: true, reason: 'zero' };
+
+  // Affordability pre-check mirrors the requireCredits gate (org pools + the
+  // triggering member's personal free credits). Insufficient → skip the AI work.
+  const balance = await getBalance(orgId, userId);
+  if (balance.total < amount) return { deducted: 0, charged: false, reason: 'insufficient' };
+
+  try {
+    const { transactionId } = await preDeduct(orgId, userId, amount, action, {
+      feature: action, workspaceId, ...metadata,
+    });
+    if (transactionId) await settle(transactionId, amount); // finalize (refund 0)
+    return { deducted: amount, charged: true, reason: 'ok' };
+  } catch (e) {
+    // Lost the race for the last credits between the check and the deduct.
+    console.error('[credit] chargeAction deduct failed:', e.message);
+    return { deducted: 0, charged: false, reason: 'deduct_failed' };
+  }
+}
+
+/**
+ * Affordability check for an action WITHOUT deducting — the pre-gate for
+ * background AI that is charged POST-success (avatar preview regen). We must not
+ * run the paid AI for an org that can't afford the charge, but we also can't
+ * finalize the charge until the work succeeds; this splits the two so the caller
+ * can: pre-check → generate → chargeAction only on success. Mirrors chargeAction's
+ * resolution exactly. Returns { ok, reason }:
+ *   ok:true  → affordable, OR deduction legitimately off (no-org/disabled/zero).
+ *   ok:false → org can't afford it → caller SKIPS the AI work.
+ */
+async function canAffordAction(action, { orgId, userId, ctx = {} } = {}) {
+  if (!orgId) return { ok: true, reason: 'no_org' };
+  let config; let tier;
+  try {
+    ({ config, tier } = await tierService.getOrgTierConfig(orgId));
+  } catch (e) {
+    return { ok: true, reason: 'tier_lookup_failed' };
+  }
+  if (!config || !isFeatureEnabled(config, action)) return { ok: true, reason: 'disabled' };
+  let amount;
+  try {
+    amount = resolveCredits(action, { tier, ...ctx });
+  } catch (e) {
+    return { ok: true, reason: 'resolve_failed' };
+  }
+  if (!amount || amount <= 0) return { ok: true, reason: 'zero' };
+  const balance = await getBalance(orgId, userId);
+  return balance.total >= amount
+    ? { ok: true, reason: 'affordable' }
+    : { ok: false, reason: 'insufficient' };
+}
+
 module.exports = {
   wordsToCredits,
+  deductForRequest,
+  chargeAction,
+  canAffordAction,
   isFeatureEnabled,
   getOrCreateCredit,
   getBalance,
@@ -796,7 +1144,9 @@ module.exports = {
   grantFreeCredits,
   grantFreeCreditsIfNew,
   grantSubscriptionCredits,
+  grantMonthlyCreditsIfDue,
   grantGeneralCredits,
   grantGeneralCreditsIdempotent,
   expireSubscriptionCredits,
+  monthKey,
 };

@@ -23,4 +23,12 @@ router.post('/extra-seats', rf('billing'), billingController.updateExtraSeats);
 router.get('/credit-packs', billingController.getCreditPacks);
 router.post('/credit-packs/checkout', rf('billing'), billingController.createCreditPackCheckout);
 
+// Phase 7: top-up REQUEST (Admin/Editor → notifies Owner). NO rf('billing')
+// here: that flag is owner-scoped (allowedRoles:['owner'] → "owns ≥1 org"), but
+// this route is deliberately for NON-owner members, who in the agency/invite
+// flow may own no org and would be wrongly 403'd. authenticateToken (above)
+// covers auth; requestTopup itself enforces the real, target-org-scoped rule
+// (active admin/editor, not the owner).
+router.post('/request-topup', billingController.requestTopup);
+
 module.exports = router;

@@ -8,12 +8,19 @@
 // ─── Plan prices ────────────────────────────────────────────────
 
 const PRICE_TO_PLAN = {
+  // Legacy prices (archived in Stripe) — kept mapped so existing subscriptions
+  // still resolve to a plan. Listed FIRST so the canonical entries below win
+  // when billingController.getPrices builds the public price list.
+  'price_1TCaUDPViW8Lznb8599QuBfr': 'pro-monthly',    // old $59/mo
+  'price_1TCaUDPViW8Lznb86MXvgr4Z': 'pro-yearly',     // old $564/yr
+  'price_1TXcfBPViW8Lznb8647tzgfh': 'agency-yearly',  // old $2,988/yr
+
   [process.env.STRIPE_STANDARD_MONTHLY_PRICE_ID || 'price_1TCaMYPViW8Lznb8OykrDOqY']: 'standard-monthly',
   [process.env.STRIPE_STANDARD_YEARLY_PRICE_ID || 'price_1TCaMYPViW8Lznb8SOYEOsk2']: 'standard-yearly',
-  [process.env.STRIPE_PRO_MONTHLY_PRICE_ID || 'price_1TCaUDPViW8Lznb8599QuBfr']: 'pro-monthly',
-  [process.env.STRIPE_PRO_YEARLY_PRICE_ID || 'price_1TCaUDPViW8Lznb86MXvgr4Z']: 'pro-yearly',
+  [process.env.STRIPE_PRO_MONTHLY_PRICE_ID || 'price_1TqgFlPViW8Lznb83LUTC8zG']: 'pro-monthly',    // $99/mo
+  [process.env.STRIPE_PRO_YEARLY_PRICE_ID || 'price_1TqgGgPViW8Lznb8WHz3pPqE']: 'pro-yearly',      // $948/yr (-20%)
   [process.env.STRIPE_AGENCY_MONTHLY_PRICE_ID || 'price_1TWnXePViW8Lznb8eesFJjnR']: 'agency-monthly',
-  [process.env.STRIPE_AGENCY_YEARLY_PRICE_ID || 'price_1TXcfBPViW8Lznb8647tzgfh']: 'agency-yearly',
+  [process.env.STRIPE_AGENCY_YEARLY_PRICE_ID || 'price_1TqgGgPViW8Lznb8DwXr03Jq']: 'agency-yearly', // $2,868/yr (-20%)
 };
 
 function getPlanFromPriceId(priceId) {

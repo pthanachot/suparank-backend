@@ -215,8 +215,15 @@ const updateContent = async (req, res) => {
     if (req.body.startAnalysis === true &&
         content.analysisStatus === 'idle' &&
         content.targetKeywords && content.targetKeywords.length > 0) {
-      await Content.findByIdAndUpdate(content._id, { $set: { analysisStatus: 'pending' } });
-      runAnalysis(content._id);
+      // Atomic claim: only one concurrent request can flip idle → pending.
+      // The status check above is a stale read — a double-clicked Continue or
+      // a second wizard tab could both pass it and start two engine runs.
+      // Losing claimants match no document and do nothing.
+      const claimed = await Content.findOneAndUpdate(
+        { _id: content._id, analysisStatus: 'idle' },
+        { $set: { analysisStatus: 'pending' } },
+      );
+      if (claimed) runAnalysis(content._id);
     }
 
     // Autosave fires every ~1.5s while typing — dedupe to one entry per

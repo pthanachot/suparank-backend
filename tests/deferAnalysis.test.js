@@ -81,6 +81,10 @@ test('createContent without deferAnalysis keeps the auto-trigger', async () => {
   assert.equal(triggeredPending(statusUpdates), true, 'non-wizard creation paths must keep auto-analysis');
 });
 
+// The directive claims the run via an ATOMIC findOneAndUpdate CAS
+// ({ _id, analysisStatus: 'idle' } → pending) so two concurrent requests can
+// never both start an engine run. The stub emulates that: a claim query
+// matches only when the stored status is actually 'idle'.
 async function runUpdate(body, existingStatus) {
   const saved = {
     findOne: Content.findOneAndUpdate,
@@ -88,17 +92,24 @@ async function runUpdate(body, existingStatus) {
     findById: Content.findById,
     audit: auditService.fromReq,
   };
-  const statusUpdates = [];
+  const claimAttempts = [];
+  let claimsWon = 0;
   let capturedSet = null;
-  Content.findOneAndUpdate = async (_q, set) => {
+  Content.findOneAndUpdate = async (q, set) => {
+    if (q.analysisStatus === 'idle') {
+      // CAS claim attempt from the startAnalysis directive
+      claimAttempts.push(set);
+      if (existingStatus === 'idle') { claimsWon += 1; return { _id: 'c1' }; }
+      return null; // status moved on — claim loses, no analysis starts
+    }
     capturedSet = set.$set;
     return {
       _id: 'c1', contentNumber: 5, analysisStatus: existingStatus,
       targetKeywords: ['best seo tool'], locked: false,
     };
   };
-  Content.findByIdAndUpdate = async (_id, u) => { statusUpdates.push(u); return {}; };
-  Content.findById = async () => null;
+  Content.findByIdAndUpdate = async () => ({});
+  Content.findById = async () => null; // fire-and-forget runAnalysis early-returns
   auditService.fromReq = () => {};
   const req = {
     user: { userId: 'u1' },
@@ -115,28 +126,30 @@ async function runUpdate(body, existingStatus) {
     Content.findById = saved.findById;
     auditService.fromReq = saved.audit;
   }
-  return { res, statusUpdates, capturedSet };
+  return { res, claimAttempts, claimsWon, capturedSet };
 }
 
-test('updateContent(startAnalysis) starts the deferred analysis when idle', async () => {
-  const { statusUpdates } = await runUpdate(
+test('updateContent(startAnalysis) claims and starts the deferred analysis when idle', async () => {
+  const { claimAttempts, claimsWon } = await runUpdate(
     { contentType: 'product-page', startAnalysis: true }, 'idle',
   );
-  assert.equal(triggeredPending(statusUpdates), true, 'idle + startAnalysis must kick off analysis');
+  assert.equal(claimAttempts.length, 1, 'idle + startAnalysis must attempt the CAS claim');
+  assert.equal(claimsWon, 1);
+  assert.deepEqual(claimAttempts[0], { $set: { analysisStatus: 'pending' } });
 });
 
 test('updateContent(startAnalysis) is a no-op when analysis already ran', async () => {
   for (const status of ['ready', 'analyzing', 'pending', 'failed']) {
-    const { statusUpdates } = await runUpdate(
+    const { claimAttempts } = await runUpdate(
       { contentType: 'product-page', startAnalysis: true }, status,
     );
-    assert.equal(triggeredPending(statusUpdates), false, `status=${status} must not restart analysis`);
+    assert.equal(claimAttempts.length, 0, `status=${status} must not even attempt a claim`);
   }
 });
 
 test('updateContent without startAnalysis never triggers analysis', async () => {
-  const { statusUpdates } = await runUpdate({ contentType: 'product-page' }, 'idle');
-  assert.equal(triggeredPending(statusUpdates), false);
+  const { claimAttempts } = await runUpdate({ contentType: 'product-page' }, 'idle');
+  assert.equal(claimAttempts.length, 0);
 });
 
 test('startAnalysis is a directive, not a field — it must not be persisted', async () => {

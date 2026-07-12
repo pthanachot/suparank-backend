@@ -266,7 +266,10 @@ function termsToSnakeCase(terms) {
 // Returns a fetch-Response-shaped object ({ ok, status, json, text }) so the
 // call site's handling is identical for both paths.
 const JOB_POLL_MS = Number(process.env.ENGINE_JOB_POLL_MS) || 5000;
-const JOB_POLL_BUDGET_MS = 15 * 60 * 1000; // queue wait + 5-min run + slack
+// Sized WITH the engine's queue bound: ENGINE_MAX_QUEUED_ANALYZE (12) ÷ 4
+// concurrent × 5-min worst-case run = 15 min worst-case tail wait. Raise the
+// two together or tail jobs will outlive their poller.
+const JOB_POLL_BUDGET_MS = 15 * 60 * 1000;
 
 async function analyzeViaEngine(analyzeBody, preset) {
   const submitRes = await engineFetch('/api/analyze/jobs', {

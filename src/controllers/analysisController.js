@@ -254,6 +254,72 @@ function termsToSnakeCase(terms) {
   }));
 }
 
+// ─── ASYNC ANALYZE CLIENT (Phase E) ────────────────────────────
+
+// analyzeViaEngine submits an async analyze job and polls for the result,
+// falling back to the synchronous /api/analyze when the engine predates
+// /api/analyze/jobs (404/405 — safe in either deploy order). The async path
+// frees the held connection during the ~3-4 min pipeline: a job queued behind
+// the engine's concurrency cap waits in the engine's memory instead of
+// burning a connection deadline (the burn-test 502 failure mode).
+//
+// Returns a fetch-Response-shaped object ({ ok, status, json, text }) so the
+// call site's handling is identical for both paths.
+const JOB_POLL_MS = Number(process.env.ENGINE_JOB_POLL_MS) || 5000;
+const JOB_POLL_BUDGET_MS = 15 * 60 * 1000; // queue wait + 5-min run + slack
+
+async function analyzeViaEngine(analyzeBody, preset) {
+  const submitRes = await engineFetch('/api/analyze/jobs', {
+    body: analyzeBody,
+    preset,
+    timeoutMs: 30000,
+  });
+  if (submitRes.status === 404 || submitRes.status === 405) {
+    // Old engine without the jobs API — synchronous fallback.
+    return engineFetch('/api/analyze', { body: analyzeBody, preset, timeoutMs: 330000 });
+  }
+  if (!submitRes.ok) {
+    return submitRes; // shed (503 queue full) etc. — caller reads status/text
+  }
+  const submit = await submitRes.json();
+  const jobId = submit.job_id;
+  if (!jobId) {
+    return { ok: false, status: 502, text: async () => 'engine job submit returned no job_id' };
+  }
+
+  const deadline = Date.now() + JOB_POLL_BUDGET_MS;
+  // A submit that is already done (engine cache hit) resolves on the first
+  // poll; skip the initial sleep for it.
+  let sleepFirst = submit.status !== 'done';
+  while (Date.now() < deadline) {
+    if (sleepFirst) {
+      await new Promise((resolve) => setTimeout(resolve, JOB_POLL_MS));
+    }
+    sleepFirst = true;
+    let pollRes;
+    try {
+      pollRes = await engineFetch(`/api/analyze/jobs/${jobId}`, { method: 'GET', timeoutMs: 30000 });
+    } catch {
+      continue; // transient network blip — keep polling until the budget ends
+    }
+    if (pollRes.status === 404) {
+      // Job lost to an engine restart — surface as a failed analysis (the
+      // user-facing retry path resubmits from scratch).
+      return { ok: false, status: 502, text: async () => 'engine analyze job lost (engine restarted); retry the analysis' };
+    }
+    if (!pollRes.ok) continue;
+    const job = await pollRes.json();
+    if (job.status === 'done') {
+      return { ok: true, status: 200, json: async () => job.result };
+    }
+    if (job.status === 'failed') {
+      return { ok: false, status: 502, text: async () => job.error || 'analyze job failed' };
+    }
+    // queued/running — keep polling
+  }
+  return { ok: false, status: 504, text: async () => 'engine analyze job did not finish within the polling budget' };
+}
+
 // ─── RUN ANALYSIS (background) ─────────────────────────────────
 
 async function runAnalysis(contentId, opts = {}) {
@@ -321,13 +387,15 @@ async function runAnalysis(contentId, opts = {}) {
       if (content.contentType) {
         analyzeBody.content_type = content.contentType;
       }
+      // Explicit re-analysis must produce FRESH data: refresh bypasses the
+      // engine's analyze-cache read (the run still updates the cache).
+      if (opts.refresh) {
+        analyzeBody.refresh = true;
+      }
       // preset (if any) is merged into the body by engineFetch — the engine
       // reads the body `preset` field, not the X-Model-Preset header.
-      const analyzeRes = await engineFetch('/api/analyze', {
-        body: analyzeBody,
-        preset,
-        timeoutMs: 330000, // 5.5 min — slightly above engine's 5-min context
-      });
+      // Phase E: async submit + poll, with sync fallback for old engines.
+      const analyzeRes = await analyzeViaEngine(analyzeBody, preset);
       if (analyzeRes.ok) {
         analyzeData = await analyzeRes.json();
         contentBrief = analyzeData.content_brief || {};
@@ -344,8 +412,13 @@ async function runAnalysis(contentId, opts = {}) {
         // for a hypothetical build that emits a lump cost but no steps; the
         // current engine emits neither, so that branch stays inert.
         try {
-          const steps = Array.isArray(analyzeData.pipeline_steps) ? analyzeData.pipeline_steps : [];
-          const pipelineCost = Number(contentBrief.pipeline_cost) || 0;
+          // Engine cache hit (Phase D): the payload's pipeline_steps are the
+          // ORIGINAL run's — that cost was recorded when the cache filled.
+          // Re-recording it here would double-count COGS in the ledger.
+          const steps = analyzeData.cache_hit
+            ? []
+            : (Array.isArray(analyzeData.pipeline_steps) ? analyzeData.pipeline_steps : []);
+          const pipelineCost = analyzeData.cache_hit ? 0 : (Number(contentBrief.pipeline_cost) || 0);
           if (steps.length > 0 || pipelineCost > 0) {
             // orgId + tier resolved once at the top of runAnalysis (Phase 4).
             const base = {
@@ -689,7 +762,9 @@ const reanalyze = async (req, res) => {
     // success only (see its success hook) — NOT here at trigger — so an engine
     // outage or a zero-keyword content never bills. The rc('reScore') route gate
     // already ran the pre-flight 402, so the user had the credits when they asked.
-    runAnalysis(content._id, { bill: { action: 'reScore', userId: req.user?.userId } });
+    // refresh: an explicit re-analysis must bypass the engine's analyze-cache
+    // read — the user is paying for fresh data, not a cached replay.
+    runAnalysis(content._id, { bill: { action: 'reScore', userId: req.user?.userId }, refresh: true });
 
     res.json({ analysisStatus: 'pending', message: 'Re-analysis started' });
   } catch (err) {

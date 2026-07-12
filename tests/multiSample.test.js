@@ -43,7 +43,11 @@ describe('runAnalysis multiSample passthrough', () => {
     Content.findByIdAndUpdate = async () => ({});
     Workspace.findById = () => ({ select: () => ({ lean: async () => ({ organizationId: 'org1' }) }) });
     global.fetch = async (url, opts) => {
-      if (String(url).endsWith('/api/analyze')) {
+      // Phase E: runAnalysis submits to /api/analyze/jobs first (and would
+      // fall back to /api/analyze only on 404). Capture the analyze body from
+      // either endpoint; a 502 fails the run fast right after capture.
+      const u = String(url);
+      if (u.endsWith('/api/analyze') || u.endsWith('/api/analyze/jobs')) {
         analyzeBodies.push(JSON.parse(opts.body));
         return { ok: false, status: 502, text: async () => 'down', json: async () => ({}) };
       }

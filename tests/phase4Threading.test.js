@@ -74,6 +74,12 @@ async function runAndCapture(tier, contentType) {
     if (opts.headers) { headers[u.split('/api/')[1]] = opts.headers; }
     const json = async () => {
       if (u.includes('/discover')) return { candidates: [] };
+      // Phase E job protocol: submit answers "done" (skips the poll sleep),
+      // the follow-up GET carries the result.
+      if (u.includes('/analyze/jobs/')) {
+        return { job_id: 'j1', status: 'done', result: { content_brief: {}, competitor_pages: [], pipeline_steps: [], conversations: [] } };
+      }
+      if (u.includes('/analyze/jobs')) return { job_id: 'j1', status: 'done' };
       if (u.includes('/analyze')) return { content_brief: {}, competitor_pages: [], pipeline_steps: [], conversations: [] };
       if (u.includes('/ai-format-recommend')) return { nlp_terms: [] };
       if (u.includes('/recommend-outline')) return { sections: [] };
@@ -102,38 +108,38 @@ async function runAndCapture(tier, contentType) {
 // silently burned base-model COGS. engineFetch now merges preset into the
 // body (the real contract) and still sends the header (informational). These
 // tests pin the BODY threading — the field the engine actually reads.
-test('runAnalysis(Free): /analyze + /recommend-outline carry body preset "budget"', async () => {
+test('runAnalysis(Free): analyze job + /recommend-outline carry body preset "budget"', async () => {
   const { bodies, headers } = await runAndCapture('free');
-  assert.ok(bodies.analyze, 'analyze was called');
-  assert.equal(bodies.analyze.preset, 'budget');
+  assert.ok(bodies['analyze/jobs'], 'analyze job was submitted');
+  assert.equal(bodies['analyze/jobs'].preset, 'budget');
   assert.ok(bodies['recommend-outline'], 'recommend-outline was called');
   assert.equal(bodies['recommend-outline'].preset, 'budget');
   // Header still rides along for proxy-log visibility.
-  assert.equal(headers.analyze['X-Model-Preset'], 'budget');
+  assert.equal(headers['analyze/jobs']['X-Model-Preset'], 'budget');
   assert.equal(headers['recommend-outline']['X-Model-Preset'], 'budget');
 });
 
 test('runAnalysis(paid): no preset in body or header (base models)', async () => {
   const { bodies, headers } = await runAndCapture('professional');
-  assert.ok(bodies.analyze, 'analyze was called');
-  assert.equal('preset' in bodies.analyze, false);
+  assert.ok(bodies['analyze/jobs'], 'analyze job was submitted');
+  assert.equal('preset' in bodies['analyze/jobs'], false);
   assert.equal('preset' in bodies['recommend-outline'], false);
-  assert.equal('X-Model-Preset' in (headers.analyze || {}), false);
+  assert.equal('X-Model-Preset' in (headers['analyze/jobs'] || {}), false);
   assert.equal('X-Model-Preset' in (headers['recommend-outline'] || {}), false);
 });
 
-// ─── runAnalysis threads the declared page type into /analyze ────────────
+// ─── runAnalysis threads the declared page type into the analyze job ─────
 
 test('runAnalysis forwards content.contentType as body content_type', async () => {
   const { bodies } = await runAndCapture('professional', 'product-page');
-  assert.ok(bodies.analyze, 'analyze was called');
-  assert.equal(bodies.analyze.content_type, 'product-page');
+  assert.ok(bodies['analyze/jobs'], 'analyze job was submitted');
+  assert.equal(bodies['analyze/jobs'].content_type, 'product-page');
 });
 
 test('runAnalysis omits content_type when the content has none', async () => {
   const { bodies } = await runAndCapture('professional');
-  assert.ok(bodies.analyze, 'analyze was called');
-  assert.equal('content_type' in bodies.analyze, false);
+  assert.ok(bodies['analyze/jobs'], 'analyze job was submitted');
+  assert.equal('content_type' in bodies['analyze/jobs'], false);
 });
 
 // regenerate-outline is a SECOND live outline path (review finding #1) — it must

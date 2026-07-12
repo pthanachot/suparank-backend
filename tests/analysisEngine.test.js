@@ -83,6 +83,37 @@ describe('engineFetch', () => {
     assert.equal(calls[1].opts.headers['X-Model-Preset'], undefined);
   });
 
+  // The engine reads `preset` from the request BODY — its handlers have no
+  // X-Model-Preset handling. Header-only delivery silently dropped the Free
+  // tier's "budget" preset (Free runs burned base-model COGS). These pin the
+  // body contract so that regression cannot come back.
+  it('merges preset into the request body (the contract the engine reads)', async () => {
+    await engineFetch('/api/analyze', { body: { keywords: ['a'] }, preset: 'budget', timeoutMs: 1000 });
+    assert.deepEqual(JSON.parse(calls[0].opts.body), { preset: 'budget', keywords: ['a'] });
+  });
+
+  it('a caller-supplied body.preset wins over the ambient preset option', async () => {
+    await engineFetch('/api/analyze', { body: { preset: 'explicit', keywords: ['a'] }, preset: 'budget', timeoutMs: 1000 });
+    assert.equal(JSON.parse(calls[0].opts.body).preset, 'explicit');
+  });
+
+  it('does not mutate the caller body object when merging preset', async () => {
+    const body = { keywords: ['a'] };
+    await engineFetch('/api/analyze', { body, preset: 'budget', timeoutMs: 1000 });
+    assert.deepEqual(body, { keywords: ['a'] }, 'caller object must stay untouched');
+  });
+
+  it('preset without a body stays header-only (no body invented)', async () => {
+    await engineFetch('/api/score', { preset: 'budget', timeoutMs: 1000 });
+    assert.equal(calls[0].opts.body, undefined);
+  });
+
+  it('no preset leaves the body byte-identical', async () => {
+    await engineFetch('/api/analyze', { body: { keywords: ['a'] }, timeoutMs: 1000 });
+    assert.deepEqual(JSON.parse(calls[0].opts.body), { keywords: ['a'] });
+    assert.equal(JSON.parse(calls[0].opts.body).preset, undefined);
+  });
+
   it('sets an AbortSignal from timeoutMs', async () => {
     await engineFetch('/api/score', { body: {}, timeoutMs: 1000 });
     assert.ok(calls[0].opts.signal instanceof AbortSignal, 'timeoutMs should produce an AbortSignal');

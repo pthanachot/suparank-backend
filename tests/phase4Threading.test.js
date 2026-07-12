@@ -51,7 +51,7 @@ test('resolvePreset: tierService failure → "" (fail-safe)', async () => {
 
 // Drive runAnalysis with a fully stubbed environment and capture the JSON
 // bodies POSTed to each engine endpoint.
-async function runAndCapture(tier) {
+async function runAndCapture(tier, contentType) {
   const saved = {
     findById: Content.findById,
     update: Content.findByIdAndUpdate,
@@ -61,7 +61,10 @@ async function runAndCapture(tier) {
   };
   const bodies = {};
   const headers = {};
-  Content.findById = async () => ({ _id: 'c1', workspaceId: 'w1', targetKeywords: ['best seo tool'] });
+  Content.findById = async () => ({
+    _id: 'c1', workspaceId: 'w1', targetKeywords: ['best seo tool'],
+    ...(contentType ? { contentType } : {}),
+  });
   Content.findByIdAndUpdate = async () => ({});
   Workspace.findById = () => ({ select: () => ({ lean: async () => ({ organizationId: 'org1' }) }) });
   tierService.getOrgTierConfig = async () => ({ tier });
@@ -90,25 +93,47 @@ async function runAndCapture(tier) {
   return { bodies, headers };
 }
 
-// The preset moved from the request BODY (dead field the engine never read)
-// to the X-Model-Preset HEADER, consumed by the engine's withPreset middleware
-// (2026-07-09 dead-code cleanup). These tests pin the header threading.
-test('runAnalysis(Free): /analyze + /recommend-outline carry X-Model-Preset "budget"', async () => {
+// CONTRACT CORRECTION (2026-07-11): the engine reads `preset` from the request
+// BODY (handleAnalyze/recommend-outline decode a `preset` JSON field). It has
+// NO X-Model-Preset handling — the "withPreset middleware" the 2026-07-09
+// cleanup referenced never existed in any engine commit or branch (verified
+// via git log -S across the engine repo). That cleanup therefore severed the
+// Free tier's budget preset entirely: header-only delivery meant Free runs
+// silently burned base-model COGS. engineFetch now merges preset into the
+// body (the real contract) and still sends the header (informational). These
+// tests pin the BODY threading — the field the engine actually reads.
+test('runAnalysis(Free): /analyze + /recommend-outline carry body preset "budget"', async () => {
   const { bodies, headers } = await runAndCapture('free');
   assert.ok(bodies.analyze, 'analyze was called');
-  assert.equal(headers.analyze['X-Model-Preset'], 'budget');
+  assert.equal(bodies.analyze.preset, 'budget');
   assert.ok(bodies['recommend-outline'], 'recommend-outline was called');
+  assert.equal(bodies['recommend-outline'].preset, 'budget');
+  // Header still rides along for proxy-log visibility.
+  assert.equal(headers.analyze['X-Model-Preset'], 'budget');
   assert.equal(headers['recommend-outline']['X-Model-Preset'], 'budget');
-  // The dead body field must not resurrect.
-  assert.equal('preset' in bodies.analyze, false);
 });
 
-test('runAnalysis(paid): no X-Model-Preset header (base models)', async () => {
+test('runAnalysis(paid): no preset in body or header (base models)', async () => {
   const { bodies, headers } = await runAndCapture('professional');
   assert.ok(bodies.analyze, 'analyze was called');
+  assert.equal('preset' in bodies.analyze, false);
+  assert.equal('preset' in bodies['recommend-outline'], false);
   assert.equal('X-Model-Preset' in (headers.analyze || {}), false);
   assert.equal('X-Model-Preset' in (headers['recommend-outline'] || {}), false);
-  assert.equal('preset' in bodies.analyze, false);
+});
+
+// ─── runAnalysis threads the declared page type into /analyze ────────────
+
+test('runAnalysis forwards content.contentType as body content_type', async () => {
+  const { bodies } = await runAndCapture('professional', 'product-page');
+  assert.ok(bodies.analyze, 'analyze was called');
+  assert.equal(bodies.analyze.content_type, 'product-page');
+});
+
+test('runAnalysis omits content_type when the content has none', async () => {
+  const { bodies } = await runAndCapture('professional');
+  assert.ok(bodies.analyze, 'analyze was called');
+  assert.equal('content_type' in bodies.analyze, false);
 });
 
 // regenerate-outline is a SECOND live outline path (review finding #1) — it must
@@ -145,11 +170,11 @@ async function runRegenerate(tier) {
   return { outlineBody, outlineHeaders };
 }
 
-test('regenerateOutline(Free): recommend-outline carries X-Model-Preset "budget"', async () => {
+test('regenerateOutline(Free): recommend-outline carries body preset "budget"', async () => {
   const { outlineBody, outlineHeaders } = await runRegenerate('free');
   assert.ok(outlineBody, 'recommend-outline was called');
+  assert.equal(outlineBody.preset, 'budget'); // the field the engine reads
   assert.equal(outlineHeaders['X-Model-Preset'], 'budget');
-  assert.equal('preset' in outlineBody, false); // dead body field must not resurrect
 });
 
 test('regenerateOutline(paid): no X-Model-Preset header (base models)', async () => {

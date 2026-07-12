@@ -66,7 +66,7 @@ const createContent = async (req, res) => {
     const workspace = req.workspace;
 
     const contentNumber = await Content.getNextContentNumber();
-    const { title, slug, description, blocks, targetKeywords, targetPageUrl, strikingSnapshot, country, device, score, wordCount, status, folder, platform, versions } = req.body;
+    const { title, slug, description, blocks, targetKeywords, targetPageUrl, strikingSnapshot, country, device, score, wordCount, status, folder, platform, versions, deferAnalysis } = req.body;
 
     // Determine plan tier at creation time.
     // Paid users can opt to use a free lifetime slot (quotaSource='free').
@@ -113,8 +113,13 @@ const createContent = async (req, res) => {
       createdOnPlan,
     });
 
-    // Auto-trigger analysis if keywords are provided
-    if (content.targetKeywords && content.targetKeywords.length > 0) {
+    // Auto-trigger analysis if keywords are provided — unless the caller defers
+    // it. The article wizard defers so its Content Type step can persist the
+    // declared page type BEFORE analysis starts (runAnalysis reads
+    // content.contentType when calling the engine); it then starts analysis via
+    // the updateContent startAnalysis directive, which mirrors this trigger's
+    // billing exactly. Every other creation path keeps the auto-trigger.
+    if (!deferAnalysis && content.targetKeywords && content.targetKeywords.length > 0) {
       await Content.findByIdAndUpdate(content._id, { $set: { analysisStatus: 'pending' } });
       runAnalysis(content._id);
     }
@@ -198,6 +203,20 @@ const updateContent = async (req, res) => {
 
     if (!content) {
       return res.status(404).json({ error: 'Content not found' });
+    }
+
+    // startAnalysis directive (wizard Content Type step): kick off the deferred
+    // first analysis now that the declared page type is saved. Deliberately
+    // mirrors createContent's auto-trigger — same fire-and-forget, same billing
+    // (NOT the audited POST /analyze route, so the first analysis stays free
+    // exactly as it was when creation auto-triggered it). Guarded to the
+    // never-analyzed state so it cannot restart or double-run an analysis; the
+    // directive itself is not in allowedFields, so nothing persists.
+    if (req.body.startAnalysis === true &&
+        content.analysisStatus === 'idle' &&
+        content.targetKeywords && content.targetKeywords.length > 0) {
+      await Content.findByIdAndUpdate(content._id, { $set: { analysisStatus: 'pending' } });
+      runAnalysis(content._id);
     }
 
     // Autosave fires every ~1.5s while typing — dedupe to one entry per

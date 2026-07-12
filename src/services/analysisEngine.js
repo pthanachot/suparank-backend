@@ -43,17 +43,25 @@ const DEFAULT_TIMEOUT_MS = 60000;
  * @param {string} [opts.method='POST'] - HTTP method
  * @param {object} [opts.body] - JSON body (stringified here; omit for none)
  * @param {number} [opts.timeoutMs=DEFAULT_TIMEOUT_MS] - AbortSignal.timeout duration in ms
- * @param {string} [opts.preset] - model preset → X-Model-Preset header
+ * @param {string} [opts.preset] - model preset → body `preset` field (the engine's
+ *   contract; see below) + X-Model-Preset header (informational, for proxy logs)
  * @param {object} [opts.headers] - extra headers (merged after the preset header)
  * @param {AbortSignal} [opts.signal] - caller signal; used instead of the timeout when set
  * @returns {Promise<Response>}
  */
 function engineFetch(path, { method = 'POST', body, timeoutMs = DEFAULT_TIMEOUT_MS, preset, headers, signal } = {}) {
   const extra = { ...(preset ? { 'X-Model-Preset': preset } : {}), ...headers };
+  // The engine reads `preset` from the REQUEST BODY (its handlers decode a
+  // `preset` JSON field); it has no X-Model-Preset handling at all. This client
+  // originally sent the header only, so the Free tier's "budget" preset never
+  // reached the engine and Free runs silently burned base-model COGS. Merge
+  // preset into the body here — shallow copy, never mutate the caller's object.
+  // A caller-supplied body.preset wins (explicit beats ambient).
+  const finalBody = preset && body !== undefined ? { preset, ...body } : body;
   return fetch(`${ENGINE_URL}${path}`, {
     method,
     headers: engineHeaders(extra),
-    ...(body !== undefined && { body: JSON.stringify(body) }),
+    ...(finalBody !== undefined && { body: JSON.stringify(finalBody) }),
     signal: signal || AbortSignal.timeout(timeoutMs),
   });
 }

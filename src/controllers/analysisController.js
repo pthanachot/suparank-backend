@@ -315,8 +315,14 @@ async function runAnalysis(contentId, opts = {}) {
       if (selectedUrls.length > 0) {
         analyzeBody.selected_urls = selectedUrls;
       }
-      // preset (if any) rides the X-Model-Preset header — the engine ignores a
-      // body `preset` field.
+      // Declared page type (wizard "Content Type" step) → engine lens on the
+      // structure + guidance prompts. Absent/serp-based = engine default; the
+      // engine normalizes and warns on unknown values, so forward verbatim.
+      if (content.contentType) {
+        analyzeBody.content_type = content.contentType;
+      }
+      // preset (if any) is merged into the body by engineFetch — the engine
+      // reads the body `preset` field, not the X-Model-Preset header.
       const analyzeRes = await engineFetch('/api/analyze', {
         body: analyzeBody,
         preset,

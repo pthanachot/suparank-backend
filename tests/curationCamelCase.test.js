@@ -94,6 +94,8 @@ const INPUTS = {
       sample_size: 2, low_sample: true, avg_word_count: 1000, avg_h2_count: 5,
       avg_h3_count: 8, avg_images: 5, avg_lists: 2, avg_tables: 2, avg_faqs: 3, avg_paragraphs: 15,
     },
+    intent_mismatch: 'Declared content type "blog-post" usually serves…',
+    completeness: { score: 0.67, is_complete: false, degraded: ['term_guidance', 'competitor_weaknesses'] },
   },
   curateAiFormatData: {
     keyword: 'crm', recommended_format: 'guide', format_confidence: 0.9,

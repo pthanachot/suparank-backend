@@ -205,6 +205,18 @@ function curateContentBrief(brief) {
       avgFAQs: brief.matched_stats.avg_faqs || 0,
       avgParagraphs: brief.matched_stats.avg_paragraphs || 0,
     } : null,
+    // P0.2: the intent-mismatch advisory (declared type vs SERP intent) —
+    // structured, user-appropriate wording from the engine.
+    intentMismatch: brief.intent_mismatch || '',
+    // P0.2: the engine grades which brief components shipped fully vs
+    // degraded (an LLM step failing non-fatally leaves its component empty).
+    // Never curated before — the editor could not distinguish a complete
+    // brief from a silently thin one.
+    completeness: brief.completeness ? {
+      score: brief.completeness.score || 0,
+      isComplete: brief.completeness.is_complete || false,
+      degraded: brief.completeness.degraded || [],
+    } : null,
   };
 }
 

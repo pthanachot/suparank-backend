@@ -99,9 +99,12 @@ const INPUTS = {
       front_loading_guidance: 'answer early',
     },
     nlp_terms: [{ term: 'crm', group: 'mention', benchmark_count: 5, position: 'intro', proximity_partners: ['software'], volatile: false }],
-    citation_formats: [{ engine: 'chatgpt', cited_total: 6, classified: 3, counts: { listicle: 2, 'product-page': 1 }, matched_count: 1 }],
-    citation_format_signal: 'AI engines split on your declared product page…',
   },
+  // Rides the ANALYZE response's ai_analysis, curated separately from
+  // curateAiFormatData (whose input never carries these fields).
+  curateCitationFormats: [
+    { engine: 'chatgpt', cited_total: 6, classified: 3, counts: { listicle: 2, 'product-page': 1 }, matched_count: 1 },
+  ],
   curateCitationAppearance: [
     { domain: 'x.com', appearances: 3, samples: 10, rate: 0.3, example_urls: ['https://x.com/a'] },
   ],

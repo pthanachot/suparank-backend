@@ -208,18 +208,23 @@ function curateAiFormatData(raw) {
       proximityPartners: t.proximity_partners || [],
       volatile: t.volatile || false,
     })),
-    // Engine Phase 4 (type-aware benchmarks): per-engine citation-format
-    // census + advisory. Optional — absent without a declared content type
-    // or from older engines.
-    citationFormats: (raw.citation_formats || []).map((c) => ({
-      engine: c.engine || '',
-      citedTotal: c.cited_total || 0,
-      classified: c.classified || 0,
-      counts: c.counts || {},
-      matchedCount: c.matched_count || 0,
-    })),
-    citationFormatSignal: raw.citation_format_signal || '',
   };
+}
+
+// Map engine ai_analysis.citation_formats (snake_case) → camelCase (engine
+// Phase 4). NOTE: these fields ride the ANALYZE response's ai_analysis — the
+// /api/ai-format-recommend response never carries them, so they are attached
+// to aiFormatData separately (same pattern as citationAppearance), NOT read
+// inside curateAiFormatData.
+function curateCitationFormats(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((c) => ({
+    engine: c.engine || '',
+    citedTotal: c.cited_total || 0,
+    classified: c.classified || 0,
+    counts: c.counts || {},
+    matchedCount: c.matched_count || 0,
+  }));
 }
 
 // Map engine citation_appearance (snake_case) → camelCase for the frontend.
@@ -612,6 +617,15 @@ async function runAnalysis(contentId, opts = {}) {
     // keep aiFormatData honestly null rather than a citationAppearance-only stub.
     if (curatedAiFormat && citationAppearance.length > 0) {
       curatedAiFormat.citationAppearance = citationAppearance;
+    }
+    // Engine Phase 4 (type-aware benchmarks): the per-engine citation-format
+    // census + advisory ALSO ride the analyze response's ai_analysis (the
+    // ai-format-recommend response never carries them). Attached with the
+    // same guard as citationAppearance: only onto an existing format payload.
+    const citationFormats = curateCitationFormats(analyzeData.ai_analysis?.citation_formats);
+    if (curatedAiFormat && citationFormats.length > 0) {
+      curatedAiFormat.citationFormats = citationFormats;
+      curatedAiFormat.citationFormatSignal = analyzeData.ai_analysis?.citation_format_signal || '';
     }
 
     // Step 5: Save curated results to DB
@@ -1190,6 +1204,6 @@ module.exports = {
   // remap is exactly the bot-access leak the test guards against.
   _curators: {
     curateBenchmark, curateCompetitors, curateContentBrief, curateAiFormatData,
-    curateCitationAppearance, curateRecommendedOutline, curateBotAccess,
+    curateCitationAppearance, curateCitationFormats, curateRecommendedOutline, curateBotAccess,
   },
 };

@@ -18,6 +18,20 @@ const codeDataSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const toggleDataSchema = new mongoose.Schema(
+  { summary: String, content: String },
+  { _id: false }
+);
+
+const embedDataSchema = new mongoose.Schema(
+  {
+    url: String,
+    embedType: { type: String, enum: ['youtube', 'twitter', 'generic'] },
+    embedUrl: String,
+  },
+  { _id: false }
+);
+
 const tableDataSchema = new mongoose.Schema(
   {
     headers: [String],
@@ -41,12 +55,19 @@ const blockSchema = new mongoose.Schema(
     text: { type: String, default: '' },
     src: String,
     alt: String,
+    // caption/indent/toggleData/embedData were missing here — Mongoose strict
+    // mode silently stripped them on every save, so toggle/embed blocks and
+    // image captions never survived a reload even when the editor sent them.
+    caption: String,
     width: Number,
     align: { type: String, enum: ['left', 'center', 'right', 'justify'] },
+    indent: Number,
     faqItems: [faqItemSchema],
     ctaData: ctaDataSchema,
     tableData: tableDataSchema,
     codeData: codeDataSchema,
+    toggleData: toggleDataSchema,
+    embedData: embedDataSchema,
   },
   { _id: false }
 );

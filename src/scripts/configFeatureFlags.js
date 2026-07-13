@@ -310,6 +310,21 @@ const FLAGS = [
     },
   },
   {
+    // Conversation Threads Phase 1 (CONVERSATION-THREADS-PLAN.md) — durable
+    // AI conversation history in Mongo. Gates BOTH the /ai/thread(s) routes
+    // (via rf) and the capture writes inside the chat/agent/side-channel
+    // handlers (via flagService.isFlagLive — middleware can't gate those).
+    // KILL: flip implemented:false here and redeploy — capture stops, the
+    // history routes 404, and run behavior degrades to pre-threads exactly.
+    // No plan gate: history is table-stakes, not an upsell.
+    key: 'aiThreads',
+    displayName: 'AI Conversation Threads',
+    description: 'Durable AI chat history per document — survives reloads; groundwork for resume/new-conversation.',
+    enabled: true,
+    implemented: true,
+    conditions: {},
+  },
+  {
     // Phase 18B — per-workspace / per-org data export (tar.gz) for offboarding +
     // GDPR portability. Ships dark; flip implemented:true to launch. No plan gate
     // (GDPR portability is universal); access is enforced per-route (workspace

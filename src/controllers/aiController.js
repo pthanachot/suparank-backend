@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const Content = require('../models/Content');
 const Workspace = require('../models/Workspace');
 const BrandVoice = require('../models/BrandVoice');
@@ -19,6 +20,7 @@ const UsageTracker = require('../models/UsageTracker');
 const UserUsageTracker = require('../models/UserUsageTracker');
 const costLedger = require('../services/costLedgerService');
 const tierService = require('../services/tierService');
+const threadService = require('../services/threadService');
 const { tierToPreset } = require('../config/modelPreset');
 
 /**
@@ -48,6 +50,14 @@ const WRITING_ENGINE_DEFAULT_MODEL = 'google/gemini-2.5-flash';
 const contentSessionMap = new Map();
 const SESSION_TTL_MS = 60 * 60 * 1000; // 1 hour
 
+// Max lifetime for an in-flight agent-run registry entry (W4-b/c). A run that
+// never reaches its handler's deletion (a hang inside the awaited settle/
+// commit, or a stream that never terminates) would otherwise leak the entry
+// forever — making run-status lie "active" and stop-revert a silent no-op.
+// Generous vs the engine's ~58-turn / token-budget ceilings so it never
+// evicts a genuinely-live run.
+const AGENT_RUN_TTL_MS = 30 * 60 * 1000;
+
 // Clean up stale sessions every 10 minutes. unref() so this housekeeping
 // timer never holds the process open (tests, graceful shutdown).
 setInterval(() => {
@@ -55,6 +65,18 @@ setInterval(() => {
   for (const [key, entry] of contentSessionMap) {
     if (now - entry.lastUsed > SESSION_TTL_MS) {
       contentSessionMap.delete(key);
+    }
+  }
+  // W4-b/c: evict stale in-flight run entries (see AGENT_RUN_TTL_MS).
+  for (const [key, entry] of activeAgentRuns) {
+    if (now - entry.startedAt > AGENT_RUN_TTL_MS) {
+      // W4-c-2 review: a detached run that never completes would otherwise pin
+      // its engine reader + response forever (run-status also lies "active").
+      // ABORT it at the TTL, not just forget it — this is the hard server-side
+      // ceiling. The abort unwinds the handler, which deletes its own entry;
+      // delete here too in case the run already errored past its abort.
+      try { entry.abort?.(); } catch { /* best effort */ }
+      activeAgentRuns.delete(key);
     }
   }
 }, 10 * 60 * 1000).unref();
@@ -98,6 +120,22 @@ function makeUsageTap() {
   let outputTokens = 0;
   let model = '';
   let docWrites = 0;
+  // W4-c prerequisite: capture the run's terminal metadata from the complete
+  // event so the run record (AgentUsageLog) can persist stopReason — the
+  // future catch-up UI needs to tell a finished run from a died one.
+  let stopReason = '';
+  // Threads Phase 1: accumulate the run's ASSISTANT TEXT across the whole
+  // stream. `complete.fullText` is last-turn-only (the engine's accumulator
+  // resets per turn), and the engine's message list is unusable as a capture
+  // source (compacted mid-run, no run markers, wiped by sequential runs) —
+  // the tap is the canonical capture point. Chat streams `text_delta`;
+  // freeform-agent text turns stream `agent_commentary` (same textDelta
+  // payload field). tool_start marks a turn boundary → new segment.
+  let segments = [];
+  let currentSegment = '';
+  let lastFullText = '';
+  let turns = 0;
+  let steeringApplied = false;
   return {
     addChunk(buf) {
       buffer += buf.toString('utf8');
@@ -109,6 +147,29 @@ function makeUsageTap() {
         if (!data || data === '[DONE]' || data[0] !== '{') continue;
         try {
           const ev = JSON.parse(data);
+          if (ev && (ev.type === 'text_delta' || ev.type === 'agent_commentary') && typeof ev.textDelta === 'string') {
+            currentSegment += ev.textDelta;
+          } else if (ev && ev.type === 'tool_start') {
+            // Turn boundary: seal the running text segment.
+            if (currentSegment.trim()) segments.push(currentSegment.trim());
+            currentSegment = '';
+            turns++;
+          } else if (ev && ev.type === 'steering_applied') {
+            steeringApplied = true;
+          }
+          if (ev && ev.type === 'complete') {
+            if (typeof ev.fullText === 'string' && ev.fullText) lastFullText = ev.fullText;
+          }
+          if (ev && ev.type === 'complete' && ev.completion && typeof ev.completion.stopReason === 'string') {
+            stopReason = ev.completion.stopReason;
+          }
+          // W4-c (review V5): the token-budget / output-limit caps emit an
+          // `error` event (with a code) and break WITHOUT a `complete` event,
+          // so the run record would otherwise store stopReason=''. Capture the
+          // known terminal codes from error events too.
+          if (ev && ev.type === 'error' && (ev.code === 'token_budget' || ev.code === 'max_turns')) {
+            stopReason = ev.code;
+          }
           if (ev && ev.type === 'usage' && ev.usage) {
             // Go emits snake_case (input_tokens/output_tokens) — see
             // writing-engine api.Usage json tags. Accept camelCase too for
@@ -133,7 +194,23 @@ function makeUsageTap() {
       }
     },
     snapshot() {
-      return { inputTokens, outputTokens, model, docWrites };
+      return { inputTokens, outputTokens, model, docWrites, stopReason };
+    },
+    // Threads Phase 1: the run's full assistant text (all text turns joined),
+    // with the last complete.fullText as fallback ("Cancelled" is deliberately
+    // NOT text the model wrote — never fall back to it when segments exist).
+    finalAssistantText() {
+      const all = [...segments];
+      if (currentSegment.trim()) all.push(currentSegment.trim());
+      const joined = all.join('\n\n').trim();
+      if (joined) return joined;
+      return lastFullText === 'Cancelled' ? '' : lastFullText.trim();
+    },
+    steeringWasApplied() {
+      return steeringApplied;
+    },
+    turnCount() {
+      return turns;
     },
   };
 }
@@ -142,7 +219,7 @@ function makeUsageTap() {
  * Persist the accumulated usage at stream end. Best-effort: a failed write
  * must NOT block the response that already went to the user.
  */
-async function persistUsage(req, content, tap, source) {
+async function persistUsage(req, content, tap, source, runMeta = {}) {
   const totals = tap.snapshot();
   if (totals.inputTokens === 0 && totals.outputTokens === 0) return;
   AgentUsageLog.create({
@@ -153,6 +230,13 @@ async function persistUsage(req, content, tap, source) {
     inputTokens: totals.inputTokens,
     outputTokens: totals.outputTokens,
     source,
+    // W4-c prerequisite run-record fields: what the future catch-up UI reads.
+    // stopReason '' + aborted=true ⇒ the stream died/was stopped mid-run.
+    sessionId: runMeta.sessionId || '',
+    stopReason: totals.stopReason || '',
+    docWrites: totals.docWrites || 0,
+    aborted: !!runMeta.aborted,
+    completedAt: new Date(),
   }).catch((err) => {
     // Never throw past the SSE response — observability hygiene only.
     console.warn('[usage-tap] persist failed', err.message);
@@ -276,7 +360,12 @@ const MODE_ALLOWED_TOOLS = {
 // This helper finds the content within that workspace.
 async function resolveContent(req, res) {
   const { contentNumber } = req.params;
-  const content = await Content.findByNumber(req.workspace._id, contentNumber);
+  // W2-d: the agent route's credit estimator (estAgent) already fetched this
+  // exact document — reuse it instead of a second identical indexed read.
+  const pre = req._prefetchedContent;
+  const content = (pre && String(pre.contentNumber) === String(contentNumber))
+    ? pre
+    : await Content.findByNumber(req.workspace._id, contentNumber);
   if (!content) {
     res.status(404).json({ error: 'Content not found' });
     return null;
@@ -300,9 +389,58 @@ async function resolveContent(req, res) {
  * @param {string} [opts.avatarId] - Selected avatar ID (optional)
  * @param {boolean} [opts.reuseSession] - Reuse existing session for conversation memory
  */
+/**
+ * W0 timing helper: run fn(), recording its duration under `label` in the
+ * timings map. Failures propagate unchanged — timing must never alter
+ * control flow.
+ */
+async function timed(timings, label, fn) {
+  const t0 = Date.now();
+  try {
+    return await fn();
+  } finally {
+    timings[label] = (timings[label] || 0) + (Date.now() - t0);
+  }
+}
+
+/** W2-b: content hash for push-skip decisions (safe subset only). */
+function pushHash(s) {
+  return crypto.createHash('sha256').update(s).digest('hex');
+}
+
+/**
+ * W2-b: record how many engine-side document writes the last run made for
+ * this content. The document push may be skipped ONLY when the FE markdown
+ * is unchanged AND this is 0 — after any engine write the engine's copy is
+ * ahead of what we last pushed, and re-pushing is how FE stays authoritative.
+ */
+// ─── W4-b/c: in-flight agent-run registry ────────────────────────────────
+// One entry per streaming agent run: powers the stop-&-revert intent flag
+// (billing honors an EXPLICIT revert — refund + no article slot — while plain
+// disconnects keep the docWrites anti-abuse guard) and the run-status
+// endpoint. markdownBefore is the pre-run document, used to restore the
+// ENGINE's copy on revert so the revert is real server-side, not just a
+// client-side setBlocks.
+const activeAgentRuns = new Map(); // contentId → { sessionId, markdownBefore, startedAt, revertIntent }
+
+function recordRunDocWrites(contentId, sessionId, docWrites) {
+  const entry = contentSessionMap.get(contentId);
+  // Review fix (W2-1b): guard on the run's OWN session. A concurrent setup on
+  // the same content may have REPLACED the map entry with a newer session —
+  // an orphaned older run must lose its record (safe: next setup re-pushes)
+  // rather than clobber the live session's marker back to 0 and re-arm a
+  // document-push skip while that session's engine copy is ahead.
+  if (entry && entry.sessionId === sessionId) entry.lastRunDocWrites = docWrites;
+}
+
 async function setupSession(content, { avatarId, reuseSession } = {}) {
   const contentId = content._id.toString();
   let sessionId;
+  // W0: per-push timing map, logged as one [timing] line at the end so a
+  // slow setup is diagnosable to the specific engine hop / Mongo fetch.
+  const timings = {};
+  const tSetup = Date.now();
+  let reused = false;
 
   // Reuse existing session if available (conversation memory)
   if (reuseSession) {
@@ -310,136 +448,217 @@ async function setupSession(content, { avatarId, reuseSession } = {}) {
     if (existing) {
       existing.lastUsed = Date.now();
       sessionId = existing.sessionId;
+      reused = true;
     }
   }
 
   // Create new session if needed
   if (!sessionId) {
-    sessionId = await writingEngine.createSession();
+    sessionId = await timed(timings, 'createSession', () => writingEngine.createSession());
     rememberSession(contentId, sessionId);
   }
 
-  // 2. Convert blocks → markdown and push document
+  // W2-b: per-session push hashes. rememberSession REPLACES the map entry on
+  // session creation, so a fresh session always starts with empty hashes
+  // (never skips). Skips are restricted to the review-verified SAFE subset —
+  // document (guarded), brandVoice, imageStyle, mode, plan — all of which the
+  // engine rehydrates from its DB after a restart. brief / context files /
+  // CFS config are NOT skippable: the engine does NOT rehydrate them on the
+  // run path, and a restarted engine returns 200 (not 404), so a hash-skip
+  // there would silently run the agent with an empty brief.
+  const entry = contentSessionMap.get(contentId);
+  let hashes = entry && entry.sessionId === sessionId ? (entry.pushHashes ||= {}) : {};
+  const skipped = [];
+
   const markdown = blocksToMarkdown(content.blocks || []);
-  if (markdown) {
-    await writingEngine.pushDocument(sessionId, markdown);
-  }
 
-  // 3. Convert benchmark → brief and push
-  const brief = benchmarkToContentBrief(content);
-
-  // 3b. If the wizard picked another draft as a writing-style reference,
-  // append its markdown to authorContext with a strict "STYLE ONLY" header.
-  // The Go engine already feeds authorContext into the system prompt, so
-  // this needs zero engine changes. Reference is scoped to the same
-  // workspace (lookup via findByNumber + content.workspaceId).
-  if (content.styleReferenceContentNumber) {
-    const ref = await Content.findByNumber(
-      content.workspaceId,
-      content.styleReferenceContentNumber,
-    );
-    // B4: never feed a LOCKED reference's text to the LLM — that would exfiltrate
-    // locked content via the style-reference channel (the primary doc is already
-    // gated at resolveContent; this closes the secondary read).
-    if (ref && !ref.locked && Array.isArray(ref.blocks) && ref.blocks.length > 0) {
-      const refMd = blocksToMarkdown(ref.blocks);
-      if (refMd.trim()) {
-        const styleBlock =
-          `\n\n---\n## Writing style reference (STYLE ONLY — do NOT copy topics or facts)\n` +
-          `Match the tone, voice, sentence rhythm, paragraph pacing, and formality of ` +
-          `the following reference article written by the same author. The reference is ` +
-          `about a DIFFERENT topic — do NOT reuse any of its facts, examples, structure, ` +
-          `headings, or subject matter. Only emulate HOW it's written.\n\n` +
-          `### Reference: "${ref.title || 'Untitled'}"\n\n` +
-          refMd;
-        brief.authorContext = (brief.authorContext || '') + styleBlock;
+  // ── W2-a: parallel fan-out ────────────────────────────────────────────
+  // The pushes and their Mongo prefetches are independent (engine session
+  // fields are individually mutex-guarded; the run is only submitted after
+  // ALL of these settle, so cross-push ordering doesn't matter — the old
+  // "mode before plan" comment was disproven in review). createSession is
+  // the only hard prerequisite and completed above.
+  //
+  // Wrapped in runFanout() so a REUSED session the engine has since evicted
+  // (redeploy with a fresh store, or the engine's own session TTL — more
+  // reachable now that W5-b autocomplete seeds bare sessions for content the
+  // user is merely typing in) can be recreated and the WHOLE fan-out retried
+  // once. The pushes run in parallel against `sessionId`, so recovering only
+  // the document push would leave the siblings pointed at the dead session —
+  // hence a fan-out-level retry, not a per-push one. Mirrors setupSessionLite.
+  const runFanout = () => {
+    // 2. Document push (FATAL on failure, as before).
+    const taskDocument = async () => {
+      if (!markdown) return;
+      const h = pushHash(markdown);
+      if (hashes.document === h && entry?.lastRunDocWrites === 0) {
+        skipped.push('document');
+        return;
       }
-    }
-  }
+      await timed(timings, 'pushDocument', () => writingEngine.pushDocument(sessionId, markdown));
+      hashes.document = h;
+    };
 
-  // 3c. Internal-link inventory from the workspace's crawled sitemap pages
-  // (non-fatal — the engine skips the links signal when this is absent).
-  try {
-    const workspaceId = content.workspaceId || content.workspace;
-    brief.availableLinks = await buildAvailableLinks(
-      workspaceId,
-      brief.targetKeyword,
-      brief.secondaryKeywords,
-    );
-    // R3: full crawled-URL allowlist for hallucination classification (top-30
-    // availableLinks feeds prompts; this feeds only the link verifier). Never
-    // rendered into a prompt — the engine reads it in AnalyzeLinks only.
-    brief.allowlistUrls = await buildAllowlistUrls(workspaceId);
-  } catch (err) {
-    console.error('availableLinks build failed (non-fatal):', err.message);
-  }
+    // 3. Brief assembly + push (FATAL on failure, as before). Context files
+    // need the ASSEMBLED brief, so hand it over via a promise that resolves
+    // even when this task throws (else allSettled would hang on taskContext).
+    let briefResolve;
+    const briefReady = new Promise((resolve) => { briefResolve = resolve; });
+    const taskBrief = async () => {
+      try {
+        const brief = benchmarkToContentBrief(content);
 
-  await writingEngine.pushBrief(sessionId, brief);
+        // 3b. Style-reference article → authorContext (STYLE ONLY header).
+        // B4: never feed a LOCKED reference's text to the LLM.
+        if (content.styleReferenceContentNumber) {
+          const ref = await timed(timings, 'styleRefLookup', () => Content.findByNumber(
+            content.workspaceId,
+            content.styleReferenceContentNumber,
+          ));
+          if (ref && !ref.locked && Array.isArray(ref.blocks) && ref.blocks.length > 0) {
+            const refMd = blocksToMarkdown(ref.blocks);
+            if (refMd.trim()) {
+              const styleBlock =
+                `\n\n---\n## Writing style reference (STYLE ONLY — do NOT copy topics or facts)\n` +
+                `Match the tone, voice, sentence rhythm, paragraph pacing, and formality of ` +
+                `the following reference article written by the same author. The reference is ` +
+                `about a DIFFERENT topic — do NOT reuse any of its facts, examples, structure, ` +
+                `headings, or subject matter. Only emulate HOW it's written.\n\n` +
+                `### Reference: "${ref.title || 'Untitled'}"\n\n` +
+                refMd;
+              brief.authorContext = (brief.authorContext || '') + styleBlock;
+            }
+          }
+        }
 
-  // 4. Generate and push context files for ReadFile tool (non-fatal)
-  try {
-    const contextFiles = {};
+        // 3c. Internal-link inventory (non-fatal — engine skips the signal).
+        try {
+          const workspaceId = content.workspaceId || content.workspace;
+          brief.availableLinks = await timed(timings, 'buildLinks', () => buildAvailableLinks(
+            workspaceId,
+            brief.targetKeyword,
+            brief.secondaryKeywords,
+          ));
+          // R3: full crawled-URL allowlist for hallucination classification.
+          brief.allowlistUrls = await timed(timings, 'buildLinks', () => buildAllowlistUrls(workspaceId));
+        } catch (err) {
+          console.error('availableLinks build failed (non-fatal):', err.message);
+        }
 
-    // research-outline.md — from benchmark + competitor data
-    if (content.recommendedOutline || content.competitorPages?.length || content.peopleAlsoAsk?.length) {
-      contextFiles['research-outline.md'] = buildResearchOutlineMd(content);
-    }
-
-    // seo-targets.md — from SEO brief
-    if (brief && (brief.nlpTerms?.length || brief.secondaryKeywords?.length || brief.targetKeyword)) {
-      contextFiles['seo-targets.md'] = buildSeoTargetsMd(brief);
-    }
-
-    // content-audit.md — from latest audit results (if available)
-    const latestAudit = content.audits?.[content.audits.length - 1];
-    if (latestAudit) {
-      const auditMd = buildContentAuditMd(latestAudit);
-      if (auditMd) contextFiles['content-audit.md'] = auditMd;
-    }
-
-    if (Object.keys(contextFiles).length > 0) {
-      await writingEngine.pushContextFiles(sessionId, contextFiles);
-    }
-  } catch (err) {
-    console.error('Context files push failed (non-fatal):', err.message);
-  }
-
-  // 5. Push brand voice + selected avatar to the engine (non-fatal)
-  try {
-    const workspaceId = content.workspaceId || content.workspace;
-    const brandVoice = await BrandVoice.findOne({ workspace: workspaceId, active: true }).lean();
-    let combinedMarkdown = '';
-
-    if (brandVoice && brandVoice.content) {
-      combinedMarkdown += brandVoice.content;
-    }
-
-    if (avatarId) {
-      const avatar = await Avatar.findOne({ _id: avatarId, workspace: workspaceId, active: true }).lean();
-      if (avatar && avatar.content) {
-        combinedMarkdown += (combinedMarkdown ? '\n\n---\n\n' : '') + avatar.content;
+        briefResolve(brief);
+        await timed(timings, 'pushBrief', () => writingEngine.pushBrief(sessionId, brief));
+      } catch (err) {
+        briefResolve(null); // unblock taskContextFiles; brief failure stays fatal
+        throw err;
       }
-    }
+    };
 
-    if (combinedMarkdown.trim()) {
-      await writingEngine.pushBrandVoice(sessionId, combinedMarkdown);
-    }
+    // 4. Context files (non-fatal, needs the assembled brief).
+    const taskContextFiles = async () => {
+      const brief = await briefReady;
+      if (!brief) return; // brief assembly failed — its error is already fatal
+      try {
+        const contextFiles = {};
+        if (content.recommendedOutline || content.competitorPages?.length || content.peopleAlsoAsk?.length) {
+          contextFiles['research-outline.md'] = buildResearchOutlineMd(content);
+        }
+        if (brief.nlpTerms?.length || brief.secondaryKeywords?.length || brief.targetKeyword) {
+          contextFiles['seo-targets.md'] = buildSeoTargetsMd(brief);
+        }
+        const latestAudit = content.audits?.[content.audits.length - 1];
+        if (latestAudit) {
+          const auditMd = buildContentAuditMd(latestAudit);
+          if (auditMd) contextFiles['content-audit.md'] = auditMd;
+        }
+        if (Object.keys(contextFiles).length > 0) {
+          await timed(timings, 'pushContextFiles', () => writingEngine.pushContextFiles(sessionId, contextFiles));
+        }
+      } catch (err) {
+        console.error('Context files push failed (non-fatal):', err.message);
+      }
+    };
 
-    // Push the workspace's image style. Always pushed (even empty) so a
-    // reused session is CLEARED when the user removes the style — the
-    // engine persists styles across sessions/restarts otherwise.
-    await writingEngine.pushImageStyle(sessionId, brandVoice?.imageStyle || '');
-  } catch (err) {
-    console.error('Brand voice push failed (non-fatal):', err.message);
+    // 5. Brand voice + image style (non-fatal; both W2-b skippable).
+    const taskBrandVoice = async () => {
+      try {
+        const workspaceId = content.workspaceId || content.workspace;
+        const [brandVoice, avatar] = await Promise.all([
+          timed(timings, 'brandVoiceLookup', () => BrandVoice.findOne({ workspace: workspaceId, active: true }).lean()),
+          avatarId
+            ? Avatar.findOne({ _id: avatarId, workspace: workspaceId, active: true }).lean()
+            : Promise.resolve(null),
+        ]);
+        let combinedMarkdown = '';
+        if (brandVoice && brandVoice.content) combinedMarkdown += brandVoice.content;
+        if (avatar && avatar.content) {
+          combinedMarkdown += (combinedMarkdown ? '\n\n---\n\n' : '') + avatar.content;
+        }
+
+        if (combinedMarkdown.trim()) {
+          const h = pushHash(combinedMarkdown);
+          if (hashes.brandVoice === h) {
+            skipped.push('brandVoice');
+          } else {
+            await timed(timings, 'pushBrandVoice', () => writingEngine.pushBrandVoice(sessionId, combinedMarkdown));
+            hashes.brandVoice = h;
+          }
+        }
+
+        // Image style: pushed (even empty) so a reused session is CLEARED when
+        // the user removes the style — skipped only when unchanged for this
+        // exact session.
+        const style = brandVoice?.imageStyle || '';
+        const sh = pushHash(style);
+        if (hashes.imageStyle === sh) {
+          skipped.push('imageStyle');
+        } else {
+          await timed(timings, 'pushImageStyle', () => writingEngine.pushImageStyle(sessionId, style));
+          hashes.imageStyle = sh;
+        }
+      } catch (err) {
+        console.error('Brand voice push failed (non-fatal):', err.message);
+      }
+    };
+
+    // 6. Plan-mode orchestration: mode + plan + CFS (non-fatal, aggregated).
+    const taskPlanMode = () =>
+      timed(timings, 'planModeContext', () => pushPlanModeContext(sessionId, content, timings, hashes, skipped));
+
+    return Promise.allSettled([
+      taskDocument(), taskBrief(), taskContextFiles(), taskBrandVoice(), taskPlanMode(),
+    ]);
+  };
+
+  let results = await runFanout();
+
+  // A REUSED session the engine no longer holds → its (unskipped) pushes 404.
+  // Recreate a fresh session and retry the fan-out ONCE. A fresh session starts
+  // with EMPTY hashes so nothing is skipped (the doc/brief WILL be pushed and so
+  // WILL surface a real 404, not silently skip) — and `reused=false` here means
+  // the retry itself can never recurse. Only fires on the fatal (document/brief)
+  // pushes; a genuine non-404 error still aborts.
+  const isGone = (r) => r.status === 'rejected' && r.reason?.status === 404;
+  if (reused && (isGone(results[0]) || isGone(results[1]))) {
+    console.warn(`[setup] engine session ${sessionId} gone (404) — recreating and retrying setup once`);
+    contentSessionMap.delete(contentId);
+    sessionId = await timed(timings, 'createSession', () => writingEngine.createSession());
+    rememberSession(contentId, sessionId);
+    hashes = (contentSessionMap.get(contentId).pushHashes ||= {}); // persist retry's hashes on the new entry
+    skipped.length = 0;
+    reused = false;
+    results = await runFanout();
   }
 
-  // ── M5: plan-mode orchestration ──────────────────────────────────────
-  // Push the session's mode + current plan + CFS connection info BEFORE
-  // returning. Order matters: mode is pushed first so the strategy
-  // router knows which strategy to instantiate; plan and CFS come after.
-  // Failures here are logged but don't block chat — Go falls back to
-  // chat-mode defaults on missing pushes.
-  await pushPlanModeContext(sessionId, content);
+  // Preserve the old sequential fatality: document + brief failures abort
+  // setup (thrown to the handler); everything else is internally non-fatal.
+  for (const r of [results[0], results[1]]) {
+    if (r.status === 'rejected') throw r.reason;
+  }
+
+  console.log(
+    `[timing] setupSession content=${content.contentNumber} reused=${reused} ` +
+    `total=${Date.now() - tSetup}ms skipped=[${skipped.join(',')}] ${JSON.stringify(timings)}`
+  );
 
   return { sessionId, markdown };
 }
@@ -541,6 +760,32 @@ async function setupSessionImage(content) {
 }
 
 /**
+ * W5-b: ghost-text autocomplete session setup — the LIGHTEST of all the setup
+ * variants. The engine's /complete reads NO document (only the optional
+ * SEO-brief keyword already persisted in the session), so unlike
+ * setupSessionLite this pushes NOTHING: it reuses the shared contentSessionMap
+ * session if one exists (getting the keyword hint for free), else mints a BARE
+ * session purely to satisfy the engine's requireSession gate. A later
+ * chat/agent/inline-edit reuses this same session and runs the real setup — so
+ * seeding a bare session here is harmless (rememberSession resets its push
+ * hashes; the first real setup pushes everything).
+ *
+ * Returns the sessionId. Callers must handle a 404 from the engine (an evicted
+ * reused session) by recreating a bare session and retrying once.
+ */
+async function setupSessionAutocomplete(content) {
+  const contentId = content._id.toString();
+  const existing = contentSessionMap.get(contentId);
+  if (existing) {
+    existing.lastUsed = Date.now();
+    return existing.sessionId;
+  }
+  const sessionId = await writingEngine.createSession(AbortSignal.timeout(10000));
+  rememberSession(contentId, sessionId);
+  return sessionId;
+}
+
+/**
  * Push mode + plan + CFS config to the Go session. M5 orchestration glue.
  *
  * Mode comes from Content.mode (persistent — Plan transition statics
@@ -551,49 +796,75 @@ async function setupSessionImage(content) {
  * Go tools can't authenticate against /api/internal/cfs/* and would
  * fail mid-call. Better to fail loudly here than silently in the loop.
  */
-async function pushPlanModeContext(sessionId, content) {
+async function pushPlanModeContext(sessionId, content, timings = {}, hashes = {}, skipped = []) {
   // Bug #H fix: aggregate failures into one structured log line at the
   // end so a misconfigured session is visible in a single grep, not
   // spread across three separate errors. Includes sessionId + content
   // identifiers so the line is correlatable in multi-tenant logs.
   const failures = [];
 
-  const mode = content.mode || 'chat';
-  const allowed = MODE_ALLOWED_TOOLS[mode] || [];
-  try {
-    await writingEngine.pushMode(sessionId, mode, allowed);
-  } catch (err) {
-    failures.push({ step: 'pushMode', error: err.message });
-  }
-
-  // Plan resolution mirrors planController.get: proposed > draft > approved.
-  let plan = null;
-  try {
-    plan = await Plan.findProposed(content._id);
-    if (!plan) plan = await Plan.findDraft(content._id);
-    if (!plan && content.activePlanId) {
-      plan = await Plan.findById(content.activePlanId);
+  // W2-a: the three pushes are independent engine session fields (mutex-
+  // guarded per field; the run starts only after all pushes settle), so run
+  // them concurrently. Each sub-task catches into failures[] as before.
+  const modeTask = async () => {
+    const mode = content.mode || 'chat';
+    const allowed = MODE_ALLOWED_TOOLS[mode] || [];
+    // W2-b: mode is engine-DB-hydrated — safe to skip when unchanged.
+    const h = pushHash(JSON.stringify({ mode, allowed }));
+    if (hashes.mode === h) {
+      skipped.push('mode');
+      return;
     }
-  } catch (err) {
-    failures.push({ step: 'planLookup', error: err.message });
-  }
+    try {
+      await timed(timings, 'pushMode', () => writingEngine.pushMode(sessionId, mode, allowed));
+      hashes.mode = h;
+    } catch (err) {
+      failures.push({ step: 'pushMode', error: err.message });
+    }
+  };
 
-  try {
-    await writingEngine.pushPlan(sessionId, plan ? toGoPlan(plan) : null);
-  } catch (err) {
-    failures.push({ step: 'pushPlan', error: err.message });
-  }
+  const planTask = async () => {
+    // Plan resolution mirrors planController.get: proposed > draft > approved.
+    let plan = null;
+    try {
+      plan = await Plan.findProposed(content._id);
+      if (!plan) plan = await Plan.findDraft(content._id);
+      if (!plan && content.activePlanId) {
+        plan = await Plan.findById(content.activePlanId);
+      }
+    } catch (err) {
+      failures.push({ step: 'planLookup', error: err.message });
+    }
 
-  // CFS config — required for Go's context tools. Without it, Go's
-  // CFS client constructor returns nil and the tools error out. Fail
-  // loud rather than letting that surface mid-loop.
-  const apiKey = process.env.INTERNAL_API_KEY;
-  const expressBaseUrl = process.env.EXPRESS_INTERNAL_BASE_URL ||
-    process.env.PUBLIC_BASE_URL ||
-    'http://localhost:4001';
-  if (!apiKey) {
-    failures.push({ step: 'cfsConfig', error: 'INTERNAL_API_KEY not set — context tools will be unavailable' });
-  } else {
+    const goPlan = plan ? toGoPlan(plan) : null;
+    // W2-b: plan is engine-DB-hydrated — safe to skip when unchanged. The
+    // lookup above still runs every turn (the plan can change server-side);
+    // only the engine round-trip is elided.
+    const h = pushHash(JSON.stringify(goPlan));
+    if (hashes.plan === h) {
+      skipped.push('plan');
+      return;
+    }
+    try {
+      await timed(timings, 'pushPlan', () => writingEngine.pushPlan(sessionId, goPlan));
+      hashes.plan = h;
+    } catch (err) {
+      failures.push({ step: 'pushPlan', error: err.message });
+    }
+  };
+
+  const cfsTask = async () => {
+    // CFS config — required for Go's context tools. NEVER hash-skipped: the
+    // engine does not rehydrate it after a restart (memory-only), so a skip
+    // could silently disable the context tools for the whole run.
+    const apiKey = process.env.INTERNAL_API_KEY;
+    const expressBaseUrl = process.env.EXPRESS_INTERNAL_BASE_URL ||
+      process.env.PUBLIC_BASE_URL ||
+      'http://localhost:4001';
+    if (!apiKey) {
+      failures.push({ step: 'cfsConfig', error: 'INTERNAL_API_KEY not set — context tools will be unavailable' });
+      return;
+    }
     // Workspace number is denormalized only on Workspace, not Content —
     // do one targeted lookup to resolve it.
     let workspaceNumber = 0;
@@ -605,16 +876,18 @@ async function pushPlanModeContext(sessionId, content) {
     }
 
     try {
-      await writingEngine.pushCFSConfig(sessionId, {
+      await timed(timings, 'pushCFSConfig', () => writingEngine.pushCFSConfig(sessionId, {
         baseUrl: expressBaseUrl,
         apiKey,
         workspaceNumber,
         contentNumber: content.contentNumber || 0,
-      });
+      }));
     } catch (err) {
       failures.push({ step: 'pushCFSConfig', error: err.message });
     }
-  }
+  };
+
+  await Promise.all([modeTask(), planTask(), cfsTask()]);
 
   if (failures.length > 0) {
     // CFS/config failures silently disable the plan-mode context tools (the
@@ -642,17 +915,25 @@ async function pushPlanModeContext(sessionId, content) {
 // ─────────────────────────────────────────────────────────────
 const chat = async (req, res) => {
   let creditTxId = null;
+  const tReq = Date.now(); // W0: request-start reference for [timing] lines
+  // Threads Phase 1: backend-minted run identifier (no engine runId exists) —
+  // the idempotency key on this run's thread appends.
+  const runId = crypto.randomUUID();
   try {
     const content = await resolveContent(req, res);
     if (!content) return;
 
-    const { prompt, avatarId } = req.body;
+    const { prompt, avatarId, displayLabel } = req.body;
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'prompt is required' });
     }
 
     // Set up Writing Engine session
     const { sessionId } = await setupSession(content, { avatarId });
+    // W2-b: poison the doc-write marker until this run completes cleanly — a
+    // crashed run must not leave a stale 0 that would let the next setup skip
+    // the document push while the engine's copy is ahead of the FE's.
+    recordRunDocWrites(content._id.toString(), sessionId, -1);
 
     // Pre-deduct credits before starting the stream
     if (req.creditContext?.deductionEnabled) {
@@ -672,6 +953,17 @@ const chat = async (req, res) => {
       }
     }
 
+    // Threads Phase 1: record the user turn POST-GATE (a 402/400-bounced
+    // request must not write a phantom prompt) and pre-run (a mid-run crash
+    // must not lose it). Best-effort — appendMessage never throws.
+    const thread = await threadService.getOrCreateActiveThread(content, req.user?.userId);
+    await threadService.appendMessage(thread, {
+      kind: 'user',
+      text: prompt,
+      displayText: typeof displayLabel === 'string' ? displayLabel : '',
+      meta: { runId, sessionId, userId: req.user?.userId || null, channel: 'chat' },
+    });
+
     // AbortController tied to the client request so that if the browser
     // disconnects (user pressed Stop / Esc), we abort the fetch to the Go
     // engine — which in turn cancels the handler's r.Context(), stopping
@@ -685,7 +977,9 @@ const chat = async (req, res) => {
 
     // Start streaming request to the engine (Phase 4: tier preset → model set)
     const preset = await resolvePreset(req);
+    const tConnect = Date.now();
     const chatRes = await writingEngine.sendChatMessageStream(sessionId, prompt, abortCtrl.signal, preset);
+    console.log(`[timing] ai.chat engine-connect=${Date.now() - tConnect}ms (request+${Date.now() - tReq}ms)`);
 
     // Set up SSE headers for the client
     res.writeHead(200, {
@@ -701,10 +995,15 @@ const chat = async (req, res) => {
     const reader = chatRes.body.getReader();
     const usageTap = makeUsageTap();
 
+    let firstByteAt = 0; // W0: time-to-first-engine-byte
     const processEvents = async () => {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        if (!firstByteAt) {
+          firstByteAt = Date.now();
+          console.log(`[timing] ai.chat first-engine-byte=+${firstByteAt - tReq}ms (from request start)`);
+        }
         const buf = Buffer.from(value);
         usageTap.addChunk(buf);
         res.write(buf);
@@ -748,7 +1047,33 @@ const chat = async (req, res) => {
       );
     }
 
-    persistUsage(req, content, usageTap, 'chat');
+    console.log(`[timing] ai.chat stream-total=${Date.now() - tReq}ms`);
+    // W2-b: gate the next setup's document-push skip on whether THIS run
+    // wrote to the engine-side document.
+    recordRunDocWrites(content._id.toString(), sessionId, usageTap.snapshot().docWrites);
+    persistUsage(req, content, usageTap, 'chat', { sessionId, aborted: clientDisconnected });
+    // Threads Phase 1: record the assistant turn at the single convergence
+    // point (success AND client-abort funnel here; hard errors go to the
+    // outer catch and deliberately append nothing — D6, the replay shaper
+    // seals a dangling user message).
+    {
+      const finalText = usageTap.finalAssistantText();
+      if (finalText) {
+        const t = usageTap.snapshot();
+        await threadService.appendMessage(thread, {
+          kind: 'assistant',
+          text: finalText,
+          meta: {
+            runId, sessionId, channel: 'chat',
+            model: t.model, tokensIn: t.inputTokens, tokensOut: t.outputTokens,
+            docWrites: t.docWrites, stopReason: t.stopReason, turns: usageTap.turnCount(),
+          },
+        });
+      }
+      if (usageTap.steeringWasApplied() && thread) {
+        threadService.markSteersApplied(thread._id);
+      }
+    }
     if (!clientDisconnected) res.end();
   } catch (err) {
     // Refund credits on error
@@ -797,11 +1122,19 @@ function clampAgentBudget(maxIterations, targetScore) {
 // ─────────────────────────────────────────────────────────────
 const agent = async (req, res) => {
   let creditTxId = null;
+  // W4-b/c: hoisted so the catch can clean the in-flight registry (content
+  // itself is block-scoped to the try). myRunEntry is hoisted too so the catch
+  // can identity-check before deleting (a shadowing same-content run must stay).
+  let runRegistryKey = null;
+  let myRunEntry = null;
+  const tReq = Date.now(); // W0: request-start reference for [timing] lines
+  // Threads Phase 1: backend-minted run identifier (see chat).
+  const runId = crypto.randomUUID();
   try {
     const content = await resolveContent(req, res);
     if (!content) return;
 
-    const { goal, targetScore, maxIterations, allowedTools, avatarId, mode } = req.body;
+    const { goal, targetScore, maxIterations, allowedTools, avatarId, mode, displayLabel, commandName } = req.body;
     if (!goal || typeof goal !== 'string') {
       return res.status(400).json({ error: 'goal is required' });
     }
@@ -838,7 +1171,9 @@ const agent = async (req, res) => {
 
     // Set up Writing Engine session (reuse for conversation memory in freeform mode)
     const isFreeform = !mode || mode === 'freeform';
-    const { sessionId } = await setupSession(content, { avatarId, reuseSession: isFreeform });
+    const { sessionId, markdown: markdownBefore } = await setupSession(content, { avatarId, reuseSession: isFreeform });
+    // W2-b: poison the doc-write marker until this run completes cleanly (see chat).
+    recordRunDocWrites(content._id.toString(), sessionId, -1);
 
     // Pre-deduct credits before starting the stream
     if (req.creditContext?.deductionEnabled) {
@@ -858,35 +1193,84 @@ const agent = async (req, res) => {
       }
     }
 
-    // AbortController tied to the client request so that if the browser
-    // disconnects (user pressed Stop / Esc), we abort the fetch to the Go
-    // engine — which in turn cancels the handler's r.Context(), stopping
-    // the agent mid-turn.
+    // Threads Phase 1: record the user turn POST-GATE (article-gate 429 and
+    // credit 402 bounces above must not write phantom prompts), pre-run.
+    // `text` = the full engineered goal (the replay source); `displayLabel` =
+    // what the FE bubble showed ('/auto-optimize'). Best-effort, never throws.
+    const thread = await threadService.getOrCreateActiveThread(content, req.user?.userId);
+    await threadService.appendMessage(thread, {
+      kind: 'user',
+      text: goal,
+      displayText: typeof displayLabel === 'string' ? displayLabel : '',
+      meta: {
+        runId, sessionId, userId: req.user?.userId || null, channel: 'agent',
+        commandName: typeof commandName === 'string' ? commandName.slice(0, 64) : '',
+      },
+    });
+
+    // W4-c-2 DETACHED RUNS: a passive client disconnect (tab close / navigate
+    // away) no longer aborts the engine — the run keeps going server-side and
+    // the user catches up on reopen (run-status → engine-content reconcile).
+    // An EXPLICIT Stop / Stop&Revert instead reaches the server out-of-band
+    // (POST /ai/stop[-revert]) and calls the registry's abort() BEFORE the
+    // socket closes, so by the time req.on('close') fires the controller is
+    // already aborted and this is a stop, not a detach.
     const abortCtrl = new AbortController();
     let clientDisconnected = false;
+    let detached = false;
     req.on('close', () => {
       clientDisconnected = true;
-      abortCtrl.abort();
+      // Already aborted ⇒ an explicit stop drove this close; leave detached
+      // false so the catch/settle path treats it as a stop. Otherwise the
+      // client simply vanished — detach and let the run finish.
+      if (!abortCtrl.signal.aborted) detached = true;
     });
+
+    // W4-b/c: register the in-flight run (stop-&-revert intent + run-status +
+    // explicit-stop abort). Registered as late as possible so early returns
+    // (402 etc.) never leave a stale entry; removed in BOTH the success path
+    // and the outer catch. abort() lets /ai/stop and /ai/stop-revert halt the
+    // engine out-of-band now that a socket close no longer does.
+    runRegistryKey = content._id.toString();
+    // Keep a reference to OUR entry object. Same-content runs are guarded by the
+    // FE (one at a time) and the engine's per-session single-flight, but if two
+    // ever overlap, a later run's set() would shadow this one — so every read
+    // and delete below is identity-checked against myRunEntry rather than
+    // trusting whatever currently occupies the key (mirrors the W2 session
+    // guard). A finishing run must never delete or read a different run's entry.
+    myRunEntry = {
+      sessionId,
+      markdownBefore: markdownBefore || '',
+      startedAt: Date.now(),
+      revertIntent: false,
+      abort: () => abortCtrl.abort(),
+    };
+    activeAgentRuns.set(runRegistryKey, myRunEntry);
 
     // Start agent — returns a raw SSE response from the Writing Engine
     // mode: "freeform" (default, Claude Code-style) or "sequential" (legacy phases)
     const agentPreset = await resolvePreset(req);
     const { safeIterations, safeTargetScore } = clampAgentBudget(maxIterations, targetScore);
+    const tConnect = Date.now();
     const agentRes = await writingEngine.startAgent(
       sessionId, goal, safeTargetScore, safeIterations, abortCtrl.signal, allowedTools, mode || 'freeform', agentPreset
     );
+    console.log(`[timing] ai.agent engine-connect=${Date.now() - tConnect}ms (request+${Date.now() - tReq}ms)`);
 
-    // Set up SSE headers for the client
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    });
-
-    // Emit session_init event so frontend knows the sessionId for mid-run actions
-    res.write(`data: ${JSON.stringify({ type: 'session_init', sessionId })}\n\n`);
+    // If the client already detached during the engine-connect await, the socket
+    // is dead — skip the header + session_init writes (they'd hit a closed
+    // response) but let the run continue detached below.
+    if (!detached && !res.writableEnded) {
+      // Set up SSE headers for the client
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      // Emit session_init event so frontend knows the sessionId for mid-run actions
+      res.write(`data: ${JSON.stringify({ type: 'session_init', sessionId })}\n\n`);
+    }
 
     // Raw byte pipe — forward Go engine SSE stream directly to the client.
     // All event transformation (document_diff → patch/draft) is now handled
@@ -895,35 +1279,63 @@ const agent = async (req, res) => {
     const reader = agentRes.body.getReader();
     const usageTap = makeUsageTap();
 
+    let firstByteAt = 0; // W0: time-to-first-engine-byte
     const processEvents = async () => {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        if (!firstByteAt) {
+          firstByteAt = Date.now();
+          console.log(`[timing] ai.agent first-engine-byte=+${firstByteAt - tReq}ms (from request start)`);
+        }
         const buf = Buffer.from(value);
         usageTap.addChunk(buf);
-        res.write(buf);
+        // W4-c-2: once the client has detached, its socket is dead — keep
+        // DRAINING the engine stream (so the run finishes and usage is tallied)
+        // but stop forwarding to the closed response (a write would throw
+        // EPIPE / ERR_STREAM_WRITE_AFTER_END).
+        if (!detached && !res.writableEnded) {
+          try {
+            res.write(buf);
+          } catch (writeErr) {
+            // Client vanished between the close event and this write — treat
+            // the rest of the run as detached and keep draining the engine.
+            detached = true;
+          }
+        }
       }
     };
 
-    // Cancel reader on abort (belt-and-braces — the fetch signal already
-    // aborts the upstream, but cancel() releases the reader lock cleanly).
+    // Cancel reader on abort (explicit Stop / Stop&Revert only — a passive
+    // detach never aborts, so the reader keeps draining to completion).
     abortCtrl.signal.addEventListener('abort', () => {
       reader.cancel().catch(() => {});
     });
 
+    // W4-b: the stop-revert endpoint sets revertIntent on THIS entry (identity
+    // via sessionId match) while the stream is live. Read it off myRunEntry —
+    // the object stop-revert mutated — not a re-get, so a concurrent same-content
+    // run that shadowed the key can't feed us its markdownBefore/revertIntent.
+    const runEntry = myRunEntry;
+
+    // W4-c-2: distinguishes a run that ran to completion (detached or attached)
+    // from one cut short by an explicit Stop — drives the run record's `aborted`
+    // flag that the catch-up UI reads to decide "finished" vs "was stopped".
+    let streamCompleted = false;
     try {
       await processEvents();
+      streamCompleted = true;
     } catch (streamErr) {
       if (clientDisconnected || abortCtrl.signal.aborted) {
-        console.log('[agent-sse] stream aborted by client disconnect');
-        // Refund ONLY when nothing was written (review BLOCKER-2): the doc
-        // edits stream to the client BEFORE completion, so "read until the
-        // final document_diff, then drop the connection" would otherwise yield
-        // a full article with a 100-credit refund and no slot — the count-gate
-        // defeated via abort. Once the run has written, treat it as delivered:
-        // fall through to settle + commit below.
+        console.log('[agent-sse] stream aborted by explicit stop');
+        // Refund when nothing was written (review BLOCKER-2) OR when the user
+        // EXPLICITLY stopped-and-reverted (W4-b): the doc edits stream to the
+        // client BEFORE completion, so a silent "read until the final
+        // document_diff, then drop the connection" must never refund — but a
+        // declared revert also restores the ENGINE document below.
+        const revertNow = !!myRunEntry.revertIntent;
         const wroteBeforeAbort = usageTap.snapshot().docWrites > 0;
-        if (creditTxId && !wroteBeforeAbort) {
+        if (creditTxId && (!wroteBeforeAbort || revertNow)) {
           creditService.refund(creditTxId).catch((e) =>
             console.error('[credit] agent abort refund failed:', e.message)
           );
@@ -933,6 +1345,16 @@ const agent = async (req, res) => {
         throw streamErr;
       }
     }
+
+    // Re-read after the stream ended — the flag is now authoritative.
+    const revertFinal = !!myRunEntry.revertIntent;
+    // W4-b (review V3): delete the entry HERE, before the awaited settle/
+    // commit below. A concurrent stop-revert POST landing during that await
+    // then deterministically 409s (no matching in-flight run) instead of
+    // setting an intent this handler has already read past. W4-c-2 review:
+    // identity-guarded — only clear the key if it's still OURS, so a
+    // same-content run that shadowed it (and is still live) is left intact.
+    if (activeAgentRuns.get(runRegistryKey) === myRunEntry) activeAgentRuns.delete(runRegistryKey);
 
     // Stream completed — settle the deduction. Agent cost is fixed per mode
     // (== the reserved estimate), so settle() refunds 0 — but it must be settle(),
@@ -949,25 +1371,91 @@ const agent = async (req, res) => {
 
     if (creditTxId) {
       const reserved = req.creditContext?.estimatedCredits ?? 0;
-      const actual = (billingAction === 'articleGenerate' && !wroteDocument)
-        ? resolveCredits('inlineAction', { tier: req.creditContext?.tier })
-        : reserved;
+      // W4-b (review V1, user-chosen policy): a reverted run that WROTE settles
+      // to the small inlineAction price rather than a full refund. Full refund
+      // was a money leak — a hostile client could keep the streamed article in
+      // Mongo (which the FE owns via autosave) while paying nothing, unbounded.
+      // Charging inlineAction removes the "free" incentive (bounded by the
+      // credit pool) while keeping the honest revert cheap. A reverted run that
+      // never wrote is a plain stop → also inlineAction (matches the no-write
+      // articleGenerate branch). No article slot is consumed either way.
+      let actual;
+      if (revertFinal) {
+        actual = resolveCredits('inlineAction', { tier: req.creditContext?.tier });
+      } else {
+        actual = (billingAction === 'articleGenerate' && !wroteDocument)
+          ? resolveCredits('inlineAction', { tier: req.creditContext?.tier })
+          : reserved;
+      }
       creditService.settle(creditTxId, Math.min(actual, reserved)).catch((e) =>
         console.error('[credit] agent settle failed:', e.message)
       );
+      creditTxId = null;
     }
 
     // Article count-gate: commit whenever the run ACTUALLY WROTE — including
-    // abort-after-write (the article was delivered; see BLOCKER-2 above). Pure
-    // no-write aborts and thrown errors (outer catch) never reach here — failed
-    // generations don't count.
-    if (articleGate && wroteDocument) {
+    // abort-after-write (the article was delivered; see BLOCKER-2 above) —
+    // EXCEPT an explicit stop-&-revert (W4-b): the run is billed as an
+    // inlineAction, not an article delivery, so no slot is consumed.
+    if (articleGate && wroteDocument && !revertFinal) {
       await commitArticleGeneration(content, articleGate);
     }
+    if (revertFinal && wroteDocument) {
+      console.log(`[audit] stop-revert billed as inlineAction content=${content.contentNumber} session=${sessionId}`);
+    }
 
-    persistUsage(req, content, usageTap, 'agent');
+    // W4-b: make the revert REAL server-side — restore the engine session's
+    // pre-run document so engine + FE (snapshot restore) + Mongo (reconcile
+    // save of the reverted blocks) all converge on the pre-run state. Best
+    // effort: on failure the poison marker below still forces a re-push of
+    // the FE's (reverted) content on the next run.
+    if (revertFinal && wroteDocument && runEntry?.markdownBefore) {
+      // Review V2: AWAIT the restore before recording the doc-write marker so
+      // the ordering is deterministic — a late fire-and-forget push could
+      // otherwise interleave with the next run's setup.
+      try {
+        await writingEngine.pushDocument(sessionId, runEntry.markdownBefore);
+      } catch (e) {
+        console.warn('[agent] revert doc restore failed (next setup re-pushes):', e.message);
+      }
+    }
+
+    console.log(`[timing] ai.agent stream-total=${Date.now() - tReq}ms${revertFinal ? ' (stop-revert)' : ''}`);
+    // W2-b: gate the next setup's document-push skip on whether THIS run
+    // wrote to the engine-side document. A reverted run poisons the marker
+    // so the next setup re-pushes regardless of the restore's hash.
+    recordRunDocWrites(content._id.toString(), sessionId, revertFinal ? -1 : usageTap.snapshot().docWrites);
+    // aborted reflects whether the RUN finished, not whether the CLIENT stayed:
+    // a detached run that completed server-side is NOT aborted (the catch-up UI
+    // reads this to show "finished while you were away" vs "was stopped").
+    persistUsage(req, content, usageTap, 'agent', { sessionId, aborted: !streamCompleted });
+    // Threads Phase 1: record the assistant turn at the convergence point —
+    // success, passive detach (drained server-side, so the tap has the full
+    // text), explicit stop, stop-revert, and the TTL abort ALL pass through
+    // here exactly once. Hard errors hit the outer catch → no append (D6).
+    {
+      const finalText = usageTap.finalAssistantText();
+      if (finalText) {
+        const t = usageTap.snapshot();
+        await threadService.appendMessage(thread, {
+          kind: 'assistant',
+          text: revertFinal ? `${finalText}\n\n[This run was stopped and its changes were reverted.]` : finalText,
+          meta: {
+            runId, sessionId, channel: 'agent',
+            model: t.model, tokensIn: t.inputTokens, tokensOut: t.outputTokens,
+            docWrites: revertFinal ? 0 : t.docWrites, stopReason: t.stopReason,
+            turns: usageTap.turnCount(),
+          },
+        });
+      }
+      if (usageTap.steeringWasApplied() && thread) {
+        threadService.markSteersApplied(thread._id);
+      }
+    }
     if (!clientDisconnected) res.end();
   } catch (err) {
+    // W4-b/c: never leave a stale in-flight entry behind a thrown stream.
+    if (runRegistryKey && activeAgentRuns.get(runRegistryKey) === myRunEntry) activeAgentRuns.delete(runRegistryKey);
     // Refund credits on error
     if (creditTxId) {
       creditService.refund(creditTxId).catch((e) =>
@@ -1236,7 +1724,7 @@ const inlineEdit = async (req, res) => {
     const content = await resolveContent(req, res);
     if (!content) return;
 
-    const { selectedText, instruction } = req.body || {};
+    const { selectedText, instruction, preview } = req.body || {};
     if (!selectedText || typeof selectedText !== 'string' || !selectedText.trim()) {
       return res.status(400).json({ error: 'selectedText is required' });
     }
@@ -1264,7 +1752,9 @@ const inlineEdit = async (req, res) => {
 
     let result;
     try {
-      result = await writingEngine.inlineEdit(sessionId, { selectedText, instruction });
+      // W5-a: preview mode computes the replacement + diff without mutating the
+      // engine document — the editor applies on accept.
+      result = await writingEngine.inlineEdit(sessionId, { selectedText, instruction, preview: !!preview });
     } catch (err) {
       // Engine unreachable / timeout / 5xx → 502 so the client falls back to chat.
       console.error('[inline-edit] engine call failed:', err.message);
@@ -1309,6 +1799,16 @@ const inlineEdit = async (req, res) => {
       return res.status(422).json({ error: result.error || 'no edit produced' });
     }
 
+    // W2-b: the engine applied this edit to ITS document copy. If the editor
+    // discards its local apply (stale-range guard), the FE markdown hash won't
+    // change — poison the marker so the next setup re-pushes rather than
+    // skipping while the engine copy is ahead. W5-a: in PREVIEW mode the engine
+    // did NOT apply (doc unchanged), so no poison — an accepted edit changes the
+    // FE hash and re-pushes naturally; a rejected one leaves nothing to sync.
+    if (!preview) {
+      recordRunDocWrites(content._id.toString(), sessionId, -1);
+    }
+
     // Charge ONLY on success. preDeduct + settle run as ONE cycle here so no
     // pending tx is left for the orphan-sweep to later refund (which would
     // silently undercharge). Settled to the SAME aiChatMessage cost the prior
@@ -1336,10 +1836,113 @@ const inlineEdit = async (req, res) => {
 
     recordInlineEditCogs(false);
 
-    return res.json({ editedText: result.editedText });
+    // W5-a: return originalText + diff so the editor can render the accept/reject
+    // preview. Included only when the engine provides them — the real engine
+    // populates both on the apply path too (so that response is {editedText,
+    // originalText, diff}); a bare-editedText engine reply stays { editedText }.
+    // Additive keys; no inline-edit consumer reads result.applied.
+    const payload = { editedText: result.editedText };
+    if (result.originalText != null) payload.originalText = result.originalText;
+    if (result.diff != null) payload.diff = result.diff;
+    return res.json(payload);
   } catch (err) {
     console.error('[inline-edit] handler error:', err);
     return res.status(500).json({ error: 'inline edit failed' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// POST /:workspaceNumber/content/:contentNumber/ai/autocomplete
+// W5-b: ghost-text (Cursor-style Tab completion). The FLYWEIGHT AI endpoint —
+// registered with the lightest auth chain (rwr only, NO feature/permission/
+// credit gates), excluded from the global per-IP limiter, and metered by its
+// OWN per-user bucket (see workspaceRoutes). It is FREE: no credit charge, only
+// a fire-and-forget COGS ledger row for margin tracking. Every soft failure
+// (engine down, timeout, refusal, empty) returns 200 {completion:''} so the
+// editor simply shows no ghost text — autocomplete must NEVER surface an error.
+// ─────────────────────────────────────────────────────────────
+const AUTOCOMPLETE_TIMEOUT_MS = 5000;
+
+const autocomplete = async (req, res) => {
+  // resolveContent runs its OWN indexed Mongo read; on a transient DB error (or
+  // a CastError) it REJECTS. This is the highest-QPS AI handler, so an unguarded
+  // reject here would both violate the soft-fail contract AND (Express 4 doesn't
+  // await handlers) surface as an unhandledRejection. Isolate it so any throw
+  // degrades to "no suggestion".
+  let content;
+  try {
+    content = await resolveContent(req, res);
+  } catch (err) {
+    console.warn('[autocomplete] content lookup failed:', err.message);
+    if (res.headersSent) return;
+    return res.json({ completion: '' });
+  }
+  if (!content) return; // 404 (not found) / 403 (locked) already sent
+
+  const { textBefore, textAfter, maxTokens } = req.body || {};
+  if (typeof textBefore !== 'string' || textBefore.trim() === '') {
+    return res.status(400).json({ error: 'textBefore is required' });
+  }
+  // Bound the payload defensively (the engine trims to ~200 words anyway).
+  const tb = textBefore.slice(-4000);
+  const ta = typeof textAfter === 'string' && textAfter ? textAfter.slice(0, 2000) : undefined;
+  let mt = Number(maxTokens);
+  if (!Number.isFinite(mt) || mt <= 0) mt = 0; // 0 → engine default (100)
+  else if (mt > 200) mt = 200;                 // ghost text is 1-2 sentences
+
+  // Cancel the engine call if the client navigates away (stale keystroke) or we
+  // exceed the latency budget — a ghost suggestion that arrives late is useless
+  // and we shouldn't keep paying the model for it.
+  const ac = new AbortController();
+  let clientGone = false;
+  const onClose = () => { clientGone = true; ac.abort(); };
+  req.on('close', onClose);
+  const timer = setTimeout(() => ac.abort(), AUTOCOMPLETE_TIMEOUT_MS);
+
+  try {
+    let sessionId = await setupSessionAutocomplete(content);
+    let result;
+    try {
+      result = await writingEngine.complete(sessionId, { textBefore: tb, textAfter: ta, maxTokens: mt }, ac.signal);
+    } catch (err) {
+      // A reused session the engine no longer has (redeploy / eviction) 404s —
+      // mirror setupSessionLite: drop the poisoned entry, mint a bare session,
+      // retry ONCE. Any other error falls through to the soft-fail below.
+      if (err.status === 404) {
+        contentSessionMap.delete(content._id.toString());
+        sessionId = await writingEngine.createSession(AbortSignal.timeout(10000));
+        rememberSession(content._id.toString(), sessionId);
+        result = await writingEngine.complete(sessionId, { textBefore: tb, textAfter: ta, maxTokens: mt }, ac.signal);
+      } else {
+        throw err;
+      }
+    }
+
+    // FREE feature — no credit charge. Record COGS only (fire-and-forget) so the
+    // margin dashboard sees autocomplete volume/cost. Mirrors inlineEdit's tap.
+    if (result?.usage?.model) {
+      costLedger.recordForWorkspace({
+        action: 'autocomplete',
+        model: result.usage.model,
+        tokensIn: result.usage.input_tokens || 0,
+        tokensOut: result.usage.output_tokens || 0,
+        workspaceId: content.workspaceId,
+        userId: req.user?.userId || null,
+        metadata: { contentId: content._id?.toString() },
+      });
+    }
+
+    // Soft-fail on any engine-reported error (refusal / empty) — no ghost text.
+    return res.json({ completion: (result && !result.error && result.completion) || '' });
+  } catch (err) {
+    if (clientGone) return; // socket already gone — nothing to write
+    // Timeout or engine failure: never error the editor, just suppress the ghost.
+    if (!ac.signal.aborted) console.warn('[autocomplete] failed:', err.message);
+    if (res.headersSent) return;
+    return res.json({ completion: '' });
+  } finally {
+    clearTimeout(timer);
+    req.off('close', onClose);
   }
 };
 
@@ -1439,7 +2042,23 @@ const clarifyAnswer = async (req, res) => {
     if (!sessionBoundToContent(content._id.toString(), sessionId)) {
       return res.status(409).json({ error: 'Session does not match this content (it may have expired — restart the chat)' });
     }
+    // W2-b (review Gap A, defensive): answering resumes the paused agent loop.
+    // Its writes stream back on the ORIGINAL run's SSE (whose completion
+    // records the real docWrites), but poison here anyway so a contract drift
+    // (or a resume whose stream dies unobserved) can never leave a stale 0.
+    recordRunDocWrites(content._id.toString(), sessionId, -1);
     const result = await writingEngine.submitClarifyAnswer(sessionId, answer);
+    // Threads Phase 1: the user's answer to the AI's question is conversation
+    // content (engine-side it lands as a tool_result, which D3 never persists
+    // — this append is the only durable record). After-success only.
+    {
+      const thread = await threadService.getOrCreateActiveThread(content, req.user?.userId);
+      await threadService.appendMessage(thread, {
+        kind: 'user',
+        text: String(answer),
+        meta: { sessionId, userId: req.user?.userId || null, channel: 'clarify' },
+      });
+    }
     return res.json(result);
   } catch (err) {
     console.error('Clarify answer error:', err);
@@ -1452,6 +2071,177 @@ const clarifyAnswer = async (req, res) => {
     // state) instead of flattening to 500; non-HTTP failures (engine
     // unreachable) have no status and stay 500.
     return res.status(err.status || 500).json({ error: err.message || 'Failed to submit answer' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// POST /:workspaceNumber/content/:contentNumber/ai/steer
+// W4-a: queue a mid-run steering message for the in-flight run.
+// Side-channel — no credit gate (the tokens it adds are billed
+// through the run's own usage tap). 409 when no run is active.
+// ─────────────────────────────────────────────────────────────
+const steer = async (req, res) => {
+  try {
+    const { sessionId, message } = req.body;
+    if (!sessionId || typeof message !== 'string' || !message.trim()) {
+      return res.status(400).json({ error: 'sessionId and message are required' });
+    }
+    if (message.length > 4096) {
+      return res.status(400).json({ error: 'steering message too long (max 4096 chars)' });
+    }
+    const content = await resolveContent(req, res);
+    if (!content) return;
+    // Tenancy: same rule as clarifyAnswer — the sessionId must be bound to
+    // THIS content, so a caller can't steer another content's run.
+    if (!sessionBoundToContent(content._id.toString(), sessionId)) {
+      return res.status(409).json({ error: 'Session does not match this content (it may have expired — restart the chat)' });
+    }
+    const result = await writingEngine.steer(sessionId, message.trim());
+    // Threads Phase 1: steers are user input — without this they vanish from
+    // history and a replayed conversation shows the assistant reacting to
+    // instructions that aren't there. Recorded only AFTER the engine accepted
+    // the queue (a 409/429 bounce never reached the run). applied:false until
+    // the run's tap sees steering_applied — an honest "queued but the run
+    // ended first" stays false.
+    {
+      const thread = await threadService.getOrCreateActiveThread(content, req.user?.userId);
+      await threadService.appendMessage(thread, {
+        kind: 'user',
+        text: message.trim(),
+        meta: { sessionId, userId: req.user?.userId || null, channel: 'steer', applied: false },
+      });
+    }
+    return res.json(result);
+  } catch (err) {
+    console.error('Steer error:', err);
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      return res.status(504).json({ error: 'Engine timed out queuing the message' });
+    }
+    // Pass engine statuses through: 409 = no active run (client should send
+    // it as a normal message), 429 = queue full.
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to queue steering message' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// POST /:workspaceNumber/content/:contentNumber/ai/stop-revert
+// W4-b: declare stop-&-revert intent for the in-flight agent run.
+// The FE awaits this BEFORE aborting the stream; the agent handler
+// then refunds, skips the article slot, and restores the engine's
+// pre-run document. 409 when no matching run is in flight.
+// ─────────────────────────────────────────────────────────────
+const stopRevert = async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    if (!sessionId) {
+      return res.status(400).json({ error: 'sessionId is required' });
+    }
+    const content = await resolveContent(req, res);
+    if (!content) return;
+    if (!sessionBoundToContent(content._id.toString(), sessionId)) {
+      return res.status(409).json({ error: 'Session does not match this content' });
+    }
+    const entry = activeAgentRuns.get(content._id.toString());
+    if (!entry || entry.sessionId !== sessionId) {
+      return res.status(409).json({ error: 'No matching agent run is in flight — the run may have already finished. Use "Revert this run" instead.' });
+    }
+    entry.revertIntent = true;
+    // W4-c-2: a socket close no longer aborts the engine (detached runs keep
+    // going), so the stop MUST be driven here — halt the run out-of-band. The
+    // handler then reads revertIntent, refunds/settles, and restores the doc.
+    if (typeof entry.abort === 'function') entry.abort();
+    return res.json({ status: 'ok' });
+  } catch (err) {
+    console.error('Stop-revert error:', err);
+    return res.status(500).json({ error: err.message || 'Failed to record revert intent' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// POST /:workspaceNumber/content/:contentNumber/ai/stop
+// W4-c-2: explicit "Stop" (keep partial work). Halts the in-flight
+// run out-of-band — a socket close alone now DETACHES rather than
+// aborting, so an intentional stop must reach the server here. No
+// revert, no refund beyond the existing docWrites anti-abuse guard
+// (nothing written ⇒ refunded in the handler's abort branch).
+// 409 when no matching run is in flight.
+// ─────────────────────────────────────────────────────────────
+const stopRun = async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    if (!sessionId) {
+      return res.status(400).json({ error: 'sessionId is required' });
+    }
+    const content = await resolveContent(req, res);
+    if (!content) return;
+    if (!sessionBoundToContent(content._id.toString(), sessionId)) {
+      return res.status(409).json({ error: 'Session does not match this content' });
+    }
+    const entry = activeAgentRuns.get(content._id.toString());
+    if (!entry || entry.sessionId !== sessionId) {
+      return res.status(409).json({ error: 'No matching agent run is in flight — the run may have already finished.' });
+    }
+    if (typeof entry.abort === 'function') entry.abort();
+    return res.json({ status: 'ok' });
+  } catch (err) {
+    console.error('Stop-run error:', err);
+    return res.status(500).json({ error: err.message || 'Failed to stop the run' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// GET /:workspaceNumber/content/:contentNumber/ai/engine-content?sessionId=
+// W4-c-2: read the engine session's current document markdown for the
+// detached-run catch-up reconcile. Tenancy: the sessionId must be the
+// one bound to THIS content. The FE re-applies the returned markdown
+// through its normal apply path (never verbatim) so structured blocks
+// survive the round-trip.
+// ─────────────────────────────────────────────────────────────
+const engineContent = async (req, res) => {
+  try {
+    const sessionId = req.query.sessionId;
+    if (!sessionId) {
+      return res.status(400).json({ error: 'sessionId is required' });
+    }
+    const content = await resolveContent(req, res);
+    if (!content) return;
+    if (!sessionBoundToContent(content._id.toString(), sessionId)) {
+      return res.status(409).json({ error: 'Session does not match this content' });
+    }
+    const doc = await writingEngine.getContent(sessionId);
+    return res.json({ title: doc.title || '', content: doc.content || '', wordCount: doc.wordCount || 0 });
+  } catch (err) {
+    // 404 = the engine evicted the session (TTL) — the catch-up can't reconcile
+    // from the engine; the FE falls back to its autosaved mirror. Pass it through.
+    if (err.status) {
+      return res.status(err.status).json({ error: err.message || 'Failed to read engine content' });
+    }
+    console.error('Engine-content error:', err);
+    return res.status(500).json({ error: err.message || 'Failed to read engine content' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// GET /:workspaceNumber/content/:contentNumber/ai/run-status
+// W4-c prerequisite: is a run in flight, and how did the last one
+// end? Read by the future detached-run catch-up UI.
+// ─────────────────────────────────────────────────────────────
+const runStatus = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+    const entry = activeAgentRuns.get(content._id.toString());
+    const last = await AgentUsageLog.findOne({ contentId: content._id })
+      .sort({ createdAt: -1 })
+      .select('source sessionId stopReason docWrites aborted completedAt createdAt')
+      .lean();
+    return res.json({
+      active: entry ? { sessionId: entry.sessionId, startedAt: entry.startedAt } : null,
+      last: last || null,
+    });
+  } catch (err) {
+    console.error('Run-status error:', err);
+    return res.status(500).json({ error: err.message || 'Failed to read run status' });
   }
 };
 
@@ -1473,10 +2263,27 @@ const planConfirm = async (req, res) => {
     if (!sessionBoundToContent(content._id.toString(), sessionId)) {
       return res.status(409).json({ error: 'Session does not match this content (it may have expired — restart the chat)' });
     }
+    // W2-b (review Gap A, defensive): see clarifyAnswer — the resumed run's
+    // writes are recorded by its own stream completion; the poison guards
+    // against any unobserved-resume edge.
+    recordRunDocWrites(content._id.toString(), sessionId, -1);
     const result = await writingEngine.submitPlanConfirm(sessionId, {
       action,
       selectedSteps: selectedSteps || [],
     });
+    // Threads Phase 1: the plan decision is user input (engine-side it's an
+    // injected pseudo-message that D3's capture never sees). After-success.
+    {
+      const steps = Array.isArray(selectedSteps) && selectedSteps.length
+        ? ` — steps: ${selectedSteps.slice(0, 20).join(', ')}`
+        : '';
+      const thread = await threadService.getOrCreateActiveThread(content, req.user?.userId);
+      await threadService.appendMessage(thread, {
+        kind: 'user',
+        text: `[Plan decision] ${action}${steps}`,
+        meta: { sessionId, userId: req.user?.userId || null, channel: 'plan-confirm' },
+      });
+    }
     return res.json(result);
   } catch (err) {
     console.error('Plan confirm error:', err);
@@ -1487,6 +2294,51 @@ const planConfirm = async (req, res) => {
     }
     // Pass the engine's HTTP status through instead of flattening to 500.
     return res.status(err.status || 500).json({ error: err.message || 'Failed to submit plan confirm' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// GET /:workspaceNumber/content/:contentNumber/ai/thread
+// Threads Phase 1: the active thread's history for the chat bar's
+// reload-survival view. Paginated newest-first (?page=0 is the most
+// recent page), each page returned ascending ready to render.
+// ─────────────────────────────────────────────────────────────
+const getThread = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+    const page = Math.max(0, parseInt(req.query.page, 10) || 0);
+    const history = await threadService.getThreadHistory(content._id, { page });
+    return res.json(history);
+  } catch (err) {
+    console.error('[threads] getThread error:', err);
+    return res.status(500).json({ error: 'Failed to load conversation history' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// POST /:workspaceNumber/content/:contentNumber/ai/threads
+// Threads Phase 1 (pulled forward from Phase 4's UX wave): archive the
+// active thread and start a fresh one. This makes the chat bar's existing
+// "New chat" button REAL — pre-threads it only cleared component state, so
+// the "cleared" conversation would resurrect from history on reload.
+// (Until Phase 2 ships seeding, the warm ENGINE session may still remember
+// the old conversation — pre-existing behavior, unchanged by this route.)
+// ─────────────────────────────────────────────────────────────
+const newThread = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+    const thread = await threadService.startNewThread(content, req.user?.userId);
+    if (!thread) {
+      // Flag off (or write failure) — report cleanly; the FE treats this as
+      // "local clear only", which is exactly the pre-threads behavior.
+      return res.status(409).json({ error: 'Conversation threads are not enabled' });
+    }
+    return res.json({ threadId: thread._id, status: 'ok' });
+  } catch (err) {
+    console.error('[threads] newThread error:', err);
+    return res.status(500).json({ error: 'Failed to start a new conversation' });
   }
 };
 
@@ -1575,10 +2427,15 @@ async function resyncBriefIfActive(contentId) {
   }
 }
 
-module.exports = { chat, agent, generateImage, inlineEdit, rehostImage, uploadImage, clarifyAnswer, planConfirm, listSkills, resyncBriefIfActive,
+module.exports = { chat, agent, generateImage, inlineEdit, autocomplete, rehostImage, uploadImage, clarifyAnswer, planConfirm, steer, stopRevert, stopRun, engineContent, runStatus, getThread, newThread, listSkills, resyncBriefIfActive,
   // Exported for test coverage (cost-ledger usage tap + Phase-4 preset resolver).
   // Not part of the runtime API surface.
   makeUsageTap, resolvePreset, clampAgentBudget,
   checkArticleAllowance, commitArticleGeneration,
-  // Exported so tests can seed the content→session binding (resume tenancy).
-  contentSessionMap, rememberSession };
+  // Exported so tests can seed the content→session binding (resume tenancy)
+  // and pin the W2-b doc-write marker's session guard.
+  contentSessionMap, rememberSession, recordRunDocWrites,
+  // Exported for the setupSession evicted-session (404) retry test.
+  setupSession,
+  // W4-b: exported for the stop-revert registry lifecycle test.
+  activeAgentRuns };

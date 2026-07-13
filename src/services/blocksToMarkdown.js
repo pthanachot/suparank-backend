@@ -35,6 +35,15 @@ function stripHtml(html) {
 }
 
 /**
+ * Escape double quotes for safe embedding in an HTML attribute.
+ * @param {string} s
+ * @returns {string}
+ */
+function escapeAttr(s) {
+  return String(s).replace(/"/g, '&quot;');
+}
+
+/**
  * Convert an array of editor blocks to a markdown string.
  * Handles: headings, paragraphs, lists, quotes, images, FAQ, tables, code, dividers.
  *
@@ -57,11 +66,11 @@ function blocksToMarkdown(blocks) {
       }
 
       case 'li':
-        lines.push('- ' + text);
+        lines.push('  '.repeat(b.indent || 0) + '- ' + text);
         break;
 
       case 'ol':
-        lines.push('1. ' + text);
+        lines.push('  '.repeat(b.indent || 0) + '1. ' + text);
         break;
 
       case 'quote':
@@ -72,6 +81,7 @@ function blocksToMarkdown(blocks) {
         const alt = b.alt || '';
         const src = b.src || '';
         lines.push(`![${alt}](${src})`);
+        if (b.caption) lines.push(`*${b.caption}*`);
         break;
       }
 
@@ -125,6 +135,33 @@ function blocksToMarkdown(blocks) {
         // CTA is an editor-only feature, render as link
         if (b.ctaData) {
           lines.push(`[${b.ctaData.buttonText || 'Click here'}](${b.ctaData.url || '#'})`);
+        }
+        break;
+
+      case 'toggle':
+        // Serialized as a raw-HTML <details> block so the content survives
+        // the engine round-trip (the editor reconstructs it on apply —
+        // reconstructStructuredBlocks in the frontend). Dropping it here
+        // destroyed toggle blocks on every agent run.
+        if (b.toggleData) {
+          lines.push('<details>');
+          lines.push(`<summary>${b.toggleData.summary || 'Toggle'}</summary>`);
+          lines.push('');
+          lines.push(b.toggleData.content || '');
+          lines.push('');
+          lines.push('</details>');
+        }
+        break;
+
+      case 'embed':
+        // Serialized as a raw-HTML iframe carrying the original url +
+        // embed type in data attributes so the editor can reconstruct the
+        // embed block after the engine round-trip.
+        if (b.embedData && b.embedData.url) {
+          const src = escapeAttr(b.embedData.embedUrl || b.embedData.url);
+          const type = escapeAttr(b.embedData.embedType || 'generic');
+          const url = escapeAttr(b.embedData.url);
+          lines.push(`<iframe src="${src}" data-embed-type="${type}" data-url="${url}"></iframe>`);
         }
         break;
 

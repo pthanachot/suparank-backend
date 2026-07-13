@@ -21,6 +21,24 @@ const { requireQuota: rq } = require('../middleware/tierEnforcement');
 const { requireCredits: rc } = require('../middleware/creditGate');
 const { resolveCredits } = require('../config/creditRules');
 const { rejectIfLocked, contentLockResolver } = require('../middleware/lockGuard');
+const rateLimit = require('express-rate-limit');
+
+// W5-b: ghost-text autocomplete fires on every typing pause, so it is EXCLUDED
+// from the global per-IP apiLimiter (index.js) — which would 429 the whole app
+// for an active writer — and metered here by its OWN per-user bucket instead.
+// Keyed by userId (authenticateToken runs at router mount, line 58, so req.user
+// is always set; IP is only a defensive fallback). Generous enough never to
+// throttle real writing, tight enough to cap a runaway client loop. A throttled
+// ghost-text call is a non-event: return 200 {completion:''} (identical to "no
+// suggestion"), never a 429 error the editor would have to handle.
+const autocompleteLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => String(req.user?.userId || req.ip),
+  handler: (_req, res) => res.status(200).json({ completion: '' }),
+});
 
 // Phase 6 credit-cost estimators (pull the amount from creditCosts/creditRules
 // so Option B (Free fixed-bundle → 0) and mode-aware costs apply consistently).
@@ -39,10 +57,12 @@ const Content = require('../models/Content');
 const estAgent = async (req, { tier }) => {
   let content = null;
   try {
-    content = await Content.findOne({
-      workspaceId: req.workspace._id,
-      contentNumber: Number(req.params.contentNumber),
-    }).select('mode activePlanId articleGeneratedPlanId').lean();
+    // W2-d: fetch the FULL document once and stash it for the controller's
+    // resolveContent — previously this was a duplicate read per agent request
+    // (3-field lean here + full findByNumber in aiController). Same request,
+    // no writes in between, so reuse is safe.
+    content = await Content.findByNumber(req.workspace._id, req.params.contentNumber);
+    if (content) req._prefetchedContent = content;
   } catch { /* fall back to body-only classification */ }
   return resolveCredits(classifyAgentRun(req.body, content), { tier });
 };
@@ -148,6 +168,13 @@ router.post('/:workspaceNumber/content/:contentNumber/ai/chat', rwr, rf('aiChat'
 router.post('/:workspaceNumber/content/:contentNumber/ai/agent', rwr, rf('aiChat'), requirePermission('ai.generate'), rc('aiAgent', estAgent), aiController.agent);
 router.post('/:workspaceNumber/content/:contentNumber/ai/generate-image', rwr, rf('aiChat'), requirePermission('ai.generate'), rc('imageGenerate', estFixed('imageGenerate')), aiController.generateImage);
 router.post('/:workspaceNumber/content/:contentNumber/ai/inline-edit', rwr, rf('aiChat'), requirePermission('ai.generate'), rc('aiChat', estChat), aiController.inlineEdit);
+// W5-b ghost text: the FLYWEIGHT AI route. Per-user limiter FIRST (shed
+// over-limit calls before the workspace query). Feature-gated + the SAME v4
+// policy (ai.generate) as chat/agent/inline-edit so authorization can't drift —
+// it calls a paid model into the user's doc. Both gates are CACHED (~free). NO
+// credit gate (rc): it is free (COGS-ledger only). No doc push either — see
+// setupSessionAutocomplete.
+router.post('/:workspaceNumber/content/:contentNumber/ai/autocomplete', autocompleteLimiter, rwr, rf('aiChat'), requirePermission('ai.generate'), aiController.autocomplete);
 router.post('/:workspaceNumber/content/:contentNumber/ai/upload-image', rwr, rp('content', 'update'), aiController.uploadImage);
 // R18: rehost a picked image-search result to B2 (SSRF-hardened). Gated like
 // upload-image (content:update, no credit gate) — it's a content mutation with
@@ -155,6 +182,19 @@ router.post('/:workspaceNumber/content/:contentNumber/ai/upload-image', rwr, rp(
 router.post('/:workspaceNumber/content/:contentNumber/ai/rehost-image', rwr, rp('content', 'update'), aiController.rehostImage);
 router.post('/:workspaceNumber/content/:contentNumber/ai/clarify-answer', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.clarifyAnswer);
 router.post('/:workspaceNumber/content/:contentNumber/ai/plan-confirm', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.planConfirm);
+// W4-a/b/c: mid-run side-channels + run status. Gated like the confirm family
+// (no rc credit gate: steering tokens ride the run's own usage tap; stop-revert
+// and run-status consume nothing).
+router.post('/:workspaceNumber/content/:contentNumber/ai/steer', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.steer);
+router.post('/:workspaceNumber/content/:contentNumber/ai/stop-revert', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.stopRevert);
+router.post('/:workspaceNumber/content/:contentNumber/ai/stop', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.stopRun);
+router.get('/:workspaceNumber/content/:contentNumber/ai/run-status', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.runStatus);
+router.get('/:workspaceNumber/content/:contentNumber/ai/engine-content', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.engineContent);
+// Threads Phase 1: durable conversation history. Gated on the aiThreads flag
+// (rf — the same flag also gates the capture writes via flagService inside
+// the handlers) + the aiChat permission family like run-status. No rc.
+router.get('/:workspaceNumber/content/:contentNumber/ai/thread', rwr, rf('aiThreads'), rp('aiChat', 'use'), aiController.getThread);
+router.post('/:workspaceNumber/content/:contentNumber/ai/threads', rwr, rf('aiThreads'), rp('aiChat', 'use'), aiController.newThread);
 
 // Plan mode under content (M1 — writing-engine plan mode).
 // Gated like the confirm family (ai/plan-confirm): rf('aiChat') + rp('aiChat','use').

@@ -236,14 +236,16 @@ async function generateImage(sessionId, { description, format, style }) {
  * { originalText, editedText, applied, diff, error? }.
  *
  * @param {string} sessionId
- * @param {{ selectedText: string, instruction: string, context?: string }} params
- * @returns {Promise<{ originalText: string, editedText: string, applied: boolean, error?: string }>}
+ * @param {{ selectedText: string, instruction: string, context?: string, preview?: boolean }} params
+ * @returns {Promise<{ originalText: string, editedText: string, applied: boolean, diff?: object, error?: string }>}
  */
-async function inlineEdit(sessionId, { selectedText, instruction, context }) {
+async function inlineEdit(sessionId, { selectedText, instruction, context, preview }) {
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/inline-edit`, {
     method: 'POST',
     headers: engineHeaders(),
-    body: JSON.stringify({ selectedText, instruction, context }),
+    // W5-a: preview=true → engine computes the replacement + diff without
+    // mutating its document (the editor applies on accept).
+    body: JSON.stringify({ selectedText, instruction, context, preview: !!preview }),
     // 20s > the engine's 15s LLM client timeout, so on a slow model the
     // engine's own cleaner error (→ 422 → chat fallback) usually wins the
     // race instead of an abort here surfacing as a generic 502. (Was 15s ==
@@ -254,6 +256,34 @@ async function inlineEdit(sessionId, { selectedText, instruction, context }) {
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`Writing Engine: inline edit failed (${res.status}): ${body}`);
+  }
+  return res.json();
+}
+
+/**
+ * W5-b: ghost-text autocomplete. Non-streaming, latency-critical single call —
+ * the engine's /complete needs only the surrounding text (never the document),
+ * so this is the lightest engine hop we make. Propagates err.status so the
+ * controller can recreate an evicted (404) session and retry once.
+ *
+ * @param {string} sessionId
+ * @param {{textBefore:string, textAfter?:string, maxTokens?:number}} args
+ * @param {AbortSignal} [signal] caller's abort (client-disconnect + budget cap).
+ *   Falls back to a short timeout so a hung engine can't pin the request.
+ * @returns {Promise<{completion?:string, error?:string, usage?:object}>}
+ */
+async function complete(sessionId, { textBefore, textAfter, maxTokens }, signal) {
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/complete`, {
+    method: 'POST',
+    headers: engineHeaders(),
+    body: JSON.stringify({ textBefore, textAfter, maxTokens }),
+    signal: signal ?? AbortSignal.timeout(5000),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    const err = new Error(`Writing Engine: complete failed (${res.status}): ${body}`);
+    err.status = res.status;
+    throw err;
   }
   return res.json();
 }
@@ -398,6 +428,54 @@ async function submitClarifyAnswer(sessionId, answer) {
 }
 
 /**
+ * W4-a: queue a mid-run steering message. Side-channel like clarify-answer —
+ * the engine injects it between turns of the in-flight run; 409 when no run
+ * is active (caller tells the user to send it as a normal message).
+ *
+ * @param {string} sessionId
+ * @param {string} message
+ */
+async function steer(sessionId, message) {
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/steer`, {
+    method: 'POST',
+    headers: engineHeaders(),
+    body: JSON.stringify({ message }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    const err = new Error(`Writing Engine: steer failed (${res.status}): ${body}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+/**
+ * W4-c-2: read a session's CURRENT document markdown. Used by the detached-run
+ * catch-up path — when a run finished while the editor was closed, the FE pulls
+ * the engine's authoritative markdown and re-applies it through the normal
+ * apply path (markdownToBlocks → mergeUiMetadata), never verbatim.
+ *
+ * @param {string} sessionId
+ * @returns {Promise<{title:string, content:string, format:string, wordCount:number}>}
+ */
+async function getContent(sessionId) {
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/content`, {
+    method: 'GET',
+    headers: engineHeaders(),
+    signal: AbortSignal.timeout(ENGINE_PUSH_TIMEOUT_MS),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    const err = new Error(`Writing Engine: get content failed (${res.status}): ${body}`);
+    err.status = res.status; // let the controller pass the engine status through (404 = session evicted)
+    throw err;
+  }
+  return res.json();
+}
+
+/**
  * Push context files (.md virtual files) to a Writing Engine session.
  * The AI reads these on demand via ReadFile tool.
  *
@@ -473,7 +551,10 @@ module.exports = {
   startAgent,
   generateImage,
   inlineEdit,
+  complete,
   submitClarifyAnswer,
+  steer,
+  getContent,
   pushContextFiles,
   submitPlanConfirm,
   WRITING_ENGINE_URL,

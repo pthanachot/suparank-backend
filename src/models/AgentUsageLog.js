@@ -38,6 +38,19 @@ const agentUsageLogSchema = new mongoose.Schema(
     // SSE endpoint that produced this row: 'chat' or 'agent'. Useful
     // signal for filtering; cost estimate aggregates across both.
     source: { type: String, enum: ['chat', 'agent'], required: true },
+
+    // ── W4-c prerequisite: run-record fields ─────────────────────────────
+    // Enough for a run-status/catch-up UI to tell a finished run from a
+    // died one without a separate collection. All optional/additive.
+    sessionId: { type: String, default: '' },
+    // Engine stopReason from the complete event ('done', 'stale',
+    // 'token_budget', …). '' when the stream ended without a complete event.
+    stopReason: { type: String, default: '' },
+    // Server-observed document_diff count for this run.
+    docWrites: { type: Number, default: 0 },
+    // True when the client disconnected/stopped before stream end.
+    aborted: { type: Boolean, default: false },
+    completedAt: { type: Date },
   },
   { timestamps: true }
 );

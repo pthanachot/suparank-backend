@@ -164,6 +164,23 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // input before any route handler builds a query. (Phase 20 hardening.)
 app.use(require('./middleware/mongoSanitize'));
 
+// W0 (writing-moment UX plan): request-timing instrumentation. Logs any
+// request slower than REQUEST_TIMING_MIN_MS (default 250ms). SSE routes log
+// their full stream duration on finish — long lines there are expected; the
+// interesting numbers are the [timing] lines from aiController (setup pushes,
+// time-to-first-engine-byte) that break the total down.
+const REQUEST_TIMING_MIN_MS = parseInt(process.env.REQUEST_TIMING_MIN_MS || '250', 10);
+app.use((req, res, next) => {
+  const t0 = Date.now();
+  res.on('finish', () => {
+    const ms = Date.now() - t0;
+    if (ms >= REQUEST_TIMING_MIN_MS) {
+      console.log(`[timing] ${req.method} ${req.originalUrl} ${res.statusCode} ${ms}ms`);
+    }
+  });
+  next();
+});
+
 // Rate limiting — skip the internal API. Internal traffic comes from the Go
 // writing-engine (server-to-server, authenticated by INTERNAL_API_KEY) and
 // can legitimately make many CFS reads per plan-mode turn. Throttling it
@@ -182,7 +199,13 @@ function buildApiLimiter() {
     max: () => systemSettingsService.getSettings().rateLimit?.max || ENV_DEFAULT_MAX,
     standardHeaders: true,
     legacyHeaders: false,
-    skip: (req) => req.originalUrl.startsWith('/api/internal/'),
+    // Skip server-to-server engine traffic, and W5-b ghost-text autocomplete —
+    // it fires on every typing pause, so throttling it by this per-IP bucket
+    // would 429 the whole app for one active writer. It has its OWN per-user
+    // limiter in workspaceRoutes (autocompleteLimiter). Match the /ai/autocomplete
+    // suffix on originalUrl (with or without a query string).
+    skip: (req) => req.originalUrl.startsWith('/api/internal/') ||
+      /\/ai\/autocomplete(?:\?|$)/.test(req.originalUrl),
   });
 }
 let apiLimiter = buildApiLimiter();

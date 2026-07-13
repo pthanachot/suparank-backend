@@ -143,6 +143,25 @@ test('200 returns { editedText } on success', async () => {
   } finally { s.restore(); }
 });
 
+test('W5-a: preview forwards preview:true and returns originalText + diff', async () => {
+  let seenArgs = null;
+  const s = withStubs({
+    inlineEdit: async (_sid, args) => {
+      seenArgs = args;
+      return { editedText: 'shorter', originalText: 'x long', applied: false, diff: { ops: [] } };
+    },
+  });
+  try {
+    const res = mockRes();
+    await aiController.inlineEdit(mockReq({ selectedText: 'x long', instruction: 'Shorten.', preview: true }), res);
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual(seenArgs.preview, true, 'preview flag forwarded to the engine');
+    assert.strictEqual(res.body.editedText, 'shorter');
+    assert.strictEqual(res.body.originalText, 'x long');
+    assert.deepStrictEqual(res.body.diff, { ops: [] });
+  } finally { s.restore(); }
+});
+
 test('reuses the engine session across calls (createSession called once)', async () => {
   // Unique content id so this test owns a fresh entry in the module-global
   // contentSessionMap (prior tests populated 'c1').

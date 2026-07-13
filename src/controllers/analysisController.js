@@ -181,6 +181,16 @@ function curateContentBrief(brief) {
         format: p.format, wordCount: p.word_count,
       })),
     } : null,
+    // Engine Phase 5: type-aware DESCRIPTIVE word-count band with provenance.
+    // Replaces the pooled avg×0.7/×1.3 as the display truth when present
+    // (commercial types' comparable pages run 4-6x shorter than the pooled
+    // SERP average). Descriptive only — the score does not read it.
+    wordCountBand: brief.word_count_band ? {
+      min: brief.word_count_band.min || 0,
+      max: brief.word_count_band.max || 0,
+      source: brief.word_count_band.source || '',
+      basis: brief.word_count_band.basis || '',
+    } : null,
   };
 }
 

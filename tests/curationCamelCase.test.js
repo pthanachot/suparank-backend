@@ -89,6 +89,7 @@ const INPUTS = {
       kind: 'minority', message: '2 of 14 ranking pages match…',
       matched_pages: [{ url: 'https://v.com/pricing', title: 'Pricing', position: 3, format: 'product-page', word_count: 900 }],
     },
+    word_count_band: { min: 250, max: 2500, source: 'prior+matched', basis: 'industry range…' },
   },
   curateAiFormatData: {
     keyword: 'crm', recommended_format: 'guide', format_confidence: 0.9,

@@ -142,6 +142,18 @@ test('runAnalysis omits content_type when the content has none', async () => {
   assert.equal('content_type' in bodies['analyze/jobs'], false);
 });
 
+// P0.1 launch gating is HIDE, DON'T DELETE: types hidden from the wizard's
+// card grid (listicle, comparison, category-page, service-page,
+// llm-optimized) remain first-class — stored pre-launch content and
+// style-reference inheritance still carry them, and re-analysis must forward
+// them verbatim for full engine lens treatment.
+test('runAnalysis forwards HIDDEN launch types unchanged (hide, don\'t delete)', async () => {
+  for (const hidden of ['listicle', 'comparison', 'category-page', 'service-page', 'llm-optimized']) {
+    const { bodies } = await runAndCapture('professional', hidden);
+    assert.equal(bodies['analyze/jobs'].content_type, hidden, `${hidden} must forward verbatim`);
+  }
+});
+
 // regenerate-outline is a SECOND live outline path (review finding #1) — it must
 // also thread the preset, else Free users leak base-model COGS on regenerate.
 async function runRegenerate(tier) {

@@ -159,6 +159,28 @@ function curateContentBrief(brief) {
     })),
     competitorWeaknesses: brief.competitor_weaknesses || [],
     pipelineCost: brief.pipeline_cost || 0,
+    // Type-aware benchmark fields (engine Phases 2-3). contentType is the
+    // declared page type whose lens shaped this brief; serpFormats is the
+    // format census of the ranking pages; formatSignal is the strategic
+    // advisory ("2 of 14 ranking pages are product pages — these are the
+    // slots you compete for"). All optional — absent for briefs analyzed
+    // without a declared type or by older engines.
+    contentType: brief.content_type || '',
+    serpFormats: brief.serp_formats ? {
+      total: brief.serp_formats.total || 0,
+      counts: brief.serp_formats.counts || {},
+      declaredType: brief.serp_formats.declared_type || '',
+      matchedLabels: brief.serp_formats.matched_labels || [],
+      matchedCount: brief.serp_formats.matched_count || 0,
+    } : null,
+    formatSignal: brief.format_signal ? {
+      kind: brief.format_signal.kind || '',
+      message: brief.format_signal.message || '',
+      matchedPages: (brief.format_signal.matched_pages || []).map((p) => ({
+        url: p.url, title: p.title, position: p.position,
+        format: p.format, wordCount: p.word_count,
+      })),
+    } : null,
   };
 }
 

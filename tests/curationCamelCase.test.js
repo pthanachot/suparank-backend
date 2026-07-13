@@ -80,6 +80,15 @@ const INPUTS = {
     clusters: [{ id: 'c1', label: 'features', terms: ['a'] }],
     competitor_weaknesses: ['thin content'],
     pipeline_cost: 0.42,
+    content_type: 'product-page',
+    serp_formats: {
+      total: 14, counts: { listicle: 9, 'product-page': 2 },
+      declared_type: 'product-page', matched_labels: ['product-page'], matched_count: 2,
+    },
+    format_signal: {
+      kind: 'minority', message: '2 of 14 ranking pages match…',
+      matched_pages: [{ url: 'https://v.com/pricing', title: 'Pricing', position: 3, format: 'product-page', word_count: 900 }],
+    },
   },
   curateAiFormatData: {
     keyword: 'crm', recommended_format: 'guide', format_confidence: 0.9,

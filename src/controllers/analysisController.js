@@ -208,6 +208,17 @@ function curateAiFormatData(raw) {
       proximityPartners: t.proximity_partners || [],
       volatile: t.volatile || false,
     })),
+    // Engine Phase 4 (type-aware benchmarks): per-engine citation-format
+    // census + advisory. Optional — absent without a declared content type
+    // or from older engines.
+    citationFormats: (raw.citation_formats || []).map((c) => ({
+      engine: c.engine || '',
+      citedTotal: c.cited_total || 0,
+      classified: c.classified || 0,
+      counts: c.counts || {},
+      matchedCount: c.matched_count || 0,
+    })),
+    citationFormatSignal: raw.citation_format_signal || '',
   };
 }
 

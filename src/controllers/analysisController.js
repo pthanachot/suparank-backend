@@ -191,6 +191,20 @@ function curateContentBrief(brief) {
       source: brief.word_count_band.source || '',
       basis: brief.word_count_band.basis || '',
     } : null,
+    // Engine Phase 6: structural averages over type-matched ranking pages —
+    // calibration evidence alongside (never replacing) the pooled stats.
+    matchedStats: brief.matched_stats ? {
+      sampleSize: brief.matched_stats.sample_size || 0,
+      lowSample: brief.matched_stats.low_sample || false,
+      avgWordCount: brief.matched_stats.avg_word_count || 0,
+      avgH2Count: brief.matched_stats.avg_h2_count || 0,
+      avgH3Count: brief.matched_stats.avg_h3_count || 0,
+      avgImages: brief.matched_stats.avg_images || 0,
+      avgLists: brief.matched_stats.avg_lists || 0,
+      avgTables: brief.matched_stats.avg_tables || 0,
+      avgFAQs: brief.matched_stats.avg_faqs || 0,
+      avgParagraphs: brief.matched_stats.avg_paragraphs || 0,
+    } : null,
   };
 }
 

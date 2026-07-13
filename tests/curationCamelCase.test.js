@@ -90,6 +90,10 @@ const INPUTS = {
       matched_pages: [{ url: 'https://v.com/pricing', title: 'Pricing', position: 3, format: 'product-page', word_count: 900 }],
     },
     word_count_band: { min: 250, max: 2500, source: 'prior+matched', basis: 'industry range…' },
+    matched_stats: {
+      sample_size: 2, low_sample: true, avg_word_count: 1000, avg_h2_count: 5,
+      avg_h3_count: 8, avg_images: 5, avg_lists: 2, avg_tables: 2, avg_faqs: 3, avg_paragraphs: 15,
+    },
   },
   curateAiFormatData: {
     keyword: 'crm', recommended_format: 'guide', format_confidence: 0.9,

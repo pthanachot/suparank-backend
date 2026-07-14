@@ -207,18 +207,26 @@ function extractNlpTerms(benchmark, topicClusters) {
 }
 
 /**
- * Map Suparank intent to a content type string.
+ * Fallback content type when the user declared none: inferred from the SERP
+ * intent, in the CANONICAL declared-type vocabulary (engine content_type.go /
+ * wizard launchTypes.ts). P2.4: this previously spoke a pre-content-type-era
+ * vocabulary ('guide'/'review') and tested pre-engine intent names
+ * ('commercial'), so every real intent fell through to the default. The value
+ * only seasons the writing-engine prompt ("Content type: …"), but two
+ * vocabularies for one concept is exactly the cross-repo drift that keeps
+ * biting.
  * @param {Object} intent - { primary, sophistication, decisionStage }
  * @returns {string}
  */
 function mapContentType(intent) {
   const primary = (intent.primary || '').toLowerCase();
   switch (primary) {
-    case 'informational': return 'guide';
-    case 'commercial': return 'comparison';
-    case 'transactional': return 'review';
-    case 'navigational': return 'guide';
-    default: return 'guide';
+    case 'informational': return 'blog-post';
+    case 'educational_commercial': return 'blog-post';
+    case 'commercial_investigation': return 'comparison';
+    case 'transactional': return 'landing-page';
+    case 'navigational': return 'blog-post';
+    default: return 'blog-post';
   }
 }
 

@@ -191,3 +191,34 @@ describe('benchmarkToContentBrief - word-count band passthrough (P2.1b)', () => 
     assert.equal('wordCountBand' in toBrief(content), false);
   });
 });
+
+// P2.4: the no-declared-type fallback speaks the CANONICAL content-type
+// vocabulary (engine content_type.go). The old mapper emitted a
+// pre-content-type-era vocabulary ('guide'/'review') and tested pre-engine
+// intent names ('commercial'), so real intents always fell to the default.
+describe('contentType fallback vocabulary (P2.4)', () => {
+  const briefFor = (intent, declared) => benchmarkToContentBrief({
+    _id: 'x',
+    targetKeywords: ['k'],
+    ...(declared ? { contentType: declared } : {}),
+    ...(intent ? { intent } : {}),
+    benchmark: { keywords: ['k'], topNlpTerms: [] },
+  });
+
+  it('a declared type always wins over the intent fallback', () => {
+    assert.equal(briefFor({ primary: 'transactional' }, 'faq').contentType, 'faq');
+  });
+
+  it('maps real engine intents to canonical type ids', () => {
+    assert.equal(briefFor({ primary: 'informational' }).contentType, 'blog-post');
+    assert.equal(briefFor({ primary: 'commercial_investigation' }).contentType, 'comparison');
+    assert.equal(briefFor({ primary: 'educational_commercial' }).contentType, 'blog-post');
+    assert.equal(briefFor({ primary: 'transactional' }).contentType, 'landing-page');
+    assert.equal(briefFor({ primary: 'navigational' }).contentType, 'blog-post');
+  });
+
+  it('unknown or absent intent degrades to blog-post', () => {
+    assert.equal(briefFor({ primary: 'something-new' }).contentType, 'blog-post');
+    assert.equal(briefFor(undefined).contentType, 'blog-post');
+  });
+});

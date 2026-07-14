@@ -636,15 +636,14 @@ async function runAnalysis(contentId, opts = {}) {
     }
 
     // Rec 3: the citation appearance-rate signal rides the analyze response's
-    // `ai_analysis.citation_appearance` — the fanout-enriched path where an AI
-    // answer's cited domains are sampled across the parent + fan-out queries.
-    // NOTE: the current writing-engine `/analyze` does NOT run that citation
-    // sampling (it generates a single simulated answer with no real citations),
-    // so `ai_analysis` is absent and this resolves to []. The read is kept as a
-    // forward-compatible passthrough for a future citation-sampling producer;
-    // it is intentionally NOT synthesized from empty data. Until that pipeline
-    // exists, aiFormatData.citationAppearance simply stays unset (the frontend
-    // field is optional). Do not "fix" this by fabricating appearance rows.
+    // `ai_analysis.citation_appearance` — the ANALYSIS ENGINE samples real AI
+    // answers (parent + fan-out queries, per-engine conversations) and
+    // aggregates how consistently each domain is cited
+    // (aisearch.ComputeCitationAppearance). Present whenever the run's AEO
+    // branch succeeded; resolves to [] when AI engines are unconfigured or the
+    // branch failed — degrade by omission, never synthesize appearance rows
+    // from empty data. (P2.4: this comment previously described the
+    // pre-AEO-branch engine and claimed ai_analysis is always absent.)
     const curatedAiFormat = aiFormatData ? curateAiFormatData(aiFormatData) : null;
     const citationAppearance = curateCitationAppearance(analyzeData.ai_analysis?.citation_appearance);
     // Attach only when the format payload exists — never persist a partial

@@ -41,6 +41,7 @@ const DELETE_MODELS = [
   'WorkspaceUsageTracker', 'WorkspaceMember', 'ClientSubscription', 'Site', 'Sitemap', 'CrawlPage',
   'BrandVoice', 'Avatar', 'AiTracker', 'AiTrackerScan', 'AiTrackerPrompt', 'AiTrackerCompetitor',
   'Invite', 'Workspace',
+  'AiThread', 'AiThreadMessage', // Threads P5
 ].map((n) => [n, require(`../src/models/${n}`)]);
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -143,6 +144,13 @@ beforeEach(() => {
   origs.trFind = AiTracker.find; origs.smFind = Sitemap.find;
   AiTracker.find = () => chain([]);
   Sitemap.find = () => chain([]);
+  // Threads P5: thread enumeration + COGS scrub in deleteWorkspaceData.
+  const AiThreadModel = require('../src/models/AiThread');
+  const AiCostLedgerModel = require('../src/models/AiCostLedger');
+  origs.threadFind = AiThreadModel.find;
+  origs.costScrub = AiCostLedgerModel.updateMany;
+  AiThreadModel.find = () => chain([]);
+  AiCostLedgerModel.updateMany = async () => ({ modifiedCount: 0 });
 
   // ── deleteMany across every purge-touched collection ──
   origs.deleteMany = {};
@@ -190,6 +198,8 @@ afterEach(() => {
   ClientSubscription.find = origs.csFind; ClientSubscription.findOne = origs.csFindOne;
   Domain.find = origs.domainFind; Subscription.exists = origs.subExists;
   AiTracker.find = origs.trFind; Sitemap.find = origs.smFind;
+  require('../src/models/AiThread').find = origs.threadFind;
+  require('../src/models/AiCostLedger').updateMany = origs.costScrub;
   for (const [name, Model] of DELETE_MODELS) Model.deleteMany = origs.deleteMany[name];
   flagService.isFlagLive = origs.flag; brandService.isSaasModeEntitled = origs.entitled;
   brandService.getBrandForOrg = origs.brandFor; brandService.clearBrandCache = origs.clearBrand;

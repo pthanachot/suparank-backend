@@ -288,6 +288,51 @@ async function complete(sessionId, { textBefore, textAfter, maxTokens }, signal)
   return res.json();
 }
 
+/**
+ * Threads Phase 2: seed a session's conversation history from the durable
+ * thread (shaped [{role, content}] — see threadService.shapeThreadForReplay).
+ * REPLACES the engine session's history. The engine claims the single-flight
+ * lock for the write; 409 (run in flight) propagates via err.status so
+ * setupSession's seed task can surface it as the existing busy path.
+ */
+async function seedMessages(sessionId, messages, signal) {
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/messages`, {
+    method: 'POST',
+    headers: engineHeaders(),
+    body: JSON.stringify({ messages }),
+    signal: signal ?? AbortSignal.timeout(15000),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    const err = new Error(`Writing Engine: seed messages failed (${res.status}): ${body}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+/**
+ * Threads Phase 3: summarize a span of thread rows into a compaction record.
+ * Session-independent (the backend owns all thread state). 70s timeout — the
+ * engine's dedicated compact client allows 60s for ~24k-token inputs; ours
+ * must outlast it so the engine's cleaner error wins the race.
+ */
+async function compact({ messages, previousSummary, maxTokens }, signal) {
+  const res = await fetch(`${WRITING_ENGINE_URL}/api/compact`, {
+    method: 'POST',
+    headers: engineHeaders(),
+    body: JSON.stringify({ messages, previousSummary: previousSummary || '', maxTokens: maxTokens || 1200 }),
+    signal: signal ?? AbortSignal.timeout(70000),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    const err = new Error(`Writing Engine: compact failed (${res.status}): ${body}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
 // ─── M5: plan-mode push methods ─────────────────────────────────────────
 //
 // Express orchestrates plan-mode state by pushing the current view onto
@@ -552,6 +597,8 @@ module.exports = {
   generateImage,
   inlineEdit,
   complete,
+  seedMessages,
+  compact,
   submitClarifyAnswer,
   steer,
   getContent,

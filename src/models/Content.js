@@ -365,24 +365,74 @@ async function archivePlansForContent(contentId) {
   );
 }
 
+// Threads P5: a deleted content's conversations are unreachable (every thread
+// route resolves through the content) — DELETE them children-first rather
+// than archive (deviation from the plan's early wording: contents don't
+// undelete, and 90 days of unreachable rows serves nobody). Lazy requires
+// avoid cycles; deleteMany on messages first mirrors deletionService.
+async function deleteThreadsForContent(contentId) {
+  if (!contentId) return;
+  const AiThread = require('./AiThread');
+  const AiThreadMessage = require('./AiThreadMessage');
+  const threads = await AiThread.find({ contentId }).select('_id').lean();
+  if (!threads.length) return;
+  const ids = threads.map((t) => t._id);
+  await AiThreadMessage.deleteMany({ threadId: { $in: ids } });
+  await AiThread.deleteMany({ _id: { $in: ids } });
+}
+
+async function cascadeContentDelete(contentId) {
+  await archivePlansForContent(contentId);
+  await deleteThreadsForContent(contentId);
+}
+
+// Batch variant for deleteMany (P5 review): the per-content loop was 2+
+// queries × N contents inside a user-facing workspace/admin delete, and a
+// mid-loop failure left contents 1..k-1 stripped of conversations while the
+// delete itself aborted. Four bulk statements shrink that window to a
+// single all-or-nothing step per collection. Fail-closed like the rest of
+// the hooks: a throw here blocks the content delete (orphaned-but-live
+// threads would be unreachable, which is worse).
+async function cascadeContentDeleteBulk(contentIds) {
+  if (!contentIds.length) return;
+  const Plan = require('./Plan');
+  const AiThread = require('./AiThread');
+  const AiThreadMessage = require('./AiThreadMessage');
+  await Plan.updateMany(
+    { contentId: { $in: contentIds }, status: { $nin: ['archived'] } },
+    { $set: { status: 'archived' } }
+  );
+  const threads = await AiThread.find({ contentId: { $in: contentIds } }).select('_id').lean();
+  if (!threads.length) return;
+  const ids = threads.map((t) => t._id);
+  await AiThreadMessage.deleteMany({ threadId: { $in: ids } });
+  await AiThread.deleteMany({ _id: { $in: ids } });
+}
+
 contentSchema.pre('deleteOne', { document: true, query: false }, async function () {
-  await archivePlansForContent(this._id);
+  await cascadeContentDelete(this._id);
 });
 
 contentSchema.pre('deleteOne', { document: false, query: true }, async function () {
   const doc = await this.model.findOne(this.getFilter()).select('_id');
-  if (doc) await archivePlansForContent(doc._id);
+  if (doc) await cascadeContentDelete(doc._id);
 });
 
 contentSchema.pre('deleteMany', { document: false, query: true }, async function () {
   const docs = await this.model.find(this.getFilter()).select('_id');
-  for (const d of docs) await archivePlansForContent(d._id);
+  await cascadeContentDeleteBulk(docs.map((d) => d._id));
 });
 
 contentSchema.pre('findOneAndDelete', async function () {
   const doc = await this.model.findOne(this.getFilter()).select('_id');
-  if (doc) await archivePlansForContent(doc._id);
+  if (doc) await cascadeContentDelete(doc._id);
 });
+
+// Test-only handles (P5 review: hook *registration* is provable from outside,
+// hook *behavior* is not — a vacuous presence-assert passed with the thread
+// cascade deleted). Not part of the model's public API.
+contentSchema.statics._cascadeContentDelete = cascadeContentDelete;
+contentSchema.statics._cascadeContentDeleteBulk = cascadeContentDeleteBulk;
  
 // Compound indexes
 contentSchema.index({ workspaceId: 1, contentNumber: 1 });

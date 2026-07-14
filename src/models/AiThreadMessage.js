@@ -39,8 +39,9 @@ const aiThreadMessageSchema = new mongoose.Schema(
     text: { type: String, required: true, maxlength: 32768 },
     displayText: { type: String, default: '', maxlength: 200 },
     meta: {
-      // Backend-minted crypto.randomUUID() per run — idempotency key for the
-      // run's appends (no engine-side run identifier exists).
+      // Backend-minted crypto.randomUUID() per run — CORRELATION id tying a
+      // run's user/assistant/side-channel rows together (no engine-side run
+      // identifier exists). Not a dedup key — appends fire once per request.
       runId: { type: String, default: '' },
       // Engine session that served this turn. Phase 2 uses it as the
       // Mongo-backed tenancy fallback for post-restart catch-up reads.
@@ -55,6 +56,9 @@ const aiThreadMessageSchema = new mongoose.Schema(
       stopReason: { type: String, default: '' },
       turns: { type: Number, default: 0 },
       applied: { type: Boolean, default: undefined },
+      // kind:'compaction' rows only (P3): the max seq this summary covers —
+      // THE replay-window contract (getReplayPayload fetches seq > this).
+      coversThroughSeq: { type: Number, default: undefined },
     },
   },
   { timestamps: true }

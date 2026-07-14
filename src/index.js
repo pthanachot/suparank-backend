@@ -268,6 +268,10 @@ app.use('/api/contact', contactRoutes);
 // Public, unauthenticated endpoints (token-gated shared reports)
 app.use('/api/public', require('./routes/publicRoutes'));
 
+// Free marketing tools (unauthenticated compute — guarded per-route by
+// publicToolsGuard: honeypot, per-IP daily caps, daily budget kill-switch)
+app.use('/api/public/tools', require('./routes/publicToolsRoutes'));
+
 // Internal API for the Go writing-engine (CFS reads, plan writes, skills
 // bridge). Gated by internalAuth middleware — NOT user-facing.
 app.use('/api/internal/cfs', internalCfsRoutes);
@@ -713,6 +717,22 @@ cron.schedule('45 3 * * *', async () => {
     }
   } catch (err) {
     console.error('[cron] retention purge scheduler error:', err.message);
+  }
+}, { timezone: 'Etc/UTC' });
+
+// ─── Threads P5: nightly prune of archived conversations past retention
+// (default 90d, THREAD_ARCHIVE_RETENTION_DAYS). Children-first — a TTL index
+// on the thread could not cascade to its messages. Self-gates on the
+// aiThreads flag. 04:10 UTC, after the retention purge.
+const threadServiceForCron = require('./services/threadService');
+cron.schedule('10 4 * * *', async () => {
+  try {
+    const r = await threadServiceForCron.pruneArchivedThreads();
+    if (r.due > 0) {
+      console.log(`[cron] thread prune: ${r.threads} thread(s) + ${r.messages} message(s) past retention removed`);
+    }
+  } catch (err) {
+    console.error('[cron] thread prune scheduler error:', err.message);
   }
 }, { timezone: 'Etc/UTC' });
 

@@ -48,8 +48,16 @@ beforeEach(() => {
   real.bvFind = BrandVoice.find; real.wsFindById = Workspace.findById; real.wsFind = Workspace.find;
   real.orgFindById = Organization.findById; real.planFind = AgencyPlan.find; real.subFind = ClientSubscription.find;
   real.brandFor = brandService.getBrandForOrg;
+  // Threads P5: conversations ride the bundle now — default empty.
+  const AiThread = require('../src/models/AiThread');
+  const AiThreadMessage = require('../src/models/AiThreadMessage');
+  real.threadFind = AiThread.find; real.threadMsgFind = AiThreadMessage.find;
+  AiThread.find = () => q([]);
+  AiThreadMessage.find = () => q([]);
 
-  Content.find = () => q([content]);
+  // Filter-aware (Threads P5 review): the service queries unlocked bodies and
+  // locked ids separately — a filter-blind stub would double-count content.
+  Content.find = (f) => q(f && f.locked === true ? [] : [content]);
   AiTracker.find = () => q([tracker]);
   AiTrackerPrompt.find = () => q([{ _id: 'p1', trackerId: 't1', prompt: 'best crm?' }]);
   AiTrackerScan.find = () => q([{ _id: 's1', trackerId: 't1', status: 'completed' }]);
@@ -70,6 +78,8 @@ afterEach(() => {
   BrandVoice.find = real.bvFind; Workspace.findById = real.wsFindById; Workspace.find = real.wsFind;
   Organization.findById = real.orgFindById; AgencyPlan.find = real.planFind; ClientSubscription.find = real.subFind;
   brandService.getBrandForOrg = real.brandFor;
+  require('../src/models/AiThread').find = real.threadFind;
+  require('../src/models/AiThreadMessage').find = real.threadMsgFind;
 });
 
 const names = (entries) => entries.map((e) => e.name);

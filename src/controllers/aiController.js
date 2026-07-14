@@ -99,6 +99,25 @@ function rememberSession(contentId, sessionId) {
   contentSessionMap.set(contentId, { sessionId, lastUsed: Date.now(), sessionIds });
 }
 
+// Threads Phase 2: register a ONE-SHOT session (chat turns) in the tenancy
+// set WITHOUT replacing the primary. Pre-fix, every chat turn's fresh session
+// became the primary via rememberSession — silently truncating the freeform
+// agent's warm-session memory chain (Phase-1 review finding). With no
+// existing entry there is nothing to protect, so the session becomes the
+// primary normally.
+function rememberSessionSecondary(contentId, sessionId) {
+  const existing = contentSessionMap.get(contentId);
+  if (!existing || !(existing.sessionIds instanceof Set)) {
+    rememberSession(contentId, sessionId);
+    return;
+  }
+  existing.sessionIds.add(sessionId);
+  while (existing.sessionIds.size > 32) {
+    existing.sessionIds.delete(existing.sessionIds.values().next().value);
+  }
+  existing.lastUsed = Date.now();
+}
+
 // Resume tenancy: is `sessionId` one of the recent sessions bound to THIS
 // content? Rejects an arbitrary / other-content engine sessionId while
 // tolerating concurrent same-content session creation.
@@ -149,11 +168,6 @@ function makeUsageTap() {
           const ev = JSON.parse(data);
           if (ev && (ev.type === 'text_delta' || ev.type === 'agent_commentary') && typeof ev.textDelta === 'string') {
             currentSegment += ev.textDelta;
-          } else if (ev && ev.type === 'tool_start') {
-            // Turn boundary: seal the running text segment.
-            if (currentSegment.trim()) segments.push(currentSegment.trim());
-            currentSegment = '';
-            turns++;
           } else if (ev && ev.type === 'steering_applied') {
             steeringApplied = true;
           }
@@ -163,11 +177,24 @@ function makeUsageTap() {
           if (ev && ev.type === 'complete' && ev.completion && typeof ev.completion.stopReason === 'string') {
             stopReason = ev.completion.stopReason;
           }
+          // Review (capture BUG-1/BUG-4): the engine emits exactly ONE usage
+          // event per successful turn, AFTER that turn's text — the only true
+          // turn boundary on the wire. Sealing here (not on tool_start, which
+          // fires per tool CALL and misses text→text turns around nudges/
+          // steers) keeps consecutive text turns from fusing char-to-char,
+          // and `turns` counts real turns, not tool invocations.
+          if (ev && ev.type === 'usage' && ev.usage) {
+            if (currentSegment.trim()) segments.push(currentSegment.trim());
+            currentSegment = '';
+            turns++;
+          }
           // W4-c (review V5): the token-budget / output-limit caps emit an
           // `error` event (with a code) and break WITHOUT a `complete` event,
-          // so the run record would otherwise store stopReason=''. Capture the
-          // known terminal codes from error events too.
-          if (ev && ev.type === 'error' && (ev.code === 'token_budget' || ev.code === 'max_turns')) {
+          // so the run record would otherwise store stopReason=''. Threads
+          // P1 review (CAVEAT-5): capture ANY coded error, not just the two
+          // W4 knew about — an api_error run's partial text was otherwise
+          // indistinguishable from a clean reply in the thread record.
+          if (ev && ev.type === 'error' && typeof ev.code === 'string' && ev.code) {
             stopReason = ev.code;
           }
           if (ev && ev.type === 'usage' && ev.usage) {
@@ -199,10 +226,14 @@ function makeUsageTap() {
     // Threads Phase 1: the run's full assistant text (all text turns joined),
     // with the last complete.fullText as fallback ("Cancelled" is deliberately
     // NOT text the model wrote — never fall back to it when segments exist).
+    // P2 fidelity review (BUG-1 defense-in-depth): consecutive IDENTICAL
+    // segments collapse to one — a nudged model re-stating its answer verbatim
+    // must not persist the duplicate into the thread it will be re-seeded from.
     finalAssistantText() {
       const all = [...segments];
       if (currentSegment.trim()) all.push(currentSegment.trim());
-      const joined = all.join('\n\n').trim();
+      const deduped = all.filter((seg, i) => i === 0 || seg !== all[i - 1]);
+      const joined = deduped.join('\n\n').trim();
       if (joined) return joined;
       return lastFullText === 'Cancelled' ? '' : lastFullText.trim();
     },
@@ -233,6 +264,7 @@ async function persistUsage(req, content, tap, source, runMeta = {}) {
     // W4-c prerequisite run-record fields: what the future catch-up UI reads.
     // stopReason '' + aborted=true ⇒ the stream died/was stopped mid-run.
     sessionId: runMeta.sessionId || '',
+    runId: runMeta.runId || '', // P4: unambiguous run identity (sessions are reused)
     stopReason: totals.stopReason || '',
     docWrites: totals.docWrites || 0,
     aborted: !!runMeta.aborted,
@@ -423,6 +455,24 @@ function pushHash(s) {
 // client-side setBlocks.
 const activeAgentRuns = new Map(); // contentId → { sessionId, markdownBefore, startedAt, revertIntent }
 
+// P4 review BUG-2: per-content THREAD-WRITE lock. activeAgentRuns only covers
+// agent runs (registered late, deleted early at the W4-b V3 point — before
+// the convergence append), and CHAT runs never register at all. An
+// archive/activate landing between a run's user append and its assistant
+// append splits the pair across threads: the reply re-resolves onto the
+// newly active thread as a contextless foreign row. Both run handlers hold
+// this from just before their user append until after the convergence
+// append (finally); newThread/activateThread 409 while held.
+const threadWriteLocks = new Map(); // contentId → count
+function lockThreadWrites(contentId) {
+  threadWriteLocks.set(contentId, (threadWriteLocks.get(contentId) || 0) + 1);
+}
+function unlockThreadWrites(contentId) {
+  const n = (threadWriteLocks.get(contentId) || 1) - 1;
+  if (n <= 0) threadWriteLocks.delete(contentId);
+  else threadWriteLocks.set(contentId, n);
+}
+
 function recordRunDocWrites(contentId, sessionId, docWrites) {
   const entry = contentSessionMap.get(contentId);
   // Review fix (W2-1b): guard on the run's OWN session. A concurrent setup on
@@ -433,7 +483,31 @@ function recordRunDocWrites(contentId, sessionId, docWrites) {
   if (entry && entry.sessionId === sessionId) entry.lastRunDocWrites = docWrites;
 }
 
-async function setupSession(content, { avatarId, reuseSession } = {}) {
+/**
+ * P2 (review BUG-2): advance the seeding marker past a freeform run's own
+ * thread rows — ONLY when the interval it would cover is exactly this run's
+ * user+assistant pair, CONTIGUOUS from the current marker. Any interleaved
+ * foreign row (a second tab's chat turn, another user on the shared thread)
+ * or this run's own side-channel rows (steer/clarify — separate requests we
+ * don't track here) leaves the marker stale, which re-seeds next run (3ms).
+ * An over-eager bump would instead hide the interleaved rows from the warm
+ * session INDEFINITELY (each later run's own bump keeps stamp == marker) —
+ * always err toward re-seeding. Exported for tests.
+ */
+function maybeBumpSeededMarker(contentId, sessionId, userAppended, assistantAppended) {
+  if (!userAppended || !assistantAppended) return false;
+  const entry = contentSessionMap.get(contentId);
+  if (!entry || entry.sessionId !== sessionId || !entry.seeded) return false;
+  if (entry.seeded.threadId !== assistantAppended.threadId) return false;
+  if (userAppended.threadId !== assistantAppended.threadId) return false;
+  // Contiguity: marker → user → assistant with nothing in between.
+  if (userAppended.seq !== entry.seeded.seq + 1) return false;
+  if (assistantAppended.seq !== userAppended.seq + 1) return false;
+  entry.seeded.seq = assistantAppended.seq;
+  return true;
+}
+
+async function setupSession(content, { avatarId, reuseSession, secondary, memoryRun = true } = {}) {
   const contentId = content._id.toString();
   let sessionId;
   // W0: per-push timing map, logged as one [timing] line at the end so a
@@ -452,10 +526,13 @@ async function setupSession(content, { avatarId, reuseSession } = {}) {
     }
   }
 
-  // Create new session if needed
+  // Create new session if needed. Threads P2: `secondary` (chat turns) joins
+  // the tenancy set without dethroning the warm primary — a chat turn must
+  // not truncate the agent's memory chain.
   if (!sessionId) {
     sessionId = await timed(timings, 'createSession', () => writingEngine.createSession());
-    rememberSession(contentId, sessionId);
+    if (secondary) rememberSessionSecondary(contentId, sessionId);
+    else rememberSession(contentId, sessionId);
   }
 
   // W2-b: per-session push hashes. rememberSession REPLACES the map entry on
@@ -624,8 +701,65 @@ async function setupSession(content, { avatarId, reuseSession } = {}) {
     const taskPlanMode = () =>
       timed(timings, 'planModeContext', () => pushPlanModeContext(sessionId, content, timings, hashes, skipped));
 
+    // 7. Threads Phase 2: seed the session's conversation from the durable
+    // thread (THE SEEDING INVARIANT). A session's history is valid only when
+    // its `seeded` marker matches the active thread's identity AND covers its
+    // newest durable message; otherwise re-seed. One rule covers: fresh
+    // sessions, backend restarts (marker gone), thread switch / New
+    // conversation (threadId mismatch), chat turns advancing the thread on a
+    // separate session (seq stale), and sequential-run history wipes (their
+    // sessions are never marked seeded). FATAL like document/brief — memory
+    // is a contract now, not best-effort. The in-flight turn's user message
+    // is excluded BY ORDERING (handlers append it after setupSession).
+    const taskSeed = async () => {
+      // P2 review BUG-1: sequential/parallel runs are OUTSIDE the memory
+      // contract (D5) — the engine runs them on a nil baseline and full-
+      // rewrites their session history afterward, DESTROYING any seed. The
+      // old code seeded + marked them anyway; the wipe then hid behind a
+      // current-looking marker and the NEXT freeform run skipped its re-seed
+      // over gutted history (silent wrong memory, triggered by every slash
+      // command). Non-memory runs skip seeding entirely (the engine would
+      // never read it) and never set a marker — their fresh primary entry
+      // stays unmarked, so the next freeform run re-seeds. Capture of these
+      // runs into the thread is unaffected.
+      if (!memoryRun) return;
+      const stamp = await threadService.getActiveThreadStamp(contentId);
+      if (!stamp) return; // flag off / no thread / empty — nothing to seed
+      const e = contentSessionMap.get(contentId);
+      const marker = e && e.sessionId === sessionId ? e.seeded : null;
+      if (reused && marker && marker.threadId === stamp.threadId && marker.seq >= stamp.lastSeq) {
+        skipped.push('seed');
+        return;
+      }
+      const payload = await threadService.getReplayPayload(content._id);
+      if (!payload || !payload.messages.length) return;
+      try {
+        await timed(timings, 'seedMessages', () => writingEngine.seedMessages(sessionId, payload.messages));
+      } catch (err) {
+        // Engine 409 = a run (typically a detached one still draining) holds
+        // this warm session's single-flight lock. Pre-P2 the same collision
+        // surfaced as the engine's friendly busy bounce at run start; keep
+        // that UX — rewrite the message and let the handler map err.status.
+        if (err.status === 409) {
+          err.message = 'Another AI run is still working on this document — wait for it to finish (or stop it), then try again.';
+        }
+        throw err;
+      }
+      // Review BUG-2: the marker records what was ACTUALLY REPLAYED
+      // (payload.lastSeq = max fetched row seq), NOT the stamp. A concurrent
+      // append can allocate its seq (bumping the stamp's counter) before its
+      // row lands — a stamp-based marker would then claim coverage of a row
+      // the seed never contained, and the skip check would hide that turn
+      // from the warm session FOREVER. A lagging marker merely re-seeds next
+      // run (3ms) — always err on the side of re-seeding.
+      const eNow = contentSessionMap.get(contentId);
+      if (eNow && eNow.sessionId === sessionId) {
+        eNow.seeded = { threadId: payload.threadId, seq: payload.lastSeq };
+      }
+    };
+
     return Promise.allSettled([
-      taskDocument(), taskBrief(), taskContextFiles(), taskBrandVoice(), taskPlanMode(),
+      taskDocument(), taskBrief(), taskContextFiles(), taskBrandVoice(), taskPlanMode(), taskSeed(),
     ]);
   };
 
@@ -637,8 +771,12 @@ async function setupSession(content, { avatarId, reuseSession } = {}) {
   // WILL surface a real 404, not silently skip) — and `reused=false` here means
   // the retry itself can never recurse. Only fires on the fatal (document/brief)
   // pushes; a genuine non-404 error still aborts.
+  // Threads P2: the seed task (index 5) joins BOTH positional lists — a 404
+  // from a reused-but-evicted session must trigger the recreate-retry, and a
+  // seed failure is FATAL (running without contracted memory silently answers
+  // as an amnesiac; the run would look fine and be wrong).
   const isGone = (r) => r.status === 'rejected' && r.reason?.status === 404;
-  if (reused && (isGone(results[0]) || isGone(results[1]))) {
+  if (reused && (isGone(results[0]) || isGone(results[1]) || isGone(results[5]))) {
     console.warn(`[setup] engine session ${sessionId} gone (404) — recreating and retrying setup once`);
     contentSessionMap.delete(contentId);
     sessionId = await timed(timings, 'createSession', () => writingEngine.createSession());
@@ -651,7 +789,8 @@ async function setupSession(content, { avatarId, reuseSession } = {}) {
 
   // Preserve the old sequential fatality: document + brief failures abort
   // setup (thrown to the handler); everything else is internally non-fatal.
-  for (const r of [results[0], results[1]]) {
+  // P2: + seed (results[5]) — see above.
+  for (const r of [results[0], results[1], results[5]]) {
     if (r.status === 'rejected') throw r.reason;
   }
 
@@ -915,21 +1054,30 @@ async function pushPlanModeContext(sessionId, content, timings = {}, hashes = {}
 // ─────────────────────────────────────────────────────────────
 const chat = async (req, res) => {
   let creditTxId = null;
+  let threadLockKey = null; // P4: released in the finally
   const tReq = Date.now(); // W0: request-start reference for [timing] lines
   // Threads Phase 1: backend-minted run identifier (no engine runId exists) —
-  // the idempotency key on this run's thread appends.
+  // the CORRELATION id linking this run's thread appends (user + assistant +
+  // side-channels). Not a dedup key: each append site fires at most once per
+  // request, and a browser retry is genuinely a new run (it re-charges).
   const runId = crypto.randomUUID();
   try {
     const content = await resolveContent(req, res);
     if (!content) return;
 
     const { prompt, avatarId, displayLabel } = req.body;
-    if (!prompt || typeof prompt !== 'string') {
+    // trim(): a whitespace-only prompt would persist a blank thread row that
+    // 400s every future compact AND seed (P3 lifecycle review BUG-2).
+    if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
       return res.status(400).json({ error: 'prompt is required' });
     }
 
-    // Set up Writing Engine session
-    const { sessionId } = await setupSession(content, { avatarId });
+    // Set up Writing Engine session. Threads P2: chat is STATELESS — a fresh
+    // one-shot session per turn (never collides with a detached agent run's
+    // single-flight lock), seeded from the durable thread by the setup fan-out
+    // so it still has full conversation memory. `secondary` keeps it out of
+    // the primary slot (pre-fix, every chat turn truncated agent memory).
+    const { sessionId } = await setupSession(content, { avatarId, secondary: true });
     // W2-b: poison the doc-write marker until this run completes cleanly — a
     // crashed run must not leave a stale 0 that would let the next setup skip
     // the document push while the engine's copy is ahead of the FE's.
@@ -956,6 +1104,10 @@ const chat = async (req, res) => {
     // Threads Phase 1: record the user turn POST-GATE (a 402/400-bounced
     // request must not write a phantom prompt) and pre-run (a mid-run crash
     // must not lose it). Best-effort — appendMessage never throws.
+    // P4: hold the thread-write lock across the whole user→assistant span so
+    // an archive/activate can't split the pair across threads.
+    threadLockKey = content._id.toString();
+    lockThreadWrites(threadLockKey);
     const thread = await threadService.getOrCreateActiveThread(content, req.user?.userId);
     await threadService.appendMessage(thread, {
       kind: 'user',
@@ -1051,15 +1203,25 @@ const chat = async (req, res) => {
     // W2-b: gate the next setup's document-push skip on whether THIS run
     // wrote to the engine-side document.
     recordRunDocWrites(content._id.toString(), sessionId, usageTap.snapshot().docWrites);
-    persistUsage(req, content, usageTap, 'chat', { sessionId, aborted: clientDisconnected });
+    persistUsage(req, content, usageTap, 'chat', { sessionId, runId, aborted: clientDisconnected });
     // Threads Phase 1: record the assistant turn at the single convergence
     // point (success AND client-abort funnel here; hard errors go to the
     // outer catch and deliberately append nothing — D6, the replay shaper
     // seals a dangling user message).
     {
-      const finalText = usageTap.finalAssistantText();
+      const t = usageTap.snapshot();
+      let finalText = usageTap.finalAssistantText();
+      // Review BUG-2 (chat variant): a tool-only chat reply that edited the
+      // doc but narrated nothing still gets an honest assistant row.
+      if (!finalText && !clientDisconnected && t.docWrites > 0) {
+        // Parenthetical reported speech — see the agent convergence note.
+        finalText = `(run summary: ${t.docWrites} document edit${t.docWrites === 1 ? '' : 's'} were applied)`;
+      }
+      // Review CAVEAT-5: a client-aborted chat reply is partial — mark it.
+      if (finalText && clientDisconnected) {
+        finalText += '\n\n(response interrupted before completion)';
+      }
       if (finalText) {
-        const t = usageTap.snapshot();
         await threadService.appendMessage(thread, {
           kind: 'assistant',
           text: finalText,
@@ -1068,11 +1230,14 @@ const chat = async (req, res) => {
             model: t.model, tokensIn: t.inputTokens, tokensOut: t.outputTokens,
             docWrites: t.docWrites, stopReason: t.stopReason, turns: usageTap.turnCount(),
           },
-        });
+        }, content); // re-resolve target if the thread was archived mid-run
       }
       if (usageTap.steeringWasApplied() && thread) {
-        threadService.markSteersApplied(thread._id);
+        threadService.markSteersApplied(thread._id, tReq);
       }
+      // P3: compaction trigger — detached (never delays the response, never
+      // throws; failures retry after a later run).
+      void threadService.maybeCompactThread(content);
     }
     if (!clientDisconnected) res.end();
   } catch (err) {
@@ -1090,10 +1255,21 @@ const chat = async (req, res) => {
     }
     console.error('AI chat error:', err);
     if (!res.headersSent) {
+      // P2 (review CAVEAT-1): a seed-409 (busy warm session) surfaces as the
+      // SAME SSE busy event the engine's own single-flight bounce produces —
+      // the FE already renders that as its neutral busy chip. An HTTP 409
+      // would hit the generic !res.ok throw → red error bubble.
+      if (err.status === 409) {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+        res.write(`data: ${JSON.stringify({ type: 'error', code: 'busy', error: err.message })}\n\n`);
+        return res.end();
+      }
       return res.status(500).json({ error: err.message || 'AI chat failed' });
     }
     res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`);
     res.end();
+  } finally {
+    if (threadLockKey) unlockThreadWrites(threadLockKey); // P4
   }
 };
 
@@ -1127,6 +1303,7 @@ const agent = async (req, res) => {
   // can identity-check before deleting (a shadowing same-content run must stay).
   let runRegistryKey = null;
   let myRunEntry = null;
+  let threadLockKey = null; // P4: released in the finally
   const tReq = Date.now(); // W0: request-start reference for [timing] lines
   // Threads Phase 1: backend-minted run identifier (see chat).
   const runId = crypto.randomUUID();
@@ -1169,9 +1346,11 @@ const agent = async (req, res) => {
       }
     }
 
-    // Set up Writing Engine session (reuse for conversation memory in freeform mode)
+    // Set up Writing Engine session (reuse for conversation memory in freeform
+    // mode). P2: memoryRun mirrors isFreeform — sequential runs are outside
+    // the memory contract (D5): no seed (the engine wipes it), no marker.
     const isFreeform = !mode || mode === 'freeform';
-    const { sessionId, markdown: markdownBefore } = await setupSession(content, { avatarId, reuseSession: isFreeform });
+    const { sessionId, markdown: markdownBefore } = await setupSession(content, { avatarId, reuseSession: isFreeform, memoryRun: isFreeform });
     // W2-b: poison the doc-write marker until this run completes cleanly (see chat).
     recordRunDocWrites(content._id.toString(), sessionId, -1);
 
@@ -1197,8 +1376,15 @@ const agent = async (req, res) => {
     // credit 402 bounces above must not write phantom prompts), pre-run.
     // `text` = the full engineered goal (the replay source); `displayLabel` =
     // what the FE bubble showed ('/auto-optimize'). Best-effort, never throws.
+    // P4: thread-write lock across user→assistant appends (covers the
+    // pre-registration window AND the post-registry-delete tail — the
+    // registry is removed at the W4-b V3 point ~100 lines before the append).
+    threadLockKey = content._id.toString();
+    lockThreadWrites(threadLockKey);
     const thread = await threadService.getOrCreateActiveThread(content, req.user?.userId);
-    await threadService.appendMessage(thread, {
+    // userAppended feeds the convergence bump's CONTIGUITY check (P2 review
+    // BUG-2) — the marker may only advance across rows this run itself wrote.
+    const userAppended = await threadService.appendMessage(thread, {
       kind: 'user',
       text: goal,
       displayText: typeof displayLabel === 'string' ? displayLabel : '',
@@ -1244,6 +1430,10 @@ const agent = async (req, res) => {
       startedAt: Date.now(),
       revertIntent: false,
       abort: () => abortCtrl.abort(),
+      // Threads P1 review (CAVEAT-8): lets side-channel appends (steer/
+      // clarify/plan-confirm) correlate their rows to the run they landed in
+      // — sessionId alone is ambiguous (freeform reuses sessions across runs).
+      runId,
     };
     activeAgentRuns.set(runRegistryKey, myRunEntry);
 
@@ -1428,29 +1618,54 @@ const agent = async (req, res) => {
     // aborted reflects whether the RUN finished, not whether the CLIENT stayed:
     // a detached run that completed server-side is NOT aborted (the catch-up UI
     // reads this to show "finished while you were away" vs "was stopped").
-    persistUsage(req, content, usageTap, 'agent', { sessionId, aborted: !streamCompleted });
+    persistUsage(req, content, usageTap, 'agent', { sessionId, runId, aborted: !streamCompleted });
     // Threads Phase 1: record the assistant turn at the convergence point —
     // success, passive detach (drained server-side, so the tap has the full
     // text), explicit stop, stop-revert, and the TTL abort ALL pass through
     // here exactly once. Hard errors hit the outer catch → no append (D6).
     {
-      const finalText = usageTap.finalAssistantText();
+      const t = usageTap.snapshot();
+      let finalText = usageTap.finalAssistantText();
+      // Review BUG-2: a SUCCESSFUL run whose model narrated nothing (tools
+      // only — sequential's normal shape) must still record an assistant row,
+      // else the thread ends in a dangling user message and the Phase-2
+      // replay shaper brands a successful run "interrupted".
+      if (!finalText && streamCompleted && (t.docWrites > 0 || t.stopReason)) {
+        // Fidelity review CAVEAT-1: reported-speech parentheticals, NOT
+        // bracketed assistant-voice — seeded exemplars written as "[Run
+        // completed…]" invite register imitation from exemplar-biased models.
+        finalText = t.docWrites > 0
+          ? `(run summary: ${t.docWrites} document edit${t.docWrites === 1 ? '' : 's'} were applied)`
+          : '(run summary: the run completed with no document changes)';
+      }
+      // Review CAVEAT-5: partial text from a stopped/TTL-aborted/errored
+      // stream must not read as a complete reply (revert has its own marker).
+      if (finalText && !streamCompleted && !revertFinal) {
+        finalText += '\n\n(response interrupted before completion)';
+      }
       if (finalText) {
-        const t = usageTap.snapshot();
-        await threadService.appendMessage(thread, {
+        const appended = await threadService.appendMessage(thread, {
           kind: 'assistant',
-          text: revertFinal ? `${finalText}\n\n[This run was stopped and its changes were reverted.]` : finalText,
+          text: revertFinal ? `${finalText}\n\n(this run was stopped and its changes were reverted)` : finalText,
           meta: {
             runId, sessionId, channel: 'agent',
             model: t.model, tokensIn: t.inputTokens, tokensOut: t.outputTokens,
             docWrites: revertFinal ? 0 : t.docWrites, stopReason: t.stopReason,
             turns: usageTap.turnCount(),
           },
-        });
+        }, content); // re-resolve target if the thread was archived mid-run
+        // Threads P2: this run's rows already live in the warm session's
+        // NATIVE engine history — advance the seeded marker past them so the
+        // next run doesn't re-seed over richer in-session context. The helper
+        // enforces session + thread identity AND contiguity (review BUG-2):
+        // any interleaved foreign row leaves the marker stale → re-seed.
+        maybeBumpSeededMarker(content._id.toString(), sessionId, userAppended, appended);
       }
       if (usageTap.steeringWasApplied() && thread) {
-        threadService.markSteersApplied(thread._id);
+        threadService.markSteersApplied(thread._id, tReq);
       }
+      // P3: compaction trigger — detached (see the chat convergence note).
+      void threadService.maybeCompactThread(content);
     }
     if (!clientDisconnected) res.end();
   } catch (err) {
@@ -1470,10 +1685,19 @@ const agent = async (req, res) => {
     }
     console.error('AI agent error:', err);
     if (!res.headersSent) {
+      // P2 (review CAVEAT-1): seed-409 → the engine-shaped SSE busy event the
+      // FE already understands (see the chat handler note).
+      if (err.status === 409) {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+        res.write(`data: ${JSON.stringify({ type: 'error', code: 'busy', error: err.message })}\n\n`);
+        return res.end();
+      }
       return res.status(500).json({ error: err.message || 'AI agent failed' });
     }
     res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`);
     res.end();
+  } finally {
+    if (threadLockKey) unlockThreadWrites(threadLockKey); // P4
   }
 };
 
@@ -2052,11 +2276,12 @@ const clarifyAnswer = async (req, res) => {
     // content (engine-side it lands as a tool_result, which D3 never persists
     // — this append is the only durable record). After-success only.
     {
+      const runId = activeAgentRuns.get(content._id.toString())?.runId || '';
       const thread = await threadService.getOrCreateActiveThread(content, req.user?.userId);
       await threadService.appendMessage(thread, {
         kind: 'user',
         text: String(answer),
-        meta: { sessionId, userId: req.user?.userId || null, channel: 'clarify' },
+        meta: { runId, sessionId, userId: req.user?.userId || null, channel: 'clarify' },
       });
     }
     return res.json(result);
@@ -2104,11 +2329,12 @@ const steer = async (req, res) => {
     // the run's tap sees steering_applied — an honest "queued but the run
     // ended first" stays false.
     {
+      const runId = activeAgentRuns.get(content._id.toString())?.runId || '';
       const thread = await threadService.getOrCreateActiveThread(content, req.user?.userId);
       await threadService.appendMessage(thread, {
         kind: 'user',
         text: message.trim(),
-        meta: { sessionId, userId: req.user?.userId || null, channel: 'steer', applied: false },
+        meta: { runId, sessionId, userId: req.user?.userId || null, channel: 'steer', applied: false },
       });
     }
     return res.json(result);
@@ -2200,12 +2426,22 @@ const stopRun = async (req, res) => {
 const engineContent = async (req, res) => {
   try {
     const sessionId = req.query.sessionId;
-    if (!sessionId) {
+    // P2 review (CAVEAT-5): extended-qs can deliver an OBJECT here
+    // (?sessionId[$ne]=x) which would flow into the durable-tenancy Mongo
+    // query as an operator. Not exploitable end-to-end, but fail it early.
+    if (!sessionId || typeof sessionId !== 'string') {
       return res.status(400).json({ error: 'sessionId is required' });
     }
     const content = await resolveContent(req, res);
     if (!content) return;
-    if (!sessionBoundToContent(content._id.toString(), sessionId)) {
+    // Threads P2 (review GAP-6): the in-memory binding dies with the process,
+    // but engine sessions are now recoverable — a post-restart catch-up read
+    // used to 409 here even though the session lives on in engine SQLite.
+    // Fall back to the DURABLE record: accept a session the thread has seen
+    // serve THIS content within 24h. Mid-run side-channels (steer/stop/…)
+    // deliberately keep the map-only check — they're instance-affine anyway.
+    if (!sessionBoundToContent(content._id.toString(), sessionId)
+      && !(await threadService.sessionSeenForContent(content._id, sessionId))) {
       return res.status(409).json({ error: 'Session does not match this content' });
     }
     const doc = await writingEngine.getContent(sessionId);
@@ -2233,7 +2469,7 @@ const runStatus = async (req, res) => {
     const entry = activeAgentRuns.get(content._id.toString());
     const last = await AgentUsageLog.findOne({ contentId: content._id })
       .sort({ createdAt: -1 })
-      .select('source sessionId stopReason docWrites aborted completedAt createdAt')
+      .select('source sessionId runId stopReason docWrites aborted completedAt createdAt')
       .lean();
     return res.json({
       active: entry ? { sessionId: entry.sessionId, startedAt: entry.startedAt } : null,
@@ -2277,11 +2513,12 @@ const planConfirm = async (req, res) => {
       const steps = Array.isArray(selectedSteps) && selectedSteps.length
         ? ` — steps: ${selectedSteps.slice(0, 20).join(', ')}`
         : '';
+      const runId = activeAgentRuns.get(content._id.toString())?.runId || '';
       const thread = await threadService.getOrCreateActiveThread(content, req.user?.userId);
       await threadService.appendMessage(thread, {
         kind: 'user',
         text: `[Plan decision] ${action}${steps}`,
-        meta: { sessionId, userId: req.user?.userId || null, channel: 'plan-confirm' },
+        meta: { runId, sessionId, userId: req.user?.userId || null, channel: 'plan-confirm' },
       });
     }
     return res.json(result);
@@ -2329,16 +2566,87 @@ const newThread = async (req, res) => {
   try {
     const content = await resolveContent(req, res);
     if (!content) return;
+    // Review BUG-2 (primary guard): archiving mid-run would file the in-flight
+    // run's reply on the archived thread (its handler captured the thread doc
+    // pre-run). The FE disables the button per-tab only — a second tab /
+    // another user / a detached run still reaches here. Same 409 shape as
+    // stop-revert. P4: ALSO consult threadWriteLocks — chat runs never
+    // register in activeAgentRuns, and agent runs leave it before their
+    // convergence append.
+    if (activeAgentRuns.has(content._id.toString()) || threadWriteLocks.has(content._id.toString())) {
+      return res.status(409).json({ error: 'An AI run is in progress on this document — stop it (or let it finish) before starting a new conversation.' });
+    }
     const thread = await threadService.startNewThread(content, req.user?.userId);
-    if (!thread) {
-      // Flag off (or write failure) — report cleanly; the FE treats this as
-      // "local clear only", which is exactly the pre-threads behavior.
+    if (thread && thread.disabled) {
+      // Flag off — report cleanly; the FE treats this as "local clear only",
+      // which is exactly the pre-threads behavior.
       return res.status(409).json({ error: 'Conversation threads are not enabled' });
+    }
+    if (!thread) {
+      return res.status(500).json({ error: 'Failed to start a new conversation' });
     }
     return res.json({ threadId: thread._id, status: 'ok' });
   } catch (err) {
     console.error('[threads] newThread error:', err);
     return res.status(500).json({ error: 'Failed to start a new conversation' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// GET /:workspaceNumber/content/:contentNumber/ai/threads
+// Threads Phase 4: the picker's list — active first, then archived.
+// ─────────────────────────────────────────────────────────────
+const listThreads = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+    const threads = await threadService.listThreads(content._id, {
+      limit: Math.max(1, parseInt(req.query.limit, 10) || 20),
+    });
+    return res.json({ threads });
+  } catch (err) {
+    console.error('[threads] listThreads error:', err);
+    return res.status(500).json({ error: 'Failed to list conversations' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// POST /:workspaceNumber/content/:contentNumber/ai/threads/:threadId/activate
+// Threads Phase 4: resume an archived conversation. Same in-flight-run
+// guard as newThread — swapping the active thread mid-run would file the
+// run's reply on an archived thread. No session surgery: the seeding
+// invariant re-seeds the next run (marker threadId mismatch).
+// ─────────────────────────────────────────────────────────────
+const activateThread = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+    const { threadId } = req.params;
+    if (!threadId || !/^[a-f0-9]{24}$/i.test(threadId)) {
+      return res.status(400).json({ error: 'Invalid conversation id' });
+    }
+    // P4 review BUG-2: threadWriteLocks covers chat runs (never in the
+    // registry) and the agent tail window (registry deleted pre-append).
+    if (activeAgentRuns.has(content._id.toString()) || threadWriteLocks.has(content._id.toString())) {
+      return res.status(409).json({ error: 'An AI run is in progress on this document — stop it (or let it finish) before switching conversations.' });
+    }
+    const thread = await threadService.activateThread(content, threadId);
+    if (thread && thread.disabled) {
+      return res.status(409).json({ error: 'Conversation threads are not enabled' });
+    }
+    // P4 review BUG-3: a genuine miss is a 404; an internal/race failure is a
+    // retryable 503 — never tell the user their conversation "doesn't exist"
+    // because Mongo hiccuped (or the bounded activate retry lost).
+    if (thread && thread.error) {
+      return res.status(503).json({ error: 'Could not switch conversations right now — please try again.' });
+    }
+    if (!thread) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    return res.json({ threadId: thread._id, title: thread.title || '', status: 'ok' });
+  } catch (err) {
+    console.error('[threads] activateThread error:', err);
+    return res.status(500).json({ error: 'Failed to switch conversations' });
   }
 };
 
@@ -2427,7 +2735,7 @@ async function resyncBriefIfActive(contentId) {
   }
 }
 
-module.exports = { chat, agent, generateImage, inlineEdit, autocomplete, rehostImage, uploadImage, clarifyAnswer, planConfirm, steer, stopRevert, stopRun, engineContent, runStatus, getThread, newThread, listSkills, resyncBriefIfActive,
+module.exports = { chat, agent, generateImage, inlineEdit, autocomplete, rehostImage, uploadImage, clarifyAnswer, planConfirm, steer, stopRevert, stopRun, engineContent, runStatus, getThread, newThread, listThreads, activateThread, listSkills, resyncBriefIfActive,
   // Exported for test coverage (cost-ledger usage tap + Phase-4 preset resolver).
   // Not part of the runtime API surface.
   makeUsageTap, resolvePreset, clampAgentBudget,
@@ -2435,6 +2743,10 @@ module.exports = { chat, agent, generateImage, inlineEdit, autocomplete, rehostI
   // Exported so tests can seed the content→session binding (resume tenancy)
   // and pin the W2-b doc-write marker's session guard.
   contentSessionMap, rememberSession, recordRunDocWrites,
+  // P2: exported for the seeding-marker contiguity tests (review BUG-2).
+  maybeBumpSeededMarker,
+  // P4: exported for the thread-write-lock guard tests (review BUG-2).
+  lockThreadWrites, unlockThreadWrites,
   // Exported for the setupSession evicted-session (404) retry test.
   setupSession,
   // W4-b: exported for the stop-revert registry lifecycle test.

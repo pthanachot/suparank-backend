@@ -102,11 +102,17 @@ test('tap captures token_budget from an error event (review V5 gap)', () => {
   assert.strictEqual(tap.snapshot().stopReason, 'token_budget');
 });
 
-test('tap ignores generic error codes for stopReason', () => {
+test('tap captures ANY coded error for stopReason, but a complete event overrides it', () => {
+  // Threads P1 review (CAVEAT-5) widened the W4 two-code whitelist: an
+  // api_error run's partial text was otherwise indistinguishable from a clean
+  // reply in the thread record. Safe because stopReason is last-writer-wins —
+  // a mid-run recoverable error followed by a real completion ends 'done'.
   const tap = makeUsageTap();
   feed(tap, { type: 'usage', usage: { input_tokens: 1, output_tokens: 1 } });
   feed(tap, { type: 'error', code: 'api_error', error: 'provider blip' });
-  assert.strictEqual(tap.snapshot().stopReason, '');
+  assert.strictEqual(tap.snapshot().stopReason, 'api_error');
+  feed(tap, { type: 'complete', completion: { stopReason: 'done' } });
+  assert.strictEqual(tap.snapshot().stopReason, 'done', 'completion outranks an earlier coded error');
 });
 
 test('docWrites counts only document_diff, not document_update', () => {

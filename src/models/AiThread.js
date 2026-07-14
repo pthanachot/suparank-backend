@@ -43,9 +43,14 @@ const aiThreadSchema = new mongoose.Schema(
     messageCount: { type: Number, default: 0 },
     // Running ceil(text.length/4) sum — Phase 3's compaction trigger.
     tokenEstimate: { type: Number, default: 0 },
-    // Seq of the newest 'compaction' message; -1 = never compacted. Replay
-    // (Phase 2) sends the compaction summary + everything after this seq.
+    // Phase-3 TRIGGER BOOKKEEPING ONLY (the replay fetch keys off the newest
+    // kind:'compaction' row's meta.coversThroughSeq, never these fields):
+    // seq of the newest compaction row, -1 = never compacted…
     lastCompactionSeq: { type: Number, default: -1 },
+    // …and the thread's cumulative tokenEstimate AT that moment — the trigger
+    // fires on (tokenEstimate - tokenEstimateAtCompaction) > threshold, i.e.
+    // tokens accumulated SINCE the last compaction.
+    tokenEstimateAtCompaction: { type: Number, default: 0 },
   },
   { timestamps: true }
 );
@@ -53,5 +58,21 @@ const aiThreadSchema = new mongoose.Schema(
 // Hot path: resolve the active thread for a content (getOrCreateActiveThread)
 // and the Phase-4 picker (recent threads for a content, newest first).
 aiThreadSchema.index({ contentId: 1, status: 1, lastMessageAt: -1 });
+
+// Review BUG-1: at most ONE active thread per (content, owner). The
+// getOrCreateActiveThread upsert is only race-free when a unique index backs
+// its filter — without this, two concurrent first-runs (two tabs, shared
+// thread) could both insert an active thread and split the conversation
+// across independent seq counters (nondeterministic history, Phase-2 replay
+// seeding from whichever wins). Partial: archived threads are unlimited.
+aiThreadSchema.index(
+  { contentId: 1, ownerUserId: 1 },
+  { unique: true, partialFilterExpression: { status: 'active' }, name: 'one_active_thread_per_owner' },
+);
+
+// P5 review: the nightly prune's find({ status:'archived', archivedAt:{$lt} })
+// .sort({ archivedAt:1 }) was an unindexed collection scan — none of the
+// indexes above prefix on status alone.
+aiThreadSchema.index({ status: 1, archivedAt: 1 });
 
 module.exports = mongoose.model('AiThread', aiThreadSchema);

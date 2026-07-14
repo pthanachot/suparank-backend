@@ -195,6 +195,9 @@ router.get('/:workspaceNumber/content/:contentNumber/ai/engine-content', rwr, rf
 // the handlers) + the aiChat permission family like run-status. No rc.
 router.get('/:workspaceNumber/content/:contentNumber/ai/thread', rwr, rf('aiThreads'), rp('aiChat', 'use'), aiController.getThread);
 router.post('/:workspaceNumber/content/:contentNumber/ai/threads', rwr, rf('aiThreads'), rp('aiChat', 'use'), aiController.newThread);
+// Threads Phase 4: picker list + resume-an-archived-conversation.
+router.get('/:workspaceNumber/content/:contentNumber/ai/threads', rwr, rf('aiThreads'), rp('aiChat', 'use'), aiController.listThreads);
+router.post('/:workspaceNumber/content/:contentNumber/ai/threads/:threadId/activate', rwr, rf('aiThreads'), rp('aiChat', 'use'), aiController.activateThread);
 
 // Plan mode under content (M1 — writing-engine plan mode).
 // Gated like the confirm family (ai/plan-confirm): rf('aiChat') + rp('aiChat','use').

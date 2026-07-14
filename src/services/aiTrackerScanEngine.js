@@ -23,7 +23,9 @@ const PLATFORMS = [
 function recordTrackerCost(ctx, { model, engine, step, tokensIn = 0, tokensOut = 0 }) {
   if (!ctx) return;
   costLedger.record({
-    action: 'tracker_scan',
+    // Public free tools reuse the search functions with ctx.ledgerAction =
+    // 'public_tool' so their spend lands under the tools' daily budget cap.
+    action: ctx.ledgerAction || 'tracker_scan',
     model,
     tokensIn,
     tokensOut,
@@ -1768,6 +1770,12 @@ async function runScan(tracker, prompts, competitors, onProgress, ctx) {
 module.exports = {
   runScan,
   PLATFORMS,
+  // Single-engine search functions — used by the public free tools
+  // (publicToolsController) for one-shot visibility checks.
+  searchChatGPT,
+  searchGemini,
+  searchPerplexity,
+  searchClaude,
   normalizeBrandKey,
   isSameBrand,
   getAvailablePlatformIdsSilent,

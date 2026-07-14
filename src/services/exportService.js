@@ -24,6 +24,8 @@ const Content = require('../models/Content');
 const AiTracker = require('../models/AiTracker');
 const AiTrackerPrompt = require('../models/AiTrackerPrompt');
 const AiTrackerScan = require('../models/AiTrackerScan');
+const AiThread = require('../models/AiThread');
+const AiThreadMessage = require('../models/AiThreadMessage');
 const ReportSnapshot = require('../models/ReportSnapshot');
 const KeywordResearchHistory = require('../models/KeywordResearchHistory');
 const BrandVoice = require('../models/BrandVoice');
@@ -162,10 +164,11 @@ async function serializeWorkspace(workspaceId, prefix = '') {
   if (!workspace) return entries;
 
   // ── content ──
-  // B4: exclude locked content (paid-created, then downgraded to free). Its body
-  // must not leak — the same invariant contentController.getContent enforces on
-  // read. Data-portability/erasure has its own path (erasureController), which is
-  // exempt from this convenience archive.
+  // B4: exclude locked content BODIES (paid-created, then downgraded to free).
+  // The body must not leak — the same invariant contentController.getContent
+  // enforces on read. (P5 review: erasureController only DELETES — this tar is
+  // the system's only export, so the exclusion must be visible in the manifest
+  // and must not swallow the user's own conversation prompts; see below.)
   const contents = await Content.find({ workspaceId, locked: { $ne: true } }).lean();
   for (const c of contents) {
     // Filter null slots — blocksToMarkdown/renderBlocksHtml deref block fields and
@@ -188,6 +191,26 @@ async function serializeWorkspace(workspaceId, prefix = '') {
     entries.push({ name: `${dir}/tracker.json`, data: json(tr) });
     entries.push({ name: `${dir}/prompts.json`, data: json(prompts) });
     entries.push({ name: `${dir}/scans.json`, data: json(scans) });
+  }
+
+  // ── AI conversation threads (Threads P5 — GDPR portability: prompts are
+  // user personal data). Grouped per content, children fetched per thread.
+  // P5 review: conversations for LOCKED contents export too — the thread is
+  // the user's own typed prompts + replies (Art. 20 "data provided by the
+  // data subject"), not the paid deliverable, and it never contains the
+  // locked body. Only the content body stays excluded; locked dirs are
+  // suffixed so the omitted body is legible in the archive.
+  const lockedContents = await Content.find({ workspaceId, locked: true })
+    .select('_id contentNumber title slug').lean();
+  const threadContents = contents.concat(lockedContents.map((c) => ({ ...c, _locked: true })));
+  const contentIds = threadContents.map((c) => c._id);
+  const threads = contentIds.length ? await AiThread.find({ contentId: { $in: contentIds } }).lean() : [];
+  for (const t of threads) {
+    if (!t.messageCount) continue; // empty artifacts — nothing to port
+    const messages = await AiThreadMessage.find({ threadId: t._id }).sort({ seq: 1 }).lean();
+    const c = threadContents.find((x) => String(x._id) === String(t.contentId));
+    const cDir = c ? `${c.contentNumber}-${slugify(c.title || c.slug)}${c._locked ? '-locked' : ''}` : String(t.contentId);
+    entries.push({ name: `${p}conversations/${cDir}/${t._id}.json`, data: json({ thread: t, messages }) });
   }
 
   // ── reports ──
@@ -217,7 +240,11 @@ async function serializeWorkspace(workspaceId, prefix = '') {
       workspace: { id: String(workspace._id), number: workspace.workspaceNumber, name: workspace.name },
       counts: {
         content: contents.length,
+        // P5 review: locked bodies are withheld by design — say so instead
+        // of silently omitting them from a portability archive.
+        lockedContentExcluded: lockedContents.length,
         aiTrackers: trackers.length,
+        conversations: threads.filter((t) => t.messageCount).length,
         reports: reports.length,
         keywordSearches: keywords.length,
         brandVoices: brandVoices.length,

@@ -47,6 +47,9 @@ const AiTracker = require('../models/AiTracker');
 const AiTrackerScan = require('../models/AiTrackerScan');
 const AiTrackerPrompt = require('../models/AiTrackerPrompt');
 const AiTrackerCompetitor = require('../models/AiTrackerCompetitor');
+const AiThread = require('../models/AiThread');
+const AiThreadMessage = require('../models/AiThreadMessage');
+const AiCostLedger = require('../models/AiCostLedger');
 
 // org-scoped models
 const AgencyPlan = require('../models/AgencyPlan');
@@ -209,6 +212,30 @@ async function deleteWorkspaceData(workspaceId, counts = {}) {
   }
   await _del(counts, 'sitemaps', Sitemap, { workspaceId });
 
+  // Threads P5: conversation threads (children BEFORE parents — same
+  // discipline as the tracker scans above; AiThreadMessage is keyed only by
+  // threadId).
+  const threadIds = (await AiThread.find({ workspaceId }).select('_id').lean()).map((t) => t._id);
+  if (threadIds.length) {
+    await _del(counts, 'aiThreadMessages', AiThreadMessage, { threadId: { $in: threadIds } });
+  }
+  await _del(counts, 'aiThreads', AiThread, { workspaceId });
+
+  // Threads P5 (drive-by, twice review-flagged): AiCostLedger rows carried
+  // dangling tenant linkage after erasure. COGS rows are OUR accounting —
+  // aggregate margins must survive — so SCRUB the tenant fields rather than
+  // delete: the numbers stay, the erased tenant's linkage (and contentId
+  // metadata) goes.
+  try {
+    const scrub = await AiCostLedger.updateMany(
+      { workspaceId },
+      { $set: { workspaceId: null, organizationId: null, userId: null, metadata: {} } },
+    );
+    if (scrub.modifiedCount) counts.aiCostLedgerScrubbed = (counts.aiCostLedgerScrubbed || 0) + scrub.modifiedCount;
+  } catch (err) {
+    console.error('[deletion] AiCostLedger scrub failed (non-fatal):', err.message);
+  }
+
   await _del(counts, 'content', Content, { workspaceId });
   await _del(counts, 'plans', Plan, { workspaceId });
   await _del(counts, 'agentUsageLogs', AgentUsageLog, { workspaceId });
@@ -273,6 +300,19 @@ async function deleteOrgData(orgId, counts = {}) {
   await _del(counts, 'sites', Site, { organizationId: orgId });
   await _del(counts, 'sitemaps', Sitemap, { organizationId: orgId });
   await _del(counts, 'workspaceMembers', WorkspaceMember, { organizationId: orgId });
+  // Threads P5 review (BUG-1): the per-workspace ledger scrub misses rows
+  // whose workspace was deleted via the NON-erasure paths (workspace/admin
+  // cascade deletes never scrub) and org-only rows (schema allows null
+  // workspaceId). An org erasure must not certify with live org linkage.
+  try {
+    const scrub = await AiCostLedger.updateMany(
+      { organizationId: orgId },
+      { $set: { workspaceId: null, organizationId: null, userId: null, metadata: {} } },
+    );
+    if (scrub.modifiedCount) counts.aiCostLedgerScrubbed = (counts.aiCostLedgerScrubbed || 0) + scrub.modifiedCount;
+  } catch (err) {
+    console.error('[deletion] org-level AiCostLedger scrub failed (non-fatal):', err.message);
+  }
 
   await _del(counts, 'organization', Organization, { _id: orgId });
   return counts;

@@ -46,6 +46,9 @@ const DELETE_MODELS = {
   AiTrackerScan: require('../src/models/AiTrackerScan'),
   AiTrackerPrompt: require('../src/models/AiTrackerPrompt'),
   AiTrackerCompetitor: require('../src/models/AiTrackerCompetitor'),
+  // Threads P5
+  AiThread: require('../src/models/AiThread'),
+  AiThreadMessage: require('../src/models/AiThreadMessage'),
   Workspace,
   Organization,
   AgencyPlan: require('../src/models/AgencyPlan'),
@@ -89,6 +92,12 @@ beforeEach(() => {
   };
   AiTracker.find = () => leanQuery([]);
   Sitemap.find = () => leanQuery([]);
+  // Threads P5: thread-children enumeration + COGS scrub
+  origs.aiThreadFind = DELETE_MODELS.AiThread.find;
+  DELETE_MODELS.AiThread.find = () => leanQuery([]);
+  const AiCostLedger = require('../src/models/AiCostLedger');
+  origs.costLedgerUpdateMany = AiCostLedger.updateMany;
+  AiCostLedger.updateMany = async (filter, update) => { calls.costScrubs = (calls.costScrubs || []); calls.costScrubs.push({ filter, update }); return { modifiedCount: 2 }; };
   Workspace.find = () => leanQuery([]);
   Organization.find = () => leanQuery([]);
   ClientSubscription.find = () => leanQuery([]);
@@ -126,6 +135,8 @@ beforeEach(() => {
 
 afterEach(() => {
   for (const [name, Model] of Object.entries(DELETE_MODELS)) Model.deleteMany = origs.deleteMany[name];
+  DELETE_MODELS.AiThread.find = origs.aiThreadFind;
+  require('../src/models/AiCostLedger').updateMany = origs.costLedgerUpdateMany;
   AiTracker.find = origs.finds.AiTracker; Sitemap.find = origs.finds.Sitemap; Workspace.find = origs.finds.Workspace;
   Organization.find = origs.finds.Organization; ClientSubscription.find = origs.finds.ClientSubscription; Domain.find = origs.finds.Domain;
   DELETE_MODELS.Subscription.find = origs.finds.Subscription;
@@ -148,9 +159,14 @@ describe('deleteWorkspaceData', () => {
       'Content', 'Plan', 'AgentUsageLog', 'KeywordResearchHistory', 'ReportShare', 'ReportSnapshot',
       'WorkspaceUsageTracker', 'WorkspaceMember', 'ClientSubscription', 'Site', 'Sitemap',
       'BrandVoice', 'Avatar', 'AiTracker', 'Invite', 'Workspace',
+      'AiThread', // Threads P5
     ]) {
       assert.ok(n.includes(expected), `expected ${expected} to be deleted`);
     }
+    // Threads P5: the COGS ledger keeps its numbers but loses tenant linkage.
+    assert.equal(calls.costScrubs?.length, 1, 'AiCostLedger scrubbed exactly once');
+    assert.deepEqual(calls.costScrubs[0].update.$set, { workspaceId: null, organizationId: null, userId: null, metadata: {} });
+    assert.ok(counts.aiCostLedgerScrubbed >= 1, 'scrub counted');
     assert.deepEqual(filterFor('Workspace'), { _id: 'ws1' });
     // brand assets are scoped by `workspace`, not `workspaceId`
     assert.deepEqual(filterFor('BrandVoice'), { workspace: 'ws1' });
@@ -168,6 +184,18 @@ describe('deleteWorkspaceData', () => {
     assert.deepEqual(filterFor('AiTrackerScan'), { trackerId: { $in: ['t1', 't2'] } });
     // ordering: scans deleted before the parent tracker
     assert.ok(n.indexOf('AiTrackerScan') < n.indexOf('AiTracker'));
+  });
+
+  // Threads P5 review: with the default empty AiThread.find stub, the message
+  // delete never fired in any test — pin the children-first order the same
+  // way the tracker test below does.
+  it('deletes AiThreadMessages (by threadId) BEFORE the threads', async () => {
+    DELETE_MODELS.AiThread.find = () => leanQuery([{ _id: 'T1' }]);
+    await deletion.deleteWorkspaceData('ws1');
+    const n = deletedNames();
+    assert.ok(n.includes('AiThreadMessage'), 'thread children enumerated and deleted');
+    assert.deepEqual(filterFor('AiThreadMessage'), { threadId: { $in: ['T1'] } });
+    assert.ok(n.indexOf('AiThreadMessage') < n.indexOf('AiThread'), 'children BEFORE parents');
   });
 
   it('deletes CrawlPages (by sitemapId) BEFORE the sitemaps', async () => {
@@ -245,6 +273,19 @@ describe('deleteOrgData', () => {
     ]);
     await deletion.deleteOrgData('org1');
     assert.ok(calls.stripeCancels.some((c) => c.id === 'sub_remnant' && c.connected === true));
+  });
+
+  // Threads P5 review BUG-1: the per-workspace scrub misses ledger rows whose
+  // workspace was deleted via the NON-erasure cascades (which never scrub)
+  // and org-only rows (schema allows workspaceId: null). Org erasure must
+  // sweep the ledger by organizationId itself — belt-and-suspenders.
+  it('scrubs AiCostLedger by organizationId even with zero workspaces left', async () => {
+    // Workspace.find → [] (default): the workspace-loop scrub can't fire.
+    const counts = await deletion.deleteOrgData('org1');
+    const orgScrubs = (calls.costScrubs || []).filter((s) => s.filter.organizationId === 'org1');
+    assert.equal(orgScrubs.length, 1, 'org-level ledger scrub ran');
+    assert.deepEqual(orgScrubs[0].update.$set, { workspaceId: null, organizationId: null, userId: null, metadata: {} });
+    assert.ok(counts.aiCostLedgerScrubbed >= 1, 'scrub counted toward the erasure report');
   });
 });
 

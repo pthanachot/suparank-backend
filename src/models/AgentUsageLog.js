@@ -43,6 +43,10 @@ const agentUsageLogSchema = new mongoose.Schema(
     // Enough for a run-status/catch-up UI to tell a finished run from a
     // died one without a separate collection. All optional/additive.
     sessionId: { type: String, default: '' },
+    // P4 review: sessions are REUSED across runs (and threads), so sessionId
+    // is ambiguous as a run identifier — the catch-up UI's "changes not
+    // applied yet" annotation needs the backend-minted per-run id.
+    runId: { type: String, default: '' },
     // Engine stopReason from the complete event ('done', 'stale',
     // 'token_budget', …). '' when the stream ended without a complete event.
     stopReason: { type: String, default: '' },

@@ -80,6 +80,12 @@ function benchmarkToContentBrief(content) {
       pageCount: benchmark.pageCount || 0,
     },
 
+    // P2.1b: the analysis engine's type-aware word-count band. The writing
+    // engine's live-score Word Count signal uses it for commercial tiers
+    // (source !== "serp-corpus"), mirroring the frontend display score —
+    // without it the two scores would diverge for commercial page types.
+    ...(content.contentBrief?.wordCountBand ? { wordCountBand: content.contentBrief.wordCountBand } : {}),
+
     // Topic clusters and subtopics for coverage scoring
     topicClusters: (benchmark.topicClusters || []).map((c) => ({
       label: c.topic || c.label || '',

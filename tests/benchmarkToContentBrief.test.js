@@ -168,3 +168,26 @@ describe('benchmarkToContentBrief - AI answer analysis (R5, AEO/citability)', ()
     assert.equal(brief.aiAnswerAnalysis, analysis);
   });
 });
+
+describe('benchmarkToContentBrief - word-count band passthrough (P2.1b)', () => {
+  const { benchmarkToContentBrief: toBrief } = require('../src/services/benchmarkToContentBrief');
+
+  it('passes the curated wordCountBand to the writing engine', () => {
+    const content = {
+      _id: 'x', targetKeywords: ['crm software'],
+      benchmark: { keywords: ['crm software'], topNlpTerms: [], topicClusters: [] },
+      contentBrief: { wordCountBand: { min: 250, max: 2500, source: 'industry-prior', basis: 'industry range' } },
+    };
+    const brief = toBrief(content);
+    assert.deepEqual(brief.wordCountBand, { min: 250, max: 2500, source: 'industry-prior', basis: 'industry range' });
+  });
+
+  it('omits wordCountBand when the brief has none (older analyses)', () => {
+    const content = {
+      _id: 'x', targetKeywords: ['crm software'],
+      benchmark: { keywords: ['crm software'], topNlpTerms: [], topicClusters: [] },
+      contentBrief: {},
+    };
+    assert.equal('wordCountBand' in toBrief(content), false);
+  });
+});

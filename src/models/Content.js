@@ -199,7 +199,8 @@ const contentSchema = new mongoose.Schema(
     contentType: {
       type: String,
       enum: ['serp-based', 'blog-post', 'landing-page', 'comparison', 'listicle',
-             'product-page', 'category-page', 'service-page', 'llm-optimized', ''],
+             'product-page', 'category-page', 'service-page', 'llm-optimized',
+             'homepage', 'glossary', 'documentation', 'faq', ''],
       default: '',
     },
     contentContext: { type: String, default: '' },

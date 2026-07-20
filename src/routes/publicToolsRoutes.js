@@ -23,6 +23,15 @@ const {
   shareOfVoiceCacheInput,
 } = publicToolsController;
 
+// MASTER KILL SWITCH — the free tools are hidden until launch. Everything
+// under /api/public/tools 404s unless PUBLIC_TOOLS_ENABLED=true is set
+// (read per-request so ops can flip it without a code change; the frontend
+// twin is TOOLS_ENABLED in components/tools/registry.ts).
+router.use((req, res, next) => {
+  if (process.env.PUBLIC_TOOLS_ENABLED === 'true') return next();
+  return res.status(404).json({ error: 'not found' });
+});
+
 /**
  * GET /api/public/tools/status
  * Health + degradation state for the tool pages. The frontend polls this on

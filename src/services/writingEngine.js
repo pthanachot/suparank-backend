@@ -90,7 +90,13 @@ async function pushBrief(sessionId, brief) {
     signal: AbortSignal.timeout(ENGINE_PUSH_TIMEOUT_MS),
   });
   if (!res.ok) {
-    throw new Error(`Writing Engine: push brief failed (${res.status})`);
+    const err = new Error(`Writing Engine: push brief failed (${res.status})`);
+    err.status = res.status; // parity with pushDocument (line 74): brief is a
+    // FATAL push wired into setupSession's recreate-retry (isGone checks
+    // reason.status === 404). Without this, a stale-session 404 on a reused
+    // session whose document push was hash-skipped is invisible to the retry
+    // and aborts setup instead of self-healing.
+    throw err;
   }
 }
 

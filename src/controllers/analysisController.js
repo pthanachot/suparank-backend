@@ -6,6 +6,7 @@ const costLedger = require('../services/costLedgerService');
 const creditService = require('../services/creditService');
 const { tierToPreset } = require('../config/modelPreset');
 const { engineFetch } = require('../services/analysisEngine');
+const { resolveLocale } = require('../config/locales');
 
 // Workspace resolved by permissions middleware (req.workspace).
 // This helper finds the content within that workspace.
@@ -431,11 +432,27 @@ async function runAnalysis(contentId, opts = {}) {
     } catch { /* best-effort — model selection falls back to base */ }
     const preset = tierToPreset(tier);
 
+    // Issue 2 (A4): resolve the content's market + language into provider locale
+    // params (gl/hl for Serper, location_code/language_code for DataForSEO) and
+    // forward them on the SEO-corpus calls below — /api/discover and /api/analyze.
+    // NOT yet forwarded to /api/ai-format-recommend (AEO branch, deferred) or
+    // /api/recommend-outline (localized together with its prompt in a later step);
+    // both keep sending { keywords } only. Empty country/language falls back to
+    // US/English — byte-identical to pre-locale behavior. The engine carries these
+    // fields but ignores them until the provider-wiring phase (A6-A8).
+    const locale = resolveLocale(content.country, content.language);
+    const localeBody = {
+      gl: locale.gl,
+      hl: locale.hl,
+      location_code: locale.locationCode,
+      language_code: locale.languageCode,
+    };
+
     // Step 1: Discover (SERP data, related searches, PAA, volumes)
     let discoverData = {};
     try {
       const discoverRes = await engineFetch('/api/discover', {
-        body: { keywords },
+        body: { keywords, ...localeBody },
         timeoutMs: 60000,
       });
       if (discoverRes.ok) {
@@ -454,7 +471,7 @@ async function runAnalysis(contentId, opts = {}) {
     let competitorPages = [];
     let analyzeData = {};
     try {
-      const analyzeBody = { keywords };
+      const analyzeBody = { keywords, ...localeBody };
       if (selectedUrls.length > 0) {
         analyzeBody.selected_urls = selectedUrls;
       }

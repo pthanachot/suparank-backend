@@ -7,6 +7,7 @@ const creditService = require('../services/creditService');
 const tierService = require('../services/tierService');
 const { pruneVersions } = require('../services/versionRetention');
 const costLedger = require('../services/costLedgerService');
+const { isSupportedLanguage, isSelectableLanguage } = require('../config/locales');
 
 // Workspace is resolved by the permissions middleware (resolveWorkspaceWithRole)
 // and available as req.workspace.
@@ -66,7 +67,20 @@ const createContent = async (req, res) => {
     const workspace = req.workspace;
 
     const contentNumber = await Content.getNextContentNumber();
-    const { title, slug, description, blocks, targetKeywords, targetPageUrl, strikingSnapshot, country, device, score, wordCount, status, folder, platform, versions, deferAnalysis } = req.body;
+    const { title, slug, description, blocks, targetKeywords, targetPageUrl, strikingSnapshot, country, device, language, score, wordCount, status, folder, platform, versions, deferAnalysis } = req.body;
+
+    // Validate the content language before persisting (W3). A falsy value
+    // (absent/empty/null) defaults to English in the model. A tier-3 language is
+    // a real supported language but not usable until Phase C, so it is rejected
+    // here as well as hidden in the UI — the two gates must agree.
+    if (language) {
+      if (!isSupportedLanguage(language)) {
+        return res.status(422).json({ error: `Unsupported language: ${language}` });
+      }
+      if (!isSelectableLanguage(language)) {
+        return res.status(422).json({ error: `Language not yet available: ${language}` });
+      }
+    }
 
     // Determine plan tier at creation time.
     // Paid users can opt to use a free lifetime slot (quotaSource='free').
@@ -104,6 +118,7 @@ const createContent = async (req, res) => {
         : undefined,
       country,
       device,
+      ...(language ? { language } : {}),
       score,
       wordCount,
       status,

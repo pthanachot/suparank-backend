@@ -7,65 +7,14 @@
  */
 
 // ─── Country Mapping ─────────────────────────────────────────────────────────
+// The country → locale table now lives in config/locales.js (single source of
+// truth, shared with content-analysis localization — Issue 2). resolveCountry
+// keeps its display-name signature for backward compatibility.
 
-const COUNTRY_MAP = {
-  'United States':       { locationName: 'United States',       gl: 'us', languageCode: 'en' },
-  'United Kingdom':      { locationName: 'United Kingdom',      gl: 'uk', languageCode: 'en' },
-  'Canada':              { locationName: 'Canada',              gl: 'ca', languageCode: 'en' },
-  'Australia':           { locationName: 'Australia',           gl: 'au', languageCode: 'en' },
-  'Germany':             { locationName: 'Germany',             gl: 'de', languageCode: 'de' },
-  'France':              { locationName: 'France',              gl: 'fr', languageCode: 'fr' },
-  'Spain':               { locationName: 'Spain',               gl: 'es', languageCode: 'es' },
-  'Italy':               { locationName: 'Italy',               gl: 'it', languageCode: 'it' },
-  'Netherlands':         { locationName: 'Netherlands',         gl: 'nl', languageCode: 'nl' },
-  'Belgium':             { locationName: 'Belgium',             gl: 'be', languageCode: 'nl' },
-  'Switzerland':         { locationName: 'Switzerland',         gl: 'ch', languageCode: 'de' },
-  'Austria':             { locationName: 'Austria',             gl: 'at', languageCode: 'de' },
-  'Sweden':              { locationName: 'Sweden',              gl: 'se', languageCode: 'sv' },
-  'Norway':              { locationName: 'Norway',              gl: 'no', languageCode: 'no' },
-  'Denmark':             { locationName: 'Denmark',             gl: 'dk', languageCode: 'da' },
-  'Finland':             { locationName: 'Finland',             gl: 'fi', languageCode: 'fi' },
-  'Poland':              { locationName: 'Poland',              gl: 'pl', languageCode: 'pl' },
-  'Czech Republic':      { locationName: 'Czechia',             gl: 'cz', languageCode: 'cs' },
-  'Romania':             { locationName: 'Romania',             gl: 'ro', languageCode: 'ro' },
-  'Hungary':             { locationName: 'Hungary',             gl: 'hu', languageCode: 'hu' },
-  'Portugal':            { locationName: 'Portugal',            gl: 'pt', languageCode: 'pt' },
-  'Greece':              { locationName: 'Greece',              gl: 'gr', languageCode: 'el' },
-  'Ireland':             { locationName: 'Ireland',             gl: 'ie', languageCode: 'en' },
-  'Turkey':              { locationName: 'Turkey',              gl: 'tr', languageCode: 'tr' },
-  'Israel':              { locationName: 'Israel',              gl: 'il', languageCode: 'he' },
-  'United Arab Emirates':{ locationName: 'United Arab Emirates',gl: 'ae', languageCode: 'ar' },
-  'Saudi Arabia':        { locationName: 'Saudi Arabia',        gl: 'sa', languageCode: 'ar' },
-  'Egypt':               { locationName: 'Egypt',               gl: 'eg', languageCode: 'ar' },
-  'South Africa':        { locationName: 'South Africa',        gl: 'za', languageCode: 'en' },
-  'Nigeria':             { locationName: 'Nigeria',             gl: 'ng', languageCode: 'en' },
-  'Kenya':               { locationName: 'Kenya',               gl: 'ke', languageCode: 'en' },
-  'India':               { locationName: 'India',               gl: 'in', languageCode: 'en' },
-  'Japan':               { locationName: 'Japan',               gl: 'jp', languageCode: 'ja' },
-  'South Korea':         { locationName: 'South Korea',         gl: 'kr', languageCode: 'ko' },
-  'China':               { locationName: 'China',               gl: 'cn', languageCode: 'zh' },
-  'Taiwan':              { locationName: 'Taiwan',              gl: 'tw', languageCode: 'zh' },
-  'Hong Kong':           { locationName: 'Hong Kong',           gl: 'hk', languageCode: 'zh' },
-  'Singapore':           { locationName: 'Singapore',           gl: 'sg', languageCode: 'en' },
-  'Malaysia':            { locationName: 'Malaysia',            gl: 'my', languageCode: 'ms' },
-  'Indonesia':           { locationName: 'Indonesia',           gl: 'id', languageCode: 'id' },
-  'Thailand':            { locationName: 'Thailand',            gl: 'th', languageCode: 'th' },
-  'Vietnam':             { locationName: 'Vietnam',             gl: 'vn', languageCode: 'vi' },
-  'Philippines':         { locationName: 'Philippines',         gl: 'ph', languageCode: 'en' },
-  'Pakistan':            { locationName: 'Pakistan',            gl: 'pk', languageCode: 'en' },
-  'Bangladesh':          { locationName: 'Bangladesh',          gl: 'bd', languageCode: 'bn' },
-  'Brazil':              { locationName: 'Brazil',              gl: 'br', languageCode: 'pt' },
-  'Mexico':              { locationName: 'Mexico',              gl: 'mx', languageCode: 'es' },
-  'Argentina':           { locationName: 'Argentina',           gl: 'ar', languageCode: 'es' },
-  'Colombia':            { locationName: 'Colombia',            gl: 'co', languageCode: 'es' },
-  'Chile':               { locationName: 'Chile',               gl: 'cl', languageCode: 'es' },
-  'Peru':                { locationName: 'Peru',                gl: 'pe', languageCode: 'es' },
-  'New Zealand':         { locationName: 'New Zealand',         gl: 'nz', languageCode: 'en' },
-  'Ukraine':             { locationName: 'Ukraine',             gl: 'ua', languageCode: 'uk' },
-};
+const { resolveCountryByName, COUNTRY_LOCALES_BY_NAME } = require('../config/locales');
 
 function resolveCountry(displayName) {
-  return COUNTRY_MAP[displayName] || COUNTRY_MAP['United States'];
+  return resolveCountryByName(displayName);
 }
 
 // ─── Question Detection ──────────────────────────────────────────────────────
@@ -292,7 +241,7 @@ async function fetchSerpResults(keyword, gl = 'us', hl = 'en') {
   }
 }
 
-const SUPPORTED_COUNTRIES = Object.keys(COUNTRY_MAP);
+const SUPPORTED_COUNTRIES = Object.keys(COUNTRY_LOCALES_BY_NAME);
 
 module.exports = {
   resolveCountry,

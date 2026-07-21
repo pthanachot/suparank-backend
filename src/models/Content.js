@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const Counter = require('./Counter');
+const { SUPPORTED_LANGUAGE_CODES } = require('../config/locales');
 
 /* ───────────── sub-schemas (match frontend editor types)  ───────────── */
 
@@ -183,6 +184,10 @@ const contentSchema = new mongoose.Schema(
     appliedGscQueries: { type: [String], default: [] },
     country: { type: String, default: '' },
     device: { type: String, enum: ['desktop', 'mobile', ''], default: '' },
+    // Content/analysis language (ISO 639-1). Drives locale-aware SERP/volume
+    // fetch, prompts, and scoring (Issue 2 Phase A+). Defaults to English so
+    // pre-existing content and non-localized create paths are unaffected.
+    language: { type: String, enum: SUPPORTED_LANGUAGE_CODES, default: 'en' },
     score: { type: Number, default: 0, min: 0, max: 100 },
     wordCount: { type: Number, default: 0 },
 

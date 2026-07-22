@@ -734,11 +734,18 @@ const createAvatar = async (req, res) => {
 
     const avatar = await Avatar.create(avatarData);
 
-    // Upload avatar.md to B2
-    const b2Key = `brand-voice/${workspace._id}/avatars/${avatar._id}/avatar.md`;
-    await uploadBuffer(Buffer.from(avatar.content, 'utf-8'), 'text/markdown', b2Key);
-    avatar.b2Key = b2Key;
-    await avatar.save();
+    // Upload avatar.md to B2 — best-effort. The avatar's markdown already lives
+    // in Mongo (avatar.content), which is what the writing engine reads at run
+    // time, so a failed/absent B2 upload (e.g. B2 unconfigured in local dev)
+    // must NOT lose the just-created avatar. Persist the b2Key only on success.
+    try {
+      const b2Key = `brand-voice/${workspace._id}/avatars/${avatar._id}/avatar.md`;
+      await uploadBuffer(Buffer.from(avatar.content, 'utf-8'), 'text/markdown', b2Key);
+      avatar.b2Key = b2Key;
+      await avatar.save();
+    } catch (uploadErr) {
+      console.warn('createAvatar: B2 markdown upload failed (avatar still created):', uploadErr.message);
+    }
 
     res.status(201).json({ avatar });
   } catch (err) {

@@ -10,6 +10,8 @@ const UserCredit = require('../models/UserCredit');
 const UserUsageTracker = require('../models/UserUsageTracker');
 const tierService = require('../services/tierService');
 const seatService = require('../services/seatService');
+const { ACTIVE_ACTIONS } = require('../config/creditCosts');
+const { resolveCredits } = require('../config/creditRules');
 
 /**
  * GET /api/org/tier-info?orgId=...
@@ -182,7 +184,17 @@ const getTierInfo = async (req, res) => {
       },
     } : null;
 
-    res.json({ tier, config, usage, creditBalance, freeQuotaSlots });
+    // Phase 6b (cost transparency): a read-only, tier-aware credit-cost map so
+    // the editor can show "~N ⚡" per action and pre-flight affordability. Built
+    // from ACTIVE_ACTIONS via the resolver — never the raw spec objects — so no
+    // internal metadata (markupClass/notes) or inactive/roadmap prices leak, and
+    // Free-bundle actions correctly resolve to 0.
+    const creditCosts = {};
+    for (const action of ACTIVE_ACTIONS) {
+      try { creditCosts[action] = resolveCredits(action, { tier }); } catch { /* skip unresolvable */ }
+    }
+
+    res.json({ tier, config, usage, creditBalance, freeQuotaSlots, creditCosts });
   } catch (err) {
     console.error('getTierInfo error:', err.message);
     res.status(500).json({ error: 'Failed to get tier info' });

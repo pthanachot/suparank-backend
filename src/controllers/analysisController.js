@@ -7,6 +7,7 @@ const creditService = require('../services/creditService');
 const { tierToPreset } = require('../config/modelPreset');
 const { engineFetch } = require('../services/analysisEngine');
 const { resolveLocale } = require('../config/locales');
+const { recordObservation } = require('./observeController');
 
 // Workspace resolved by permissions middleware (req.workspace).
 // This helper finds the content within that workspace.
@@ -447,12 +448,17 @@ function analyzeRetryBackoffMs(attempt) {
 // Wraps analyzeViaEngine with transient-failure retries. Returns a successful
 // (ok) engine response, or throws the last error for the caller's failed-state
 // handler. Never double-bills: runAnalysis charges only after a full success.
-async function analyzeWithRetry(analyzeBody, preset) {
+async function analyzeWithRetry(analyzeBody, preset, meta = {}) {
   let lastErr;
   for (let attempt = 0; attempt <= ANALYZE_MAX_RETRIES; attempt++) {
     try {
       const res = await analyzeViaEngine(analyzeBody, preset);
-      if (res.ok) return res;
+      if (res.ok) {
+        // Phase 7.3 metric: a transient failure that a retry rescued (attempt>0
+        // means at least one prior try failed). Fire-and-forget, never blocks.
+        if (attempt > 0) recordObservation('analysis_recovered', { attempts: attempt, workspaceNumber: meta.workspaceNumber, contentNumber: meta.contentNumber }, meta.userId);
+        return res;
+      }
       const body = await res.text();
       lastErr = new Error(`Engine returned ${res.status}: ${body}`);
     } catch (e) {
@@ -564,7 +570,7 @@ async function runAnalysis(contentId, opts = {}) {
       // Phase E: async submit + poll, with sync fallback for old engines.
       // Phase 1: retry transient failures (timeout / blip / 502 deadline) inside
       // this single attempt before ever surfacing a "failed" state.
-      const analyzeRes = await analyzeWithRetry(analyzeBody, preset);
+      const analyzeRes = await analyzeWithRetry(analyzeBody, preset, { userId: content.userId, contentNumber: content.contentNumber });
       if (analyzeRes.ok) {
         analyzeData = await analyzeRes.json();
         contentBrief = analyzeData.content_brief || {};
@@ -905,6 +911,11 @@ const getBenchmark = async (req, res) => {
       analysisStatus: content.analysisStatus,
       analysisError: content.analysisError || '',
       analyzedAt: content.analyzedAt || null,
+      // Whether this draft was started from an existing page (URL import /
+      // striking-distance "optimize"). The setup wizard reads it to hide the
+      // "generate from scratch" writing mode — that mode would overwrite the
+      // page the editor auto-imports.
+      targetPageUrl: content.targetPageUrl || '',
       // W8/B6: the scoring lens of record (ISO 639-1) so the editor's live score
       // and citability stem in the same language as the engine's /api/score. Prefer
       // the brief's stamped language (A15), fall back to the resolved locale.

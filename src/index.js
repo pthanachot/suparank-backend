@@ -264,6 +264,7 @@ app.use('/api/tenant', require('./routes/tenantRoutes'));
 app.use('/api/admin', adminRoutes);
 app.use('/api/feedback', feedbackRoutes);
 app.use('/api/contact', contactRoutes);
+app.use('/api/observe', require('./routes/observeRoutes')); // Phase 7.3 product metrics
 
 // Public, unauthenticated endpoints (token-gated shared reports)
 app.use('/api/public', require('./routes/publicRoutes'));

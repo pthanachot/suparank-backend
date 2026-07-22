@@ -41,6 +41,11 @@ function benchmarkToContentBrief(content) {
     targetDensity: benchmark.avgKeywordDensity || 1.5,
     searchIntent: intent.primary || 'informational',
 
+    // A14: the content language — drives the writing engine's "write in {language}"
+    // directive so generated prose matches the analysis locale. Prefer the brief's
+    // stamped language (A15), fall back to the content field, then English.
+    language: (content.contentBrief && content.contentBrief.language) || content.language || 'en',
+
     // Content structure
     targetWordCount: content.targetWordCount || benchmark.avgWordCount || 2000,
     serpQuestions: extractSerpQuestions(peopleAlsoAsk),

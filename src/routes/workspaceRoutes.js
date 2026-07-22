@@ -134,6 +134,9 @@ router.post('/:workspaceNumber/opportunities/:id/dismiss', rwr, rf('analysis'), 
 router.get('/:workspaceNumber/content/:contentNumber/available-links', rwr, rp('content', 'read'), contentController.getAvailableLinks);
 router.get('/:workspaceNumber/content/:contentNumber/movement', rwr, rp('content', 'read'), contentController.getMovement);
 router.post('/:workspaceNumber/content/:contentNumber/reanalyze', rwr, rf('analysis'), requirePermission('ai.audit'), rq('auditsRun', 'maxAuditsPerMonth', 'auditLimitType'), rc('reScore', estFixed('reScore')), analysisController.reanalyze);
+// Phase 1: free retry after a TRANSIENT engine failure — deliberately NO rq/rc
+// billing (our fault, not the user's). Server-gated to transient-failed content.
+router.post('/:workspaceNumber/content/:contentNumber/retry-analysis', rwr, rf('analysis'), requirePermission('ai.audit'), analysisController.retryAnalysis);
 // NOTE: the /score endpoint (backend scorer) was removed — scoring is done
 // entirely client-side in the editor (scoreContent.ts). Term counts still come
 // from the engine via /score-terms below.

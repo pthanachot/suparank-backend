@@ -49,7 +49,9 @@ beforeEach(() => {
   incCalls = [];
   deductCalls = [];
   chargeCalls = [];
-  content = { _id: 'c1', analysisStatus: 'ready' };
+  // A real re-analysis needs a target keyword (the controller now 400s without
+  // one) — these tests exercise the quota/charge path of a VALID re-analysis.
+  content = { _id: 'c1', analysisStatus: 'ready', targetKeywords: ['crm software'] };
   Content.findByNumber = async () => content;
   Content.findById = async () => null; // neutralize the fire-and-forget runAnalysis
   Content.findByIdAndUpdate = async () => ({});

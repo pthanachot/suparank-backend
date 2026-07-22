@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-07-21T15:41:15.998Z",
+  "generatedAt": "2026-07-22T02:07:30.227Z",
   "runner": "frontend/scoreContent.ts",
   "drafts": [
     {
@@ -275,8 +275,8 @@
       "earlyReturn": false,
       "signals": {
         "Word Count": {
-          "yourValue": 124,
-          "score": 10,
+          "yourValue": 130,
+          "score": 11,
           "status": "poor"
         },
         "H2 Headings": {
@@ -305,9 +305,9 @@
           "status": "good"
         },
         "Keyword Density": {
-          "yourValue": 2.42,
-          "score": 0,
-          "status": "poor"
+          "yourValue": 2.31,
+          "score": 15,
+          "status": "needs_work"
         },
         "Images": {
           "yourValue": 0,

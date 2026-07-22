@@ -398,6 +398,77 @@ async function analyzeViaEngine(analyzeBody, preset) {
   return { ok: false, status: 504, text: async () => 'engine analyze job did not finish within the polling budget' };
 }
 
+// ─── TRANSIENT-FAILURE RETRY (Phase 1: writing never waits on infra) ──
+// The real production analysis failures are transient: engine LLM-step timeouts
+// (502 "context deadline exceeded"), fetch/abort timeouts, and connection blips
+// ("fetch failed"). Retry those a couple of times INSIDE the single runAnalysis
+// attempt (which bills only on success — see the charge hook below), so a hiccup
+// doesn't surface to the writer as a hard "failed".
+//
+// Two predicates, deliberately different:
+//  - isRetryableEngineError → drives the AUTO-retry loop. Narrow: only failures
+//    a fresh resubmit is likely to clear. NOT engine 502 broadly (the engine
+//    also 502s on "could not crawl", a content problem a retry can't fix).
+//  - isTransientEngineError → drives the `transient:` marker (→ free manual
+//    retry). Broader: adds the "we already waited / engine bounced" cases
+//    (job lost, polling budget) that shouldn't auto-retry but aren't the user's
+//    fault either.
+function isRetryableEngineError(message) {
+  if (!message) return false;
+  const m = String(message).toLowerCase();
+  return (
+    m.includes('context deadline exceeded') ||
+    m.includes('aborted due to timeout') ||
+    m.includes('timeouterror') || m.includes('aborterror') ||
+    m.includes('fetch failed') ||
+    m.includes('econnrefused') || m.includes('econnreset') || m.includes('etimedout') ||
+    m.includes('socket hang up')
+  );
+}
+
+function isTransientEngineError(message) {
+  if (!message) return false;
+  const m = String(message).toLowerCase();
+  return (
+    isRetryableEngineError(message) ||
+    m.includes('job lost') || m.includes('engine restarted') ||
+    m.includes('polling budget') || m.includes('did not finish within')
+  );
+}
+
+const ANALYZE_MAX_RETRIES = 2;
+// Read per-call (not at module load) so tests can zero the backoff.
+function analyzeRetryBackoffMs(attempt) {
+  const override = process.env.ANALYZE_RETRY_BACKOFF_MS;
+  if (override != null && override !== '') return Number(override);
+  return [5000, 15000][attempt] ?? 15000;
+}
+
+// Wraps analyzeViaEngine with transient-failure retries. Returns a successful
+// (ok) engine response, or throws the last error for the caller's failed-state
+// handler. Never double-bills: runAnalysis charges only after a full success.
+async function analyzeWithRetry(analyzeBody, preset) {
+  let lastErr;
+  for (let attempt = 0; attempt <= ANALYZE_MAX_RETRIES; attempt++) {
+    try {
+      const res = await analyzeViaEngine(analyzeBody, preset);
+      if (res.ok) return res;
+      const body = await res.text();
+      lastErr = new Error(`Engine returned ${res.status}: ${body}`);
+    } catch (e) {
+      lastErr = e;
+    }
+    if (attempt < ANALYZE_MAX_RETRIES && isRetryableEngineError(lastErr.message)) {
+      const wait = analyzeRetryBackoffMs(attempt);
+      console.warn(`[analysis] analyze attempt ${attempt + 1}/${ANALYZE_MAX_RETRIES + 1} failed: ${String(lastErr.message).slice(0, 140)} — retrying in ${wait}ms`);
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      continue;
+    }
+    break;
+  }
+  throw lastErr;
+}
+
 // ─── RUN ANALYSIS (background) ─────────────────────────────────
 
 async function runAnalysis(contentId, opts = {}) {
@@ -407,8 +478,11 @@ async function runAnalysis(contentId, opts = {}) {
 
     const keywords = content.targetKeywords;
     if (!keywords || keywords.length === 0) {
+      // Not a failure — there's simply nothing to analyze yet. Leave it idle so
+      // the editor shows "not analyzed" instead of a scary error. The trigger /
+      // reanalyze routes 400 before this; this is the defensive fallback.
       await Content.findByIdAndUpdate(contentId, {
-        $set: { analysisStatus: 'failed', analysisError: 'No keywords to analyze' },
+        $set: { analysisStatus: 'idle', analysisError: '' },
       });
       return;
     }
@@ -434,12 +508,11 @@ async function runAnalysis(contentId, opts = {}) {
 
     // Issue 2 (A4): resolve the content's market + language into provider locale
     // params (gl/hl for Serper, location_code/language_code for DataForSEO) and
-    // forward them on the SEO-corpus calls below — /api/discover and /api/analyze.
-    // NOT yet forwarded to /api/ai-format-recommend (AEO branch, deferred) or
-    // /api/recommend-outline (localized together with its prompt in a later step);
-    // both keep sending { keywords } only. Empty country/language falls back to
-    // US/English — byte-identical to pre-locale behavior. The engine carries these
-    // fields but ignores them until the provider-wiring phase (A6-A8).
+    // forward them on the SEO-corpus calls below — /api/discover and /api/analyze,
+    // plus /api/recommend-outline (A12: localizes the outline headings/rationale).
+    // NOT forwarded to /api/ai-format-recommend (AEO branch, deferred). Empty
+    // country/language falls back to US/English — byte-identical to pre-locale
+    // behavior.
     const locale = resolveLocale(content.country, content.language);
     const localeBody = {
       gl: locale.gl,
@@ -489,7 +562,9 @@ async function runAnalysis(contentId, opts = {}) {
       // preset (if any) is merged into the body by engineFetch — the engine
       // reads the body `preset` field, not the X-Model-Preset header.
       // Phase E: async submit + poll, with sync fallback for old engines.
-      const analyzeRes = await analyzeViaEngine(analyzeBody, preset);
+      // Phase 1: retry transient failures (timeout / blip / 502 deadline) inside
+      // this single attempt before ever surfacing a "failed" state.
+      const analyzeRes = await analyzeWithRetry(analyzeBody, preset);
       if (analyzeRes.ok) {
         analyzeData = await analyzeRes.json();
         contentBrief = analyzeData.content_brief || {};
@@ -554,8 +629,11 @@ async function runAnalysis(contentId, opts = {}) {
       }
     } catch (err) {
       console.error('[analysis] analyze failed:', err.message);
+      // Phase 1: tag transient (our-fault) failures so the editor offers a free
+      // retry instead of a dead-end "failed".
+      const prefix = isTransientEngineError(err.message) ? 'transient: ' : '';
       await Content.findByIdAndUpdate(contentId, {
-        $set: { analysisStatus: 'failed', analysisError: err.message },
+        $set: { analysisStatus: 'failed', analysisError: prefix + err.message },
       });
       return;
     }
@@ -628,6 +706,7 @@ async function runAnalysis(contentId, opts = {}) {
           structure: contentBrief.structure || [],
           terms: (contentBrief.terms || []).slice(0, 15),
           ai_conversations: aiConversations,
+          language_code: locale.languageCode, // A12: localize headings/rationale
         },
         timeoutMs: 60000,
       }).then(async (res) => {
@@ -689,7 +768,9 @@ async function runAnalysis(contentId, opts = {}) {
       benchmark: curateBenchmark(contentBrief),
       intent: contentBrief.intent || null,
       competitors: curateCompetitors(candidates),
-      contentBrief: curateContentBrief(contentBrief),
+      // A15: stamp the language onto the persisted brief — it is the scoring lens
+      // of record (Phase B reads it to pick the stemmer for score/re-analyze).
+      contentBrief: { ...(curateContentBrief(contentBrief) || {}), language: locale.languageCode },
       relatedSearches: discoverData.related_searches || [],
       peopleAlsoAsk: discoverData.people_also_ask || [],
       keywordVolumes: discoverData.keyword_volumes || [],
@@ -773,6 +854,12 @@ const triggerAnalysis = async (req, res) => {
       return res.status(409).json({ error: 'Analysis already in progress' });
     }
 
+    // Phase 1: no keyword = nothing to research. Reject up front instead of
+    // letting it become a scary "failed" analysis.
+    if (!content.targetKeywords || content.targetKeywords.length === 0) {
+      return res.status(400).json({ error: 'Add a target keyword to run the research.' });
+    }
+
     await Content.findByIdAndUpdate(content._id, {
       $set: { analysisStatus: 'pending' },
     });
@@ -818,6 +905,11 @@ const getBenchmark = async (req, res) => {
       analysisStatus: content.analysisStatus,
       analysisError: content.analysisError || '',
       analyzedAt: content.analyzedAt || null,
+      // W8/B6: the scoring lens of record (ISO 639-1) so the editor's live score
+      // and citability stem in the same language as the engine's /api/score. Prefer
+      // the brief's stamped language (A15), fall back to the resolved locale.
+      language: (content.contentBrief && content.contentBrief.language) ||
+        resolveLocale(content.country, content.language).languageCode,
       benchmark: content.benchmark || null,
       intent: content.intent || null,
       competitors: content.competitors || [],
@@ -850,6 +942,11 @@ const reanalyze = async (req, res) => {
       return res.status(409).json({ error: 'Analysis already in progress' });
     }
 
+    // Phase 1: reject a zero-keyword re-analysis up front (never a "failed" state).
+    if (!content.targetKeywords || content.targetKeywords.length === 0) {
+      return res.status(400).json({ error: 'Add a target keyword to run the research.' });
+    }
+
     await Content.findByIdAndUpdate(content._id, {
       $set: { analysisStatus: 'pending', analysisError: '' },
     });
@@ -872,6 +969,37 @@ const reanalyze = async (req, res) => {
   } catch (err) {
     console.error('reanalyze error:', err.message);
     res.status(500).json({ error: 'Failed to trigger re-analysis' });
+  }
+};
+
+// ─── POST /:contentNumber/retry-analysis — free retry after a transient failure ──
+// Our engine hiccupped (timeout / connection blip / restart). Retrying that is
+// on us: no credit charge (no opts.bill) and no audit-quota hit. Server-gated to
+// content actually in a transient-failed state, so it can't be abused as a free
+// re-score. This route deliberately carries NO rq/rc billing middleware.
+const retryAnalysis = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+
+    if (content.analysisStatus === 'analyzing') {
+      return res.status(409).json({ error: 'Analysis already in progress' });
+    }
+    if (content.analysisStatus !== 'failed' || !String(content.analysisError || '').startsWith('transient:')) {
+      return res.status(409).json({ error: 'Nothing to retry for free — run a fresh analysis instead.' });
+    }
+
+    await Content.findByIdAndUpdate(content._id, {
+      $set: { analysisStatus: 'pending', analysisError: '' },
+    });
+
+    // No opts.bill → not charged on success; no incrementQuota → truly free.
+    runAnalysis(content._id, { refresh: true });
+
+    res.json({ analysisStatus: 'pending', message: 'Retrying analysis' });
+  } catch (err) {
+    console.error('retryAnalysis error:', err.message);
+    res.status(500).json({ error: 'Failed to retry analysis' });
   }
 };
 
@@ -906,11 +1034,16 @@ const scoreTerms = async (req, res) => {
       return res.status(400).json({ error: 'maximum 500 terms' });
     }
 
+    // B2: the scoring lens of record — the language the brief's terms were stemmed
+    // in (A15 stamp), so the engine counts with the SAME stemmer that built the ranges.
+    const scoreLang = (content.contentBrief && content.contentBrief.language) ||
+      resolveLocale(content.country, content.language).languageCode;
     const engineRes = await engineFetch('/api/score', {
       body: {
         keyword: (content.targetKeywords && content.targetKeywords[0]) || '',
         content: draftText,
         terms,
+        language_code: scoreLang,
       },
       timeoutMs: 15000, // scoring is sub-second; don't hang on a stuck engine
     });
@@ -1016,6 +1149,8 @@ const internalLinks = async (req, res) => {
         sections,
         links: links.map((l) => ({ url: l.url, title: l.title, relevance: l.relevance })),
         max_suggestions: max_suggestions || undefined,
+        language_code: (content.contentBrief && content.contentBrief.language) ||
+          resolveLocale(content.country, content.language).languageCode, // B2: stem anchors in the brief's language
       },
       timeoutMs: 20000,
     });
@@ -1116,6 +1251,7 @@ const regenerateOutline = async (req, res) => {
       }
     } catch { /* best-effort — falls back to base */ }
 
+    const outlineLocale = resolveLocale(content.country, content.language);
     const outlineRes = await engineFetch('/api/recommend-outline', {
       preset,
       body: {
@@ -1126,6 +1262,7 @@ const regenerateOutline = async (req, res) => {
         structure: structureToSnakeCase((content.contentBrief && content.contentBrief.structure) || []),
         terms: termsToSnakeCase(((content.contentBrief && content.contentBrief.terms) || []).slice(0, 15)),
         ai_conversations: (content.aiConversations || []).slice(0, 3),
+        language_code: outlineLocale.languageCode, // A12: localize headings/rationale
       },
       timeoutMs: 30000,
     });
@@ -1248,7 +1385,7 @@ const getOutcomes = async (req, res) => {
 };
 
 module.exports = {
-  triggerAnalysis, getBenchmark, reanalyze, runAnalysis, scoreTerms, importUrl,
+  triggerAnalysis, getBenchmark, reanalyze, retryAnalysis, runAnalysis, scoreTerms, importUrl,
   internalLinks, readabilityCheck, regenerateOutline, curateCitationAppearance,
   getBotAccess, getOutcomes,
   // Exported for the camelCase-boundary invariant test (tests/curationCamelCase.test.js).

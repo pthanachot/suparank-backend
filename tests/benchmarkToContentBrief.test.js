@@ -222,3 +222,18 @@ describe('contentType fallback vocabulary (P2.4)', () => {
     assert.equal(briefFor(undefined).contentType, 'blog-post');
   });
 });
+
+describe('benchmarkToContentBrief - language (A14)', () => {
+  it('threads the stamped brief language to the writing-engine brief', () => {
+    const brief = benchmarkToContentBrief({
+      _id: 'x', targetKeywords: ['versicherung'], language: 'de',
+      contentBrief: { language: 'de' },
+    });
+    assert.equal(brief.language, 'de');
+  });
+
+  it('falls back to content.language, then English', () => {
+    assert.equal(benchmarkToContentBrief({ _id: 'x', targetKeywords: ['k'], language: 'fr' }).language, 'fr');
+    assert.equal(benchmarkToContentBrief({ _id: 'x', targetKeywords: ['k'] }).language, 'en');
+  });
+});

@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-07-14T04:37:04Z",
+  "generatedAt": "2026-07-22T01:50:36Z",
   "runner": "writing-engine/seo.Score",
   "drafts": [
     {
@@ -35,8 +35,8 @@
     },
     {
       "name": "inflected-forms",
-      "overallScore": 35,
-      "nlpScore": 54,
+      "overallScore": 32,
+      "nlpScore": 40,
       "keywordScore": 0,
       "signals": {
         "FAQ": 100,
@@ -48,7 +48,7 @@
         "Keyword in H1": 0,
         "Keyword in H2": 60,
         "Lists": 0,
-        "NLP Term Coverage": 54,
+        "NLP Term Coverage": 40,
         "Paragraphs": 15,
         "Readability": 100,
         "Subtopic Coverage": 0,
@@ -59,8 +59,8 @@
     },
     {
       "name": "short-term-trap",
-      "overallScore": 19,
-      "nlpScore": 6,
+      "overallScore": 20,
+      "nlpScore": 13,
       "keywordScore": 0,
       "signals": {
         "FAQ": 100,
@@ -72,7 +72,7 @@
         "Keyword in H1": 0,
         "Keyword in H2": 60,
         "Lists": 0,
-        "NLP Term Coverage": 6,
+        "NLP Term Coverage": 13,
         "Paragraphs": 15,
         "Readability": 100,
         "Subtopic Coverage": 0,
@@ -83,7 +83,7 @@
     },
     {
       "name": "unicode-headings",
-      "overallScore": 43,
+      "overallScore": 44,
       "nlpScore": 63,
       "keywordScore": 100,
       "signals": {
@@ -91,7 +91,7 @@
         "H2 Headings": 47,
         "H3 Headings": 0,
         "Images": 0,
-        "Keyword Density": 85,
+        "Keyword Density": 100,
         "Keyword in First 100": 100,
         "Keyword in H1": 100,
         "Keyword in H2": 60,
@@ -107,8 +107,8 @@
     },
     {
       "name": "tables-heavy",
-      "overallScore": 40,
-      "nlpScore": 59,
+      "overallScore": 42,
+      "nlpScore": 71,
       "keywordScore": 100,
       "signals": {
         "FAQ": 100,
@@ -120,7 +120,7 @@
         "Keyword in H1": 100,
         "Keyword in H2": 60,
         "Lists": 0,
-        "NLP Term Coverage": 59,
+        "NLP Term Coverage": 71,
         "Paragraphs": 15,
         "Readability": 100,
         "Subtopic Coverage": 0,
@@ -131,8 +131,8 @@
     },
     {
       "name": "faq-heavy",
-      "overallScore": 45,
-      "nlpScore": 81,
+      "overallScore": 46,
+      "nlpScore": 88,
       "keywordScore": 100,
       "signals": {
         "FAQ": 100,
@@ -144,7 +144,7 @@
         "Keyword in H1": 100,
         "Keyword in H2": 60,
         "Lists": 0,
-        "NLP Term Coverage": 81,
+        "NLP Term Coverage": 88,
         "Paragraphs": 40,
         "Readability": 100,
         "Subtopic Coverage": 0,
@@ -156,7 +156,7 @@
     {
       "name": "keyword-stuffed",
       "overallScore": 32,
-      "nlpScore": 23,
+      "nlpScore": 22,
       "keywordScore": 100,
       "signals": {
         "FAQ": 100,
@@ -168,7 +168,7 @@
         "Keyword in H1": 100,
         "Keyword in H2": 100,
         "Lists": 0,
-        "NLP Term Coverage": 23,
+        "NLP Term Coverage": 22,
         "Paragraphs": 10,
         "Readability": 100,
         "Subtopic Coverage": 0,
@@ -179,8 +179,8 @@
     },
     {
       "name": "overused-terms",
-      "overallScore": 31,
-      "nlpScore": 31,
+      "overallScore": 30,
+      "nlpScore": 25,
       "keywordScore": 0,
       "signals": {
         "FAQ": 100,
@@ -192,7 +192,7 @@
         "Keyword in H1": 0,
         "Keyword in H2": 100,
         "Lists": 0,
-        "NLP Term Coverage": 31,
+        "NLP Term Coverage": 25,
         "Paragraphs": 10,
         "Readability": 100,
         "Subtopic Coverage": 0,

@@ -15,8 +15,9 @@
  *
  * Language tiers (Issue 2 plan):
  *   tier 1 — space-delimited + stemmer available: full term scoring after Phase B.
- *            (Exact stemmer coverage is finalized by task B0; some tier-1 entries
- *             may demote to tier 2 if kljensen/snowball lacks the language.)
+ *            B0 RESOLVED: all 15 tier-1 languages have a verified Snowball stemmer
+ *            — en/es/fr/ru/sv/no/hu via kljensen/snowball, and de/it/nl/pt/da/fi/
+ *            ro/tr via blevesearch/snowballstem. No demotions; the table stands.
  *   tier 2 — space-delimited, no stemmer: exact-match term scoring.
  *   tier 3 — no word delimiters (Thai/CJK): BLOCKED until Phase C (segmentation).
  *            NOT selectable in the creation UI yet — enabling before Phase C
@@ -144,14 +145,16 @@ function isSupportedLanguage(code) {
   return typeof code === 'string' && SUPPORTED_LANGUAGE_SET.has(code);
 }
 
-// A supported language may not be usable end-to-end yet: tier 3 (Thai/CJK) needs
-// Phase C (segmentation) before analysis works, so it is NOT selectable. The
-// creation UI and createContent both gate on this — keep them in lockstep with
-// the frontend's SELECTABLE_LANGUAGES filter. When Phase C ships, raise the max.
+// A supported language may not be usable end-to-end yet. Tier 1/2 are always
+// selectable. Tier 3 (Thai/CJK) needed Phase C (segmentation) — now shipped — and
+// then per-language launch sign-off: Thai + Korean are enabled; Chinese/Japanese
+// are held (see ENABLED_TIER3). This MUST stay in lockstep with the frontend's
+// lib/locales.ts (ENABLED_TIER3 + SELECTABLE_LANGUAGES) — the two are one enum.
 const SELECTABLE_TIER_MAX = 2;
+const ENABLED_TIER3 = new Set(['th', 'ko']);
 function isSelectableLanguage(code) {
   const lang = SUPPORTED_LANGUAGES.find((l) => l.code === code);
-  return !!lang && lang.tier <= SELECTABLE_TIER_MAX;
+  return !!lang && (lang.tier <= SELECTABLE_TIER_MAX || ENABLED_TIER3.has(code));
 }
 
 // Content-analysis path (A4): country code + chosen content language → the exact

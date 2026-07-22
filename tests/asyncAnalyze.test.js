@@ -153,6 +153,46 @@ describe('runAnalysis async job protocol', () => {
     assert.match(s.analysisError || '', /could not crawl/);
   });
 
+  it('transient analyze failure (context deadline) retries and succeeds — resubmits, ends ready', async () => {
+    process.env.ANALYZE_RETRY_BACKOFF_MS = '0'; // no wait in tests
+    let submitCount = 0;
+    global.fetch = async (url) => {
+      const u = String(url);
+      if (u.endsWith('/api/analyze/jobs')) {
+        submitCount++;
+        return { ok: true, status: 202, json: async () => ({ job_id: `j${submitCount}`, status: 'queued' }), text: async () => '' };
+      }
+      if (u.includes('/api/analyze/jobs/')) {
+        // 1st attempt's job fails transiently; the resubmitted job is done.
+        return submitCount <= 1
+          ? { ok: true, status: 200, json: async () => ({ status: 'failed', error: 'structure synthesis: read response: context deadline exceeded' }) }
+          : { ok: true, status: 200, json: async () => ({ status: 'done', result: jobResult() }) };
+      }
+      return { ok: false, status: 502, text: async () => 'down', json: async () => ({}) }; // discover/outline best-effort
+    };
+    await runAnalysis('c1'); // no opts.bill → the free initial analysis
+    assert.equal(submitCount, 2, 'a transient failure should trigger exactly one resubmit');
+    assert.equal(lastStatus().analysisStatus, 'ready', 'the retry succeeded → ready, not failed');
+    delete process.env.ANALYZE_RETRY_BACKOFF_MS;
+  });
+
+  it('non-retryable engine failure (could not crawl) does NOT retry', async () => {
+    process.env.ANALYZE_RETRY_BACKOFF_MS = '0';
+    let submitCount = 0;
+    global.fetch = async (url) => {
+      const u = String(url);
+      if (u.endsWith('/api/analyze/jobs')) { submitCount++; return { ok: true, status: 202, json: async () => ({ job_id: 'j', status: 'queued' }) }; }
+      if (u.includes('/api/analyze/jobs/')) return { ok: true, status: 200, json: async () => ({ status: 'failed', error: 'could not crawl any competitor pages' }) };
+      return { ok: false, status: 502, text: async () => 'down', json: async () => ({}) };
+    };
+    await runAnalysis('c1');
+    assert.equal(submitCount, 1, 'a content-level failure must not resubmit');
+    const s = lastStatus();
+    assert.equal(s.analysisStatus, 'failed');
+    assert.ok(!/^transient:/.test(s.analysisError || ''), 'crawl failure is not tagged transient');
+    delete process.env.ANALYZE_RETRY_BACKOFF_MS;
+  });
+
   it('opts.refresh → submit body carries refresh: true', async () => {
     const calls = stubFetch({
       submit: okJSON({ job_id: 'j1', status: 'done' }),

@@ -1,6 +1,8 @@
 const mongoose = require('mongoose');
 const Content = require('../models/Content');
-const { runAnalysis } = require('./analysisController');
+// startAnalysis, not runAnalysis: both call sites below are fire-and-forget, and
+// the wrapper guarantees the promise can never reject and kill the process.
+const { startAnalysis } = require('./analysisController');
 const imageStorage = require('../services/imageStorage');
 const auditService = require('../services/auditService');
 const creditService = require('../services/creditService');
@@ -147,7 +149,7 @@ const createContent = async (req, res) => {
     // billing exactly. Every other creation path keeps the auto-trigger.
     if (!deferAnalysis && content.targetKeywords && content.targetKeywords.length > 0) {
       await Content.findByIdAndUpdate(content._id, { $set: { analysisStatus: 'pending' } });
-      runAnalysis(content._id);
+      startAnalysis(content._id);
     }
 
     // Track article creation against tier quota
@@ -252,7 +254,7 @@ const updateContent = async (req, res) => {
         { _id: content._id, analysisStatus: 'idle' },
         { $set: { analysisStatus: 'pending' } },
       );
-      if (claimed) runAnalysis(content._id);
+      if (claimed) startAnalysis(content._id);
     }
 
     // Autosave fires every ~1.5s while typing — dedupe to one entry per

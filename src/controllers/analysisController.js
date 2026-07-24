@@ -842,12 +842,71 @@ async function runAnalysis(contentId, opts = {}) {
       console.error('[analysis] brief resync failed (non-fatal):', resyncErr.message);
     }
   } catch (err) {
-    console.error('[analysis] unexpected error:', err.message);
+    // Do NOT read err.message blindly: a thrown non-Error (string, plain object)
+    // would make this line throw from inside the catch, rejecting the promise of
+    // a function every caller invokes fire-and-forget. On Node >=15 that is an
+    // unhandled rejection — the process exits and strands every OTHER in-flight
+    // analysis at 'analyzing' too.
+    const msg = (err && err.message) || String(err);
+    console.error('[analysis] unexpected error:', msg);
     await Content.findByIdAndUpdate(contentId, {
-      $set: { analysisStatus: 'failed', analysisError: err.message },
+      $set: { analysisStatus: 'failed', analysisError: msg },
     }).catch(() => {});
   }
 }
+
+// Every caller invokes runAnalysis fire-and-forget. This is the boundary that
+// guarantees it can never reject: an unhandled rejection exits the process on
+// Node >=15, which would strand every OTHER in-flight analysis at 'analyzing'
+// — the exact failure recoverInterruptedAnalyses below exists to clean up.
+// Callers use this, never runAnalysis directly.
+const startAnalysis = (contentId, opts) =>
+  runAnalysis(contentId, opts).catch((err) => {
+    console.error('[analysis] runAnalysis rejected:', (err && err.message) || String(err));
+  });
+
+// ─── STARTUP RECOVERY ──────────────────────────────────────────
+// runAnalysis is an in-process fire-and-forget async function: no queue, no job
+// row, no lease, no heartbeat. A document sits at 'analyzing' for the several
+// minutes the engine pipeline takes, so ANY process death in that window
+// (deploy, crash, OOM, nodemon reload on a file save) strands it there forever.
+//
+// That is not merely cosmetic. Every re-run route refuses to start while the
+// status reads 'analyzing' — triggerAnalysis, reanalyze and retryAnalysis all
+// 409 on it — because they treat the field as a liveness signal when it is only
+// a flag. A stranded article is therefore permanently un-analyzable without a
+// direct DB edit. This sweep is what makes the flag safe to trust.
+//
+// Mirrors the AiTracker scan and Sitemap crawl sweeps in index.js, and must run
+// before the crons do. The 'transient: ' prefix is load-bearing: retryAnalysis
+// only accepts a failure tagged transient, so a stranded article surfaces the
+// FREE retry affordance instead of asking the user to pay for a fresh run —
+// correct, because the interruption was our fault.
+//
+// Assumes a single backend instance, as the sibling sweeps already do. With two
+// running, a boot of one would fail the other's genuinely in-flight analyses; a
+// lease/heartbeat timestamp is the multi-instance-safe version.
+//
+// Deliberately NOT time-windowed, unlike the orphaned-credit sweep beside it in
+// index.js. app.listen runs before this does, so an analysis started in the
+// connect window can be swept mid-run — but that is self-healing (the live run's
+// terminal write lands last, so the row ends at ready/failed correctly; the user
+// may see a brief wrong status). Adding an `updatedAt` guard to close that would
+// trade a cosmetic flash for a permanently stranded row whenever a crash lands
+// just before a restart, and the sweep only runs at boot so nothing would ever
+// revisit it. The race is the cheaper failure.
+const recoverInterruptedAnalyses = async () => {
+  const result = await Content.updateMany(
+    { analysisStatus: { $in: ['pending', 'analyzing'] } },
+    {
+      $set: {
+        analysisStatus: 'failed',
+        analysisError: 'transient: Analysis interrupted by server restart',
+      },
+    }
+  );
+  return (result && result.modifiedCount) || 0;
+};
 
 // ─── POST /:contentNumber/analyze — trigger analysis ───────────
 
@@ -876,7 +935,7 @@ const triggerAnalysis = async (req, res) => {
     }
 
     // Fire-and-forget: run analysis in background
-    runAnalysis(content._id);
+    startAnalysis(content._id);
 
     res.json({ analysisStatus: 'pending', message: 'Analysis started' });
   } catch (err) {
@@ -974,7 +1033,7 @@ const reanalyze = async (req, res) => {
     // already ran the pre-flight 402, so the user had the credits when they asked.
     // refresh: an explicit re-analysis must bypass the engine's analyze-cache
     // read — the user is paying for fresh data, not a cached replay.
-    runAnalysis(content._id, { bill: { action: 'reScore', userId: req.user?.userId }, refresh: true });
+    startAnalysis(content._id, { bill: { action: 'reScore', userId: req.user?.userId }, refresh: true });
 
     res.json({ analysisStatus: 'pending', message: 'Re-analysis started' });
   } catch (err) {
@@ -1005,7 +1064,7 @@ const retryAnalysis = async (req, res) => {
     });
 
     // No opts.bill → not charged on success; no incrementQuota → truly free.
-    runAnalysis(content._id, { refresh: true });
+    startAnalysis(content._id, { refresh: true });
 
     res.json({ analysisStatus: 'pending', message: 'Retrying analysis' });
   } catch (err) {
@@ -1396,7 +1455,8 @@ const getOutcomes = async (req, res) => {
 };
 
 module.exports = {
-  triggerAnalysis, getBenchmark, reanalyze, retryAnalysis, runAnalysis, scoreTerms, importUrl,
+  triggerAnalysis, getBenchmark, reanalyze, retryAnalysis, runAnalysis, startAnalysis,
+  recoverInterruptedAnalyses, scoreTerms, importUrl,
   internalLinks, readabilityCheck, regenerateOutline, curateCitationAppearance,
   getBotAccess, getOutcomes,
   // Exported for the camelCase-boundary invariant test (tests/curationCamelCase.test.js).

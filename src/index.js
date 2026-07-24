@@ -72,6 +72,22 @@ connectDB()
       console.log(`[startup] recovered ${recoveredCrawls.modifiedCount} interrupted sitemap crawl(s)`);
     }
 
+    // Recover analyses stranded mid-run by a restart. A content doc sits at
+    // 'analyzing' for the minutes the engine pipeline takes, and every re-run
+    // route 409s while it reads that way — so without this sweep an interrupted
+    // article is permanently un-analyzable. See
+    // analysisController.recoverInterruptedAnalyses for the full rationale.
+    // Wrapped: a failed recovery sweep must not stop the API from booting.
+    try {
+      const { recoverInterruptedAnalyses } = require('./controllers/analysisController');
+      const recoveredAnalyses = await recoverInterruptedAnalyses();
+      if (recoveredAnalyses > 0) {
+        console.log(`[startup] recovered ${recoveredAnalyses} interrupted analysis/analyses`);
+      }
+    } catch (e) {
+      console.error('[startup] analysis recovery sweep failed:', e.message);
+    }
+
     // F4-13: refund orphaned pending CreditTransactions. When a scan crashes
     // between preDeduct and settle (process kill, OOM, server restart), the
     // pre-deducted credits stay locked in `pending` state forever. This sweep

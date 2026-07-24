@@ -183,7 +183,7 @@ const updateContent = async (req, res) => {
       'title', 'slug', 'description', 'blocks', 'targetKeywords',
       'country', 'device', 'score', 'wordCount', 'status', 'folder', 'platform',
       'versions', 'publishedAt', 'scheduledAt', 'publishedUrl',
-      'contentType', 'contentContext', 'targetWordCount', 'writingMode',
+      'contentType', 'contentContext', 'targetWordCount',
       'styleReferenceContentNumber',
     ];
 

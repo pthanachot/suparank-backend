@@ -220,11 +220,10 @@ const contentSchema = new mongoose.Schema(
     },
     contentContext: { type: String, default: '' },
     targetWordCount: { type: Number, default: 0 },
-    writingMode: {
-      type: String,
-      enum: ['write', 'generate', ''],
-      default: '',
-    },
+    // writingMode removed: the wizard step that set it asked the user to commit
+    // to "write it yourself" vs "generate", but nothing ever read the field —
+    // both paths stayed fully available in the editor either way. Its only real
+    // effect was a ?reviewOutline query param, now rehomed as an editor action.
     // Optional writing-style reference — the contentNumber of another draft in
     // the SAME workspace whose markdown will be appended to the engine brief's
     // authorContext with a "STYLE ONLY" instruction. Lets users keep the voice

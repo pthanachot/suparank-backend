@@ -73,7 +73,13 @@ function renderBlockHtml(b) {
     case 'quote': return `<blockquote>${t}</blockquote>`;
     case 'divider': return '<hr>';
     case 'img':
-      return b.src ? `<figure><img src="${escapeHtml(b.src)}" alt="${escapeHtml(b.alt || '')}"></figure>` : '';
+      // width/height let the browser reserve the box before the image loads
+      // (no layout shift), matching the editor's own HTML export.
+      return b.src
+        ? `<figure><img src="${escapeHtml(b.src)}" alt="${escapeHtml(b.alt || '')}"${
+            b.intrinsicWidth && b.intrinsicHeight ? ` width="${b.intrinsicWidth}" height="${b.intrinsicHeight}"` : ''
+          }></figure>`
+        : '';
     case 'code': {
       const code = escapeHtml(b.codeData?.code || t);
       const lang = b.codeData?.language ? ` class="language-${escapeHtml(b.codeData.language)}"` : '';
@@ -92,13 +98,19 @@ function renderBlockHtml(b) {
       const headers = Array.isArray(b.tableData?.headers) ? b.tableData.headers : [];
       const rows = Array.isArray(b.tableData?.rows) ? b.tableData.rows : [];
       if (!headers.length && !rows.length) return '';
+      // Caption and per-column alignment are real markup, so the archive
+      // export carries them too — matching the editor's own HTML export.
+      const aligns = Array.isArray(b.tableData?.columnAligns) ? b.tableData.columnAligns : [];
+      const alignAttr = (i) =>
+        aligns[i] && aligns[i] !== 'left' ? ` style="text-align:${escapeHtml(aligns[i])}"` : '';
+      const cap = b.tableData?.caption ? `<caption>${escapeHtml(b.tableData.caption)}</caption>` : '';
       const th = headers.length
-        ? `<thead><tr>${headers.map((c) => `<th>${escapeHtml(c)}</th>`).join('')}</tr></thead>`
+        ? `<thead><tr>${headers.map((c, i) => `<th${alignAttr(i)}>${escapeHtml(c)}</th>`).join('')}</tr></thead>`
         : '';
       const tb = rows
-        .map((r) => `<tr>${(Array.isArray(r) ? r : []).map((c) => `<td>${escapeHtml(c)}</td>`).join('')}</tr>`)
+        .map((r) => `<tr>${(Array.isArray(r) ? r : []).map((c, i) => `<td${alignAttr(i)}>${escapeHtml(c)}</td>`).join('')}</tr>`)
         .join('');
-      return `<table>${th}<tbody>${tb}</tbody></table>`;
+      return `<table>${cap}${th}<tbody>${tb}</tbody></table>`;
     }
     case 'toggle':
       return `<details><summary>${t}</summary></details>`;

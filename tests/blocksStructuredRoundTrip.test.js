@@ -115,6 +115,30 @@ test('Content blockSchema preserves toggleData/embedData/caption/indent', () => 
   assert.strictEqual(obj.blocks[3].indent, 2);
 });
 
+/**
+ * Same failure mode as the toggle/embed case above, one feature later: the
+ * editor measures an image and stores its intrinsic size (for the export's
+ * width/height attributes and the low-resolution warning) plus a transient
+ * autoSize flag for imported images awaiting their first load. Strict mode
+ * would drop all three on save, so the export would silently lose its
+ * reserved-box attributes and imported images would never get sized.
+ */
+test('Content blockSchema preserves intrinsic image dimensions and autoSize', () => {
+  const doc = new Content({
+    title: 't',
+    blocks: [
+      { id: 'b1', type: 'img', text: '', src: 's', width: 41, align: 'center', intrinsicWidth: 1080, intrinsicHeight: 1920 },
+      { id: 'b2', type: 'img', text: '', src: 's2', autoSize: true },
+    ],
+  });
+  const obj = doc.toObject();
+  assert.strictEqual(obj.blocks[0].intrinsicWidth, 1080);
+  assert.strictEqual(obj.blocks[0].intrinsicHeight, 1920);
+  assert.strictEqual(obj.blocks[0].width, 41);
+  assert.strictEqual(obj.blocks[0].align, 'center');
+  assert.strictEqual(obj.blocks[1].autoSize, true);
+});
+
 test('Content blockSchema rejects an invalid embedType via cast error on validate', () => {
   const doc = new Content({
     title: 't',

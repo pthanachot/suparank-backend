@@ -63,6 +63,16 @@ const blockSchema = new mongoose.Schema(
     width: Number,
     align: { type: String, enum: ['left', 'center', 'right', 'justify'] },
     indent: Number,
+    // Measured pixel size of an image's source. Drives the width/height
+    // attributes in the export (reserved layout box → no CLS) and the
+    // low-resolution warning in the editor.
+    intrinsicWidth: Number,
+    intrinsicHeight: Number,
+    // Transient: marks an imported/pasted image whose shape-based sizing is
+    // still pending its first load. Persisted so an autosave that lands before
+    // the image loads does not strand it un-sized (which is exactly what
+    // strict mode did to caption/indent/toggleData above).
+    autoSize: Boolean,
     faqItems: [faqItemSchema],
     ctaData: ctaDataSchema,
     tableData: tableDataSchema,

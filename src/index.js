@@ -221,6 +221,10 @@ function buildApiLimiter() {
     // limiter in workspaceRoutes (autocompleteLimiter). Match the /ai/autocomplete
     // suffix on originalUrl (with or without a query string).
     skip: (req) => req.originalUrl.startsWith('/api/internal/') ||
+      // The notification bell polls every ~90s per tab and has its own per-user
+      // limiter (notificationRoutes) — counting it in this per-IP bucket would
+      // 429 a whole NATed office for one active user.
+      req.originalUrl.startsWith('/api/notifications') ||
       /\/ai\/autocomplete(?:\?|$)/.test(req.originalUrl),
   });
 }
@@ -279,6 +283,7 @@ app.use('/api/invites', require('./routes/inviteRoutes'));
 app.use('/api/tenant', require('./routes/tenantRoutes'));
 app.use('/api/admin', adminRoutes);
 app.use('/api/feedback', feedbackRoutes);
+app.use('/api/notifications', require('./routes/notificationRoutes'));
 app.use('/api/contact', contactRoutes);
 app.use('/api/observe', require('./routes/observeRoutes')); // Phase 7.3 product metrics
 

@@ -24,8 +24,10 @@ const Subscription = require('../models/Subscription');
 const AiTracker = require('../models/AiTracker');
 const AiTrackerPrompt = require('../models/AiTrackerPrompt');
 const KeywordResearchHistory = require('../models/KeywordResearchHistory');
+const Organization = require('../models/Organization');
 const tierService = require('./tierService');
 const seatService = require('./seatService');
+const notificationService = require('./notificationService');
 
 // ─── Helpers ────────────────────────────────────────────────────
 
@@ -335,6 +337,20 @@ async function lockPaidCreatedResources(orgId) {
   }
 
   console.log(`[downgradeService] Locked paid-created resources for org ${orgId} (preserved ${preserveCount}/tracker)`);
+
+  // How many CONTENT docs actually transitioned unlocked→locked this run.
+  // updateMany is idempotent, so modifiedCount is 0 on a repeat run — the caller
+  // notifies the owner only when a downgrade genuinely locked something new,
+  // never on an idempotent re-lock. Found by name, not index, so reordering the
+  // ops array can't silently point this at the wrong resource.
+  const contentIdx = ops.findIndex((o) => o.name === 'Content');
+  const contentResult = results[contentIdx];
+  return {
+    contentLockedCount:
+      contentResult && contentResult.status === 'fulfilled'
+        ? (contentResult.value?.modifiedCount || 0)
+        : 0,
+  };
 }
 
 async function unlockPaidCreatedResources(orgId) {
@@ -412,9 +428,10 @@ async function applyLocksForOrg(orgId) {
   const planOriginOp = tier === 'free' ? lockPaidCreatedResources : unlockPaidCreatedResources;
   const MAX_ATTEMPTS = 3;
   let lastErr = null;
+  let planResult = null;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
-      await planOriginOp(orgId);
+      planResult = await planOriginOp(orgId);
       lastErr = null;
       break;
     } catch (e) {
@@ -463,9 +480,35 @@ async function applyLocksForOrg(orgId) {
   //   New free user: counter=0, can create 3
 
   console.log(`[downgradeService] Applied locks for org ${orgId} (tier: ${config.tier || config.displayName})`);
+
+  // In-app notification: a downgrade to free just locked paid-created content.
+  // Sent to the ORG OWNER only — this is a billing consequence they alone can
+  // fix (by upgrading), and a per-member fan-out over every locked item would be
+  // noise a viewer can't act on anyway. Gated on modifiedCount so an idempotent
+  // re-run of the webhook never re-notifies. Best-effort, never throws — a
+  // notification failure must not fail the lock (which Stripe won't retry).
+  // DEFERRED (refinement): a per-owner-of-locked-content fan-out (so each
+  // affected member's own owner hears about their locked work) is a later nicety.
+  if (tier === 'free' && planResult?.contentLockedCount > 0) {
+    try {
+      const org = await Organization.findById(orgId).select('ownerId').lean();
+      if (org?.ownerId) {
+        await notificationService.emit({
+          userId: org.ownerId,
+          type: 'content.locked',
+          title: 'Some content was locked',
+          body: `Your plan change locked ${planResult.contentLockedCount} item${planResult.contentLockedCount === 1 ? '' : 's'}. Upgrade to restore access.`,
+          link: '/settings/billing',
+        });
+      }
+    } catch (err) {
+      console.error(`[downgradeService] lock notification failed (non-fatal) for org ${orgId}:`, err.message);
+    }
+  }
 }
 
 module.exports = {
   applyLocksForOrg,
   lockMembers, // exported for Phase 9 tests
+  lockPaidCreatedResources, // exported for tests/notificationEvents idempotency check
 };

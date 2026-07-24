@@ -8,6 +8,7 @@ const { tierToPreset } = require('../config/modelPreset');
 const { engineFetch } = require('../services/analysisEngine');
 const { resolveLocale } = require('../config/locales');
 const { recordObservation } = require('./observeController');
+const notificationService = require('../services/notificationService');
 
 // Workspace resolved by permissions middleware (req.workspace).
 // This helper finds the content within that workspace.
@@ -475,11 +476,52 @@ async function analyzeWithRetry(analyzeBody, preset, meta = {}) {
   throw lastErr;
 }
 
+// Best-effort in-app notification for an analysis outcome. NEVER throws — a
+// notification hiccup must never affect the analysis (mirrors the outcome-
+// snapshot block below). Recipient = the actor who triggered it (only the
+// reScore path threads one via opts.bill.userId), falling back to the content
+// creator. That fallback is exact for the initial auto-analysis (creator IS
+// the triggerer); on a teammate's retry it notifies the creator, which is
+// acceptable for v1 (see NOTIFICATION-SYSTEM-PLAN.md).
+async function notifyAnalysisOutcome(content, opts, ready) {
+  try {
+    if (!content) return; // outer catch may fire before content is loaded
+    const userId = opts?.bill?.userId || content.userId;
+    if (!userId) return;
+    const ws = await Workspace.findById(content.workspaceId).select('workspaceNumber').lean();
+    if (!ws?.workspaceNumber) return;
+    const link = `/workspace/${ws.workspaceNumber}/drafts/${content.contentNumber}`;
+    const title = content.title || 'Untitled';
+    if (ready) {
+      await notificationService.emit({
+        userId,
+        type: 'analysis.ready',
+        title: 'Your content editor is ready',
+        body: `Analysis finished for “${title}”. Open it to start optimizing.`,
+        link,
+      });
+    } else {
+      await notificationService.emit({
+        userId,
+        type: 'analysis.failed',
+        title: 'Analysis didn’t finish',
+        body: `We couldn’t finish analyzing “${title}”. Open it to retry.`,
+        link,
+      });
+    }
+  } catch (err) {
+    console.error('[analysis] notify failed (non-fatal):', err.message);
+  }
+}
+
 // ─── RUN ANALYSIS (background) ─────────────────────────────────
 
 async function runAnalysis(contentId, opts = {}) {
+  // Hoisted so the outer catch can address a failure notification. `const`
+  // inside the try would be out of scope there.
+  let content = null;
   try {
-    const content = await Content.findById(contentId);
+    content = await Content.findById(contentId);
     if (!content) return;
 
     const keywords = content.targetKeywords;
@@ -641,6 +683,7 @@ async function runAnalysis(contentId, opts = {}) {
       await Content.findByIdAndUpdate(contentId, {
         $set: { analysisStatus: 'failed', analysisError: prefix + err.message },
       });
+      await notifyAnalysisOutcome(content, opts, false);
       return;
     }
 
@@ -841,6 +884,14 @@ async function runAnalysis(contentId, opts = {}) {
     } catch (resyncErr) {
       console.error('[analysis] brief resync failed (non-fatal):', resyncErr.message);
     }
+
+    // "Your content editor is ready" — emitted LAST, so it fires only on a fully
+    // successful run and can never be contradicted by the outer catch. If a
+    // post-status step throws (e.g. the re-score charge below is NOT wrapped),
+    // control jumps to that catch, which flips the status to 'failed' and sends
+    // the failed notification instead — exactly one outcome notification per
+    // run, always matching the final persisted analysisStatus.
+    await notifyAnalysisOutcome(content, opts, true);
   } catch (err) {
     // Do NOT read err.message blindly: a thrown non-Error (string, plain object)
     // would make this line throw from inside the catch, rejecting the promise of
@@ -852,6 +903,11 @@ async function runAnalysis(contentId, opts = {}) {
     await Content.findByIdAndUpdate(contentId, {
       $set: { analysisStatus: 'failed', analysisError: msg },
     }).catch(() => {});
+    // `content` may be undefined here (if the initial findById threw);
+    // notifyAnalysisOutcome guards for that and no-ops. Only one failed path
+    // ever runs per analysis — the inner analyze catch returns, so it and this
+    // outer catch never both fire for the same run (no double notification).
+    await notifyAnalysisOutcome(content, opts, false);
   }
 }
 
@@ -1459,6 +1515,9 @@ module.exports = {
   recoverInterruptedAnalyses, scoreTerms, importUrl,
   internalLinks, readabilityCheck, regenerateOutline, curateCitationAppearance,
   getBotAccess, getOutcomes,
+  // Exported for tests/notificationEvents.test.js — pins the recipient fallback
+  // (actor → creator) and the guards, which are the parts easy to get wrong.
+  notifyAnalysisOutcome,
   // Exported for the camelCase-boundary invariant test (tests/curationCamelCase.test.js).
   // These map engine snake_case → the API's camelCase contract; a forgotten
   // remap is exactly the bot-access leak the test guards against.

@@ -51,6 +51,13 @@ const userSchema = new mongoose.Schema(
     failedLoginAttempts: { type: Number, default: 0 },
     lockUntil: Date,
 
+    // In-app notification "seen" marker. Advanced to now() when the user opens
+    // the bell; the unread badge counts announcements + notifications newer than
+    // this (clamped to createdAt so a new signup never sees historical news).
+    // A single timestamp, deliberately not per-item read state in v1. Must be a
+    // declared field — Mongoose strict mode silently drops undeclared paths.
+    notificationsSeenAt: { type: Date, default: null },
+
     onboarding: {
       completed: { type: Boolean, default: false },
       skippedAt: Date,

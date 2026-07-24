@@ -9,6 +9,7 @@ const adminSettingsController = require('../controllers/adminSettingsController'
 const adminSessionsController = require('../controllers/adminSessionsController');
 const adminBackupsController = require('../controllers/adminBackupsController');
 const platformAdminController = require('../controllers/platformAdminController');
+const announcementController = require('../controllers/announcementController');
 
 // Admin gate (union of ADMIN_EMAILS env + SystemSettings.adminEmails; also blocks
 // impersonated sessions). See middleware/validateAdmin.
@@ -79,6 +80,11 @@ router.put('/brand-configs/:orgId', adminMiddleware, brandController.adminUpdate
 router.get('/feedback', adminMiddleware, feedbackController.getFeedbackList);
 router.get('/feedback/stats', adminMiddleware, feedbackController.getFeedbackStats);
 router.put('/feedback/:id', adminMiddleware, feedbackController.updateFeedback);
+
+// ─── Announcements (platform broadcast → the notification bell) ──
+router.get('/announcements', adminMiddleware, announcementController.listAnnouncements);
+router.post('/announcements', adminMiddleware, announcementController.createAnnouncement);
+router.patch('/announcements/:id', adminMiddleware, announcementController.updateAnnouncement);
 
 // ─── Platform admin: tenant fleet + health board + impersonation (Phase 19B) ──
 // Impersonation endpoints self-gate behind IMPERSONATION_ENABLED (dark default).

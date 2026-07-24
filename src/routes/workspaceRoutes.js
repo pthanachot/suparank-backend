@@ -101,6 +101,12 @@ router.get('/:workspaceNumber/content/:contentNumber', rwr, rp('content', 'read'
 router.put('/:workspaceNumber/content/:contentNumber', rwr, rp('content', 'update'), rejectIfLocked(null, contentLockResolver), contentController.updateContent);
 router.delete('/:workspaceNumber/content/:contentNumber', rwr, rp('content', 'delete'), contentController.deleteContent);
 
+// Per-user favorite toggle (content-editors star). Gated on content:read, NOT
+// content:update, so viewers/clients can star what they can see — same reasoning
+// as content:comment. No rejectIfLocked: this writes per-user metadata, not the
+// document's content.
+router.put('/:workspaceNumber/content/:contentNumber/favorite', rwr, rp('content', 'read'), contentController.setFavorite);
+
 // Comments under content. B4: add/update mutate the locked doc's comments[] —
 // gate them like updateContent (rejectIfLocked). DELETE stays exempt (a member
 // may still remove a comment on a locked doc, same delete-a-locked-resource rule).

@@ -19,7 +19,15 @@ const listContents = async (req, res) => {
     const workspace = req.workspace;
 
     const { status, folder } = req.query;
-    const contents = await Content.findSummariesByWorkspace(workspace._id, { status, folder });
+    // favoritedBy is per-user state — collapse it to a boolean for the caller
+    // and never ship the raw member list. .lean() is safe: the schema has no
+    // virtuals and no toJSON transform, so the wire shape is unchanged.
+    const docs = await Content.findSummariesByWorkspace(workspace._id, { status, folder }).lean();
+    const me = String(req.user.userId);
+    const contents = docs.map(({ favoritedBy, ...rest }) => ({
+      ...rest,
+      favorite: Array.isArray(favoritedBy) && favoritedBy.some((id) => String(id) === me),
+    }));
     res.json({ contents });
   } catch (err) {
     console.error('listContents error:', err.message);
@@ -53,7 +61,10 @@ const getContent = async (req, res) => {
       }
     }
 
-    res.json({ content });
+    // Strip per-user favorite state — the editor doesn't use it and it would
+    // otherwise expose which members starred this doc.
+    const { favoritedBy, ...rest } = content.toObject();
+    res.json({ content: rest });
   } catch (err) {
     console.error('getContent error:', err.message);
     res.status(500).json({ error: 'Failed to fetch content' });
@@ -150,6 +161,9 @@ const createContent = async (req, res) => {
       resourceId: content.contentNumber,
       meta: { title: content.title || '(untitled)' },
     });
+    // No favoritedBy strip here (unlike getContent/updateContent): nobody can
+    // have starred a document that did not exist a moment ago, so the field is
+    // always [] and carries no information about any member.
     res.status(201).json({ content });
   } catch (err) {
     console.error('createContent error:', err.message);
@@ -259,7 +273,9 @@ const updateContent = async (req, res) => {
       },
       dedupeMinutes: significant ? 0 : 30,
     });
-    res.json({ content });
+    // Same strip as getContent — per-user favorite state never leaves the API.
+    const { favoritedBy, ...rest } = content.toObject();
+    res.json({ content: rest });
   } catch (err) {
     console.error('updateContent error:', err.message);
     res.status(500).json({ error: 'Failed to update content' });
@@ -289,6 +305,35 @@ const deleteContent = async (req, res) => {
   } catch (err) {
     console.error('deleteContent error:', err.message);
     res.status(500).json({ error: 'Failed to delete content' });
+  }
+};
+
+// ─── SET FAVORITE (per-user star) ─────────────────────────────
+
+const setFavorite = async (req, res) => {
+  try {
+    const workspace = req.workspace;
+    const favorite = req.body.favorite === true;
+
+    // timestamps: false is load-bearing. The schema has { timestamps: true }
+    // and the list is sorted updatedAt: -1 with "last edited" rendered from it,
+    // so without this a star would jump the row to the top of the list and
+    // falsely report it as just edited.
+    // $addToSet/$pull are atomic, so concurrent toggles can't lose an update.
+    const content = await Content.findOneAndUpdate(
+      { workspaceId: workspace._id, contentNumber: Number(req.params.contentNumber) },
+      favorite
+        ? { $addToSet: { favoritedBy: req.user.userId } }
+        : { $pull: { favoritedBy: req.user.userId } },
+      { new: true, timestamps: false, projection: { _id: 1 } }
+    );
+    if (!content) return res.status(404).json({ error: 'Content not found' });
+
+    // No audit entry: this is a personal UI preference, not a content mutation.
+    res.json({ favorite });
+  } catch (err) {
+    console.error('setFavorite error:', err.message);
+    res.status(500).json({ error: 'Failed to update favorite' });
   }
 };
 
@@ -968,6 +1013,6 @@ const getMovement = async (req, res) => {
   }
 };
 
-module.exports = { listContents, getContent, getAvailableLinks, getMovement, createContent, updateContent, deleteContent, addComment, updateComment, deleteComment, runAudit, runWritingQualityAudit,
+module.exports = { listContents, getContent, getAvailableLinks, getMovement, createContent, updateContent, deleteContent, setFavorite, addComment, updateComment, deleteComment, runAudit, runWritingQualityAudit,
   // Exported for test coverage (cost-ledger usage capture). Not part of the runtime API surface.
   streamAudit };

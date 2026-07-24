@@ -333,6 +333,17 @@ const contentSchema = new mongoose.Schema(
     // Downgrade locking — locked resources are read-only until the org upgrades
     locked: { type: Boolean, default: false },
 
+    // Per-user favorites (the content-editors star). Never returned to the
+    // client: listContents collapses it to a per-caller `favorite` boolean and
+    // getContent/updateContent strip it. Deliberately NOT `select: false` —
+    // nothing else in the codebase uses that flag, and four call sites load a
+    // full doc and call content.save(), which is exactly where an unselected
+    // path is easy to get wrong.
+    favoritedBy: {
+      type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+      default: [],
+    },
+
     // Tracks whether this resource was created on a free or paid plan.
     // On downgrade to free, paid-created resources are locked.
     createdOnPlan: { type: String, enum: ['free', 'paid'], default: 'free' },
@@ -490,7 +501,7 @@ contentSchema.statics.findSummariesByWorkspace = function (workspaceId, { status
   if (status) query.status = status;
   if (folder) query.folder = folder;
   return this.find(query)
-    .select('contentNumber title slug description targetKeywords country device score wordCount status folder platform contentType analysisStatus analyzedAt publishedAt scheduledAt locked createdOnPlan createdAt updatedAt')
+    .select('contentNumber title slug description targetKeywords country device score wordCount status folder platform contentType analysisStatus analyzedAt publishedAt scheduledAt locked createdOnPlan favoritedBy createdAt updatedAt')
     .sort({ updatedAt: -1 });
 };
 

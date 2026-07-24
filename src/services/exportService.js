@@ -181,7 +181,10 @@ async function serializeWorkspace(workspaceId, prefix = '') {
   // enforces on read. (P5 review: erasureController only DELETES — this tar is
   // the system's only export, so the exclusion must be visible in the manifest
   // and must not swallow the user's own conversation prompts; see below.)
-  const contents = await Content.find({ workspaceId, locked: { $ne: true } }).lean();
+  // -favoritedBy: the per-user star list is internal state, and the .json entry
+  // below dumps the whole document — without this the export bundle would carry
+  // member ObjectIds. Same invariant contentController enforces on every read.
+  const contents = await Content.find({ workspaceId, locked: { $ne: true } }).select('-favoritedBy').lean();
   for (const c of contents) {
     // Filter null slots — blocksToMarkdown/renderBlocksHtml deref block fields and
     // Mongoose can persist a null element in a DocumentArray.

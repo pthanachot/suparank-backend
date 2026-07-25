@@ -151,6 +151,20 @@ describe('startImpersonation — success', () => {
   });
 });
 
+describe('startImpersonation — single-session is NOT enforced backend-side (LOW-8.1)', () => {
+  // Documents the current gap: neither the service nor the enter route dedupes.
+  // "One session at a time" is enforced only in the UI (the impersonation_meta
+  // cookie gates the button). A double-start creates two concurrent backend
+  // sessions — both audited + TTL-bounded, but the first is orphaned from the
+  // banner. If Phase 11 adds backend enforcement, update this test.
+  it('allows a concurrent second session (no backend dedupe)', async () => {
+    const r1 = await svc.startImpersonation({ adminUser: admin, orgId: 'org1' });
+    const r2 = await svc.startImpersonation({ adminUser: admin, orgId: 'org1' });
+    assert.ok(r1.token && r2.token, 'both starts succeed');
+    assert.equal(createdSessions.length, 2, 'two concurrent impersonation sessions created — no dedupe');
+  });
+});
+
 describe('stopImpersonation', () => {
   it('not_found when the session is not an impersonation session', async () => {
     foundSession = { _id: 'sess1', impersonatorId: null, status: 'active', end: async () => {} };

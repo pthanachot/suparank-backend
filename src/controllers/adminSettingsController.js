@@ -1,18 +1,14 @@
 /**
- * Admin system settings — GET/PUT the SystemSettings singleton, plus the
- * admin-accounts list (union of ADMIN_EMAILS env + DB-managed adminEmails).
+ * Admin system settings — GET/PUT the SystemSettings singleton, plus a
+ * READ-ONLY admin-accounts list. Admin identity is env-only (Phase 2):
+ * ADMIN_EMAILS + ADMIN_EMAILS_2..5 in Railway. The add/remove endpoints were
+ * retired; listing reflects the env slots via utils/adminEmails.
  */
 const { getSettings, updateSettings } = require('../services/systemSettingsService');
+const { adminEmailSet } = require('../utils/adminEmails');
 const User = require('../models/User');
-
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-function envAdminEmails() {
-  return (process.env.ADMIN_EMAILS || '')
-    .split(',')
-    .map((e) => e.trim().toLowerCase())
-    .filter(Boolean);
-}
+const adminAudit = require('../services/adminAuditService');
+const AUDIT = require('../services/adminAuditActions');
 
 const getSystemSettings = async (req, res) => {
   res.json({ settings: getSettings() });
@@ -70,6 +66,7 @@ const updateSystemSettings = async (req, res) => {
 
     const settings = await updateSettings(patch);
     console.log(`[admin] System settings updated by ${req.user?.email}: ${JSON.stringify(patch)}`);
+    adminAudit.fromReq(req, { action: AUDIT.SETTINGS_UPDATE, targetType: 'system', targetId: 'global', meta: { patch } });
     res.json({ success: true, settings });
   } catch (error) {
     console.error('[admin] updateSystemSettings error:', error.message);
@@ -77,32 +74,28 @@ const updateSystemSettings = async (req, res) => {
   }
 };
 
-// ─── Admin accounts ─────────────────────────────────────────
-// Env entries are the locked safety floor (can't be removed here — only by
-// changing ADMIN_EMAILS). DB entries are editable, with guardrails: no
-// removing the last admin, and self-removal requires explicit confirmation.
+// ─── Admin accounts (read-only) ─────────────────────────────
+// Admin identity is env-only: ADMIN_EMAILS + ADMIN_EMAILS_2..5 in Railway.
+// Every listed admin is env-managed and locked; changes require editing the
+// env vars and redeploying. Add/remove endpoints were retired in Phase 2.
 
 const listAdmins = async (req, res) => {
   try {
-    const env = envAdminEmails();
-    const db = (getSettings().adminEmails || []).map((e) => String(e).toLowerCase());
-    const admins = [
-      ...env.map((email) => ({ email, source: 'env', locked: true })),
-      ...db.filter((email) => !env.includes(email)).map((email) => ({ email, source: 'db', locked: false })),
-    ];
-
-    const users = await User.find({ email: { $in: admins.map((a) => a.email) } })
+    const emails = [...adminEmailSet()]; // already lowercased, deduped
+    const users = await User.find({ email: { $in: emails } })
       .select('email status')
       .lean();
     const byEmail = new Map(users.map((u) => [u.email.toLowerCase(), u]));
     const me = req.user?.email?.toLowerCase();
 
     res.json({
-      admins: admins.map((a) => ({
-        ...a,
-        userExists: byEmail.has(a.email),
-        userStatus: byEmail.get(a.email)?.status || null,
-        isYou: a.email === me,
+      admins: emails.map((email) => ({
+        email,
+        source: 'env',
+        locked: true,
+        userExists: byEmail.has(email),
+        userStatus: byEmail.get(email)?.status || null,
+        isYou: email === me,
       })),
     });
   } catch (error) {
@@ -111,64 +104,4 @@ const listAdmins = async (req, res) => {
   }
 };
 
-const addAdmin = async (req, res) => {
-  try {
-    const raw = req.body?.email;
-    const email = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
-    if (!EMAIL_RE.test(email)) {
-      return res.status(400).json({ error: 'Valid email required' });
-    }
-
-    const env = envAdminEmails();
-    const db = (getSettings().adminEmails || []).map((e) => String(e).toLowerCase());
-    if (env.includes(email) || db.includes(email)) {
-      return res.status(409).json({ error: 'This email is already an admin' });
-    }
-
-    const settings = await updateSettings({ adminEmails: [...db, email] });
-    const userExists = !!(await User.exists({ email }));
-    console.log(`[admin] Admin added by ${req.user?.email}: ${email} (userExists=${userExists})`);
-    res.json({ success: true, adminEmails: settings.adminEmails, userExists });
-  } catch (error) {
-    console.error('[admin] addAdmin error:', error.message);
-    res.status(500).json({ error: 'Failed to add admin' });
-  }
-};
-
-const removeAdmin = async (req, res) => {
-  try {
-    // Express has already URL-decoded route params — decoding again throws
-    // URIError on values containing a literal '%'.
-    const email = String(req.params.email || '').trim().toLowerCase();
-    const confirm = req.query.confirm === 'true';
-
-    const env = envAdminEmails();
-    const db = (getSettings().adminEmails || []).map((e) => String(e).toLowerCase());
-
-    if (env.includes(email)) {
-      return res.status(403).json({
-        error: 'This admin is managed by the ADMIN_EMAILS environment variable and cannot be removed here.',
-      });
-    }
-    if (!db.includes(email)) {
-      return res.status(404).json({ error: 'Admin not found' });
-    }
-    if (env.length === 0 && db.length === 1) {
-      return res.status(400).json({ error: 'Cannot remove the last admin' });
-    }
-    if (email === req.user?.email?.toLowerCase() && !confirm) {
-      return res.status(400).json({
-        error: 'You are removing your own admin access. Repeat the request with ?confirm=true to proceed.',
-      });
-    }
-
-    const settings = await updateSettings({ adminEmails: db.filter((e) => e !== email) });
-    console.log(`[admin] Admin removed by ${req.user?.email}: ${email}`);
-    res.json({ success: true, adminEmails: settings.adminEmails });
-  } catch (error) {
-    console.error('[admin] removeAdmin error:', error.message);
-    res.status(500).json({ error: 'Failed to remove admin' });
-  }
-};
-
-module.exports = { getSystemSettings, updateSystemSettings, listAdmins, addAdmin, removeAdmin };
+module.exports = { getSystemSettings, updateSystemSettings, listAdmins };

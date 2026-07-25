@@ -12,6 +12,8 @@ const BrandConfig = require('../models/BrandConfig');
 const Organization = require('../models/Organization');
 const brandService = require('../services/brandService');
 const auditService = require('../services/auditService');
+const adminAudit = require('../services/adminAuditService');
+const AUDIT = require('../services/adminAuditActions');
 const { resolveOrgWithAccess } = require('./orgMemberController');
 
 // ─── GET ORG BRAND ───────────────────────────────────────────────
@@ -191,6 +193,7 @@ const adminUpdateBrandConfig = async (req, res) => {
       });
     }
 
+    adminAudit.fromReq(req, { action: AUDIT.BRAND_UPDATE, targetType: 'brand', targetId: orgId, meta: { changed: Object.keys(validated.patch) } });
     res.json({ config: doc });
   } catch (error) {
     console.error('Admin update brand config error:', error);

@@ -34,6 +34,35 @@ const Stripe = require('stripe');
 const STRIPE_API_VERSION = require('../config/stripeApiVersion');
 const tailRiskService = require('../services/tailRiskService');
 const { isAdminEmail } = require('../utils/adminEmails');
+const adminAudit = require('../services/adminAuditService');
+const AUDIT = require('../services/adminAuditActions');
+
+/**
+ * Cancel a Stripe subscription for admin delete/reset flows (Phase 11 — fixes
+ * HIGH-5.8/6.2). Returns { ok, alreadyGone, error }:
+ *   ok=true, alreadyGone=false → canceled now
+ *   ok=true, alreadyGone=true  → already gone at Stripe (resource_missing) — the
+ *                                desired end state is reached
+ *   ok=false                   → the cancel FAILED. The caller MUST NOT pretend
+ *                                the customer stopped being billed (a silent
+ *                                warn-and-proceed was the original bug).
+ * Modeled on updateSubscription's Stripe handling. `_stripe` is injectable for
+ * tests; production constructs the real client.
+ */
+async function cancelStripeSubscription(stripeSubscriptionId, _stripe = null) {
+  try {
+    const stripe = _stripe || new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: STRIPE_API_VERSION });
+    await stripe.subscriptions.cancel(stripeSubscriptionId);
+    return { ok: true, alreadyGone: false };
+  } catch (err) {
+    if (err.code === 'resource_missing') return { ok: true, alreadyGone: true };
+    console.error(
+      `[admin][ORPHAN] Stripe cancel FAILED for ${stripeSubscriptionId} — the customer may STILL BE BILLED; ` +
+        `MANUAL CANCELLATION REQUIRED: ${err.message}`
+    );
+    return { ok: false, error: err.message };
+  }
+}
 
 // ─── Canonical MRR pricing (Phase 11) ───────────────────────────
 // Single source of truth for admin revenue: prices come from the tier config
@@ -92,16 +121,12 @@ const userLookup = async (req, res) => {
       return res.status(403).json({ valid: false, error: 'User account not active' });
     }
 
-    // Admin email = union of env + DB-managed list (single source of truth).
-    const isAdmin = isAdminEmail(user.email);
-
-    // Also check roles array
-    const hasAdminRole =
-      user.roles?.includes('admin') ||
-      user.roles?.includes('super_admin') ||
-      user.roles?.includes('administrator');
-
-    if (!isAdmin && !hasAdminRole) {
+    // Env-only admin allowlist (ADMIN_EMAILS + ADMIN_EMAILS_2..5), matching the
+    // real data gate (validateAdmin). Role claims are deliberately NOT honored
+    // here: before Phase 2 they were, which let a role-holder load the admin
+    // shell that then 403'd on every tab. The shell now renders only for
+    // accounts the gate will actually admit.
+    if (!isAdminEmail(user.email)) {
       return res.status(403).json({ valid: false, error: 'Admin access required' });
     }
 
@@ -110,7 +135,7 @@ const userLookup = async (req, res) => {
       user: {
         userId: user._id.toString(),
         email: user.email,
-        roles: isAdmin ? [...(user.roles || []), 'admin'] : user.roles || [],
+        roles: [...(user.roles || []), 'admin'],
         status: user.status,
       },
     });
@@ -427,9 +452,12 @@ const getSubscriptions = async (req, res) => {
 const manageUserCredits = async (req, res) => {
   try {
     const { userId } = req.params;
-    const { action, amount, reason } = req.body;
+    const { action, reason } = req.body;
+    // Coerce to Number: a string amount would string-concatenate on the 'add'
+    // path (100 + "50" → "10050"). Number.isFinite also rejects Infinity/NaN.
+    const amount = Number(req.body.amount);
 
-    if (!amount || isNaN(amount) || amount <= 0) {
+    if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: 'Valid amount required' });
     }
 
@@ -475,6 +503,11 @@ const manageUserCredits = async (req, res) => {
       orgCredits = (credit?.subscriptionCredits || 0) + (credit?.generalCredits || 0);
     }
 
+    adminAudit.fromReq(req, {
+      action: AUDIT.USER_CREDITS, targetType: 'user', targetId: userId,
+      ...adminAudit.withDiff({ freeCredits: previousBalance }, { freeCredits: userCredit.freeCredits }),
+      meta: { op: action, amount, reason: reason || null },
+    });
     res.json({
       previousBalance,
       newBalance: orgCredits + userCredit.freeCredits,
@@ -676,12 +709,17 @@ const updateOrganization = async (req, res) => {
     const org = await Organization.findById(orgId);
     if (!org) return res.status(404).json({ error: 'Organization not found' });
 
+    const oldName = org.name;
     if (name && name.trim() && name.trim() !== org.name) {
       org.name = name.trim();
       org.slug = await Organization.generateSlug(name.trim(), org.ownerId);
     }
 
     await org.save();
+    adminAudit.fromReq(req, {
+      action: AUDIT.ORG_UPDATE, targetType: 'org', targetId: orgId,
+      ...adminAudit.withDiff({ name: oldName }, { name: org.name }),
+    });
     res.json({ success: true, organization: { id: org._id, name: org.name, slug: org.slug } });
   } catch (error) {
     console.error('[admin] updateOrganization error:', error.message);
@@ -694,9 +732,12 @@ const updateOrganization = async (req, res) => {
 const manageOrgCredits = async (req, res) => {
   try {
     const { orgId } = req.params;
-    const { action, amount, pool, reason } = req.body;
+    const { action, pool, reason } = req.body;
+    // Coerce to Number (see manageUserCredits): a string amount string-concatenates
+    // on the 'add' path.
+    const amount = Number(req.body.amount);
 
-    if (!amount || isNaN(amount) || amount < 0) {
+    if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: 'Valid amount required' });
     }
     if (!['subscription', 'general'].includes(pool)) {
@@ -734,6 +775,11 @@ const manageOrgCredits = async (req, res) => {
       balanceAfter: credit[field],
     });
 
+    adminAudit.fromReq(req, {
+      action: AUDIT.ORG_CREDITS, targetType: 'org', targetId: orgId,
+      ...adminAudit.withDiff({ [pool]: previousBalance }, { [pool]: credit[field] }),
+      meta: { op: action, pool, amount, reason: reason || null },
+    });
     res.json({
       previousBalance,
       newBalance: credit[field],
@@ -839,6 +885,7 @@ const updateSubscription = async (req, res) => {
 
     await sub.save();
 
+    adminAudit.fromReq(req, { action: AUDIT.SUB_UPDATE, targetType: 'sub', targetId: subId, meta: { op: action, status: sub.status } });
     res.json({
       success: true,
       subscription: {
@@ -947,7 +994,10 @@ const VALID_COUNTERS = ['articlesCreated', 'keywordSearches', 'auditsRun', 'aiTr
 const manageUserQuota = async (req, res) => {
   try {
     const { userId } = req.params;
-    const { counter, action, amount, reason } = req.body;
+    const { counter, action, reason } = req.body;
+    // Coerce to Number (see manageUserCredits): a string amount string-concatenates
+    // on the 'add' path.
+    const amount = Number(req.body.amount);
 
     if (!VALID_COUNTERS.includes(counter)) {
       return res.status(400).json({ error: `Invalid counter. Use: ${VALID_COUNTERS.join(', ')}` });
@@ -955,7 +1005,7 @@ const manageUserQuota = async (req, res) => {
     if (!['add', 'subtract'].includes(action)) {
       return res.status(400).json({ error: 'Action must be "add" or "subtract"' });
     }
-    if (!amount || isNaN(amount) || amount <= 0) {
+    if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: 'Valid positive amount required' });
     }
 
@@ -973,6 +1023,11 @@ const manageUserQuota = async (req, res) => {
       await UserUsageTracker.increment(user._id, counter, actualInc);
     }
 
+    adminAudit.fromReq(req, {
+      action: AUDIT.USER_QUOTA, targetType: 'user', targetId: userId,
+      ...adminAudit.withDiff({ [counter]: current }, { [counter]: newValue }),
+      meta: { op: action, amount },
+    });
     res.json({
       counter,
       previousValue: current,
@@ -992,7 +1047,10 @@ const manageUserQuota = async (req, res) => {
 const manageOrgQuota = async (req, res) => {
   try {
     const { orgId } = req.params;
-    const { counter, period, action, amount, reason } = req.body;
+    const { counter, period, action, reason } = req.body;
+    // Coerce to Number (see manageUserCredits): a string amount string-concatenates
+    // on the 'add' path.
+    const amount = Number(req.body.amount);
 
     if (!VALID_COUNTERS.includes(counter)) {
       return res.status(400).json({ error: `Invalid counter. Use: ${VALID_COUNTERS.join(', ')}` });
@@ -1003,7 +1061,7 @@ const manageOrgQuota = async (req, res) => {
     if (!['add', 'subtract'].includes(action)) {
       return res.status(400).json({ error: 'Action must be "add" or "subtract"' });
     }
-    if (!amount || isNaN(amount) || amount <= 0) {
+    if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: 'Valid positive amount required' });
     }
 
@@ -1021,6 +1079,11 @@ const manageOrgQuota = async (req, res) => {
       await UsageTracker.increment(orgId, counter, period, actualInc);
     }
 
+    adminAudit.fromReq(req, {
+      action: AUDIT.ORG_QUOTA, targetType: 'org', targetId: orgId,
+      ...adminAudit.withDiff({ [counter]: current }, { [counter]: newValue }),
+      meta: { op: action, period, amount },
+    });
     res.json({
       counter,
       period,
@@ -1054,16 +1117,21 @@ const resetOrgToFree = async (req, res) => {
 
     const summary = { oldPlanId, stripeCanceled: false, creditsExpired: 0, usageReset: false };
 
-    // 1. Cancel Stripe subscription immediately
+    // 1. Cancel Stripe subscription FIRST. If it genuinely fails, ABORT before
+    // touching anything local — otherwise we'd mark the sub 'canceled' while the
+    // customer keeps being billed (HIGH-6.2). Nothing is mutated yet, so the
+    // admin can safely retry once Stripe is reachable.
     if (oldSub?.stripeSubscriptionId) {
-      try {
-        const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: STRIPE_API_VERSION });
-        await stripe.subscriptions.cancel(oldSub.stripeSubscriptionId);
-        summary.stripeCanceled = true;
-        console.log(`[admin] Stripe subscription ${oldSub.stripeSubscriptionId} canceled for org ${orgId} (reset to free)`);
-      } catch (err) {
-        console.warn(`[admin] Failed to cancel Stripe subscription ${oldSub.stripeSubscriptionId}: ${err.message}`);
+      const result = await cancelStripeSubscription(oldSub.stripeSubscriptionId);
+      if (!result.ok) {
+        return res.status(502).json({
+          error:
+            'Could not cancel the Stripe subscription — reset aborted so the record is not marked canceled while still billing. Retry when Stripe is reachable.',
+        });
       }
+      // already-gone at Stripe ≠ canceled by this action (matches cascadeDelete).
+      summary.stripeCanceled = !result.alreadyGone;
+      console.log(`[admin] Stripe subscription ${oldSub.stripeSubscriptionId} ${result.alreadyGone ? 'already gone' : 'canceled'} for org ${orgId} (reset to free)`);
     }
 
     // 2. Expire all subscription credits
@@ -1108,6 +1176,10 @@ const resetOrgToFree = async (req, res) => {
 
     console.log(`[admin] Org ${orgId} reset to free from ${oldPlanId} by ${req.user?.email}`, summary);
 
+    adminAudit.fromReq(req, {
+      action: AUDIT.ORG_RESET_FREE, targetType: 'org', targetId: orgId,
+      before: { planId: oldPlanId }, after: { planId: 'free' }, meta: summary,
+    });
     res.json({ success: true, summary });
   } catch (error) {
     console.error('[admin] resetOrgToFree error:', error.message);
@@ -1169,6 +1241,10 @@ const overrideOrgPlan = async (req, res) => {
 
     console.log(`[admin] Arbitrary plan override for org ${orgId}: ${oldPlanId} → ${planId} by ${req.user?.email}`);
 
+    adminAudit.fromReq(req, {
+      action: AUDIT.ORG_PLAN_OVERRIDE, targetType: 'org', targetId: orgId,
+      ...adminAudit.withDiff({ planId: oldPlanId }, { planId }),
+    });
     res.json({
       success: true,
       oldPlanId,
@@ -1457,7 +1533,10 @@ const getCreditOrganizations = async (req, res) => {
 
 const bulkManageCredits = async (req, res) => {
   try {
-    const { targetType, targets, operation, amount, pool, reason } = req.body;
+    const { targetType, targets, operation, pool, reason } = req.body;
+    // Coerce to Number (see manageUserCredits): a string amount string-concatenates
+    // on the 'add' path. Explicit null-check keeps a missing amount a 400 (0 is allowed).
+    const amount = Number(req.body.amount);
 
     if (!['user', 'organization'].includes(targetType)) {
       return res.status(400).json({ error: 'targetType must be "user" or "organization"' });
@@ -1471,7 +1550,7 @@ const bulkManageCredits = async (req, res) => {
     if (!['add', 'subtract', 'set'].includes(operation)) {
       return res.status(400).json({ error: 'operation must be "add", "subtract", or "set"' });
     }
-    if (amount == null || isNaN(amount) || amount < 0) {
+    if (req.body.amount == null || !Number.isFinite(amount) || amount < 0) {
       return res.status(400).json({ error: 'Valid amount required' });
     }
     if (targetType === 'organization' && !['subscription', 'general'].includes(pool)) {
@@ -1535,6 +1614,10 @@ const bulkManageCredits = async (req, res) => {
       }
     }
 
+    adminAudit.fromReq(req, {
+      action: AUDIT.CREDITS_BULK, targetType, targetId: null,
+      meta: { operation, amount, pool: pool || null, processed: targets.length, succeeded, failed },
+    });
     res.json({ processed: targets.length, succeeded, failed, results });
   } catch (error) {
     console.error('[admin] bulkManageCredits error:', error.message);
@@ -1575,7 +1658,11 @@ const exportCreditTransactions = async (req, res) => {
     // Build CSV
     const header = 'Date,Transaction ID,Organization,User,Type,Amount,Pool,Balance After,Description,Status';
     const escCsv = (val) => {
-      const s = String(val ?? '');
+      let s = String(val ?? '');
+      // Neutralize spreadsheet formula injection: a value starting with =,+,-,@,
+      // tab, or CR is executed as a formula by Excel/Sheets. Org names and
+      // descriptions are user-controlled, so prefix with ' to keep it text.
+      if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
       return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s;
     };
     const rows = transactions.map((tx) =>
@@ -1646,19 +1733,19 @@ async function cascadeDeleteWorkspaces(workspaceIds) {
  * Returns deletion counts.
  */
 async function cascadeDeleteOrganization(orgId) {
-  const counts = { stripeSubscriptionCanceled: false, workspaces: 0, members: 0 };
+  const counts = { stripeSubscriptionCanceled: false, workspaces: 0, members: 0, stripeOrphaned: null };
 
-  // Cancel Stripe subscription immediately
+  // Cancel Stripe subscription first. Unlike reset-to-free, a delete PROCEEDS
+  // even if the cancel fails (we can't leave an un-deletable org) — but we
+  // surface the orphaned subscription id (counts.stripeOrphaned) and the helper
+  // logs a loud [ORPHAN] error, so the still-billing sub is traced, not silently
+  // dropped (HIGH-5.8).
   const sub = await Subscription.findOne({ organizationId: orgId }).lean();
   if (sub?.stripeSubscriptionId) {
-    try {
-      const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: STRIPE_API_VERSION });
-      await stripe.subscriptions.cancel(sub.stripeSubscriptionId);
-      counts.stripeSubscriptionCanceled = true;
-      console.log(`[admin] Stripe subscription ${sub.stripeSubscriptionId} canceled for org ${orgId}`);
-    } catch (err) {
-      console.warn(`[admin] Failed to cancel Stripe subscription ${sub.stripeSubscriptionId}: ${err.message}`);
-    }
+    const result = await cancelStripeSubscription(sub.stripeSubscriptionId);
+    counts.stripeSubscriptionCanceled = result.ok && !result.alreadyGone;
+    if (!result.ok) counts.stripeOrphaned = sub.stripeSubscriptionId;
+    else console.log(`[admin] Stripe subscription ${sub.stripeSubscriptionId} canceled for org ${orgId}`);
   }
 
   // Cascade-delete workspaces
@@ -1697,11 +1784,25 @@ const updateUser = async (req, res) => {
       return res.status(400).json({ error: `Invalid status. Must be one of: ${VALID_STATUSES.join(', ')}` });
     }
 
+    // Self-target guard (LOW-5.7): don't let an admin suspend/deactivate their
+    // own login account (they'd 401 on their next request and lock themselves out).
+    if (
+      status && status !== 'active' &&
+      String(user._id) === String(req.user.userId)
+    ) {
+      return res.status(400).json({ error: 'You cannot suspend or deactivate your own account.' });
+    }
+
+    const oldStatus = user.status;
     if (status) user.status = status;
 
     await user.save();
     console.log(`[admin] Updated user "${user.email}" (userId=${userId}) status=${status} by admin ${req.user.email}`);
 
+    adminAudit.fromReq(req, {
+      action: AUDIT.USER_UPDATE, targetType: 'user', targetId: user.userId,
+      ...adminAudit.withDiff({ status: oldStatus }, { status: user.status }),
+    });
     res.json({ success: true, user: { userId: user.userId, email: user.email, status: user.status } });
   } catch (error) {
     console.error('[admin] updateUser error:', error.message);
@@ -1718,6 +1819,7 @@ const adminDeleteOrganization = async (req, res) => {
     console.log(`[admin] Deleting organization "${org.name}" (${orgId}) by admin ${req.user.email}`);
     const deleted = await cascadeDeleteOrganization(orgId);
 
+    adminAudit.fromReq(req, { action: AUDIT.ORG_DELETE, targetType: 'org', targetId: orgId, meta: { name: org.name, ...deleted } });
     res.json({ success: true, deleted });
   } catch (error) {
     console.error('[admin] adminDeleteOrganization error:', error.message);
@@ -1733,9 +1835,16 @@ const adminDeleteUser = async (req, res) => {
     const user = await User.findOne({ userId: parseInt(userId) }).lean();
     if (!user) return res.status(404).json({ error: 'User not found' });
 
+    // Self-target guard (LOW-5.7): deleting your own account is a footgun —
+    // admin identity is env-based, so you'd keep the ADMIN_EMAILS slot but lose
+    // the login account. Refuse.
+    if (String(user._id) === String(req.user.userId)) {
+      return res.status(400).json({ error: 'You cannot delete your own account.' });
+    }
+
     console.log(`[admin] Deleting user "${user.email}" (userId=${userId}) by admin ${req.user.email}`);
 
-    const deleted = { ownedOrgs: 0, memberships: 0, workspaces: 0, stripeCanceled: 0 };
+    const deleted = { ownedOrgs: 0, memberships: 0, workspaces: 0, stripeCanceled: 0, stripeOrphaned: [] };
 
     // 1. Cascade-delete all organizations the user OWNS
     const ownedOrgs = await Organization.find({ ownerId: user._id }).select('_id').lean();
@@ -1744,6 +1853,7 @@ const adminDeleteUser = async (req, res) => {
       deleted.ownedOrgs++;
       deleted.workspaces += orgCounts.workspaces;
       if (orgCounts.stripeSubscriptionCanceled) deleted.stripeCanceled++;
+      if (orgCounts.stripeOrphaned) deleted.stripeOrphaned.push(orgCounts.stripeOrphaned);
     }
 
     // 2. Remove memberships from non-owned orgs
@@ -1774,6 +1884,7 @@ const adminDeleteUser = async (req, res) => {
     // 6. Delete the user document
     await User.deleteOne({ _id: user._id });
 
+    adminAudit.fromReq(req, { action: AUDIT.USER_DELETE, targetType: 'user', targetId: user.userId, meta: { email: user.email, ...deleted } });
     res.json({ success: true, deleted });
   } catch (error) {
     console.error('[admin] adminDeleteUser error:', error.message);
@@ -1782,6 +1893,7 @@ const adminDeleteUser = async (req, res) => {
 };
 
 module.exports = {
+  cancelStripeSubscription, // exported for unit tests (Phase 11)
   userLookup,
   getDashboardStats,
   getUsers,

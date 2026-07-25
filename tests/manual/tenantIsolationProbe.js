@@ -9,6 +9,8 @@
  *   POSITIVE — org B's owner token reaches its own routes (proves the route is
  *              actually live, so a NEGATIVE block is real isolation, not a dark flag).
  *   LIST-LEAK — A's own list endpoints never contain B's org/workspace.
+ *   ADMIN-GATE — /api/admin/* is env-only: a non-admin is 403'd, a slot-3 admin
+ *              is admitted (proves the 5-slot expansion), retired add/remove is 410.
  *
  * Run: node tests/manual/tenantIsolationProbe.js   (requires local mongod on :27099)
  */
@@ -160,6 +162,7 @@ const BLOCKED = new Set([400, 401, 403, 404]);
   app.use('/api/organizations', require('../../src/routes/organizationRoutes'));
   app.use('/api/workspaces', require('../../src/routes/workspaceCrudRoutes'));
   app.use('/api/workspace', require('../../src/routes/sitemapRoutes')); // /:workspaceNumber/sitemaps/...
+  app.use('/api/admin', require('../../src/routes/adminRoutes')); // platform-admin gate (env-only)
   const server = app.listen(4998);
   await new Promise((r) => server.once('listening', r));
 
@@ -270,6 +273,29 @@ const BLOCKED = new Set([400, 401, 403, 404]);
   const membersA = await call('GET', `/api/org/organizations/${orgA._id}/members`, tokenA);
   if (membersA.text.includes('ownerb@probe.test')) bad('LIST members', `A's member list contains org B's owner!`);
   else ok('GET org A members excludes org B owner');
+
+  console.log('─── ADMIN GATE: /api/admin/* is env-only (Phase 1–3) ───');
+  // Admin identity is env-only. Seed the admin in a NON-FIRST slot to prove the
+  // 5-slot expansion end-to-end (ADMIN_EMAILS stays 'nobody@nowhere.test').
+  process.env.ADMIN_EMAILS_3 = 'admin@probe.test';
+  const adminU = await User.create({ userId: 810005, email: 'admin@probe.test', name: 'AdminU', status: 'active', roles: ['member'], tokenVersion: 0 });
+  const tokenAdmin = generateAccessToken({ _id: adminU._id, email: adminU.email, roles: adminU.roles, tokenVersion: 0 }, undefined);
+  const adminTally = {};
+  const adminCheck = async (label, method, path, token, want) => {
+    const r = await call(method, path, token);
+    adminTally[r.status] = (adminTally[r.status] || 0) + 1;
+    if (r.status === want) ok(label);
+    else bad('ADMIN ' + label, `expected ${want}, got ${r.status} body=${r.text.slice(0, 120)}`);
+  };
+  // A non-admin owner token is blocked by validateAdmin (403), NOT admitted.
+  await adminCheck('non-admin owner → GET /settings/admins → 403', 'GET', '/api/admin/settings/admins', tokenA, 403);
+  // The slot-3 admin is admitted and the route is live (200) — proves a non-first slot grants admin.
+  await adminCheck('slot-3 admin → GET /settings/admins → 200', 'GET', '/api/admin/settings/admins', tokenAdmin, 200);
+  // The retired mutation route returns 410 Gone even for an admin (env-only cutover).
+  await adminCheck('admin → POST /settings/admins → 410 (retired)', 'POST', '/api/admin/settings/admins', tokenAdmin, 410);
+  // No token → 401 from authenticateToken (never reaches the gate).
+  await adminCheck('no token → GET /settings/admins → 401', 'GET', '/api/admin/settings/admins', null, 401);
+  console.log('  admin-gate status distribution: ' + JSON.stringify(adminTally));
 
   console.log(`\n══════════  ${pass} passed, ${fail} failed  ══════════`);
   if (fails.length) { console.log('\nFAILURES:'); fails.forEach((f) => console.log('  ❌ ' + f)); }

@@ -11,7 +11,7 @@ const adminBackupsController = require('../controllers/adminBackupsController');
 const platformAdminController = require('../controllers/platformAdminController');
 const announcementController = require('../controllers/announcementController');
 
-// Admin gate (union of ADMIN_EMAILS env + SystemSettings.adminEmails; also blocks
+// Admin gate (env-only: ADMIN_EMAILS + ADMIN_EMAILS_2..5; also blocks
 // impersonated sessions). See middleware/validateAdmin.
 const validateAdmin = require('../middleware/validateAdmin');
 
@@ -24,9 +24,16 @@ router.post('/user-lookup', authenticateToken, adminController.userLookup);
 router.get('/stats', adminMiddleware, adminController.getDashboardStats);
 router.get('/settings', adminMiddleware, adminSettingsController.getSystemSettings);
 router.put('/settings', adminMiddleware, adminSettingsController.updateSystemSettings);
+// Admin identity is env-only (Phase 2): managed via ADMIN_EMAILS / ADMIN_EMAILS_2..5
+// in Railway. Listing stays read-only; the add/remove endpoints are retired (410).
 router.get('/settings/admins', adminMiddleware, adminSettingsController.listAdmins);
-router.post('/settings/admins', adminMiddleware, adminSettingsController.addAdmin);
-router.delete('/settings/admins/:email', adminMiddleware, adminSettingsController.removeAdmin);
+const adminEmailsGone = (req, res) =>
+  res.status(410).json({
+    error:
+      'Admin accounts are managed via Railway environment variables (ADMIN_EMAILS…ADMIN_EMAILS_5) and can no longer be changed here.',
+  });
+router.post('/settings/admins', adminMiddleware, adminEmailsGone);
+router.delete('/settings/admins/:email', adminMiddleware, adminEmailsGone);
 router.get('/backups', adminMiddleware, adminBackupsController.getBackups);
 router.post('/backups/run', adminMiddleware, adminBackupsController.runBackupNow);
 router.get('/sessions', adminMiddleware, adminSessionsController.listSessions);
@@ -74,6 +81,11 @@ router.put('/email-portal/triggers/:triggerId/default', adminMiddleware, emailPo
 const brandController = require('../controllers/brandController');
 router.get('/brand-configs', adminMiddleware, brandController.adminListBrandConfigs);
 router.put('/brand-configs/:orgId', adminMiddleware, brandController.adminUpdateBrandConfig);
+
+// ─── Admin audit log (Phase 15 — read/export the platform-admin trail) ──
+const adminAuditController = require('../controllers/adminAuditController');
+router.get('/audit-log', adminMiddleware, adminAuditController.listAuditLog);
+router.get('/audit-log/export', adminMiddleware, adminAuditController.exportAuditLog);
 
 // ─── Feedback routes ────────────────────────────────────────
 

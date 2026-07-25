@@ -14,7 +14,9 @@ const systemSettingsSchema = new mongoose.Schema(
       windowMs: { type: Number, default: null }, // null → built-in default (15 min)
       max: { type: Number, default: null }, // null → env-based default
     },
-    // DB-managed admin emails — union with the ADMIN_EMAILS env var (Phase 4)
+    // DEPRECATED (Phase 2): admin identity is now env-only (ADMIN_EMAILS +
+    // ADMIN_EMAILS_2..5). Field retained for backward compat with existing
+    // docs; no longer read by the admin gate.
     adminEmails: { type: [String], default: [] },
     backup: {
       directory: { type: String, default: null }, // null → <backend>/backups

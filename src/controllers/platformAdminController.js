@@ -14,6 +14,8 @@
 
 const platformAdminService = require('../services/platformAdminService');
 const impersonationService = require('../services/impersonationService');
+const adminAudit = require('../services/adminAuditService');
+const AUDIT = require('../services/adminAuditActions');
 
 const impersonationEnabled = () => process.env.IMPERSONATION_ENABLED === 'true';
 
@@ -70,6 +72,7 @@ const startImpersonation = async (req, res) => {
       const [status, message] = IMPERSONATE_ERRORS[result.error] || [400, 'Cannot start impersonation'];
       return res.status(status).json({ error: message });
     }
+    adminAudit.fromReq(req, { action: AUDIT.IMPERSONATE_START, targetType: 'impersonation', targetId: result.sessionId, meta: { orgId: req.params.orgId, targetEmail: result.target?.email } });
     res.json(result);
   } catch (error) {
     console.error('[admin] startImpersonation error:', error.message);
@@ -89,6 +92,7 @@ const stopImpersonation = async (req, res) => {
       const [status, message] = IMPERSONATE_ERRORS[result.error] || [400, 'Cannot stop impersonation'];
       return res.status(status).json({ error: message });
     }
+    adminAudit.fromReq(req, { action: AUDIT.IMPERSONATE_STOP, targetType: 'impersonation', targetId: req.params.sessionId });
     res.json(result);
   } catch (error) {
     console.error('[admin] stopImpersonation error:', error.message);

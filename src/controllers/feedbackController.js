@@ -140,11 +140,14 @@ const updateFeedback = async (req, res) => {
       update.adminRespondedAt = new Date();
     }
 
-    const fb = await Feedback.findByIdAndUpdate(id, update, { new: true });
+    // runValidators enforces the status enum (new/in_review/in_progress/
+    // resolved/closed) — findByIdAndUpdate skips schema validation by default.
+    const fb = await Feedback.findByIdAndUpdate(id, update, { new: true, runValidators: true });
     if (!fb) return res.status(404).json({ error: 'Feedback not found' });
 
     res.json({ success: true, feedback: fb });
   } catch (error) {
+    if (error.name === 'ValidationError') return res.status(400).json({ error: error.message });
     console.error('[feedback] updateFeedback error:', error.message);
     res.status(500).json({ error: 'Failed to update feedback' });
   }

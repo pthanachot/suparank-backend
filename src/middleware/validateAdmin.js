@@ -1,6 +1,6 @@
 /**
- * Platform-admin gate. Admin = union of the ADMIN_EMAILS env floor and the
- * DB-managed SystemSettings.adminEmails list (see utils/adminEmails). Deliberately
+ * Platform-admin gate. Admin = the ADMIN_EMAILS env vars only (ADMIN_EMAILS +
+ * ADMIN_EMAILS_2..5; see utils/adminEmails). Env-only since Phase 2. Deliberately
  * ignores req.user.roles — JWT role claims are stale until re-login.
  *
  * Phase 19B: also hard-blocks any IMPERSONATED session. An impersonation token

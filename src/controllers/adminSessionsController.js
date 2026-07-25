@@ -5,6 +5,8 @@
  */
 const Session = require('../models/Session');
 const User = require('../models/User');
+const adminAudit = require('../services/adminAuditService');
+const AUDIT = require('../services/adminAuditActions');
 
 const listSessions = async (req, res) => {
   try {
@@ -72,6 +74,7 @@ const revokeSession = async (req, res) => {
       ? session._id.toString() === req.user.sessionId.toString()
       : false;
     console.log(`[admin] Session ${session._id} revoked by ${req.user?.email}`);
+    adminAudit.fromReq(req, { action: AUDIT.SESSION_REVOKE, targetType: 'session', targetId: session._id, meta: { sessionUserId: String(session.userId) } });
     res.json({ success: true, isCurrentSession });
   } catch (error) {
     console.error('[admin] revokeSession error:', error.message);
@@ -91,6 +94,7 @@ const revokeAllUserSessions = async (req, res) => {
     // Bump tokenVersion so even tokens without a live session check die
     await user.invalidateTokens();
 
+    adminAudit.fromReq(req, { action: AUDIT.SESSION_REVOKE_ALL, targetType: 'user', targetId: user.userId, meta: { sessionsEnded: result.modifiedCount } });
     const affectsYou = req.user?.userId?.toString() === user._id.toString();
     console.log(
       `[admin] All sessions revoked for ${user.email} by ${req.user?.email} (${result.modifiedCount} session(s))`

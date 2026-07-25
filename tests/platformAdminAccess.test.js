@@ -63,6 +63,67 @@ describe('userLookup — impersonation cannot light up the admin shell', () => {
   });
 });
 
+describe('userLookup — env-only admin (Phase 2)', () => {
+  const User = require('../src/models/User');
+  const realFindById = User.findById;
+  const SLOTS = ['ADMIN_EMAILS', 'ADMIN_EMAILS_2', 'ADMIN_EMAILS_3', 'ADMIN_EMAILS_4', 'ADMIN_EMAILS_5'];
+  const saved = {};
+
+  // User.findById(id).select(...) → resolves to the given user (or null).
+  const stubUser = (user) => {
+    User.findById = () => ({ select: async () => user });
+  };
+
+  beforeEach(() => {
+    for (const s of SLOTS) {
+      saved[s] = process.env[s];
+      delete process.env[s];
+    }
+    process.env.ADMIN_EMAILS = 'boss@x.co';
+  });
+
+  afterEach(() => {
+    User.findById = realFindById;
+    for (const s of SLOTS) {
+      if (saved[s] === undefined) delete process.env[s];
+      else process.env[s] = saved[s];
+    }
+  });
+
+  it('valid:true for an env admin, with "admin" appended to roles', async () => {
+    stubUser({ _id: 'id1', userId: 1, email: 'boss@x.co', roles: [], status: 'active' });
+    const res = mockRes();
+    await adminController.userLookup({ user: { userId: 'id1' } }, res);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.valid, true);
+    assert.ok(res.body.user.roles.includes('admin'));
+  });
+
+  it('recognizes an admin in a non-first slot (ADMIN_EMAILS_3)', async () => {
+    process.env.ADMIN_EMAILS_3 = 'slot3@x.co';
+    stubUser({ _id: 'id2', userId: 2, email: 'slot3@x.co', roles: [], status: 'active' });
+    const res = mockRes();
+    await adminController.userLookup({ user: { userId: 'id2' } }, res);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.valid, true);
+  });
+
+  it('403s a user with an admin ROLE but no env slot (role claims are not honored)', async () => {
+    stubUser({ _id: 'id3', userId: 3, email: 'roleonly@x.co', roles: ['admin', 'super_admin'], status: 'active' });
+    const res = mockRes();
+    await adminController.userLookup({ user: { userId: 'id3' } }, res);
+    assert.equal(res.statusCode, 403);
+    assert.equal(res.body.valid, false);
+  });
+
+  it('403s a non-active env admin', async () => {
+    stubUser({ _id: 'id4', userId: 4, email: 'boss@x.co', roles: [], status: 'suspended' });
+    const res = mockRes();
+    await adminController.userLookup({ user: { userId: 'id4' } }, res);
+    assert.equal(res.statusCode, 403);
+  });
+});
+
 describe('impersonation opt-in gate + error mapping', () => {
   const real = {};
   beforeEach(() => {

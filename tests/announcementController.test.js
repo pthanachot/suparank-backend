@@ -53,10 +53,13 @@ afterEach(() => {
 });
 
 describe('isSafePath', () => {
-  it('accepts a relative path, rejects absolute and protocol-relative', () => {
+  it('accepts a relative path, rejects absolute, protocol-relative, and backslash bypasses', () => {
     assert.equal(controller.isSafePath('/workspace/1/x'), true);
     assert.equal(controller.isSafePath('https://evil.com'), false);
     assert.equal(controller.isSafePath('//evil.com'), false);
+    // Backslash variants some browsers normalize to //evil.com — must be rejected.
+    assert.equal(controller.isSafePath('/\\evil.com'), false);
+    assert.equal(controller.isSafePath('/\\/evil.com'), false);
   });
 });
 

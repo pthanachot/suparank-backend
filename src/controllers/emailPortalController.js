@@ -7,6 +7,8 @@ const EmailTemplate = require('../models/EmailTemplate');
 const EmailSendLog = require('../models/EmailSendLog');
 const TriggerableEmailTemplate = require('../models/TriggerableEmailTemplate');
 const { sendEmail } = require('../utils/emailService');
+const adminAudit = require('../services/adminAuditService');
+const AUDIT = require('../services/adminAuditActions');
 // Called via module property (not destructured) so tests can stub them.
 const flagService = require('../services/flagService');
 const brandService = require('../services/brandService');
@@ -600,6 +602,7 @@ const sendBulkEmails = async (req, res) => {
       failedRecipients,
     });
 
+    adminAudit.fromReq(req, { action: AUDIT.EMAIL_SEND, targetType: 'email', targetId: null, meta: { subject, recipientCount: recipients.length, successCount, failedCount } });
     res.json({
       summary: {
         queued: successCount,
@@ -717,6 +720,7 @@ const saveTemplate = async (req, res) => {
       createdBy: req.user?.email || 'admin',
     });
 
+    adminAudit.fromReq(req, { action: AUDIT.EMAIL_TEMPLATE_SAVE, targetType: 'email', targetId: template._id, meta: { name } });
     res.status(201).json({ template });
   } catch (error) {
     console.error('[emailPortal] saveTemplate error:', error.message);
@@ -727,7 +731,9 @@ const saveTemplate = async (req, res) => {
 const deleteTemplate = async (req, res) => {
   try {
     const { id } = req.params;
-    await EmailTemplate.findByIdAndDelete(id);
+    const deleted = await EmailTemplate.findByIdAndDelete(id);
+    if (!deleted) return res.status(404).json({ error: 'Template not found' });
+    adminAudit.fromReq(req, { action: AUDIT.EMAIL_TEMPLATE_DELETE, targetType: 'email', targetId: id });
     res.json({ success: true });
   } catch (error) {
     console.error('[emailPortal] deleteTemplate error:', error.message);
@@ -822,6 +828,7 @@ const updateDefaultTemplate = async (req, res) => {
       { upsert: true, new: true }
     );
 
+    adminAudit.fromReq(req, { action: AUDIT.EMAIL_DEFAULT_UPDATE, targetType: 'email', targetId: triggerId, meta: { reset: !!reset } });
     res.json({
       success: true,
       message: reset ? 'Default template reset to original' : 'Default template saved',

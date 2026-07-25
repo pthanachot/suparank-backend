@@ -2,6 +2,8 @@ const Announcement = require('../models/Announcement');
 const User = require('../models/User');
 const OrgMember = require('../models/OrgMember');
 const WorkspaceMember = require('../models/WorkspaceMember');
+const adminAudit = require('../services/adminAuditService');
+const AUDIT = require('../services/adminAuditActions');
 
 // Admin authoring for platform announcements (the "Notifications" tab). v1 only
 // creates PLATFORM-scope, PRODUCT-class announcements; tenant-owner authoring and
@@ -12,7 +14,10 @@ const WorkspaceMember = require('../models/WorkspaceMember');
 // eventually authored by tenant owners) — the bell also re-checks this, but we
 // reject at the source too.
 function isSafePath(link) {
-  return link.startsWith('/') && !link.startsWith('//');
+  // Same-origin absolute path only. Reject protocol-relative (//host) AND the
+  // backslash variant (/\host), which some browsers normalize to //host — both
+  // are open-redirect surfaces once rendered in the bell.
+  return link.startsWith('/') && !/^\/[/\\]/.test(link);
 }
 
 // Coarse reach estimate at publish time. v1 audience = the platform: active
@@ -68,6 +73,7 @@ const createAnnouncement = async (req, res) => {
       audienceCount,
     });
 
+    adminAudit.fromReq(req, { action: AUDIT.ANNOUNCEMENT_CREATE, targetType: 'announcement', targetId: announcement._id, meta: { title: announcement.title } });
     res.status(201).json({ announcement, audienceCount });
   } catch (err) {
     // A schema violation (over-length title/body, bad enum) is the caller's
@@ -141,6 +147,7 @@ const updateAnnouncement = async (req, res) => {
       { new: true, runValidators: true }
     );
     if (!announcement) return res.status(404).json({ error: 'Announcement not found' });
+    adminAudit.fromReq(req, { action: AUDIT.ANNOUNCEMENT_UPDATE, targetType: 'announcement', targetId: req.params.id, meta: { changed: Object.keys(update) } });
     res.json({ announcement });
   } catch (err) {
     if (err.name === 'ValidationError') return res.status(400).json({ error: err.message });

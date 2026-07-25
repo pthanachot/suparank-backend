@@ -38,18 +38,23 @@ const User = require('../src/models/User');
 
 const realFind = User.find;
 const realExists = User.exists;
-const REAL_ADMIN_EMAILS = process.env.ADMIN_EMAILS;
+// Admin identity is env-only (Phase 2) across all five Railway slots.
+const SLOTS = ['ADMIN_EMAILS', 'ADMIN_EMAILS_2', 'ADMIN_EMAILS_3', 'ADMIN_EMAILS_4', 'ADMIN_EMAILS_5'];
+const REAL_SLOTS = Object.fromEntries(SLOTS.map((s) => [s, process.env[s]]));
 
 after(() => {
   User.find = realFind;
   User.exists = realExists;
-  if (REAL_ADMIN_EMAILS === undefined) delete process.env.ADMIN_EMAILS;
-  else process.env.ADMIN_EMAILS = REAL_ADMIN_EMAILS;
+  for (const s of SLOTS) {
+    if (REAL_SLOTS[s] === undefined) delete process.env[s];
+    else process.env[s] = REAL_SLOTS[s];
+  }
 });
 
 beforeEach(() => {
   state.settings.adminEmails = [];
   state.updateCalls = [];
+  for (const s of SLOTS) delete process.env[s];
   process.env.ADMIN_EMAILS = 'root@suparank.ai';
   User.find = () => ({ select: () => ({ lean: async () => [] }) });
   User.exists = async () => true;
@@ -124,95 +129,34 @@ describe('updateSystemSettings validation', () => {
 
 // ── Admin accounts ─────────────────────────────────────────────
 
-describe('listAdmins', () => {
-  it('dedupes env/db overlap, flags locked and isYou', async () => {
+describe('listAdmins (env-only, read-only)', () => {
+  it('lists every env slot as a locked env admin, deduped, with isYou', async () => {
     process.env.ADMIN_EMAILS = 'root@suparank.ai, Shared@x.com';
-    state.settings.adminEmails = ['shared@x.com', 'extra@x.com'];
-    const req = asAdmin('extra@x.com');
+    process.env.ADMIN_EMAILS_2 = 'shared@x.com'; // duplicate across slots collapses
+    process.env.ADMIN_EMAILS_4 = 'extra@x.com';
     const res = mockRes();
-    await controller.listAdmins(req, res);
+    await controller.listAdmins(asAdmin('extra@x.com'), res);
     assert.equal(res.statusCode, 200);
     const byEmail = Object.fromEntries(res.body.admins.map((a) => [a.email, a]));
     assert.equal(res.body.admins.length, 3, 'shared@x.com must not appear twice');
     assert.equal(byEmail['root@suparank.ai'].locked, true);
+    assert.equal(byEmail['root@suparank.ai'].source, 'env');
     assert.equal(byEmail['shared@x.com'].source, 'env');
-    assert.equal(byEmail['extra@x.com'].locked, false);
     assert.equal(byEmail['extra@x.com'].isYou, true);
   });
-});
 
-describe('addAdmin', () => {
-  async function add(email, actor = 'root@suparank.ai') {
-    const req = { ...asAdmin(actor), body: { email } };
+  it('ignores the deprecated DB adminEmails list entirely', async () => {
+    process.env.ADMIN_EMAILS = 'env@x.com';
+    state.settings.adminEmails = ['legacy-db@x.com'];
     const res = mockRes();
-    await controller.addAdmin(req, res);
-    return res;
-  }
-
-  it('rejects malformed emails', async () => {
-    assert.equal((await add('not-an-email')).statusCode, 400);
-    assert.equal((await add('')).statusCode, 400);
+    await controller.listAdmins(asAdmin('env@x.com'), res);
+    const emails = res.body.admins.map((a) => a.email);
+    assert.deepEqual(emails, ['env@x.com']);
+    assert.ok(!emails.includes('legacy-db@x.com'), 'DB list must no longer appear');
   });
 
-  it('409s on duplicates (env or db, case-insensitive)', async () => {
-    assert.equal((await add('ROOT@suparank.ai')).statusCode, 409);
-    state.settings.adminEmails = ['dup@x.com'];
-    assert.equal((await add('Dup@X.com')).statusCode, 409);
-  });
-
-  it('appends to the db list on success', async () => {
-    state.settings.adminEmails = ['a@x.com'];
-    const res = await add('New@X.com');
-    assert.equal(res.statusCode, 200);
-    assert.deepEqual(state.updateCalls[0], { adminEmails: ['a@x.com', 'new@x.com'] });
-  });
-});
-
-describe('removeAdmin guardrails', () => {
-  async function remove(email, { actor = 'root@suparank.ai', confirm = false } = {}) {
-    const req = {
-      ...asAdmin(actor),
-      params: { email },
-      query: confirm ? { confirm: 'true' } : {},
-    };
-    const res = mockRes();
-    await controller.removeAdmin(req, res);
-    return res;
-  }
-
-  it('refuses to remove env-managed admins (403)', async () => {
-    const res = await remove('root@suparank.ai');
-    assert.equal(res.statusCode, 403);
-    assert.equal(state.updateCalls.length, 0);
-  });
-
-  it('404s for unknown admins', async () => {
-    assert.equal((await remove('ghost@x.com')).statusCode, 404);
-  });
-
-  it('blocks removing the last admin when the env floor is empty', async () => {
-    process.env.ADMIN_EMAILS = '';
-    state.settings.adminEmails = ['only@x.com'];
-    const res = await remove('only@x.com', { actor: 'only@x.com', confirm: true });
-    assert.equal(res.statusCode, 400);
-    assert.match(res.body.error, /last admin/i);
-  });
-
-  it('requires ?confirm=true for self-removal', async () => {
-    state.settings.adminEmails = ['me@x.com'];
-    const denied = await remove('me@x.com', { actor: 'me@x.com' });
-    assert.equal(denied.statusCode, 400);
-    assert.match(denied.body.error, /confirm=true/);
-
-    const allowed = await remove('me@x.com', { actor: 'me@x.com', confirm: true });
-    assert.equal(allowed.statusCode, 200);
-    assert.deepEqual(state.updateCalls[0], { adminEmails: [] });
-  });
-
-  it('removes another db admin without ceremony', async () => {
-    state.settings.adminEmails = ['a@x.com', 'b@x.com'];
-    const res = await remove('a@x.com');
-    assert.equal(res.statusCode, 200);
-    assert.deepEqual(state.updateCalls[0], { adminEmails: ['b@x.com'] });
+  it('no longer exposes add/remove handlers', () => {
+    assert.equal(typeof controller.addAdmin, 'undefined');
+    assert.equal(typeof controller.removeAdmin, 'undefined');
   });
 });

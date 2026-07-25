@@ -154,23 +154,10 @@ if (!process.env.STRIPE_CONNECT_WEBHOOK_SECRET) {
   console.warn('[boot] STRIPE_CONNECT_WEBHOOK_SECRET is not set — Connect (SaaS mode) webhooks will reject all events until it is configured.');
 }
 
-// Maintenance mode gate. Exemptions: /api/auth (admins must be able to log
-// in), /api/admin (the dashboard, including the toggle to turn this off),
-// /api/internal (server-to-server engine traffic), /health. Stripe webhooks
-// are mounted above this middleware so they bypass it entirely.
-app.use((req, res, next) => {
-  if (!systemSettingsService.getSettings().maintenanceMode) return next();
-  const url = req.originalUrl;
-  if (
-    url.startsWith('/api/auth') ||
-    url.startsWith('/api/admin') ||
-    url.startsWith('/api/internal') ||
-    url.startsWith('/health')
-  ) {
-    return next();
-  }
-  return res.status(503).json({ error: 'SupaRank is undergoing maintenance. Please try again shortly.' });
-});
+// Maintenance mode gate — see middleware/maintenanceGate. Exempts /api/auth,
+// /api/admin, /api/internal, /health so admins can always log in and toggle it
+// off. Stripe webhooks are mounted above this middleware and bypass it entirely.
+app.use(require('./middleware/maintenanceGate'));
 
 // Body parsing
 app.use(express.json({ limit: '10mb' }));

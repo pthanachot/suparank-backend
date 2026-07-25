@@ -4,6 +4,8 @@
  * UI polls the list until the running record settles.
  */
 const backupService = require('../services/backupService');
+const adminAudit = require('../services/adminAuditService');
+const AUDIT = require('../services/adminAuditActions');
 
 const getBackups = async (req, res) => {
   try {
@@ -29,6 +31,7 @@ const runBackupNow = async (req, res) => {
       .runBackup(req.user?.email || 'admin')
       .catch((err) => console.error('[admin] background backup error:', err.message));
     console.log(`[admin] Backup triggered by ${req.user?.email}`);
+    adminAudit.fromReq(req, { action: AUDIT.BACKUP_RUN, targetType: 'system', targetId: 'backup' });
     res.status(202).json({ started: true });
   } catch (error) {
     console.error('[admin] runBackupNow error:', error.message);

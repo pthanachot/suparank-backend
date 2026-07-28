@@ -155,6 +155,15 @@ function makeUsageTap() {
   let lastFullText = '';
   let turns = 0;
   let steeringApplied = false;
+  // UX-2 Phase 2 (reload consistency): the engine's completion carries the
+  // model's closing message (finalText). For COMMENTARY-mode runs (agent/
+  // sequential — no text_delta ever streams) the live FE renders exactly that
+  // as the reply bubble, so the thread must record the same text or a reload
+  // would swap the bubble for the joined working narration. Chat runs stream
+  // text_delta into the transcript live, so THEIR record stays the joined
+  // deltas — sawTextDelta picks the branch.
+  let completionFinalText = '';
+  let sawTextDelta = false;
   return {
     addChunk(buf) {
       buffer += buf.toString('utf8');
@@ -168,6 +177,7 @@ function makeUsageTap() {
           const ev = JSON.parse(data);
           if (ev && (ev.type === 'text_delta' || ev.type === 'agent_commentary') && typeof ev.textDelta === 'string') {
             currentSegment += ev.textDelta;
+            if (ev.type === 'text_delta') sawTextDelta = true;
           } else if (ev && ev.type === 'steering_applied') {
             steeringApplied = true;
           }
@@ -176,6 +186,13 @@ function makeUsageTap() {
           }
           if (ev && ev.type === 'complete' && ev.completion && typeof ev.completion.stopReason === 'string') {
             stopReason = ev.completion.stopReason;
+            // UX-2: capture the closing message only from clean "done" stops —
+            // mirrors the FE's display gate (on truncation/stale exits the
+            // engine's finalText may be mid-work narration).
+            if (ev.completion.stopReason === 'done'
+                && typeof ev.completion.finalText === 'string' && ev.completion.finalText.trim()) {
+              completionFinalText = ev.completion.finalText.trim();
+            }
           }
           // Review (capture BUG-1/BUG-4): the engine emits exactly ONE usage
           // event per successful turn, AFTER that turn's text — the only true
@@ -230,6 +247,11 @@ function makeUsageTap() {
     // segments collapse to one — a nudged model re-stating its answer verbatim
     // must not persist the duplicate into the thread it will be re-seeded from.
     finalAssistantText() {
+      // UX-2 Phase 2: commentary-mode runs record the closing message the
+      // live bubble showed — not the joined narration (which the FE keeps
+      // session-only behind the "Working" toggle). Chat runs (sawTextDelta)
+      // keep the full joined deltas: their live transcript showed all of it.
+      if (completionFinalText && !sawTextDelta) return completionFinalText;
       const all = [...segments];
       if (currentSegment.trim()) all.push(currentSegment.trim());
       const deduped = all.filter((seg, i) => i === 0 || seg !== all[i - 1]);

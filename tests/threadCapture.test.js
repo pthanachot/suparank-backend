@@ -100,6 +100,40 @@ test('tap falls back to complete.fullText only when no deltas were seen, and nev
   assert.strictEqual(t2.finalAssistantText(), '', 'engine-synthesized "Cancelled" is not assistant text');
 });
 
+// ─── UX-2 Phase 2: completion.finalText (reload consistency) ─
+
+test('commentary-mode run records the closing message, not the joined narration', () => {
+  const tap = aiController.makeUsageTap();
+  tap.addChunk(sse({ type: 'agent_commentary', textDelta: 'Reading the doc first.' }));
+  tap.addChunk(sse({ type: 'usage', usage: { input_tokens: 10, output_tokens: 5 } }));
+  tap.addChunk(sse({ type: 'agent_commentary', textDelta: 'All set — intro rewritten and tightened.' }));
+  tap.addChunk(sse({ type: 'complete', completion: { stopReason: 'done', finalText: 'All set — intro rewritten and tightened.' } }));
+  // The live FE bubble shows finalText; the thread must match it, or a reload
+  // swaps the reply for the working narration.
+  assert.strictEqual(tap.finalAssistantText(), 'All set — intro rewritten and tightened.');
+});
+
+test('chat runs (text_delta seen) keep the full joined deltas over finalText', () => {
+  const tap = aiController.makeUsageTap();
+  tap.addChunk(sse({ type: 'text_delta', textDelta: 'First paragraph of the reply.' }));
+  tap.addChunk(sse({ type: 'usage', usage: { input_tokens: 10, output_tokens: 5 } }));
+  tap.addChunk(sse({ type: 'text_delta', textDelta: 'Second turn of the reply.' }));
+  tap.addChunk(sse({ type: 'complete', completion: { stopReason: 'done', finalText: 'Second turn of the reply.' } }));
+  assert.strictEqual(
+    tap.finalAssistantText(),
+    'First paragraph of the reply.\n\nSecond turn of the reply.',
+    'the live chat transcript showed every delta — the record must too',
+  );
+});
+
+test('finalText on a non-done stop is ignored (mirrors the FE display gate)', () => {
+  const tap = aiController.makeUsageTap();
+  tap.addChunk(sse({ type: 'agent_commentary', textDelta: 'Now I will rewrite section 3…' }));
+  tap.addChunk(sse({ type: 'complete', completion: { stopReason: 'stale', finalText: 'Now I will rewrite section 3…' } }));
+  assert.strictEqual(tap.finalAssistantText(), 'Now I will rewrite section 3…',
+    'falls through to the joined segments, not the finalText preference');
+});
+
 test('tap surfaces steering_applied', () => {
   const tap = aiController.makeUsageTap();
   assert.strictEqual(tap.steeringWasApplied(), false);

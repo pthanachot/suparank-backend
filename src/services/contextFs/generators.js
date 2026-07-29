@@ -203,6 +203,39 @@ function genKeywordSecondary({ content, params }) {
 
 // ─── /competitors/{domain}.md ────────────────────────────────────────
 
+/**
+ * Render a competitor's crawled heading structure.
+ *
+ * Two collections describe competitors and only one has the outline:
+ * `content.competitors` is SERP metadata (url/title/position/keywords) and is
+ * what the CFS iterates; `content.competitorPages` is the crawl result and
+ * carries h1s/h2s/h3s. Joined on url — the only field both share.
+ *
+ * Says so plainly when a page was not crawled, so an empty section reads as
+ * "we don't have this" rather than "this competitor has no structure".
+ */
+function competitorOutline(content, match) {
+  const pages = Array.isArray(content.competitorPages) ? content.competitorPages : [];
+  const page = match.url ? pages.find((p) => p && p.url === match.url) : null;
+  if (!page) {
+    return '_This page was not crawled — no heading data. Use the competitors that were._';
+  }
+  const lines = [];
+  const add = (arr, prefix, cap) => {
+    (Array.isArray(arr) ? arr : []).slice(0, cap).forEach((h) => {
+      const t = String(h || '').trim();
+      if (t) lines.push(`${prefix}${t}`);
+    });
+  };
+  add(page.h1s, '# ', 3);
+  add(page.h2s, '## ', 25);
+  add(page.h3s, '### ', 25);
+  if (lines.length === 0) {
+    return '_Crawled, but no headings were extracted._';
+  }
+  return lines.join('\n');
+}
+
 function genCompetitor({ content, params }) {
   const competitors = Array.isArray(content.competitors) ? content.competitors : [];
   const requested = params && params.slug;
@@ -225,6 +258,17 @@ function genCompetitor({ content, params }) {
         `- **Word count**: ${match.wordCount || 'not measured'}`,
         `- **Selected for analysis**: ${match.selected ? 'yes' : 'no'}`,
       ].join('\n'),
+    },
+    {
+      id: 'outline',
+      label: 'Their actual page outline',
+      // The headings live on content.competitorPages (crawled), NOT on
+      // content.competitors (SERP metadata). They were already rendered for
+      // the freeform flow via buildResearchOutlineMd's "Competitor Headings"
+      // and never reached plan mode, which asked the model to differentiate
+      // against pages it could not see — 38 headings across 5 crawled pages
+      // sat unread while it searched the web instead. Joined on url.
+      body: competitorOutline(content, match),
     },
     {
       id: 'keywords',

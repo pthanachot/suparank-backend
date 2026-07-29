@@ -229,6 +229,15 @@ const patch = async (req, res) => {
     // Apply patch to a plain object copy, then assign back. Mongoose Mixed
     // fields (evidenceMap) need markModified to persist.
     const pojo = plan.toObject();
+    // evidenceMap is declared `{ type: Mixed, default: {} }`, but Mongoose's
+    // `minimize` (on by default) STRIPS empty objects on save — so the default
+    // is applied in memory, dropped on write, and comes back `undefined`. Every
+    // `add /evidenceMap/<sectionId>` then failed with "parent is null/undefined"
+    // (jsonPatch requires an existing parent), which is a hard block: plan mode
+    // requires evidence on key points, so the agent could never land a section.
+    // Observed live as 26 turns of identical 400s and a plan with 0 sections.
+    // Materialise the parent here, at the only place that patches it.
+    if (!pojo.evidenceMap || typeof pojo.evidenceMap !== 'object') pojo.evidenceMap = {};
     try {
       applyPatch(pojo, ops);
     } catch (patchErr) {

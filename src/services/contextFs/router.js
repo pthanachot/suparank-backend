@@ -103,8 +103,28 @@ function list({ content, planContext }, prefix = '/') {
 
   // Competitors — disambiguate slug collisions (Bug 9 fix)
   const competitors = Array.isArray(content.competitors) ? content.competitors : [];
+  // Which of them were actually crawled, and how big their outline is. The
+  // description is the ONLY thing a model sees without opening the file, and
+  // measured behaviour is that it lists and never reads — so the listing has
+  // to advertise that an outline is in there, or the richest data in the
+  // workspace stays invisible.
+  const crawled = new Map(
+    (Array.isArray(content.competitorPages) ? content.competitorPages : [])
+      .filter((p) => p && p.url)
+      .map((p) => [p.url, (p.h2s || []).length + (p.h1s || []).length]),
+  );
   slug.assignUniqueSlugs(competitors, slug.competitorSlug).forEach(({ item: c, slug: s }) => {
-    if (s) push(`/competitors/${s}.md`, 'competitor', `Competitor: ${c.title || c.url || 'unknown'}`, 1);
+    if (!s) return;
+    const headings = crawled.get(c.url) || 0;
+    const label = `Competitor: ${c.title || c.url || 'unknown'}`;
+    push(
+      `/competitors/${s}.md`,
+      'competitor',
+      headings > 0 ? `${label} — full outline, ${headings} headings` : label,
+      // Crawled competitors outrank un-crawled ones: an outline is worth more
+      // to a planner than SERP metadata.
+      headings > 0 ? 1 : 2,
+    );
   });
 
   // Subtopics — disambiguate slug collisions

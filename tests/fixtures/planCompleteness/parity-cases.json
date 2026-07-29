@@ -1,0 +1,290 @@
+{
+  "_comment": [
+    "Shared parity cases for the plan completeness validator.",
+    "",
+    "planValidator.js (Express, authoritative gate at /plan/approve) and",
+    "plan_completeness.go (engine, in-loop feedback every turn) are hand-mirrored",
+    "implementations of one rule set. Nothing in either language forces them to",
+    "agree, and when they drift the failure is nasty in both directions: the",
+    "in-loop feedback says the plan is done while Express rejects it, or the model",
+    "burns turns chasing a bar Express never enforced.",
+    "",
+    "Every case below pins the EXACT set of rule ids both must produce. A change",
+    "to either implementation that is not made in the other fails here.",
+    "",
+    "This file is duplicated at writing-engine/internal/engine/testdata/",
+    "parity-cases.json because the two live in separate git repos and neither can",
+    "read the other's tree in CI. Edit both, or the copies drift and the test",
+    "silently stops comparing anything.",
+    "",
+    "Briefs are given as targetWordCount only; section word targets sum to it so",
+    "the wordBudget rule never fires and pollutes the expected sets."
+  ],
+  "brief": { "targetWordCount": 1000 },
+  "cases": [
+    {
+      "name": "complete plan passes",
+      "expectedRules": [],
+      "plan": {
+        "targetAudience": "a", "angle": "b", "thesis": "c",
+        "alternatives": [{ "label": "A", "chosen": false }, { "label": "B", "chosen": true, "reason": "r" }],
+        "risks": [{ "description": "r" }],
+        "sections": [
+          { "id": "s1", "heading": "One", "headingLevel": 2, "wordTarget": 300,
+            "keyPoints": [
+              { "text": "k1", "evidence": [{ "path": "/competitors/a.md", "quote": "q1", "reason": "r" }] },
+              { "text": "k2", "evidence": [{ "path": "/subtopics/b.md", "quote": "q2", "reason": "r" }] }
+            ] },
+          { "id": "s2", "heading": "Two", "headingLevel": 2, "wordTarget": 300,
+            "keyPoints": [
+              { "text": "k3", "evidence": [{ "path": "/competitors/a.md", "quote": "q3", "reason": "r" }] },
+              { "text": "k4", "evidence": [{ "path": "/keywords/primary.md", "quote": "q4", "reason": "r" }] }
+            ] },
+          { "id": "s3", "heading": "Three", "headingLevel": 2, "wordTarget": 400,
+            "keyPoints": [
+              { "text": "k5", "evidence": [{ "path": "/subtopics/b.md", "quote": "q5", "reason": "r" }] },
+              { "text": "k6", "evidence": [{ "path": "/competitors/a.md", "quote": "q6", "reason": "r" }] }
+            ] }
+        ]
+      }
+    },
+    {
+      "name": "a section resting on one citation fails the density floor",
+      "expectedRules": ["sections[1].evidence.density"],
+      "plan": {
+        "targetAudience": "a", "angle": "b", "thesis": "c",
+        "alternatives": [{ "label": "A", "chosen": false }, { "label": "B", "chosen": true, "reason": "r" }],
+        "risks": [{ "description": "r" }],
+        "sections": [
+          { "id": "s1", "heading": "One", "headingLevel": 2, "wordTarget": 300,
+            "keyPoints": [
+              { "text": "k1", "evidence": [{ "path": "/competitors/a.md", "quote": "q1", "reason": "r" }] },
+              { "text": "k2", "evidence": [{ "path": "/subtopics/b.md", "quote": "q2", "reason": "r" }] }
+            ] },
+          { "id": "s2", "heading": "Two", "headingLevel": 2, "wordTarget": 300,
+            "keyPoints": [
+              { "text": "k3", "evidence": [{ "path": "/competitors/a.md", "quote": "q3", "reason": "r" }] }
+            ] },
+          { "id": "s3", "heading": "Three", "headingLevel": 2, "wordTarget": 400,
+            "keyPoints": [
+              { "text": "k5", "evidence": [{ "path": "/subtopics/b.md", "quote": "q5", "reason": "r" }] },
+              { "text": "k6", "evidence": [{ "path": "/competitors/a.md", "quote": "q6", "reason": "r" }] }
+            ] }
+        ]
+      }
+    },
+    {
+      "name": "evidenceMap refs count toward the per-section floor",
+      "expectedRules": [],
+      "plan": {
+        "targetAudience": "a", "angle": "b", "thesis": "c",
+        "alternatives": [{ "label": "A", "chosen": false }, { "label": "B", "chosen": true, "reason": "r" }],
+        "risks": [{ "description": "r" }],
+        "evidenceMap": { "s2": [{ "path": "/keywords/primary.md", "quote": "qm", "reason": "section-level" }] },
+        "sections": [
+          { "id": "s1", "heading": "One", "headingLevel": 2, "wordTarget": 300,
+            "keyPoints": [
+              { "text": "k1", "evidence": [{ "path": "/competitors/a.md", "quote": "q1", "reason": "r" }] },
+              { "text": "k2", "evidence": [{ "path": "/subtopics/b.md", "quote": "q2", "reason": "r" }] }
+            ] },
+          { "id": "s2", "heading": "Two", "headingLevel": 2, "wordTarget": 300,
+            "keyPoints": [
+              { "text": "k3", "evidence": [{ "path": "/competitors/a.md", "quote": "q3", "reason": "r" }] }
+            ] },
+          { "id": "s3", "heading": "Three", "headingLevel": 2, "wordTarget": 400,
+            "keyPoints": [
+              { "text": "k5", "evidence": [{ "path": "/subtopics/b.md", "quote": "q5", "reason": "r" }] },
+              { "text": "k6", "evidence": [{ "path": "/competitors/a.md", "quote": "q6", "reason": "r" }] }
+            ] }
+        ]
+      }
+    },
+    {
+      "name": "an evidenceMap entry keyed to a section with no id cannot be matched",
+      "expectedRules": ["sections[1].evidence.density"],
+      "_note": [
+        "Documents a real limitation rather than asserting desired behaviour:",
+        "per-section counting joins on section.id, so refs parked under a key that",
+        "matches no section id are invisible to the floor even though the plan",
+        "does carry them. Section ids are required by the model and the JSON Patch",
+        "whitelist, so this should not arise — but if it ever does, the failure is",
+        "unsatisfiable-looking and this case is the explanation."
+      ],
+      "plan": {
+        "targetAudience": "a", "angle": "b", "thesis": "c",
+        "alternatives": [{ "label": "A", "chosen": false }, { "label": "B", "chosen": true, "reason": "r" }],
+        "risks": [{ "description": "r" }],
+        "evidenceMap": { "not-a-section-id": [{ "path": "/keywords/primary.md", "quote": "qm", "reason": "orphan" }] },
+        "sections": [
+          { "id": "s1", "heading": "One", "headingLevel": 2, "wordTarget": 300,
+            "keyPoints": [
+              { "text": "k1", "evidence": [{ "path": "/competitors/a.md", "quote": "q1", "reason": "r" }] },
+              { "text": "k2", "evidence": [{ "path": "/subtopics/b.md", "quote": "q2", "reason": "r" }] }
+            ] },
+          { "id": "s2", "heading": "Two", "headingLevel": 2, "wordTarget": 300,
+            "keyPoints": [
+              { "text": "k3", "evidence": [{ "path": "/competitors/a.md", "quote": "q3", "reason": "r" }] }
+            ] },
+          { "id": "s3", "heading": "Three", "headingLevel": 2, "wordTarget": 400,
+            "keyPoints": [
+              { "text": "k5", "evidence": [{ "path": "/subtopics/b.md", "quote": "q5", "reason": "r" }] },
+              { "text": "k6", "evidence": [{ "path": "/competitors/a.md", "quote": "q6", "reason": "r" }] }
+            ] }
+        ]
+      }
+    },
+    {
+      "name": "citing one file everywhere fails source breadth",
+      "expectedRules": ["evidence.sources"],
+      "plan": {
+        "targetAudience": "a", "angle": "b", "thesis": "c",
+        "alternatives": [{ "label": "A", "chosen": false }, { "label": "B", "chosen": true, "reason": "r" }],
+        "risks": [{ "description": "r" }],
+        "sections": [
+          { "id": "s1", "heading": "One", "headingLevel": 2, "wordTarget": 300,
+            "keyPoints": [
+              { "text": "k1", "evidence": [{ "path": "/competitors/a.md", "quote": "q1", "reason": "r" }] },
+              { "text": "k2", "evidence": [{ "path": "/competitors/a.md", "quote": "q2", "reason": "r" }] }
+            ] },
+          { "id": "s2", "heading": "Two", "headingLevel": 2, "wordTarget": 300,
+            "keyPoints": [
+              { "text": "k3", "evidence": [{ "path": "/competitors/a.md", "quote": "q3", "reason": "r" }] },
+              { "text": "k4", "evidence": [{ "path": "/competitors/a.md", "quote": "q4", "reason": "r" }] }
+            ] },
+          { "id": "s3", "heading": "Three", "headingLevel": 2, "wordTarget": 400,
+            "keyPoints": [
+              { "text": "k5", "evidence": [{ "path": "/competitors/a.md", "quote": "q5", "reason": "r" }] },
+              { "text": "k6", "evidence": [{ "path": "/competitors/a.md", "quote": "q6", "reason": "r" }] }
+            ] }
+        ]
+      }
+    },
+    {
+      "name": "fast-plan shape: empty key points get ONE complaint, not two",
+      "expectedRules": ["sections[0].keyPoints", "sections[1].keyPoints", "sections[2].keyPoints"],
+      "_note": [
+        "The engine's fast-plan pre-allocates every section with keyPoints: [].",
+        "Density must defer to the more specific keyPoints failure — otherwise a",
+        "ten-section fast plan opens with twenty items in the feedback list",
+        "instead of ten, on the turn where it is already longest."
+      ],
+      "plan": {
+        "targetAudience": "a", "angle": "b", "thesis": "c",
+        "alternatives": [{ "label": "A", "chosen": false }, { "label": "B", "chosen": true, "reason": "r" }],
+        "risks": [{ "description": "r" }],
+        "sections": [
+          { "id": "s1", "heading": "One", "headingLevel": 2, "wordTarget": 300, "keyPoints": [] },
+          { "id": "s2", "heading": "Two", "headingLevel": 2, "wordTarget": 300, "keyPoints": [] },
+          { "id": "s3", "heading": "Three", "headingLevel": 2, "wordTarget": 400, "keyPoints": [] }
+        ]
+      }
+    },
+    {
+      "name": "a key point with no evidence gets ONE complaint, not two",
+      "expectedRules": ["sections[1].keyPoints[0].evidence"],
+      "plan": {
+        "targetAudience": "a", "angle": "b", "thesis": "c",
+        "alternatives": [{ "label": "A", "chosen": false }, { "label": "B", "chosen": true, "reason": "r" }],
+        "risks": [{ "description": "r" }],
+        "sections": [
+          { "id": "s1", "heading": "One", "headingLevel": 2, "wordTarget": 300,
+            "keyPoints": [
+              { "text": "k1", "evidence": [{ "path": "/competitors/a.md", "quote": "q1", "reason": "r" }] },
+              { "text": "k2", "evidence": [{ "path": "/subtopics/b.md", "quote": "q2", "reason": "r" }] }
+            ] },
+          { "id": "s2", "heading": "Two", "headingLevel": 2, "wordTarget": 300,
+            "keyPoints": [{ "text": "k3", "evidence": [] }] },
+          { "id": "s3", "heading": "Three", "headingLevel": 2, "wordTarget": 400,
+            "keyPoints": [
+              { "text": "k5", "evidence": [{ "path": "/subtopics/b.md", "quote": "q5", "reason": "r" }] },
+              { "text": "k6", "evidence": [{ "path": "/competitors/a.md", "quote": "q6", "reason": "r" }] }
+            ] }
+        ]
+      }
+    },
+    {
+      "name": "a plan with no citations at all says nothing about source breadth",
+      "expectedRules": [
+        "sections[0].keyPoints[0].evidence",
+        "sections[1].keyPoints[0].evidence",
+        "sections[2].keyPoints[0].evidence"
+      ],
+      "plan": {
+        "targetAudience": "a", "angle": "b", "thesis": "c",
+        "alternatives": [{ "label": "A", "chosen": false }, { "label": "B", "chosen": true, "reason": "r" }],
+        "risks": [{ "description": "r" }],
+        "sections": [
+          { "id": "s1", "heading": "One", "headingLevel": 2, "wordTarget": 300, "keyPoints": [{ "text": "k1", "evidence": [] }] },
+          { "id": "s2", "heading": "Two", "headingLevel": 2, "wordTarget": 300, "keyPoints": [{ "text": "k3", "evidence": [] }] },
+          { "id": "s3", "heading": "Three", "headingLevel": 2, "wordTarget": 400, "keyPoints": [{ "text": "k5", "evidence": [] }] }
+        ]
+      }
+    },
+    {
+      "name": "the same citation listed twice counts once",
+      "expectedRules": [
+        "sections[0].evidence.density",
+        "sections[1].evidence.density",
+        "sections[2].evidence.density"
+      ],
+      "_note": [
+        "Every section here rests on ONE citation, written twice. A raw length",
+        "sum reported 2 and the whole plan passed the gate clean — the exact",
+        "thinness the floor exists to catch, laundered through a duplicate.",
+        "Source breadth does NOT catch it: the sections cite different files, so",
+        "the plan spans three paths. Only distinct-per-section counting does.",
+        "Quote comparison is whitespace-normalized, matching the policy used to",
+        "resolve quotes, so a line break cannot split one citation into two."
+      ],
+      "plan": {
+        "targetAudience": "a", "angle": "b", "thesis": "c",
+        "alternatives": [{ "label": "A", "chosen": false }, { "label": "B", "chosen": true, "reason": "r" }],
+        "risks": [{ "description": "r" }],
+        "sections": [
+          { "id": "s1", "heading": "One", "headingLevel": 2, "wordTarget": 300,
+            "keyPoints": [{ "text": "k1", "evidence": [
+              { "path": "/competitors/a.md", "quote": "one quote", "reason": "r" },
+              { "path": "/competitors/a.md", "quote": "one   quote", "reason": "r" }
+            ] }] },
+          { "id": "s2", "heading": "Two", "headingLevel": 2, "wordTarget": 300,
+            "keyPoints": [{ "text": "k3", "evidence": [
+              { "path": "/subtopics/b.md", "quote": "another quote", "reason": "r" },
+              { "path": "/subtopics/b.md", "quote": "another quote", "reason": "r" }
+            ] }] },
+          { "id": "s3", "heading": "Three", "headingLevel": 2, "wordTarget": 400,
+            "keyPoints": [{ "text": "k5", "evidence": [
+              { "path": "/keywords/primary.md", "quote": "third quote", "reason": "r" },
+              { "path": "/keywords/primary.md", "quote": "third quote", "reason": "r" }
+            ] }] }
+        ]
+      }
+    },
+    {
+      "name": "two refs on a single key point satisfy the floor",
+      "expectedRules": [],
+      "_note": "The floor counts CITATIONS per section, not key points per section.",
+      "plan": {
+        "targetAudience": "a", "angle": "b", "thesis": "c",
+        "alternatives": [{ "label": "A", "chosen": false }, { "label": "B", "chosen": true, "reason": "r" }],
+        "risks": [{ "description": "r" }],
+        "sections": [
+          { "id": "s1", "heading": "One", "headingLevel": 2, "wordTarget": 300,
+            "keyPoints": [{ "text": "k1", "evidence": [
+              { "path": "/competitors/a.md", "quote": "q1", "reason": "r" },
+              { "path": "/subtopics/b.md", "quote": "q2", "reason": "r" }
+            ] }] },
+          { "id": "s2", "heading": "Two", "headingLevel": 2, "wordTarget": 300,
+            "keyPoints": [{ "text": "k3", "evidence": [
+              { "path": "/competitors/a.md", "quote": "q3", "reason": "r" },
+              { "path": "/keywords/primary.md", "quote": "q4", "reason": "r" }
+            ] }] },
+          { "id": "s3", "heading": "Three", "headingLevel": 2, "wordTarget": 400,
+            "keyPoints": [{ "text": "k5", "evidence": [
+              { "path": "/subtopics/b.md", "quote": "q5", "reason": "r" },
+              { "path": "/competitors/a.md", "quote": "q6", "reason": "r" }
+            ] }] }
+        ]
+      }
+    }
+  ]
+}

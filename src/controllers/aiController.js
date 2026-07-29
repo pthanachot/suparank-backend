@@ -821,12 +821,13 @@ async function setupSession(content, { avatarId, reuseSession, secondary, memory
   for (const r of [results[0], results[1], results[5]]) {
     if (r.status === 'rejected') throw r.reason;
   }
-  // taskPlanMode (results[4]) is fatal for ONE reason only: a non-chat mode
-  // that failed to reach the engine (see modeTask). Checking the marker rather
-  // than the index keeps its siblings — plan and CFS pushes, which catch their
-  // own errors into `failures` — non-fatal, and stops a future throw added
-  // inside pushPlanModeContext from silently becoming a hard failure.
-  if (results[4].status === 'rejected' && results[4].reason?.fatalStep === 'pushMode') {
+  // taskPlanMode (results[4]) is fatal only for a DELIBERATELY MARKED step —
+  // today a non-chat mode that failed to reach the engine (modeTask), or a CFS
+  // failure in plan mode, where every plan-building tool depends on it. Keying
+  // on the marker rather than the index keeps unmarked rejections non-fatal, so
+  // a crash added inside pushPlanModeContext later cannot silently become a
+  // hard failure.
+  if (results[4].status === 'rejected' && results[4].reason?.fatalStep) {
     throw results[4].reason;
   }
 
@@ -1052,6 +1053,34 @@ async function pushPlanModeContext(sessionId, content, timings = {}, hashes = {}
     }
   };
 
+  // A CFS failure is FATAL in plan mode and only in plan mode.
+  //
+  // Plan mode's entire tool allowlist is CFS-dependent (registry.go modeRules):
+  // ListContext/ReadContext/GrepContext are CFS by definition, and UpdatePlan,
+  // AddSource and ExitPlanMode all refuse outright without a config. What is
+  // left is web search and AskUserTool — nothing that can produce a plan. So a
+  // plan run without CFS cannot succeed; it can only spend the user's turn
+  // budget discovering that, one tool rejection at a time.
+  //
+  // Measured: three consecutive runs, 5-9 turns each, every turn erroring with
+  // "the session has no CFS configuration", zero sections produced, and nothing
+  // said to the user beyond a generic no-proposal. Failing setup costs one
+  // clear error instead.
+  //
+  // NOT fatal for chat or execute: both keep their write/edit tools when CFS is
+  // down (chat denies only the plan-edit tools, execute only the plan tools), so
+  // they degrade rather than break. Failing them would take the common paths
+  // down over context that merely enriches them.
+  const throwIfPlanMode = (step, message) => {
+    if (mode !== 'plan') return;
+    const err = new Error(
+      `Plan mode requires the context file system, and it is unavailable (${step}: ${message}). ` +
+      'Every plan-building tool depends on it, so the run cannot proceed.'
+    );
+    err.fatalStep = step;
+    throw err;
+  };
+
   const cfsTask = async () => {
     // CFS config — required for Go's context tools. NEVER hash-skipped: the
     // engine does not rehydrate it after a restart (memory-only), so a skip
@@ -1062,6 +1091,7 @@ async function pushPlanModeContext(sessionId, content, timings = {}, hashes = {}
       'http://localhost:4001';
     if (!apiKey) {
       failures.push({ step: 'cfsConfig', error: 'INTERNAL_API_KEY not set — context tools will be unavailable' });
+      throwIfPlanMode('cfsConfig', 'INTERNAL_API_KEY is not set');
       return;
     }
     // Workspace number is denormalized only on Workspace, not Content —
@@ -1083,6 +1113,7 @@ async function pushPlanModeContext(sessionId, content, timings = {}, hashes = {}
       }));
     } catch (err) {
       failures.push({ step: 'pushCFSConfig', error: err.message });
+      throwIfPlanMode('cfsConfig', err.message);
     }
   };
 

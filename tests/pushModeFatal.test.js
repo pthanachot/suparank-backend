@@ -20,6 +20,12 @@ mongoose.set('bufferCommands', false);
 const writingEngine = require('../src/services/writingEngine');
 const aiController = require('../src/controllers/aiController');
 
+// Plan mode now ABORTS when CFS is unavailable (see the CFS block below), and
+// the test process loads no .env. Without this every plan-mode test here would
+// fail on the CFS rule before reaching the pushMode behaviour it is about. The
+// CFS tests delete it explicitly and restore it in their own finally.
+process.env.INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || 'test-internal-key';
+
 const ENGINE_PUSH = ['pushDocument', 'pushBrief', 'pushContextFiles', 'pushBrandVoice', 'pushImageStyle', 'pushMode', 'pushPlan', 'pushCFSConfig'];
 
 function makeContent(id, mode) {
@@ -199,6 +205,78 @@ test('a pushMode failure still propagates when a sibling also failed', async () 
     if (savedKey !== undefined) process.env.INTERNAL_API_KEY = savedKey;
   }
 });
+
+// ─── CFS is load-bearing in plan mode, and only there ─────────────────
+//
+// Plan mode's whole allowlist is CFS-dependent (registry.go modeRules):
+// ListContext/ReadContext/GrepContext are CFS by definition, and UpdatePlan,
+// AddSource and ExitPlanMode refuse outright without a config. What is left is
+// web search and AskUserTool — nothing that can produce a plan. So a plan run
+// without CFS cannot succeed; it can only spend the turn budget finding out.
+// Measured: three runs, 5-9 turns each, zero sections, no diagnosis.
+
+test('a missing INTERNAL_API_KEY ABORTS setup in plan mode', async () => {
+  const savedKey = process.env.INTERNAL_API_KEY;
+  delete process.env.INTERNAL_API_KEY;
+  const savedError = console.error;
+  console.error = () => {};
+  const restore = stubEngine({ createSession: async () => 'sess-nokey' });
+  try {
+    await assert.rejects(
+      () => aiController.setupSession(makeContent('c-cfs-plan', 'plan')),
+      /context file system/i,
+      'plan mode cannot run without CFS — it must fail loudly, not flail',
+    );
+  } finally {
+    console.error = savedError;
+    restore();
+    if (savedKey !== undefined) process.env.INTERNAL_API_KEY = savedKey;
+  }
+});
+
+test('a failed CFS push ABORTS setup in plan mode', async () => {
+  const savedKey = process.env.INTERNAL_API_KEY;
+  process.env.INTERNAL_API_KEY = 'test-key';
+  const savedError = console.error;
+  console.error = () => {};
+  const restore = stubEngine({ createSession: async () => 'sess-cfsfail' });
+  const savedPush = writingEngine.pushCFSConfig;
+  writingEngine.pushCFSConfig = async () => { throw new Error('engine refused cfs'); };
+  try {
+    await assert.rejects(
+      () => aiController.setupSession(makeContent('c-cfs-push', 'plan')),
+      /context file system/i,
+    );
+  } finally {
+    writingEngine.pushCFSConfig = savedPush;
+    console.error = savedError;
+    restore();
+    if (savedKey === undefined) delete process.env.INTERNAL_API_KEY;
+    else process.env.INTERNAL_API_KEY = savedKey;
+  }
+});
+
+for (const mode of ['chat', 'execute']) {
+  test(`a missing INTERNAL_API_KEY is NON-fatal in ${mode} mode`, async () => {
+    // Both keep their write/edit tools when CFS is down — chat denies only the
+    // plan-edit tools, execute only the plan tools — so they degrade rather
+    // than break. Failing them would take the common paths down over context
+    // that merely enriches them.
+    const savedKey = process.env.INTERNAL_API_KEY;
+    delete process.env.INTERNAL_API_KEY;
+    const savedError = console.error;
+    console.error = () => {};
+    const restore = stubEngine({ createSession: async () => `sess-${mode}-nokey` });
+    try {
+      const res = await aiController.setupSession(makeContent(`c-cfs-${mode}`, mode));
+      assert.strictEqual(res.sessionId, `sess-${mode}-nokey`);
+    } finally {
+      console.error = savedError;
+      restore();
+      if (savedKey !== undefined) process.env.INTERNAL_API_KEY = savedKey;
+    }
+  });
+}
 
 test('the aggregate failure log prints instead of throwing ReferenceError', async () => {
   // `mode` was declared inside modeTask but read by the log at the bottom of

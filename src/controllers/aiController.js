@@ -719,7 +719,8 @@ async function setupSession(content, { avatarId, reuseSession, secondary, memory
       }
     };
 
-    // 6. Plan-mode orchestration: mode + plan + CFS (non-fatal, aggregated).
+    // 6. Plan-mode orchestration: mode + plan + CFS. Aggregated and non-fatal,
+    //    EXCEPT a failed non-chat mode push, which aborts setup (see below).
     const taskPlanMode = () =>
       timed(timings, 'planModeContext', () => pushPlanModeContext(sessionId, content, timings, hashes, skipped));
 
@@ -798,7 +799,12 @@ async function setupSession(content, { avatarId, reuseSession, secondary, memory
   // seed failure is FATAL (running without contracted memory silently answers
   // as an amnesiac; the run would look fine and be wrong).
   const isGone = (r) => r.status === 'rejected' && r.reason?.status === 404;
-  if (reused && (isGone(results[0]) || isGone(results[1]) || isGone(results[5]))) {
+  // results[4] (planMode) joins the list now that a non-chat pushMode is fatal.
+  // It is the ONLY fatal push that is not hash-skippable when the mode changes,
+  // so on a reused-but-evicted session with an unchanged document and no brief
+  // keyword it can be the only 404 anyone sees — without it here, entering plan
+  // mode on an evicted session would hard-fail instead of recreating.
+  if (reused && (isGone(results[0]) || isGone(results[1]) || isGone(results[4]) || isGone(results[5]))) {
     console.warn(`[setup] engine session ${sessionId} gone (404) — recreating and retrying setup once`);
     contentSessionMap.delete(contentId);
     sessionId = await timed(timings, 'createSession', () => writingEngine.createSession());
@@ -814,6 +820,14 @@ async function setupSession(content, { avatarId, reuseSession, secondary, memory
   // P2: + seed (results[5]) — see above.
   for (const r of [results[0], results[1], results[5]]) {
     if (r.status === 'rejected') throw r.reason;
+  }
+  // taskPlanMode (results[4]) is fatal for ONE reason only: a non-chat mode
+  // that failed to reach the engine (see modeTask). Checking the marker rather
+  // than the index keeps its siblings — plan and CFS pushes, which catch their
+  // own errors into `failures` — non-fatal, and stops a future throw added
+  // inside pushPlanModeContext from silently becoming a hard failure.
+  if (results[4].status === 'rejected' && results[4].reason?.fatalStep === 'pushMode') {
+    throw results[4].reason;
   }
 
   console.log(
@@ -963,12 +977,18 @@ async function pushPlanModeContext(sessionId, content, timings = {}, hashes = {}
   // spread across three separate errors. Includes sessionId + content
   // identifiers so the line is correlatable in multi-tenant logs.
   const failures = [];
+  // Function-scoped: the aggregate failure log at the bottom reads `mode`.
+  // It used to be declared inside modeTask, so that log threw a ReferenceError
+  // on every failure path instead of printing — and because setupSession
+  // swallowed this function's rejection entirely, the throw was invisible too.
+  // Net effect: the CFS-misconfiguration error line this code exists to emit
+  // has never once been logged.
+  const mode = content.mode || 'chat';
 
   // W2-a: the three pushes are independent engine session fields (mutex-
   // guarded per field; the run starts only after all pushes settle), so run
   // them concurrently. Each sub-task catches into failures[] as before.
   const modeTask = async () => {
-    const mode = content.mode || 'chat';
     const allowed = MODE_ALLOWED_TOOLS[mode] || [];
     // W2-b: mode is engine-DB-hydrated — safe to skip when unchanged.
     const h = pushHash(JSON.stringify({ mode, allowed }));
@@ -980,6 +1000,24 @@ async function pushPlanModeContext(sessionId, content, timings = {}, hashes = {}
       await timed(timings, 'pushMode', () => writingEngine.pushMode(sessionId, mode, allowed));
       hashes.mode = h;
     } catch (err) {
+      // A failed mode push used to be a warning, which was harmless only while
+      // the engine ignored session mode on the agent path. It does not any
+      // more: RunFreeformAgent now picks its strategy FROM the mode, so a lost
+      // push leaves the engine on its default (chat) while Mongo says plan or
+      // execute — and the run proceeds under the WRONG contract. In plan mode
+      // that means the document is writable when the user was promised it is
+      // read-only, and UpdatePlan/ExitPlanMode are denied so no plan can ever
+      // be produced. Silent, and indistinguishable from the feature simply not
+      // working.
+      //
+      // Fatal only when the mode being pushed is NOT chat. The engine's own
+      // default IS chat (state.NewSession), so a lost chat push leaves the
+      // session in exactly the state we wanted — failing the run there would
+      // block the common path for no gain.
+      if (mode !== 'chat') {
+        err.fatalStep = 'pushMode';
+        throw err;
+      }
       failures.push({ step: 'pushMode', error: err.message });
     }
   };
@@ -1048,9 +1086,14 @@ async function pushPlanModeContext(sessionId, content, timings = {}, hashes = {}
     }
   };
 
-  await Promise.all([modeTask(), planTask(), cfsTask()]);
+  // allSettled, not all: modeTask now THROWS for a non-chat mode, and a
+  // Promise.all would short-circuit past the aggregate log below — losing the
+  // plan/CFS diagnostics for exactly the run that failed hardest. Collect
+  // everything, log once, then rethrow the fatal one.
+  const settled = await Promise.allSettled([modeTask(), planTask(), cfsTask()]);
+  const fatal = settled.find((r) => r.status === 'rejected');
 
-  if (failures.length > 0) {
+  if (failures.length > 0 || fatal) {
     // CFS/config failures silently disable the plan-mode context tools (the
     // engine's ListContext/ReadContext/etc. go unavailable), so surface those
     // at error level — a misconfigured deployment must be greppable, not
@@ -1058,15 +1101,19 @@ async function pushPlanModeContext(sessionId, content, timings = {}, hashes = {}
     const hasCfsFailure = failures.some(
       (f) => f.step === 'cfsConfig' || f.step === 'pushCFSConfig',
     );
-    const logFn = hasCfsFailure ? console.error : console.warn;
+    const logFn = hasCfsFailure || fatal ? console.error : console.warn;
     logFn('[setupSession] plan-mode push had failures', {
       sessionId,
       contentId: content._id,
       contentNumber: content.contentNumber,
       mode,
       failures,
+      ...(fatal && { fatal: fatal.reason?.message }),
     });
   }
+
+  // Aborts setup — see the fatal-step check in setupSession.
+  if (fatal) throw fatal.reason;
 }
 
 // ─────────────────────────────────────────────────────────────

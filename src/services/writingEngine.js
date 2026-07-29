@@ -368,7 +368,13 @@ async function pushMode(sessionId, mode, allowedTools) {
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Writing Engine: push mode failed (${res.status}): ${text}`);
+    const err = new Error(`Writing Engine: push mode failed (${res.status}): ${text}`);
+    // Parity with pushDocument/pushBrief: setupSession's recreate-retry keys
+    // off `.status === 404`. A non-chat mode push is FATAL now, so without
+    // this a session the engine had evicted would hard-fail the run instead of
+    // self-healing — the retry could not see that the cause was a dead session.
+    err.status = res.status;
+    throw err;
   }
   return res.json();
 }

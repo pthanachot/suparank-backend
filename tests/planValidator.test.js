@@ -15,12 +15,19 @@ function completePlan(overrides = {}) {
       { label: 'Lead with use-case framing', pros: ['Reader-relevant'], cons: ['Slower to value'], chosen: true, reason: 'Audience is exploration-stage' },
     ],
     risks: [{ description: 'Competitor X covers this angle', mitigation: 'Differentiate via use cases', severity: 'medium' }],
+    // Every section carries MIN_EVIDENCE_PER_SECTION refs and the plan spans
+    // more than MIN_DISTINCT_SOURCES paths. s2 reaches the floor through one
+    // key point plus its evidenceMap entry — the case a counter that only
+    // looked at key points would wrongly fail.
     sections: [
       {
         id: 's1',
         heading: 'Introduction',
         headingLevel: 2,
-        keyPoints: [{ text: 'Frame the problem', evidence: [{ path: '/keywords/primary.md', reason: 'target keyword' }] }],
+        keyPoints: [
+          { text: 'Frame the problem', evidence: [{ path: '/keywords/primary.md', reason: 'target keyword' }] },
+          { text: 'Name the stakes', evidence: [{ path: '/subtopics/stage.md', reason: 'coverage gap' }] },
+        ],
         wordTarget: 200,
       },
       {
@@ -34,10 +41,16 @@ function completePlan(overrides = {}) {
         id: 's3',
         heading: 'Recommendation',
         headingLevel: 2,
-        keyPoints: [{ text: 'Pick by stage', evidence: [{ path: '/subtopics/stage.md', reason: 'stage data' }] }],
+        keyPoints: [
+          { text: 'Pick by stage', evidence: [{ path: '/subtopics/stage.md', reason: 'stage data' }] },
+          { text: 'Call to action', evidence: [{ path: '/keywords/primary.md', reason: 'keyword close' }] },
+        ],
         wordTarget: 200,
       },
     ],
+    evidenceMap: {
+      s2: [{ path: '/competitors/b.md', reason: 'second competitor for contrast' }],
+    },
     ...overrides,
   };
 }
@@ -148,6 +161,74 @@ describe('validateCompleteness', () => {
       f.rule.endsWith('.heading.duplicate')
     );
     assert.equal(dupFailures.length, 0, JSON.stringify(dupFailures));
+  });
+
+  // ─── Evidence density floor ─────────────────────────────────────────
+  //
+  // The per-key-point rule is satisfied by a section with one key point
+  // carrying one citation, which is how a plan passed this gate while barely
+  // researched: across three passing runs, citations were 49, 13 and 37 over
+  // ten sections. All three were "complete". These mirror the Go tests in
+  // writing-engine/internal/engine/plan_completeness_test.go — the two
+  // validators have to agree or the in-loop feedback and the authoritative
+  // gate at /plan/approve contradict each other.
+
+  const hasRule = (result, rule) => result.failures.some((f) => f.rule === rule);
+
+  it('fails a section resting on a single citation', () => {
+    const plan = completePlan();
+    plan.sections[0].keyPoints = plan.sections[0].keyPoints.slice(0, 1);
+    const result = v.validateCompleteness(plan, { targetWordCount: 1000 });
+    assert.equal(hasRule(result, 'sections[0].evidence.density'), true, JSON.stringify(result.failures));
+  });
+
+  it('counts evidenceMap refs toward the per-section floor', () => {
+    // s2 has ONE key point and clears the floor only via evidenceMap. A
+    // counter that looked at key points alone would fail a section that had
+    // already done the right thing — unsatisfiable feedback.
+    const plan = completePlan();
+    let result = v.validateCompleteness(plan, { targetWordCount: 1000 });
+    assert.equal(hasRule(result, 'sections[1].evidence.density'), false, JSON.stringify(result.failures));
+
+    delete plan.evidenceMap;
+    result = v.validateCompleteness(plan, { targetWordCount: 1000 });
+    assert.equal(hasRule(result, 'sections[1].evidence.density'), true, JSON.stringify(result.failures));
+  });
+
+  it('does not stack a density complaint on a section already missing evidence', () => {
+    const plan = completePlan();
+    plan.sections[1].keyPoints[0].evidence = [];
+    delete plan.evidenceMap;
+    const result = v.validateCompleteness(plan, { targetWordCount: 1000 });
+    assert.equal(hasRule(result, 'sections[1].keyPoints[0].evidence'), true, JSON.stringify(result.failures));
+    assert.equal(hasRule(result, 'sections[1].evidence.density'), false, JSON.stringify(result.failures));
+  });
+
+  it('fails a plan that cites the same file everywhere', () => {
+    const plan = completePlan();
+    for (const s of plan.sections) {
+      for (const kp of s.keyPoints) {
+        for (const e of kp.evidence) e.path = '/competitors/a.md';
+      }
+    }
+    plan.evidenceMap = { s2: [{ path: '/competitors/a.md', reason: 'same file again' }] };
+    const result = v.validateCompleteness(plan, { targetWordCount: 1000 });
+    assert.equal(hasRule(result, 'evidence.sources'), true, JSON.stringify(result.failures));
+    const msg = result.failures.find((f) => f.rule === 'evidence.sources').message;
+    // A bare count is not actionable — the message has to name what it saw.
+    assert.ok(msg.includes('/competitors/a.md'), msg);
+  });
+
+  it('stays quiet about source breadth when the plan cites nothing', () => {
+    // With zero citations the per-key-point rule is the right complaint;
+    // "too few distinct sources" would fire on every empty plan in the loop.
+    const plan = completePlan();
+    for (const s of plan.sections) {
+      for (const kp of s.keyPoints) kp.evidence = [];
+    }
+    delete plan.evidenceMap;
+    const result = v.validateCompleteness(plan, { targetWordCount: 1000 });
+    assert.equal(hasRule(result, 'evidence.sources'), false, JSON.stringify(result.failures));
   });
 });
 

@@ -22,6 +22,47 @@
 
 // ─── 1. Completeness ──────────────────────────────────────────────────
 
+// Evidence density floor. Both numbers are deliberately low: the gate exists
+// to catch a plan that is thin everywhere, not to arbitrate how well-researched
+// a reasonable plan is. Raising them without re-measuring against live runs is
+// how plan mode becomes unpassable — the model burns its turn budget failing
+// ExitPlanMode and the user sees no plan at all, which is strictly worse than a
+// lightly-sourced one. See WRITING-PATHS-STATUS §5.5 for the measured baseline.
+const MIN_EVIDENCE_PER_SECTION = 2;
+const MIN_DISTINCT_SOURCES = 2;
+
+/**
+ * Every ContextRef attached to one section — its key points' evidence plus the
+ * plan-level evidenceMap entry keyed by that section's id.
+ */
+function countSectionRefs(plan, section) {
+  let n = 0;
+  for (const kp of section.keyPoints || []) {
+    if (Array.isArray(kp.evidence)) n += kp.evidence.length;
+  }
+  const mapped = section.id && plan.evidenceMap ? plan.evidenceMap[section.id] : null;
+  if (Array.isArray(mapped)) n += mapped.length;
+  return n;
+}
+
+/**
+ * Every ContextRef in the plan, from both homes. Mirrors the Go-side
+ * collectRefs in tools/plan/exit.go — if one grows a third home for refs, so
+ * must the other, or the two gates disagree about what the plan cites.
+ */
+function collectPlanRefs(plan) {
+  const out = [];
+  for (const section of plan.sections || []) {
+    for (const kp of section.keyPoints || []) {
+      if (Array.isArray(kp.evidence)) out.push(...kp.evidence);
+    }
+  }
+  for (const refs of Object.values(plan.evidenceMap || {})) {
+    if (Array.isArray(refs)) out.push(...refs);
+  }
+  return out;
+}
+
 /**
  * Validate a Plan for ExitPlanMode readiness.
  *
@@ -121,8 +162,10 @@ function validateCompleteness(plan, brief) {
         message: `Section "${section.heading || i}" needs a word target`,
       });
     }
+    let missingEvidence = false;
     (section.keyPoints || []).forEach((kp, j) => {
       if (!Array.isArray(kp.evidence) || kp.evidence.length === 0) {
+        missingEvidence = true;
         failures.push({
           rule: `sections[${i}].keyPoints[${j}].evidence`,
           message: `Key point "${(kp.text || '').slice(0, 40)}" in section "${
@@ -131,7 +174,55 @@ function validateCompleteness(plan, brief) {
         });
       }
     });
+
+    // Evidence density floor. The per-key-point rule above is satisfied by a
+    // section with one key point carrying one citation, which is how a plan
+    // could pass this gate while being barely researched: measured across
+    // three passing runs, citation counts were 49, 13 and 37 over ten sections
+    // — roughly 4.9, 1.3 and 3.7 per section. All three were "complete".
+    //
+    // Counting both homes for a ref matters: evidenceMap is keyed by section
+    // id and is where the model puts section-level support that is not tied to
+    // a single key point. Ignoring it would fail sections that are in fact
+    // well-sourced.
+    //
+    // Skipped when a key point already reported missing evidence — that
+    // failure is the more specific one, and stacking a second complaint about
+    // the same section makes the feedback list harder to act on.
+    if (!missingEvidence) {
+      const refs = countSectionRefs(plan, section);
+      if (refs < MIN_EVIDENCE_PER_SECTION) {
+        failures.push({
+          rule: `sections[${i}].evidence.density`,
+          message:
+            `Section "${section.heading || i}" rests on ${refs} citation${refs === 1 ? '' : 's'} — ` +
+            `needs at least ${MIN_EVIDENCE_PER_SECTION}. Add another key point with its own ` +
+            `evidence, or cite a second source for an existing point.`,
+        });
+      }
+    }
   });
+
+  // Source breadth. A plan can hit the per-section floor while quoting one
+  // file over and over, which is restatement rather than research. This is a
+  // floor against monoculture, not a quality lever: all three measured runs
+  // drew on 2-4 distinct paths, so it is set where it catches the pathological
+  // case without second-guessing runs that already look reasonable.
+  if (Array.isArray(plan.sections) && plan.sections.length > 0) {
+    const paths = new Set();
+    for (const ref of collectPlanRefs(plan)) {
+      if (ref && ref.path) paths.add(String(ref.path));
+    }
+    if (paths.size > 0 && paths.size < MIN_DISTINCT_SOURCES) {
+      failures.push({
+        rule: 'evidence.sources',
+        message:
+          `Every citation in the plan points at ${[...paths].join(', ')} — ` +
+          `a plan must draw on at least ${MIN_DISTINCT_SOURCES} distinct sources. ` +
+          `Call ListContext and cite a second file.`,
+      });
+    }
+  }
 
   // Word budget — sum of section targets within 10% of brief target
   if (brief && brief.targetWordCount && Array.isArray(plan.sections)) {
@@ -331,4 +422,6 @@ module.exports = {
   normalizeForQuoteMatch,
   PATCH_ALLOWED_PATHS,
   PATCH_ALLOWED_OPS,
+  MIN_EVIDENCE_PER_SECTION,
+  MIN_DISTINCT_SOURCES,
 };

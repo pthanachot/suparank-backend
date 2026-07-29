@@ -183,11 +183,21 @@ describe('buildValidatorBrief end-to-end with validateCompleteness (Bug #3 regre
         { label: 'B', chosen: true, reason: 'because' },
       ],
       risks: [{ description: 'r', mitigation: 'm', severity: 'low' }],
+      // Two refs from two distinct paths so the evidence-density floor is
+      // satisfied — these tests are about the WORD BUDGET rule, and a plan
+      // that failed for an unrelated reason would make `result.ok` useless
+      // as the assertion.
       sections: wordTargets.map((wt, i) => ({
         id: `s${i + 1}`,
         heading: `Section ${i + 1}`,
         headingLevel: 2,
-        keyPoints: [{ text: 'kp', evidence: [{ path: '/k.md', reason: 'r' }] }],
+        keyPoints: [{
+          text: 'kp',
+          evidence: [
+            { path: '/k.md', reason: 'r' },
+            { path: '/k2.md', reason: 'r2' },
+          ],
+        }],
         wordTarget: wt,
       })),
     };

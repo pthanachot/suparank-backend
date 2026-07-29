@@ -416,7 +416,15 @@ async function pushCFSConfig(sessionId, { baseUrl, apiKey, workspaceNumber, cont
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Writing Engine: push cfs failed (${res.status}): ${text}`);
+    const err = new Error(`Writing Engine: push cfs failed (${res.status}): ${text}`);
+    // Parity with pushDocument/pushBrief/pushMode. This push is FATAL in plan
+    // mode, so without a status setupSession's recreate-retry cannot recognise
+    // a 404 as a dead session — and entering plan mode on an evicted session
+    // would hard-fail instead of self-healing. CFS is not hash-skipped at all,
+    // so it 404s on EVERY evicted reuse, making this the likeliest of the four
+    // to be the one that notices.
+    err.status = res.status;
+    throw err;
   }
   return res.json();
 }

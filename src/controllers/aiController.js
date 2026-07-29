@@ -1071,13 +1071,21 @@ async function pushPlanModeContext(sessionId, content, timings = {}, hashes = {}
   // down (chat denies only the plan-edit tools, execute only the plan tools), so
   // they degrade rather than break. Failing them would take the common paths
   // down over context that merely enriches them.
-  const throwIfPlanMode = (step, message) => {
+  const throwIfPlanMode = (step, cause) => {
     if (mode !== 'plan') return;
+    const message = cause instanceof Error ? cause.message : String(cause);
     const err = new Error(
       `Plan mode requires the context file system, and it is unavailable (${step}: ${message}). ` +
       'Every plan-building tool depends on it, so the run cannot proceed.'
     );
     err.fatalStep = step;
+    // Carry the HTTP status THROUGH the wrapper. setupSession's recreate-retry
+    // keys off reason.status === 404, and a fresh Error() drops it — so without
+    // this, wrapping an evicted-session 404 in a friendlier message is exactly
+    // what stops it being recognised as an evicted session. CFS is never
+    // hash-skipped, so it 404s on every evicted reuse and is the likeliest push
+    // to hit this.
+    if (cause instanceof Error && cause.status) err.status = cause.status;
     throw err;
   };
 
@@ -1113,7 +1121,7 @@ async function pushPlanModeContext(sessionId, content, timings = {}, hashes = {}
       }));
     } catch (err) {
       failures.push({ step: 'pushCFSConfig', error: err.message });
-      throwIfPlanMode('cfsConfig', err.message);
+      throwIfPlanMode('cfsConfig', err);
     }
   };
 

@@ -256,6 +256,34 @@ test('a failed CFS push ABORTS setup in plan mode', async () => {
   }
 });
 
+test('a 404 CFS push on a REUSED session recreates and retries instead of failing', async () => {
+  // Making the CFS push fatal in plan mode without giving its error a status
+  // would break the evicted-session path: the recreate-retry keys off
+  // reason.status === 404, so a dead session would hard-fail rather than
+  // self-heal. CFS is never hash-skipped, so it 404s on EVERY evicted reuse —
+  // it is the likeliest of the fatal pushes to be the one that notices.
+  let createCalls = 0;
+  let cfsCalls = 0;
+  const restore = stubEngine({
+    createSession: async () => { createCalls++; return `fresh-cfs-${createCalls}`; },
+  });
+  const savedPush = writingEngine.pushCFSConfig;
+  writingEngine.pushCFSConfig = async () => {
+    cfsCalls++;
+    if (cfsCalls === 1) { const e = new Error('session gone'); e.status = 404; throw e; }
+  };
+  try {
+    aiController.rememberSession('c-cfs-404', 'stale-sess');
+    const res = await aiController.setupSession(makeContent('c-cfs-404', 'plan'), { reuseSession: true });
+    assert.strictEqual(cfsCalls, 2, 'CFS pushed twice (404, then success on the fresh session)');
+    assert.strictEqual(createCalls, 1, 'exactly one fresh session created — on the retry only');
+    assert.strictEqual(res.sessionId, 'fresh-cfs-1');
+  } finally {
+    writingEngine.pushCFSConfig = savedPush;
+    restore();
+  }
+});
+
 for (const mode of ['chat', 'execute']) {
   test(`a missing INTERNAL_API_KEY is NON-fatal in ${mode} mode`, async () => {
     // Both keep their write/edit tools when CFS is down — chat denies only the

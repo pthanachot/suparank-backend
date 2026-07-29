@@ -139,6 +139,67 @@ test('a non-404 pushMode failure does NOT retry — it fails once', async () => 
   }
 });
 
+test('a failed pushMode does not record its hash, so the next attempt re-pushes', async () => {
+  // This is what makes a non-404 failure recoverable without operator action:
+  // hashes.mode is assigned only AFTER a successful push, so the session stays
+  // in the map with no mode hash and the next request pushes again. If the
+  // hash were recorded optimistically, the mode would be skipped forever and
+  // the session would be permanently stuck in the wrong mode.
+  let modeCalls = 0;
+  const restore = stubEngine({
+    createSession: async () => 'sess-hash',
+    pushMode: async () => {
+      modeCalls++;
+      if (modeCalls === 1) throw new Error('transient engine blip');
+    },
+  });
+  try {
+    const content = makeContent('c-mode-hash', 'plan');
+    await assert.rejects(() => aiController.setupSession(content, { reuseSession: true }));
+    // Second attempt reuses the same session and must retry the push.
+    const res = await aiController.setupSession(content, { reuseSession: true });
+    assert.strictEqual(modeCalls, 2, 'mode re-pushed after the failure — hash was not poisoned');
+    assert.strictEqual(res.sessionId, 'sess-hash', 'same session reused, now correctly in plan mode');
+  } finally {
+    restore();
+  }
+});
+
+test('a pushMode failure still propagates when a sibling also failed', async () => {
+  // pushPlanModeContext rethrows ONE error out of three concurrent tasks, and
+  // this asserts the pushMode one survives alongside an unrelated CFS failure
+  // — i.e. the `failures.length > 0` log path does not swallow it.
+  //
+  // What it does NOT prove: that the selection PREFERS the marked error.
+  // modeTask is first in the array, so `rejected[0]` and
+  // `rejected.find(fatalStep)` return the same thing today and the two
+  // branches are indistinguishable from out here. The preference is defensive
+  // — and not hypothetical, because planTask's toGoPlan/JSON.stringify sit
+  // outside its try and can genuinely reject on a malformed plan. It cannot be
+  // exercised until either that happens or the array is reordered, which is
+  // exactly when it would matter. Treat this as a regression guard on the
+  // end-to-end behaviour, not as coverage of the tie-break.
+  const savedKey = process.env.INTERNAL_API_KEY;
+  delete process.env.INTERNAL_API_KEY;
+  const savedError = console.error;
+  console.error = () => {};
+  const restore = stubEngine({
+    createSession: async () => 'sess-both',
+    pushMode: async () => { throw new Error('the marked one'); },
+  });
+  try {
+    await assert.rejects(
+      () => aiController.setupSession(makeContent('c-mode-both', 'plan')),
+      /the marked one/,
+      'the pushMode error must be the one that propagates',
+    );
+  } finally {
+    console.error = savedError;
+    restore();
+    if (savedKey !== undefined) process.env.INTERNAL_API_KEY = savedKey;
+  }
+});
+
 test('the aggregate failure log prints instead of throwing ReferenceError', async () => {
   // `mode` was declared inside modeTask but read by the log at the bottom of
   // pushPlanModeContext, so every failure path threw a ReferenceError in place

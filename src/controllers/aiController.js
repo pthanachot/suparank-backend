@@ -1091,7 +1091,15 @@ async function pushPlanModeContext(sessionId, content, timings = {}, hashes = {}
   // plan/CFS diagnostics for exactly the run that failed hardest. Collect
   // everything, log once, then rethrow the fatal one.
   const settled = await Promise.allSettled([modeTask(), planTask(), cfsTask()]);
-  const fatal = settled.find((r) => r.status === 'rejected');
+  const rejected = settled.filter((r) => r.status === 'rejected');
+  // Prefer the MARKED error rather than the first rejection. modeTask happens
+  // to be first in the array today, so `find` would pick it — but only by
+  // accident of ordering. If a sibling ever rejects too (planTask's toGoPlan
+  // is outside its try, for one) and the array is reordered, the unmarked
+  // error would shadow the marked one, setupSession's fatalStep check would
+  // not match, and a lost plan-mode push would go back to being silent — the
+  // exact bug this change exists to kill.
+  const fatal = rejected.find((r) => r.reason?.fatalStep) || rejected[0];
 
   if (failures.length > 0 || fatal) {
     // CFS/config failures silently disable the plan-mode context tools (the
@@ -1112,7 +1120,10 @@ async function pushPlanModeContext(sessionId, content, timings = {}, hashes = {}
     });
   }
 
-  // Aborts setup — see the fatal-step check in setupSession.
+  // Rethrow so the caller can see it at all. Whether it ABORTS setup is
+  // setupSession's call, and it aborts only for fatalStep === 'pushMode' —
+  // an unmarked rejection here (a crash in one of the siblings) surfaces as a
+  // logged failure and is then swallowed, exactly as it was before.
   if (fatal) throw fatal.reason;
 }
 

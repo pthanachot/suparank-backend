@@ -133,6 +133,28 @@ function sessionBoundToContent(contentId, sessionId) {
  * so we sum them. The tap is *read-only* — the raw bytes still go to
  * `res.write` unchanged; we just observe them in flight.
  */
+/**
+ * Stop reasons that mean the run was CUT OFF mid-work by a ceiling, as opposed
+ * to ending on its own terms. Sources, all engine-side:
+ *   max_turns, token_budget, output_limit  → query.go
+ *   max_edits                              → strategy_execute.go
+ *   max_iterations                         → strategy_sequential.go
+ *
+ * Mirrors the `truncated` map in the frontend's completionChip. The two are
+ * hand-kept in step; a reason added to one and not the other degrades a message
+ * rather than breaking a run, which is why this is a duplicated constant and
+ * not a shared fixture.
+ *
+ * NOT in this set, deliberately: nudges_exhausted and stale. Those describe a
+ * model that stopped calling tools, which over 48 measured /auto-optimize runs
+ * was the NORMAL way a successful run ended — 42 of 48, every one of them with
+ * edits applied. Treating them as failures is the exact error completionChip
+ * was written to correct.
+ */
+const TRUNCATED_STOPS = new Set([
+  'max_turns', 'max_edits', 'max_iterations', 'token_budget', 'output_limit',
+]);
+
 function makeUsageTap() {
   let buffer = '';
   let inputTokens = 0;
@@ -252,6 +274,24 @@ function makeUsageTap() {
       // session-only behind the "Working" toggle). Chat runs (sawTextDelta)
       // keep the full joined deltas: their live transcript showed all of it.
       if (completionFinalText && !sawTextDelta) return completionFinalText;
+      // A TRUNCATED commentary run has no closing message (completionFinalText
+      // is captured only on stopReason === 'done') and its trailing segments are
+      // a PROMISE, not a summary: the ceiling landed mid-work, so the last thing
+      // the model said is "First, I will update the Overview section", wrapped
+      // in internal tool names and retry chatter. Persisting that made a reload
+      // replay a wall of first-person commentary over a run that delivered
+      // nothing — the live UI showed only "⚠ Turn limit reached".
+      //
+      // Scoped to TRUNCATED_STOPS on purpose. An earlier version of this guard
+      // keyed on `stopReason !== 'done'`, which swept in nudges_exhausted and
+      // stale — 42 of 48 measured runs, all of which had applied edits — and
+      // replaced their genuine wrap-up text with a robotic run summary. Whether
+      // the run was cut off is the question; "did it end on the happy path"
+      // is not.
+      //
+      // Chat runs are excluded: their deltas streamed into the transcript live,
+      // so the record must match what the user already read.
+      if (!sawTextDelta && TRUNCATED_STOPS.has(stopReason)) return '';
       const all = [...segments];
       if (currentSegment.trim()) all.push(currentSegment.trim());
       const deduped = all.filter((seg, i) => i === 0 || seg !== all[i - 1]);

@@ -126,12 +126,78 @@ test('chat runs (text_delta seen) keep the full joined deltas over finalText', (
   );
 });
 
-test('finalText on a non-done stop is ignored (mirrors the FE display gate)', () => {
+test('finalText on a non-done stop is ignored, but the segments still stand', () => {
   const tap = aiController.makeUsageTap();
   tap.addChunk(sse({ type: 'agent_commentary', textDelta: 'Now I will rewrite section 3…' }));
   tap.addChunk(sse({ type: 'complete', completion: { stopReason: 'stale', finalText: 'Now I will rewrite section 3…' } }));
   assert.strictEqual(tap.finalAssistantText(), 'Now I will rewrite section 3…',
-    'falls through to the joined segments, not the finalText preference');
+    'stale is not a truncation — it falls through to the joined segments');
+});
+
+test('nudges_exhausted keeps its text — it is how MOST successful runs end', () => {
+  // 35 of 48 measured /auto-optimize runs ended nudges_exhausted, every one
+  // with edits applied. A guard that suppressed these would gut the majority
+  // of real transcripts in the name of fixing turn-limit runs.
+  const tap = aiController.makeUsageTap();
+  tap.addChunk(sse({ type: 'agent_commentary', textDelta: 'Rewrote the intro and tightened the FAQ.' }));
+  tap.addChunk(sse({ type: 'complete', completion: { stopReason: 'nudges_exhausted' } }));
+  assert.strictEqual(tap.finalAssistantText(), 'Rewrote the intro and tightened the FAQ.');
+});
+
+test('plan_proposed keeps its text — a proposed plan is a delivered outcome', () => {
+  const tap = aiController.makeUsageTap();
+  tap.addChunk(sse({ type: 'agent_commentary', textDelta: 'Drafted a 10-section plan for your review.' }));
+  tap.addChunk(sse({ type: 'complete', completion: { stopReason: 'plan_proposed' } }));
+  assert.strictEqual(tap.finalAssistantText(), 'Drafted a 10-section plan for your review.');
+});
+
+test('every truncation ceiling suppresses, and only those', () => {
+  // Pins the set against drift: the engine emits these five from query.go,
+  // strategy_execute.go and strategy_sequential.go.
+  for (const reason of ['max_turns', 'max_edits', 'max_iterations', 'token_budget', 'output_limit']) {
+    const tap = aiController.makeUsageTap();
+    tap.addChunk(sse({ type: 'agent_commentary', textDelta: 'First, I will update the Overview section.' }));
+    tap.addChunk(sse({ type: 'complete', completion: { stopReason: reason } }));
+    assert.strictEqual(tap.finalAssistantText(), '', `${reason} must suppress`);
+  }
+  for (const reason of ['done', 'all_steps_done', 'target_score_reached', 'writing_complete', 'nudges_exhausted', 'stale', 'user_stopped', 'cancelled', 'plan_proposed', 'no_plan']) {
+    const tap = aiController.makeUsageTap();
+    tap.addChunk(sse({ type: 'agent_commentary', textDelta: 'kept' }));
+    tap.addChunk(sse({ type: 'complete', completion: { stopReason: reason } }));
+    assert.strictEqual(tap.finalAssistantText(), 'kept', `${reason} must NOT suppress`);
+  }
+});
+
+test('turn-limited agent run does not persist its working narration', () => {
+  // The reported shape: a plan-mode run narrates tool trouble across several
+  // turns, hits the turn ceiling, and writes nothing. Live, the user saw only
+  // "⚠ Turn limit reached"; on reload the thread replayed every line of this.
+  const tap = aiController.makeUsageTap();
+  tap.addChunk(sse({ type: 'agent_commentary', textDelta: 'I understand. I will now proceed with the plan.' }));
+  tap.addChunk(sse({ type: 'usage', usage: { input_tokens: 100, output_tokens: 10 } }));
+  tap.addChunk(sse({ type: 'agent_commentary', textDelta: 'I understand that `EditTool` is not working and `ReplaceSection` is the next best option.' }));
+  tap.addChunk(sse({ type: 'usage', usage: { input_tokens: 120, output_tokens: 14 } }));
+  tap.addChunk(sse({ type: 'complete', completion: { stopReason: 'max_turns', turns: 2 } }));
+  assert.strictEqual(tap.finalAssistantText(), '', 'no tool-name commentary reaches the thread');
+  assert.strictEqual(tap.snapshot().stopReason, 'max_turns', 'the digest still reports why it ended');
+});
+
+test('a CHAT run keeps its deltas even on a non-done stop (it streamed live)', () => {
+  // The exclusion that keeps the suppression honest: chat text was already in
+  // the user's transcript as it arrived, so the record must match what they saw.
+  const tap = aiController.makeUsageTap();
+  tap.addChunk(sse({ type: 'text_delta', textDelta: 'Here is the first half of the answer' }));
+  tap.addChunk(sse({ type: 'complete', completion: { stopReason: 'max_turns' } }));
+  assert.strictEqual(tap.finalAssistantText(), 'Here is the first half of the answer');
+});
+
+test('a clean commentary run is untouched by the suppression', () => {
+  const tap = aiController.makeUsageTap();
+  tap.addChunk(sse({ type: 'agent_commentary', textDelta: 'Reading the document.' }));
+  tap.addChunk(sse({ type: 'usage', usage: { input_tokens: 10, output_tokens: 5 } }));
+  tap.addChunk(sse({ type: 'complete', fullText: 'Reading the document.', completion: { stopReason: 'done' } }));
+  assert.strictEqual(tap.finalAssistantText(), 'Reading the document.',
+    'stopReason done → the existing joined-segment behaviour still applies');
 });
 
 test('tap surfaces steering_applied', () => {

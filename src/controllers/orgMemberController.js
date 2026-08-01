@@ -391,17 +391,25 @@ const inviteMember = async (req, res) => {
       const { sendEmail } = require('../utils/emailService');
       // Invariant I1: tenant-facing links use the org's custom domain when active
       const baseUrl = await require('../services/domainService').resolveBaseUrl(org._id);
+      const { htmlEscape, subjectSafe } = require('../utils/htmlEscape');
+      // Escaped for the same reason as inviteService.createInvite: inviterName
+      // and orgName are free text controlled by the sender, applyCustomTemplate
+      // substitutes them raw, and the recipient is someone else. See the note
+      // there for the full rationale.
       const emailOptions = {
         to: targetUser.email,
         orgId: org._id, // Phase 11 sender identity
         data: {
-          inviterName: inviter?.profile?.name || inviter?.email || 'A team member',
-          orgName: org.name,
-          role,
-          acceptUrl: `${baseUrl}/login`,
+          inviterName: htmlEscape(inviter?.profile?.name || inviter?.email || 'A team member'),
+          orgName: htmlEscape(org.name),
+          role: htmlEscape(role),
+          acceptUrl: htmlEscape(`${baseUrl}/login`),
         },
       };
       await applyCustomTemplate('member_invite', emailOptions, org._id);
+      // The default subject embeds {{orgName}}, so decode entities back for the
+      // plain-text Subject header.
+      if (emailOptions.subject) emailOptions.subject = subjectSafe(emailOptions.subject);
       // Template resolution can fail transiently — never dispatch a
       // subject-less shell (this notification is best-effort anyway)
       if (emailOptions.subject) {

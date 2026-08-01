@@ -16,6 +16,7 @@ const Workspace = require('../models/Workspace');
 const User = require('../models/User');
 const { applyCustomTemplate } = require('../controllers/emailPortalController');
 const { sendEmail } = require('../utils/emailService');
+const { htmlEscape, subjectSafe } = require('../utils/htmlEscape');
 const auditService = require('./auditService');
 const domainService = require('./domainService');
 
@@ -47,27 +48,54 @@ async function createInvite({ org, email, role, accessScope, workspaceIds = [], 
   const baseUrl = await domainService.resolveBaseUrl(org._id);
   const acceptUrl = `${baseUrl}/accept-invite?token=${rawToken}`;
 
+  /**
+   * ESCAPE BEFORE THE TEMPLATE. This is the highest-value escaping on the
+   * platform, because unlike the contact and feedback emails (which we send to
+   * ourselves) this one goes to an address the SENDER chooses.
+   *
+   * `inviterName` is the sender's own profile name and `orgName` is their own
+   * org name, both free text. applyCustomTemplate substitutes with a raw
+   * String(value) replace. Without escaping, anyone on the free plan could put
+   * markup in their profile name, invite a stranger, and have our
+   * infrastructure deliver it: attacker-authored HTML in an email carrying our
+   * branding and passing SPF/DKIM as genuine. That is a phishing relay built on
+   * our domain reputation, and at volume it gets the sending domain blacklisted,
+   * which would take password resets and receipts down with it.
+   *
+   * `acceptUrl` is escaped too. It is built from domainService.resolveBaseUrl,
+   * which can return an org-controlled custom domain, and it lands inside an
+   * href. Escaping cannot corrupt a URL there: `&amp;` is the correct spelling
+   * of `&` in an HTML attribute and every client decodes it, while a stray
+   * quote can no longer break out of the attribute.
+   */
   const emailOptions = {
     to: normalizedEmail,
     orgId: org._id, // Phase 11 sender identity
     data: {
-      inviterName: inviterName || 'A team member',
-      orgName: org.name,
-      role,
-      acceptUrl,
+      inviterName: htmlEscape(inviterName || 'A team member'),
+      orgName: htmlEscape(org.name),
+      role: htmlEscape(role),
+      acceptUrl: htmlEscape(acceptUrl),
     },
   };
   await applyCustomTemplate('member_invite', emailOptions, org._id);
+
+  // The default subject is "You've been invited to join {{orgName}}", so the
+  // escaped org name reaches the subject line as entities. Decode it back: a
+  // Subject is plain text and must read naturally. See utils/htmlEscape.
+  if (emailOptions.subject) emailOptions.subject = subjectSafe(emailOptions.subject);
+
   // Template resolution failing (transient DB error) must not send a
   // subject-less shell — the invite email IS the deliverable. Hardcoded
-  // fallback mirrors the default template.
+  // fallback mirrors the default template, and escapes for the same reason.
   if (!emailOptions.subject) {
-    emailOptions.subject = `You've been invited to join ${org.name}`;
+    const d = emailOptions.data;
+    emailOptions.subject = subjectSafe(`You've been invited to join ${htmlEscape(org.name)}`);
     emailOptions.html = `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;">
   <h2 style="color:#111;margin-bottom:16px;">You're invited</h2>
-  <p style="color:#555;font-size:16px;line-height:1.6;">${inviterName || 'A team member'} has invited you to join <strong>${org.name}</strong> as ${role}.</p>
+  <p style="color:#555;font-size:16px;line-height:1.6;">${d.inviterName} has invited you to join <strong>${d.orgName}</strong> as ${d.role}.</p>
   <div style="text-align:center;margin:32px 0;">
-    <a href="${acceptUrl}" style="background:#111;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:bold;display:inline-block;">Accept invitation</a>
+    <a href="${d.acceptUrl}" style="background:#111;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:bold;display:inline-block;">Accept invitation</a>
   </div>
   <p style="color:#888;font-size:14px;">This invitation expires in 7 days.</p>
 </div>`;

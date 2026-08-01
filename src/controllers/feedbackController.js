@@ -1,6 +1,7 @@
 const Feedback = require('../models/Feedback');
 const { sendEmail } = require('../utils/emailService');
 const { applyCustomTemplate } = require('./emailPortalController');
+const { htmlEscape, headerSafe, subjectSafe } = require('../utils/htmlEscape');
 
 const SUPPORT_EMAIL = 'support@suparank.ai';
 
@@ -26,29 +27,39 @@ const submitFeedback = async (req, res) => {
     // Send email notification to support (best-effort, non-blocking)
     try {
       const stars = '★'.repeat(rating) + '☆'.repeat(5 - rating);
+      // Escape before applyCustomTemplate: it substitutes into the template
+      // with a raw String(value) replace, and `feedback_submitted` always
+      // resolves a template, so this is the live path. `feature` and `comment`
+      // are user-supplied, which without this let any signed-in user put
+      // arbitrary HTML into the support inbox. `stars` is built here from a
+      // numeric rating and holds no user input.
       const emailOptions = {
         to: SUPPORT_EMAIL,
         data: {
-          feature,
+          feature: htmlEscape(feature),
           rating: String(rating),
           stars,
-          comment: comment || '(no comment)',
-          userEmail: email,
-          submittedAt: new Date().toISOString(),
+          comment: htmlEscape(comment || '(no comment)'),
+          userEmail: htmlEscape(email),
+          submittedAt: htmlEscape(new Date().toISOString()),
         },
       };
       await applyCustomTemplate('feedback_submitted', emailOptions);
 
-      // Fallback if template resolution didn't populate subject/html
+      // Undo entity escaping in the Subject only; it is plain text. See subjectSafe.
+      if (emailOptions.subject) emailOptions.subject = subjectSafe(emailOptions.subject);
+
+      // Error path only, but it uses the escaped values for the same reason.
       if (!emailOptions.subject) {
-        emailOptions.subject = `[SupaRank Feedback] ${stars} — ${feature}`;
+        const d = emailOptions.data;
+        emailOptions.subject = headerSafe(`[SupaRank Feedback] ${stars} ${feature}`);
         emailOptions.html = `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;">
   <h2 style="color:#111;margin-bottom:4px;">New Feedback Received</h2>
   <table style="width:100%;border-collapse:collapse;margin:24px 0;">
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;width:140px;">Feature</td><td style="padding:8px 0;color:#111;">${feature}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Rating</td><td style="padding:8px 0;color:#FFA163;font-size:20px;">${stars}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">User</td><td style="padding:8px 0;color:#111;">${email}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;vertical-align:top;">Comment</td><td style="padding:8px 0;color:#111;">${comment || '(none)'}</td></tr>
+    <tr><td style="padding:8px 0;color:#374151;font-weight:600;width:140px;">Feature</td><td style="padding:8px 0;color:#111;">${d.feature}</td></tr>
+    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Rating</td><td style="padding:8px 0;color:#FFA163;font-size:20px;">${d.stars}</td></tr>
+    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">User</td><td style="padding:8px 0;color:#111;">${d.userEmail}</td></tr>
+    <tr><td style="padding:8px 0;color:#374151;font-weight:600;vertical-align:top;">Comment</td><td style="padding:8px 0;color:#111;">${d.comment}</td></tr>
   </table>
 </div>`;
       }

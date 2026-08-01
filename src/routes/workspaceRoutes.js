@@ -207,6 +207,13 @@ router.post('/:workspaceNumber/content/:contentNumber/ai/threads', rwr, rf('aiTh
 // Threads Phase 4: picker list + resume-an-archived-conversation.
 router.get('/:workspaceNumber/content/:contentNumber/ai/threads', rwr, rf('aiThreads'), rp('aiChat', 'use'), aiController.listThreads);
 router.post('/:workspaceNumber/content/:contentNumber/ai/threads/:threadId/activate', rwr, rf('aiThreads'), rp('aiChat', 'use'), aiController.activateThread);
+// Conversations Phase 2: rename. Same four-middleware shape as its siblings —
+// threadCapture/threadUx assert that shape, and a route that gates differently
+// is how a permission hole gets introduced by copy-paste.
+router.patch('/:workspaceNumber/content/:contentNumber/ai/threads/:threadId', rwr, rf('aiThreads'), rp('aiChat', 'use'), aiController.renameThread);
+// Conversations Phase 5: permanent delete. Same four-middleware shape; the
+// handler carries the in-flight guard and the Phase-4 session eviction.
+router.delete('/:workspaceNumber/content/:contentNumber/ai/threads/:threadId', rwr, rf('aiThreads'), rp('aiChat', 'use'), aiController.deleteThread);
 
 // Plan mode under content (M1 — writing-engine plan mode).
 // Gated like the confirm family (ai/plan-confirm): rf('aiChat') + rp('aiChat','use').

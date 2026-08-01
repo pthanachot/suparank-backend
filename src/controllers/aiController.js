@@ -118,6 +118,45 @@ function rememberSessionSecondary(contentId, sessionId) {
   existing.lastUsed = Date.now();
 }
 
+/**
+ * Conversations Phase 4 — MAKE FORGETTING REAL.
+ *
+ * Drop this content's warm engine session so the next run mints a fresh one.
+ *
+ * THE PROBLEM. The engine has no `deleteSession`; the only way to displace a
+ * session's conversation is a REPLACING seed (`POST /session/{id}/messages`,
+ * which is a full `DELETE FROM messages` + re-insert). But `taskSeed` skips
+ * seeding entirely when the active thread is empty or gone —
+ * `getActiveThreadStamp` returns null and it returns early. So removing a
+ * conversation from Mongo does NOT remove it from the warm engine session: the
+ * next freeform run reuses that session and answers from a conversation the
+ * user just deleted.
+ *
+ * THE FIX, and why eviction is enough. Deleting the map entry means
+ * `setupSession` finds nothing to reuse, calls `createSession`, and
+ * `rememberSession` installs a REPLACEMENT entry with no `pushHashes`. The skip
+ * guard reads hashes only when `entry.sessionId === sessionId`, so a fresh
+ * session can never inherit the old one's hashes — document, brief, context
+ * files, brand voice and mode are all re-pushed. The orphaned engine session
+ * holds the old conversation but is now unreachable, and ages out on the
+ * engine's own 1-hour idle TTL.
+ *
+ * Costs one full setup (~6-8 engine round trips) on the next run. That is the
+ * price of the guarantee, and it is paid once per destructive thread action.
+ *
+ * WHAT THIS DOES NOT DO. The engine's SQLite retains `messages` for
+ * ENGINE_DB_RETENTION_DAYS (default 14) regardless. A Mongo delete is not a
+ * full erasure, and any UI that implies otherwise is overclaiming.
+ *
+ * Also drops the `sessionIds` tenancy set, so a catch-up for a detached run on
+ * the OLD session will fail its tenancy check. Both callers 409 while a run is
+ * in flight, so that window requires a run that finished, went un-caught-up,
+ * and was then followed by a destructive action.
+ */
+function forgetSession(contentId) {
+  contentSessionMap.delete(contentId);
+}
+
 // Resume tenancy: is `sessionId` one of the recent sessions bound to THIS
 // content? Rejects an arbitrary / other-content engine sessionId while
 // tolerating concurrent same-content session creation.
@@ -1390,6 +1429,12 @@ const chat = async (req, res) => {
             docWrites: t.docWrites, stopReason: t.stopReason, turns: usageTap.turnCount(),
           },
         }, content); // re-resolve target if the thread was archived mid-run
+      } else {
+        // Phase 7: same gap as the agent convergence — a chat turn that spent
+        // turns but persisted no reply (client aborted before any text, and no
+        // document writes to trigger the run-summary fallback) would otherwise
+        // cost nothing against the conversation's budget.
+        await threadService.recordTurns(thread, usageTap.turnCount());
       }
       if (usageTap.steeringWasApplied() && thread) {
         threadService.markSteersApplied(thread._id, tReq);
@@ -1498,6 +1543,83 @@ const agent = async (req, res) => {
     // bounded by the finite pools.
     const slotGated = billingAction === 'articleGenerate' || isPlanArticleWrite(content);
     let articleGate = null;
+
+    // Conversations Phase 8: refuse rather than SHADOW a live run.
+    //
+    // activeAgentRuns.set() on an occupied key silently orphans whatever was
+    // there. The victim is usually a DETACHED run still draining server-side:
+    // once its entry is replaced it becomes unreachable — /ai/run-status reports
+    // nothing active, /ai/stop 409s because the sessionId no longer matches, and
+    // the 30-minute TTL sweep can never abort it. It keeps writing the document
+    // with no way to see or stop it.
+    //
+    // Continue is clicked at exactly the moment such a twin may still be
+    // draining, which turns a rare race into a routine one. The frontend guards
+    // too, but per-tab only — a second tab, or a detached run from a closed one,
+    // reaches here regardless.
+    //
+    // Checked HERE, before setupSession, the credit hold and the user-row
+    // append: a refused run must cost nothing and leave no trace. Guarding after
+    // those (as the first cut did) still burned a session setup and left a
+    // dangling user message that the replay shaper later seals as an
+    // "interrupted" turn the user never actually made.
+    //
+    // The AbortController is created here, above the reservation, because the
+    // registry entry carries abort() and that entry now goes in BEFORE
+    // setupSession. The close handler that drives `detached` is still installed
+    // further down, once the state it writes to exists.
+    const abortCtrl = new AbortController();
+    runRegistryKey = content._id.toString();
+    {
+      const live = activeAgentRuns.get(runRegistryKey);
+      if (live) {
+        console.warn(`[agent] refusing to shadow a live run content=${content.contentNumber} `
+          + `existing=${live.runId} incoming=${runId}`);
+        runRegistryKey = null; // that entry is not ours — the finally must not free it
+        return res.status(409).json({
+          error: 'Another AI run is still working on this document — wait for it to finish (or stop it), then try again.',
+          code: 'busy',
+        });
+      }
+    }
+    // RESERVE the slot in the same synchronous step as the check above.
+    //
+    // The check alone was not a guard, it was check-then-act: it read the map
+    // here and registered ~100 lines and FIVE awaits later — setupSession's 6-8
+    // engine round trips, the credit pre-deduct, the thread read, the user-row
+    // append. Two requests arriving inside that multi-second window both saw an
+    // empty map, both passed, and the second orphaned the first — exactly the
+    // failure this block exists to prevent, and Continue makes it routine by
+    // being clicked while a twin may still be draining. Node runs a handler to
+    // its first await without interleaving, so has()+set() with no await between
+    // them is atomic and the window closes.
+    //
+    // sessionId and markdownBefore are filled in below, once setupSession
+    // returns. Readers are unaffected: /ai/stop and /ai/stop-revert already
+    // reject any entry whose sessionId does not match the caller's, which is how
+    // they behaved during this window when there was no entry at all.
+    myRunEntry = {
+      sessionId: null,
+      markdownBefore: '',
+      startedAt: Date.now(),
+      revertIntent: false,
+      abort: () => abortCtrl.abort(),
+      // Threads P1 review (CAVEAT-8): lets side-channel appends (steer/
+      // clarify/plan-confirm) correlate their rows to the run they landed in
+      // — sessionId alone is ambiguous (freeform reuses sessions across runs).
+      runId,
+    };
+    activeAgentRuns.set(runRegistryKey, myRunEntry);
+
+    // The article allowance is checked AFTER the shadow guard, not before.
+    // Ordered the other way, a free-tier document at its article limit with a
+    // run already in flight answered the second request with "You've used all 3
+    // articles included in the free plan" — reporting a permanent, plan-level
+    // condition for what is actually a transient one that clears the moment the
+    // running job finishes. Still before any session, credit or thread work, so
+    // a blocked run does nothing; checkArticleAllowance is read-only (the
+    // increment lives in commitArticleGeneration), and the finally frees the
+    // slot this reserved.
     if (slotGated) {
       articleGate = await checkArticleAllowance(req, content);
       if (articleGate.blocked) {
@@ -1510,6 +1632,11 @@ const agent = async (req, res) => {
     // the memory contract (D5): no seed (the engine wipes it), no marker.
     const isFreeform = !mode || mode === 'freeform';
     const { sessionId, markdown: markdownBefore } = await setupSession(content, { avatarId, reuseSession: isFreeform, memoryRun: isFreeform });
+    // Complete the reservation placed above. Until this line the entry holds the
+    // slot but matches no sessionId, so stop/stop-revert correctly report "no
+    // matching run in flight" rather than acting on a run that has not started.
+    myRunEntry.sessionId = sessionId;
+    myRunEntry.markdownBefore = markdownBefore || '';
     // W2-b: poison the doc-write marker until this run completes cleanly (see chat).
     recordRunDocWrites(content._id.toString(), sessionId, -1);
 
@@ -1560,7 +1687,6 @@ const agent = async (req, res) => {
     // (POST /ai/stop[-revert]) and calls the registry's abort() BEFORE the
     // socket closes, so by the time req.on('close') fires the controller is
     // already aborted and this is a stop, not a detach.
-    const abortCtrl = new AbortController();
     let clientDisconnected = false;
     let detached = false;
     req.on('close', () => {
@@ -1571,30 +1697,13 @@ const agent = async (req, res) => {
       if (!abortCtrl.signal.aborted) detached = true;
     });
 
-    // W4-b/c: register the in-flight run (stop-&-revert intent + run-status +
-    // explicit-stop abort). Registered as late as possible so early returns
-    // (402 etc.) never leave a stale entry; removed in BOTH the success path
-    // and the outer catch. abort() lets /ai/stop and /ai/stop-revert halt the
-    // engine out-of-band now that a socket close no longer does.
-    runRegistryKey = content._id.toString();
-    // Keep a reference to OUR entry object. Same-content runs are guarded by the
-    // FE (one at a time) and the engine's per-session single-flight, but if two
-    // ever overlap, a later run's set() would shadow this one — so every read
-    // and delete below is identity-checked against myRunEntry rather than
-    // trusting whatever currently occupies the key (mirrors the W2 session
-    // guard). A finishing run must never delete or read a different run's entry.
-    myRunEntry = {
-      sessionId,
-      markdownBefore: markdownBefore || '',
-      startedAt: Date.now(),
-      revertIntent: false,
-      abort: () => abortCtrl.abort(),
-      // Threads P1 review (CAVEAT-8): lets side-channel appends (steer/
-      // clarify/plan-confirm) correlate their rows to the run they landed in
-      // — sessionId alone is ambiguous (freeform reuses sessions across runs).
-      runId,
-    };
-    activeAgentRuns.set(runRegistryKey, myRunEntry);
+    // W4-b/c: the in-flight run is already registered — the reservation above
+    // IS the registration, completed with its sessionId once setupSession
+    // returned. Every read and delete below is identity-checked against
+    // myRunEntry rather than trusting whatever currently occupies the key
+    // (mirrors the W2 session guard), so a finishing run can never delete or
+    // read a different run's entry. The finally releases the slot on any early
+    // return (a 402 credit bounce) that exits before the normal delete.
 
     // Start agent — returns a raw SSE response from the Writing Engine
     // mode: "freeform" (default, Claude Code-style) or "sequential" (legacy phases)
@@ -1752,6 +1861,25 @@ const agent = async (req, res) => {
     if (revertFinal && wroteDocument) {
       console.log(`[audit] stop-revert billed as inlineAction content=${content.contentNumber} session=${sessionId}`);
     }
+    // Conversations Phase 7 (decision §4 #6): MEASURE the post-stamp path, do
+    // not reprice it.
+    //
+    // A plan-execute run that wrote anything stamps articleGeneratedPlanId and
+    // burns that plan's single paid generation. Every run afterwards on the same
+    // plan bills inlineAction (2) with no article slot — so a full rewrite costs
+    // 2 credits, repeatably, for as long as the plan stands. That may be
+    // intended generosity or a leak; nobody can tell today because it is
+    // invisible. This line makes it greppable so the question can be answered
+    // with data instead of argued from the billing code.
+    //
+    // Deliberately NOT a new branch in classifyAgentRun: that function is the
+    // subtlest code in the billing path, and adding a rule before the behaviour
+    // is measured is how a pricing bug gets shipped.
+    if (billingAction === 'inlineAction' && content.mode === 'execute'
+        && content.activePlanId && String(content.activePlanId) === String(content.articleGeneratedPlanId || '')) {
+      console.log(`[audit] post-stamp cheap run content=${content.contentNumber} plan=${content.activePlanId} `
+        + `wrote=${wroteDocument} turns=${usageTap.turnCount()} action=inlineAction`);
+    }
 
     // W4-b: make the revert REAL server-side — restore the engine session's
     // pre-run document so engine + FE (snapshot restore) + Mongo (reconcile
@@ -1819,6 +1947,14 @@ const agent = async (req, res) => {
         // enforces session + thread identity AND contiguity (review BUG-2):
         // any interleaved foreign row leaves the marker stale → re-seed.
         maybeBumpSeededMarker(content._id.toString(), sessionId, userAppended, appended);
+      } else {
+        // Phase 7: the run spent turns but persisted no reply (nothing narrated,
+        // or a truncated run whose mid-work narration is suppressed, with the
+        // run-summary fallback skipped because the stream was stopped rather
+        // than completed). appendMessage charges the budget as a side effect of
+        // writing the row, so without this those turns are free — and
+        // run-then-stop-then-repeat is the loop the ceiling exists to bound.
+        await threadService.recordTurns(thread, usageTap.turnCount());
       }
       if (usageTap.steeringWasApplied() && thread) {
         threadService.markSteersApplied(thread._id, tReq);
@@ -1857,6 +1993,17 @@ const agent = async (req, res) => {
     res.end();
   } finally {
     if (threadLockKey) unlockThreadWrites(threadLockKey); // P4
+    // Release the slot reserved before setupSession if this request exited
+    // without ever reaching the normal delete — the credit 402 returns from
+    // inside the try, which runs this finally but NOT the catch. Identity-checked
+    // so a request that was refused (and nulled its key), or one whose entry has
+    // already been superseded, can never free somebody else's run. On every
+    // normal path the entry is gone by now and this is a no-op. Without it a
+    // failed setup would pin the document for a full sweep interval — far worse
+    // than the shadowing the reservation prevents.
+    if (runRegistryKey && activeAgentRuns.get(runRegistryKey) === myRunEntry) {
+      activeAgentRuns.delete(runRegistryKey);
+    }
   }
 };
 
@@ -2631,7 +2778,12 @@ const runStatus = async (req, res) => {
       .select('source sessionId runId stopReason docWrites aborted completedAt createdAt')
       .lean();
     return res.json({
-      active: entry ? { sessionId: entry.sessionId, startedAt: entry.startedAt } : null,
+      // `entry.sessionId` is null between the slot reservation and setupSession
+      // returning. Report that as "not active", exactly as this did when no
+      // entry existed at all during that window — the catch-up UI keys off the
+      // sessionId to reconcile engine content, and a null would send it looking
+      // for a session that does not exist yet.
+      active: entry && entry.sessionId ? { sessionId: entry.sessionId, startedAt: entry.startedAt } : null,
       last: last || null,
     });
   } catch (err) {
@@ -2744,6 +2896,12 @@ const newThread = async (req, res) => {
     if (!thread) {
       return res.status(500).json({ error: 'Failed to start a new conversation' });
     }
+    // Phase 4: the warm engine session still holds the ARCHIVED conversation,
+    // and nothing would displace it — the fresh thread is empty, so `taskSeed`
+    // skips its replacing seed. Without this the next freeform run answers from
+    // the conversation the user just left. Long-standing hole; the route comment
+    // above has admitted it since Phase 1.
+    forgetSession(content._id.toString());
     return res.json({ threadId: thread._id, status: 'ok' });
   } catch (err) {
     console.error('[threads] newThread error:', err);
@@ -2773,8 +2931,13 @@ const listThreads = async (req, res) => {
 // POST /:workspaceNumber/content/:contentNumber/ai/threads/:threadId/activate
 // Threads Phase 4: resume an archived conversation. Same in-flight-run
 // guard as newThread — swapping the active thread mid-run would file the
-// run's reply on an archived thread. No session surgery: the seeding
-// invariant re-seeds the next run (marker threadId mismatch).
+// run's reply on an archived thread.
+//
+// Conversations Phase 4 CORRECTION: this used to say "no session surgery — the
+// seeding invariant re-seeds the next run". That is true only when a seed
+// actually runs, and taskSeed bails out silently in two cases (empty stamp, or
+// a replay payload the shaper emptied). Both leave the warm session holding the
+// previous conversation. It now evicts; see forgetSession.
 // ─────────────────────────────────────────────────────────────
 const activateThread = async (req, res) => {
   try {
@@ -2802,10 +2965,142 @@ const activateThread = async (req, res) => {
     if (!thread) {
       return res.status(404).json({ error: 'Conversation not found' });
     }
-    return res.json({ threadId: thread._id, title: thread.title || '', status: 'ok' });
+    // Phase 4: evict here too, despite the seeding invariant.
+    //
+    // The invariant re-seeds on a threadId mismatch, and a seed REPLACES engine
+    // history — so in the common case switching does displace the old
+    // conversation. But `taskSeed` has TWO silent bail-outs, and neither is
+    // reachable from the marker check: it returns early when the stamp is null
+    // (empty thread), and again when the replay shaper filters every message out
+    // — which happens to a thread whose only row is an assistant message, the
+    // exact shape the archived-thread re-resolve path produces. In either case
+    // no seed runs and the warm session keeps the conversation the user just
+    // switched AWAY from.
+    //
+    // Evicting makes the rule uniform — any conversation switch starts a fresh
+    // engine session — and costs one setup on a deliberate, infrequent action.
+    // Correctness here is worth more than a reused socket.
+    forgetSession(content._id.toString());
+    // Conversations Phase 9: report the DRAFT's mode alongside the conversation.
+    //
+    // Mode lives on the content, not the conversation (Content.mode is the
+    // source of truth, and neither activate nor newThread touches it). So
+    // switching to an old chat on a draft that is in plan mode silently
+    // re-enters plan mode: the document tools are denied by the engine's mode
+    // rules and the model can only research and propose. Nothing said so, and
+    // the transcript the user just opened gives no hint.
+    //
+    // Reporting rather than RESETTING is deliberate. Forcing chat here would
+    // abandon an in-progress plan the user may have spent a run building —
+    // destructive, and surprising in the other direction. The conversation is
+    // theirs to switch; the draft's mode is not something switching should
+    // silently decide.
+    return res.json({
+      threadId: thread._id, title: thread.title || '',
+      mode: content.mode || 'chat', status: 'ok',
+    });
   } catch (err) {
     console.error('[threads] activateThread error:', err);
     return res.status(500).json({ error: 'Failed to switch conversations' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// PATCH /:workspaceNumber/content/:contentNumber/ai/threads/:threadId
+// Conversations Phase 2: rename a conversation. Auto-titles are the first user
+// message truncated, which is frequently wrong or ugly.
+//
+// Carries the SAME in-flight guard as newThread/activateThread even though a
+// rename cannot corrupt a run: the four thread routes are one surface, and a
+// route that silently behaves differently under load is how the next reader
+// concludes the guard is optional.
+// ─────────────────────────────────────────────────────────────
+const renameThread = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+    const { threadId } = req.params;
+    if (!threadId || !/^[a-f0-9]{24}$/i.test(threadId)) {
+      return res.status(400).json({ error: 'Invalid conversation id' });
+    }
+    if (activeAgentRuns.has(content._id.toString()) || threadWriteLocks.has(content._id.toString())) {
+      return res.status(409).json({ error: 'An AI run is in progress on this document — stop it (or let it finish) before renaming conversations.' });
+    }
+    const thread = await threadService.renameThread(content, threadId, req.body?.title);
+    if (thread && thread.disabled) {
+      return res.status(409).json({ error: 'Conversation threads are not enabled' });
+    }
+    // An empty/whitespace title is rejected rather than stored: a stored empty
+    // title re-arms the auto-titler, so the next message would silently rename
+    // the conversation again (see threadService.renameThread).
+    if (thread && thread.invalid) {
+      return res.status(400).json({ error: 'A conversation name cannot be empty' });
+    }
+    if (thread && thread.error) {
+      return res.status(503).json({ error: 'Could not rename the conversation right now — please try again.' });
+    }
+    if (!thread) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    return res.json({ threadId: thread._id, title: thread.title || '', status: 'ok' });
+  } catch (err) {
+    console.error('[threads] renameThread error:', err);
+    return res.status(500).json({ error: 'Failed to rename the conversation' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// DELETE /:workspaceNumber/content/:contentNumber/ai/threads/:threadId
+// Conversations Phase 5: remove a conversation permanently.
+//
+// The in-flight guard is MANDATORY here, not a courtesy. Without it,
+// appendMessage's archived-thread re-resolve files the running turn's assistant
+// reply onto a freshly minted thread — whose leading assistant row
+// shapeThreadForReplay then silently DROPS, so the reply exists in history but
+// never in AI memory.
+//
+// The eviction is equally mandatory: deleting the active conversation leaves
+// zero actives, the next run mints an EMPTY thread, and an empty thread makes
+// taskSeed skip its replacing seed — so without forgetSession the warm engine
+// session would keep answering from the conversation the user just deleted.
+// Verified live: backend/scripts/forget-smoke.mjs fails at step 4 without it.
+// ─────────────────────────────────────────────────────────────
+const deleteThread = async (req, res) => {
+  try {
+    const content = await resolveContent(req, res);
+    if (!content) return;
+    const { threadId } = req.params;
+    if (!threadId || !/^[a-f0-9]{24}$/i.test(threadId)) {
+      return res.status(400).json({ error: 'Invalid conversation id' });
+    }
+    if (activeAgentRuns.has(content._id.toString()) || threadWriteLocks.has(content._id.toString())) {
+      return res.status(409).json({ error: 'An AI run is in progress on this document — stop it (or let it finish) before deleting conversations.' });
+    }
+    const result = await threadService.deleteThread(content, threadId);
+    if (result && result.disabled) {
+      return res.status(409).json({ error: 'Conversation threads are not enabled' });
+    }
+    if (result && result.error) {
+      return res.status(503).json({ error: 'Could not delete the conversation right now — please try again.' });
+    }
+    if (!result) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    // Phase 4. Unconditional: the deleted thread may have been the one the warm
+    // session was seeded from even when it was not the ACTIVE one (the marker
+    // records what was last replayed, not what is current).
+    forgetSession(content._id.toString());
+    // `wasActive` is load-bearing for the client, not diagnostics: if the user
+    // deleted the conversation they were IN, its messages are still on their
+    // screen and the header still names it. Only the server knows which one was
+    // active, so it has to say.
+    return res.json({
+      threadId, deleted: result.threads, messages: result.messages,
+      wasActive: !!result.wasActive, status: 'ok',
+    });
+  } catch (err) {
+    console.error('[threads] deleteThread error:', err);
+    return res.status(500).json({ error: 'Failed to delete the conversation' });
   }
 };
 
@@ -2894,7 +3189,7 @@ async function resyncBriefIfActive(contentId) {
   }
 }
 
-module.exports = { chat, agent, generateImage, inlineEdit, autocomplete, rehostImage, uploadImage, clarifyAnswer, planConfirm, steer, stopRevert, stopRun, engineContent, runStatus, getThread, newThread, listThreads, activateThread, listSkills, resyncBriefIfActive,
+module.exports = { chat, agent, generateImage, inlineEdit, autocomplete, rehostImage, uploadImage, clarifyAnswer, planConfirm, steer, stopRevert, stopRun, engineContent, runStatus, getThread, newThread, listThreads, activateThread, renameThread, deleteThread, listSkills, resyncBriefIfActive,
   // Exported for test coverage (cost-ledger usage tap + Phase-4 preset resolver).
   // Not part of the runtime API surface.
   makeUsageTap, resolvePreset, clampAgentBudget,
@@ -2902,6 +3197,9 @@ module.exports = { chat, agent, generateImage, inlineEdit, autocomplete, rehostI
   // Exported so tests can seed the content→session binding (resume tenancy)
   // and pin the W2-b doc-write marker's session guard.
   contentSessionMap, rememberSession, recordRunDocWrites,
+  // Conversations Phase 4: exported so tests can pin "a destructive thread
+  // action makes the engine forget" — the property Phase 5's delete rests on.
+  forgetSession,
   // P2: exported for the seeding-marker contiguity tests (review BUG-2).
   maybeBumpSeededMarker,
   // P4: exported for the thread-write-lock guard tests (review BUG-2).

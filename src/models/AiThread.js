@@ -51,6 +51,21 @@ const aiThreadSchema = new mongoose.Schema(
     // fires on (tokenEstimate - tokenEstimateAtCompaction) > threshold, i.e.
     // tokens accumulated SINCE the last compaction.
     tokenEstimateAtCompaction: { type: Number, default: 0 },
+    // Conversations Phase 7: cumulative ENGINE TURNS across every run filed on
+    // this conversation.
+    //
+    // Nothing else in the system bounds repeated work. Every engine budget —
+    // max_turns, max_edits, the cumulative token ceiling — resets to zero on
+    // each run, `creditsUsed` is written to three tables and read by nobody who
+    // blocks, and the only aggregate USD kill-switch in the codebase is a
+    // $10/day cap on anonymous public tools that never touches /ai/agent. So a
+    // one-click "continue" is an unbounded spend loop unless something counts
+    // ACROSS runs. This is that something.
+    //
+    // Turns rather than credits (decision §4 #5): legible to a user ("42 of 150
+    // turns"), and already carried per run in AiThreadMessage.meta.turns, so the
+    // increment point exists rather than needing new plumbing.
+    turnsUsed: { type: Number, default: 0 },
   },
   { timestamps: true }
 );

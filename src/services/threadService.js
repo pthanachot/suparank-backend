@@ -22,6 +22,10 @@ const costLedger = require('./costLedgerService');
 
 const MAX_TEXT = 32768;
 const MAX_DISPLAY = 200;
+/** Must match AiThread's `title` maxlength. Mongoose does not run validators on
+ *  update operators, so every WRITE path clamps with this rather than trusting
+ *  the schema — the auto-titler and the rename route both go through it. */
+const MAX_TITLE = 120;
 
 /** ceil(chars/4) — the cheap token estimate Phase 3's compaction triggers on. */
 function estimateTokens(text) {
@@ -103,12 +107,24 @@ async function appendMessage(thread, { kind, text, displayText, meta }, content)
     if (!fullText || !fullText.trim()) return null;
     const display = safeSlice(displayText, MAX_DISPLAY);
 
+    // Phase 7: fold this run's engine turns into the conversation's cumulative
+    // budget. Counted on the ASSISTANT append only — `meta.turns` is the run's
+    // own turn count, written once at the convergence point, so counting user
+    // rows (or steer/clarify side-channel rows, which carry no turns) would
+    // either double-count or add zero.
+    //
+    // A COMPACTION row must not touch it either: compaction appends a row and
+    // bumps messageCount, but it is bookkeeping, not model work the user asked
+    // for. It passes no `turns`, so the guard below excludes it naturally.
+    const runTurns = kind === 'assistant' && Number.isFinite(Number(meta?.turns))
+      ? Math.max(0, Math.floor(Number(meta.turns)))
+      : 0;
+    const inc = { messageCount: 1, tokenEstimate: estimateTokens(fullText) };
+    if (runTurns > 0) inc.turnsUsed = runTurns;
+
     let updated = await AiThread.findOneAndUpdate(
       { _id: thread._id, status: 'active' },
-      {
-        $inc: { messageCount: 1, tokenEstimate: estimateTokens(fullText) },
-        $set: { lastMessageAt: new Date() },
-      },
+      { $inc: inc, $set: { lastMessageAt: new Date() } },
       { new: true, lean: true },
     );
     if (!updated && content) {
@@ -116,10 +132,7 @@ async function appendMessage(thread, { kind, text, displayText, meta }, content)
       if (current) {
         updated = await AiThread.findOneAndUpdate(
           { _id: current._id, status: 'active' },
-          {
-            $inc: { messageCount: 1, tokenEstimate: estimateTokens(fullText) },
-            $set: { lastMessageAt: new Date() },
-          },
+          { $inc: inc, $set: { lastMessageAt: new Date() } },
           { new: true, lean: true },
         );
       }
@@ -135,7 +148,7 @@ async function appendMessage(thread, { kind, text, displayText, meta }, content)
       // Best-effort, guarded so a concurrent first-append can't overwrite.
       AiThread.updateOne(
         { _id: updated._id, title: '' },
-        { $set: { title: safeSlice(display || fullText, 120) } },
+        { $set: { title: safeSlice(display || fullText, MAX_TITLE) } },
       ).catch(() => {});
     }
 
@@ -203,12 +216,18 @@ async function getThreadHistory(contentId, { page = 0, pageSize = 50 } = {}) {
   if (hasMore) messages.pop();
   messages.reverse(); // ascending for the renderer
 
+  const turnsUsed = Math.max(0, Number(thread.turnsUsed) || 0);
   return {
     thread: {
       id: thread._id,
       title: thread.title,
       messageCount: thread.messageCount,
       lastMessageAt: thread.lastMessageAt,
+      // Phase 7: the conversation's turn budget, so a Continue affordance can
+      // name the cost BEFORE the click rather than after the spend.
+      turnsUsed,
+      turnBudget: THREAD_TURN_BUDGET,
+      turnsRemaining: Math.max(0, THREAD_TURN_BUDGET - turnsUsed),
     },
     messages: messages.map((m) => ({
       seq: m.seq,
@@ -276,10 +295,27 @@ async function startNewThread(content, userId) {
 
 // ─── Phase 2: replay shaping ─────────────────────────────────────────────
 
+// Compaction trigger — env-tunable so the live smoke can force a compaction
+// without generating 24k real tokens. Declared HERE rather than with the rest
+// of the Phase-3 constants because the replay budget below derives from it, and
+// a `const` cannot be read above its declaration.
+const COMPACT_TRIGGER_TOKENS = parseInt(process.env.THREAD_COMPACT_TRIGGER_TOKENS, 10) || 24000;
+
 // Replay budget: the shaped history sent to the engine stays under this many
 // estimated tokens (walked backward from the newest message). Compaction
 // (Phase 3) keeps real threads well below it; this is the hard stop.
-const REPLAY_TOKEN_BUDGET = 24000;
+//
+// DERIVED from the compaction trigger, not a second copy of the same number.
+// The two are coupled: compaction is what keeps a thread's unsummarized tail
+// under the trigger, and the replay budget is what carries that tail to the
+// engine. Both were literal 24000s — but only ONE was env-tunable, so raising
+// THREAD_COMPACT_TRIGGER_TOKENS would let threads grow past a replay budget
+// that stayed put, and the shaper would silently drop the oldest turns it
+// walked past. Silent history loss, from tuning one knob.
+//
+// Kept as `>=` rather than `===`: the trigger is a threshold that compaction
+// crosses before acting, so the tail can briefly exceed it.
+const REPLAY_TOKEN_BUDGET = COMPACT_TRIGGER_TOKENS;
 // How many raw rows we even consider (pre-compaction threads could be huge;
 // the token budget re-caps inside this window anyway).
 const REPLAY_MAX_ROWS = 200;
@@ -512,9 +548,8 @@ async function sessionSeenForContent(contentId, sessionId) {
 
 // ─── Phase 3: compaction ─────────────────────────────────────────────────
 
-// Trigger thresholds — env-tunable so the live smoke can force a compaction
-// without generating 24k real tokens. Production defaults per the plan.
-const COMPACT_TRIGGER_TOKENS = parseInt(process.env.THREAD_COMPACT_TRIGGER_TOKENS, 10) || 24000;
+// COMPACT_TRIGGER_TOKENS is declared with the replay budget above — the two are
+// coupled and must not drift (see the note there).
 const COMPACT_TRIGGER_MSGS = parseInt(process.env.THREAD_COMPACT_TRIGGER_MSGS, 10) || 60;
 const COMPACT_KEEP_LAST = parseInt(process.env.THREAD_COMPACT_KEEP_LAST, 10) || 8;
 // Below this many compactable rows a summary buys nothing.
@@ -804,6 +839,167 @@ async function activateThread(content, threadId) {
   }
 }
 
+/**
+ * Rename a conversation. Returns the updated lean doc, `null` for a genuine
+ * miss (foreign/unknown id), or `{ disabled: true }` when the flag is off.
+ *
+ * SAFE BY CONSTRUCTION with respect to the seeding invariant: the marker is
+ * `{ threadId, seq }`, and `title` appears nowhere in `getActiveThreadStamp`,
+ * `getReplayPayload`, the replay payload, or `maybeBumpSeededMarker`. The title
+ * is never sent to the engine at all, so a rename cannot desync a warm session.
+ * `threadReplay.test.js` pins this so it stays true.
+ *
+ * Two things this deliberately does NOT rely on:
+ *
+ *  1. **Schema validation.** `title`'s `maxlength: 120` is enforced by
+ *     `AiThread.create` only — Mongoose does not run validators on update
+ *     operators. Passing `runValidators` would work but silently changes
+ *     failure from "clamped" to "thrown"; clamping here matches what the
+ *     auto-title path already does (`safeSlice(..., 120)` at the title gate).
+ *  2. **The caller trimming.** An all-whitespace title is rejected rather than
+ *     stored, because a stored empty title re-arms the auto-titler (its gate is
+ *     `!updated.title`) and the next user message would silently rename the
+ *     conversation again — a rename that undoes itself one turn later.
+ */
+async function renameThread(content, threadId, rawTitle) {
+  if (!(await isFlagLive('aiThreads'))) return { disabled: true };
+  const title = safeSlice(String(rawTitle ?? '').trim(), MAX_TITLE);
+  if (!title) return { invalid: true };
+  try {
+    // Scoped by contentId like activateThread — a threadId alone must never be
+    // enough to touch another document's conversation.
+    return await AiThread.findOneAndUpdate(
+      { _id: threadId, contentId: content._id, ownerUserId: null },
+      { $set: { title } },
+      { new: true, lean: true },
+    );
+  } catch (err) {
+    console.error('[threads] renameThread failed:', err.message);
+    return { error: true };
+  }
+}
+
+/**
+ * Charge turns to a conversation WITHOUT filing a message.
+ *
+ * `appendMessage` folds a run's turns in as a side effect of persisting its
+ * reply, which covers the normal case — but a run can spend turns and persist
+ * nothing. The reply is only written `if (finalText)`, and finalText is empty
+ * when the model narrated nothing, or when the Phase-6 suppression drops a
+ * truncated run's mid-work narration. The run-summary fallback that would
+ * otherwise fill the gap requires `streamCompleted`, so it does not fire on an
+ * explicit stop.
+ *
+ * Net effect without this: a stopped run contributes ZERO to the budget no
+ * matter how much work it did — and run-then-stop-then-repeat is precisely the
+ * loop the ceiling exists to bound. A spend ceiling that under-counts the spend
+ * is worse than none, because it reads as protection.
+ *
+ * Returns the number charged, or null when there was nothing to charge.
+ */
+async function recordTurns(thread, turns) {
+  if (!thread) return null; // flag off / no conversation — nothing to charge
+  const n = Number.isFinite(Number(turns)) ? Math.max(0, Math.floor(Number(turns))) : 0;
+  if (n <= 0) return null;
+  try {
+    await AiThread.updateOne({ _id: thread._id, status: 'active' }, { $inc: { turnsUsed: n } });
+    return n;
+  } catch (err) {
+    // Budget accounting must never break a run that already happened.
+    console.error('[threads] recordTurns failed:', err.message);
+    return null;
+  }
+}
+
+/**
+ * Conversations Phase 7: the per-conversation turn ceiling.
+ *
+ * Deliberately generous — roughly three full plan-mode runs (50 turns each).
+ * This is not a usage cap on conversations; a user can always start a new one.
+ * It exists to bound REPEATED CONTINUATION of a single run, which is the only
+ * place in the product where one click can spend without limit.
+ *
+ * Env-tunable like the compaction thresholds, so it can be raised without a
+ * deploy if real conversations turn out to run longer.
+ */
+const THREAD_TURN_BUDGET = envPositiveInt('THREAD_TURN_BUDGET', 150);
+
+/**
+ * How much of a conversation's turn budget is left.
+ *
+ * Reads the ACTIVE thread — the budget belongs to the conversation the user is
+ * in. Returns null when threads are off or there is no conversation yet, which
+ * callers must treat as "no ceiling known", never as "exhausted": failing closed
+ * here would block runs on a flag-off deployment.
+ */
+async function getConversationBudget(contentId) {
+  if (!(await isFlagLive('aiThreads'))) return null;
+  try {
+    const thread = await AiThread.findOne(
+      { contentId, status: 'active', ownerUserId: null },
+      { turnsUsed: 1 },
+      { lean: true, sort: { createdAt: -1 } },
+    );
+    if (!thread) return null;
+    const used = Math.max(0, Number(thread.turnsUsed) || 0);
+    return {
+      used,
+      limit: THREAD_TURN_BUDGET,
+      remaining: Math.max(0, THREAD_TURN_BUDGET - used),
+      exhausted: used >= THREAD_TURN_BUDGET,
+    };
+  } catch (err) {
+    // Same reasoning as the null cases: a Mongo hiccup must not become a wall.
+    console.error('[threads] getConversationBudget failed:', err.message);
+    return null;
+  }
+}
+
+/**
+ * Conversations Phase 5: delete a conversation for good.
+ *
+ * HARD delete, not a soft status (§4 #2). A `status: 'deleted'` would have needed
+ * four separate edits to behave: `listThreads`' `$or` filter would still show the
+ * row, `pruneArchivedThreads` only reaps `'archived'` so deleted rows would live
+ * forever, `exportService` dumps every thread regardless of status, and the enum
+ * itself. Hard delete matches the four existing bulk-delete sites instead.
+ *
+ * CHILDREN FIRST, and the ordering is not stylistic. `AiThreadMessage` is keyed
+ * only by `threadId` — it carries no workspace or content field — so a parent
+ * deleted before its children orphans them permanently and unreachably, with no
+ * query that can ever find them again. If the message delete fails we abort and
+ * leave the thread intact: a thread with its messages is recoverable, messages
+ * without their thread are not.
+ *
+ * Returns the deleted counts, `null` for a genuine miss (foreign/unknown id),
+ * `{ disabled: true }` when the flag is off, or `{ error: true }` on failure.
+ *
+ * DOES NOT decide what becomes active. Deleting the active conversation
+ * deliberately leaves ZERO actives; `getOrCreateActiveThread` mints a fresh
+ * empty one on the next run (§4 #3). That is also why the caller MUST evict the
+ * engine session — an empty thread means `taskSeed` skips its replacing seed, so
+ * eviction is the only thing that makes the AI forget (see forgetSession).
+ */
+async function deleteThread(content, threadId) {
+  if (!(await isFlagLive('aiThreads'))) return { disabled: true };
+  try {
+    // Scoped by contentId like activateThread/renameThread — a threadId alone
+    // must never reach another document's conversation.
+    const target = await AiThread.findOne(
+      { _id: threadId, contentId: content._id, ownerUserId: null },
+      { _id: 1, status: 1 },
+      { lean: true },
+    );
+    if (!target) return null;
+    const dm = await AiThreadMessage.deleteMany({ threadId: target._id });
+    const dt = await AiThread.deleteOne({ _id: target._id });
+    return { messages: dm.deletedCount, threads: dt.deletedCount, wasActive: target.status === 'active' };
+  } catch (err) {
+    console.error('[threads] deleteThread failed:', err.message);
+    return { error: true };
+  }
+}
+
 // ─── Phase 5: retention ──────────────────────────────────────────────────
 
 // P5 review: clamp to >= 1. `0 || 90` silently meant 90 (fine), but a
@@ -859,5 +1055,9 @@ module.exports = {
   maybeCompactThread,
   listThreads,
   activateThread,
+  renameThread,
+  deleteThread,
+  getConversationBudget,
+  recordTurns,
   pruneArchivedThreads,
 };

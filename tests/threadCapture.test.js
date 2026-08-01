@@ -151,6 +151,32 @@ test('plan_proposed keeps its text — a proposed plan is a delivered outcome', 
   assert.strictEqual(tap.finalAssistantText(), 'Drafted a 10-section plan for your review.');
 });
 
+test('the new complete-then-error truncation shape still captures stopReason', () => {
+  // Conversations Phase 6 changed the engine: max_turns and token_budget now
+  // emit `complete` (carrying the stop reason) BEFORE their `error`, matching
+  // output_limit. The tap must keep working across that change — it reads
+  // stopReason from the completion AND scrapes it off the error code, and the
+  // A1 narration suppression keys on the result.
+  const tap = aiController.makeUsageTap();
+  tap.addChunk(sse({ type: 'agent_commentary', textDelta: 'First, I will update the Overview section.' }));
+  tap.addChunk(sse({ type: 'complete', completion: { stopReason: 'max_turns', turns: 50 } }));
+  tap.addChunk(sse({ type: 'error', code: 'max_turns', error: 'The agent reached its turn limit…' }));
+  assert.strictEqual(tap.snapshot().stopReason, 'max_turns');
+  assert.strictEqual(tap.finalAssistantText(), '',
+    'the mid-work promise must still be suppressed under the new event order');
+});
+
+test('the error-only shape still works — older engines emit no completion', () => {
+  // The error remains the ONLY carrier for paths that never reach a completion
+  // (api_error), and for an engine deployed before Phase 6. Dropping the scrape
+  // would silently lose stopReason on both.
+  const tap = aiController.makeUsageTap();
+  tap.addChunk(sse({ type: 'agent_commentary', textDelta: 'mid-work narration' }));
+  tap.addChunk(sse({ type: 'error', code: 'token_budget', error: 'output budget' }));
+  assert.strictEqual(tap.snapshot().stopReason, 'token_budget');
+  assert.strictEqual(tap.finalAssistantText(), '');
+});
+
 test('every truncation ceiling suppresses, and only those', () => {
   // Pins the set against drift: the engine emits these five from query.go,
   // strategy_execute.go and strategy_sequential.go.

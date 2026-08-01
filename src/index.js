@@ -281,6 +281,12 @@ app.use('/api/public', require('./routes/publicRoutes'));
 // publicToolsGuard: honeypot, per-IP daily caps, daily budget kill-switch)
 app.use('/api/public/tools', require('./routes/publicToolsRoutes'));
 
+// Public contact form (unauthenticated: honeypot, per-IP daily cap, HTML-
+// escaped notification email). Mounted after /api/public because publicRoutes
+// only handles /reports/:token and cannot swallow this path.
+// The authenticated twin at /api/contact above is unchanged.
+app.use('/api/public/contact', require('./routes/publicContactRoutes'));
+
 // Internal API for the Go writing-engine (CFS reads, plan writes, skills
 // bridge). Gated by internalAuth middleware — NOT user-facing.
 app.use('/api/internal/cfs', internalCfsRoutes);

@@ -15,7 +15,8 @@ const { toGoPlan } = require('../services/planSerializer');
 const imageStorage = require('../services/imageStorage');
 const creditService = require('../services/creditService');
 const { resolveCredits } = require('../config/creditRules');
-const { classifyAgentRun, isPlanArticleWrite } = require('../config/agentBilling');
+const { classifyAgentRun, isPlanArticleWrite, resolveAgentRun } = require('../config/agentBilling');
+const systemSettings = require('../services/systemSettingsService');
 const UsageTracker = require('../models/UsageTracker');
 const UserUsageTracker = require('../models/UserUsageTracker');
 const costLedger = require('../services/costLedgerService');
@@ -42,6 +43,14 @@ async function resolvePreset(req) {
 // agent uses the `agent` role — both default to gemini-2.5-flash in models.json.
 // Phase 4 (tier-aware presets) will make the engine always tag the real model.
 const WRITING_ENGINE_DEFAULT_MODEL = 'google/gemini-2.5-flash';
+// Only used when the engine's image_usage event reports images but no model
+// name (older engine build). The engine normally reports the model it resolved
+// from models.json, so the ledger prices what actually ran instead of drifting
+// from a hardcoded id here.
+const IMAGE_MODEL_FALLBACK = 'google/gemini-2.5-flash-image';
+// The engine tools that can mint an image and therefore need somewhere durable
+// to put it. Mirrors the engine's own whitelistHasImageTool.
+const IMAGE_TOOLS = ['ImageGenTool', 'ImageSearchTool'];
 
 // ─── Session reuse map ───────────────────────────────────────
 // Maps contentId → { sessionId, lastUsed } for conversation memory.
@@ -57,6 +66,23 @@ const SESSION_TTL_MS = 60 * 60 * 1000; // 1 hour
 // Generous vs the engine's ~58-turn / token-budget ceilings so it never
 // evicts a genuinely-live run.
 const AGENT_RUN_TTL_MS = 30 * 60 * 1000;
+
+// Concurrent AGENT runs ONE USER may hold across all their documents. The
+// shadow guard is per document, so without this a single user could hold an
+// unbounded number of simultaneous runs — each an engine session, an image
+// budget and a credit hold. Three is comfortably above real use (a person
+// works on one document at a time, occasionally two).
+//
+// Scope, precisely: this counts activeAgentRuns, and CHAT runs never register
+// there, so concurrent chat turns are bounded only by the per-IP limiter and
+// the credit pre-deduct. Per-process too — with N backend replicas the real
+// ceiling is 3N; a shared store is the multi-instance-safe version.
+// AGENT_MAX_RUNS_PER_USER overrides it; values below 1 fall back to the
+// default rather than blocking every run.
+const MAX_RUNS_PER_USER = (() => {
+  const n = parseInt(process.env.AGENT_MAX_RUNS_PER_USER, 10);
+  return Number.isFinite(n) && n >= 1 ? n : 3;
+})();
 
 // Clean up stale sessions every 10 minutes. unref() so this housekeeping
 // timer never holds the process open (tests, graceful shutdown).
@@ -225,6 +251,14 @@ function makeUsageTap() {
   // deltas — sawTextDelta picks the branch.
   let completionFinalText = '';
   let sawTextDelta = false;
+  // Phase 3 (image COGS): images are billed PER IMAGE by the provider, so they
+  // contribute no tokens and were invisible to this tap — the most expensive
+  // operation the engine performs recorded $0.00. The engine emits one
+  // terminal `image_usage` event per run carrying the RUN total (the
+  // completion payload's count predates the post-agent pass and would
+  // undercount). Read only this event, so nothing can double-count.
+  let images = 0;
+  let imageModel = '';
   return {
     addChunk(buf) {
       buffer += buf.toString('utf8');
@@ -275,6 +309,23 @@ function makeUsageTap() {
           if (ev && ev.type === 'error' && typeof ev.code === 'string' && ev.code) {
             stopReason = ev.code;
           }
+          // Terminal image-spend report. fullText carries the JSON payload,
+          // matching how the engine ships other structured events
+          // (agent_progress). Last one wins — there is exactly one per run.
+          if (ev && ev.type === 'image_usage' && typeof ev.fullText === 'string') {
+            try {
+              const usage = JSON.parse(ev.fullText);
+              // Clamped, not just coerced. `Number(x) || 0` still admits
+              // Infinity (JSON.parse turns 1e999 into it) and negatives, and
+              // this value is multiplied into a currency figure: one Infinity
+              // row makes every $sum over that window Infinity forever, and a
+              // negative would credit the org. The engine is trusted, but
+              // IMAGE_BUDGET_PER_RUN is operator-settable and the clamp is free.
+              const n = Number(usage.images);
+              images = Number.isFinite(n) ? Math.max(0, Math.min(500, Math.round(n))) : 0;
+              if (typeof usage.model === 'string') imageModel = usage.model;
+            } catch { /* malformed payload — leave the count at 0 */ }
+          }
           if (ev && ev.type === 'usage' && ev.usage) {
             // Go emits snake_case (input_tokens/output_tokens) — see
             // writing-engine api.Usage json tags. Accept camelCase too for
@@ -299,7 +350,7 @@ function makeUsageTap() {
       }
     },
     snapshot() {
-      return { inputTokens, outputTokens, model, docWrites, stopReason };
+      return { inputTokens, outputTokens, model, docWrites, stopReason, images, imageModel };
     },
     // Threads Phase 1: the run's full assistant text (all text turns joined),
     // with the last complete.fullText as fallback ("Cancelled" is deliberately
@@ -353,7 +404,10 @@ function makeUsageTap() {
  */
 async function persistUsage(req, content, tap, source, runMeta = {}) {
   const totals = tap.snapshot();
-  if (totals.inputTokens === 0 && totals.outputTokens === 0) return;
+  // `|| images` : image calls bill per image and carry no tokens, so a run
+  // whose only measurable spend was images would otherwise return here and
+  // record nothing at all — the exact blind spot this phase closes.
+  if (totals.inputTokens === 0 && totals.outputTokens === 0 && !totals.images) return;
   AgentUsageLog.create({
     workspaceId: content.workspaceId,
     contentId: content._id,
@@ -368,6 +422,7 @@ async function persistUsage(req, content, tap, source, runMeta = {}) {
     runId: runMeta.runId || '', // P4: unambiguous run identity (sessions are reused)
     stopReason: totals.stopReason || '',
     docWrites: totals.docWrites || 0,
+    images: totals.images || 0,
     aborted: !!runMeta.aborted,
     completedAt: new Date(),
   }).catch((err) => {
@@ -393,6 +448,36 @@ async function persistUsage(req, content, tap, source, runMeta = {}) {
       tier,
       metadata: { contentId: content._id?.toString(), source },
     });
+
+    // Images get their OWN row, never folded into the one above. That row's
+    // model is the TEXT model: passing `images` alongside it would price the
+    // images at the text model's flat rate (usually absent ⇒ $0) and, for a
+    // flat-priced model, would REPLACE the token cost entirely. Mirrors the
+    // per-image row the standalone /ai/generate-image route already writes.
+    if (totals.images > 0) {
+      costLedger.record({
+        action: 'image',
+        model: totals.imageModel || IMAGE_MODEL_FALLBACK,
+        images: totals.images,
+        organizationId: orgId,
+        workspaceId: content.workspaceId,
+        userId: req?.user?.userId || null,
+        tier,
+        // The COUNT must live in the permanent record, not only in the price.
+        // AiCostLedger has no `images` column, and every previous action:'image'
+        // row was exactly one image — so `calls` was a usable image counter
+        // until this row could carry 8. Without the count here it is
+        // recoverable only as costUsd/unit-price, which breaks the moment the
+        // price changes, and AgentUsageLog (the only other record) is pruned
+        // at 90 days and carries no join key. runId makes the two joinable.
+        metadata: {
+          contentId: content._id?.toString(),
+          source,
+          images: totals.images,
+          runId: runMeta.runId || '',
+        },
+      });
+    }
   } catch (e) {
     console.warn('[costLedger] chat/agent skipped:', e.message);
   }
@@ -1515,10 +1600,76 @@ const agent = async (req, res) => {
     const content = await resolveContent(req, res);
     if (!content) return;
 
-    const { goal, targetScore, maxIterations, allowedTools, avatarId, mode, displayLabel, commandName } = req.body;
+    // allowedTools is deliberately NOT destructured: the body's tool list is
+    // never read. resolveAgentRun below is the only source of a whitelist.
+    // `mode` is deliberately absent too: every read below uses runGate.mode,
+    // the canonicalized value, so no code path can re-derive a different
+    // answer from the raw field.
+    const { goal, targetScore, maxIterations, avatarId, displayLabel, commandName } = req.body;
     if (!goal || typeof goal !== 'string') {
       return res.status(400).json({ error: 'goal is required' });
     }
+
+    // Phase 2 enforcement: the server, not the browser, decides what a run may
+    // do. Sequential runs need a known, non-disabled commandName (whitelist
+    // comes from the server registry, verbatim); the no-command case is legal
+    // only for the plan-approve article write, verified from server-side
+    // content state; freeform forwards no tools at all. Checked before the
+    // shadow guard, credit hold and thread append — a refused run costs
+    // nothing and leaves no trace.
+    const runGate = resolveAgentRun(req.body, content, systemSettings.getSettings().disabledAgentCommands);
+    if (!runGate.ok) {
+      // Log it: with no admin UI for the disabled list and a frontend whose
+      // own gate is a build-time literal, this line is the only way an
+      // operator sees enforcement firing or spots a drifted deploy.
+      // COMMAND_MISCONFIGURED in particular is a pure config bug.
+      console.warn(`[agent] refusing run content=${content.contentNumber} `
+        + `code=${runGate.code} command=${JSON.stringify(req.body?.commandName ?? null)} `
+        + `mode=${JSON.stringify(req.body?.mode ?? null)}`);
+      return res.status(runGate.status).json({ error: runGate.error, code: runGate.code });
+    }
+    const enforcedTools = runGate.allowedTools;
+
+    // Durable-storage pre-flight for image-capable runs.
+    //
+    // REACHABILITY, so nobody mistakes this for the durability guarantee: on a
+    // default config NOTHING reaches it. /image is the only command whose
+    // whitelist carries an image tool, it ships disabled and is 403'd above,
+    // COMMAND_IMAGE_PASS is empty, and freeform/plan-write forward no tools at
+    // all. The paths that DO mint images today — freeform (the editor's
+    // Auto-write), chat, skills, actions, the parallel runner — never reach
+    // this line. The engine's REQUIRE_DURABLE_IMAGES, which removes the image
+    // tools from the registry at startup, is the control that covers all six
+    // TOOL paths — not POST /ai/generate-image, which mints an image directly
+    // and is deliberately left ungated as a per-image-billed user action;
+    // this block is the nicer error for the day /image is enabled, and it
+    // deliberately ALLOWS engine-memory + backend-B2, which the engine-side
+    // switch refuses.
+    //
+    // Without B2 the engine stores generated images in memory: they are served
+    // from the engine's own host and expire within the hour. THIS tier is the
+    // one that can judge it, because it also knows whether the rescue exists —
+    // contentController re-hosts /api/images/ links to the backend's bucket
+    // when a document is saved. So: refuse only when NEITHER side is durable,
+    // which is the configuration where every generated image is guaranteed to
+    // break. An unknown engine answer (health blip) is never treated as
+    // "not durable" — that would refuse legitimate work over a timeout.
+    if (IMAGE_TOOLS.some((t) => enforcedTools?.includes(t)) || runGate.imagePass) {
+      const caps = await writingEngine.getEngineCapabilities();
+      if (caps.imageStorage === 'memory' && !imageStorage.isEnabled()) {
+        console.warn(`[agent] refusing image-capable run content=${content.contentNumber}: `
+          + 'engine image storage is ephemeral and the backend has no B2 fallback');
+        return res.status(503).json({
+          error: 'Image generation is unavailable right now — this server has nowhere durable to store images, so they would stop loading within the hour. Your document is unchanged.',
+          code: 'IMAGE_STORAGE_UNAVAILABLE',
+        });
+      }
+    }
+    // Forward the CANONICAL mode, never req.body.mode: the engine dispatches
+    // on an exact `mode == "sequential"` comparison, so a raw "SEQUENTIAL"
+    // would route to the freeform agent while this tier treated it as a
+    // slash command.
+    const safeMode = runGate.mode;
 
     // Article count-gate (Phase 6): runs classified as articleGenerate consume
     // the article allowance on RE-generation. Classification is content-aware:
@@ -1581,6 +1732,32 @@ const agent = async (req, res) => {
           code: 'busy',
         });
       }
+
+      // Per-USER in-flight cap. The guard above is per DOCUMENT, so one user
+      // could hold N simultaneous runs across N documents — N engine sessions,
+      // N image budgets, N credit holds — and the only other limiter is a
+      // per-IP request-rate limit, which counts starts rather than in-flight
+      // work and is shared by everyone behind a NAT.
+      //
+      // Counted from the same map, in the same synchronous step as the check
+      // and reserve below: an await here would reopen exactly the
+      // check-then-act window the comment underneath warns about.
+      const uid = req.user?.userId ? String(req.user.userId) : null;
+      if (uid) {
+        let mine = 0;
+        for (const entry of activeAgentRuns.values()) {
+          if (entry.userId === uid) mine++;
+        }
+        if (mine >= MAX_RUNS_PER_USER) {
+          console.warn(`[agent] refusing run content=${content.contentNumber} user=${uid}: `
+            + `${mine} runs already in flight (cap ${MAX_RUNS_PER_USER})`);
+          runRegistryKey = null; // nothing reserved — the finally must not free it
+          return res.status(429).json({
+            error: `You already have ${mine} AI runs going. Wait for one to finish, then try again.`,
+            code: 'TOO_MANY_RUNS',
+          });
+        }
+      }
     }
     // RESERVE the slot in the same synchronous step as the check above.
     //
@@ -1608,6 +1785,10 @@ const agent = async (req, res) => {
       // clarify/plan-confirm) correlate their rows to the run they landed in
       // — sessionId alone is ambiguous (freeform reuses sessions across runs).
       runId,
+      // Owner, for the per-user in-flight cap above. Entries are removed on
+      // completion and swept after AGENT_RUN_TTL_MS, so the count self-heals
+      // even if a run dies without cleaning up.
+      userId: req.user?.userId ? String(req.user.userId) : null,
     };
     activeAgentRuns.set(runRegistryKey, myRunEntry);
 
@@ -1630,7 +1811,7 @@ const agent = async (req, res) => {
     // Set up Writing Engine session (reuse for conversation memory in freeform
     // mode). P2: memoryRun mirrors isFreeform — sequential runs are outside
     // the memory contract (D5): no seed (the engine wipes it), no marker.
-    const isFreeform = !mode || mode === 'freeform';
+    const isFreeform = safeMode === 'freeform';
     const { sessionId, markdown: markdownBefore } = await setupSession(content, { avatarId, reuseSession: isFreeform, memoryRun: isFreeform });
     // Complete the reservation placed above. Until this line the entry holds the
     // slot but matches no sessionId, so stop/stop-revert correctly report "no
@@ -1711,7 +1892,7 @@ const agent = async (req, res) => {
     const { safeIterations, safeTargetScore } = clampAgentBudget(maxIterations, targetScore);
     const tConnect = Date.now();
     const agentRes = await writingEngine.startAgent(
-      sessionId, goal, safeTargetScore, safeIterations, abortCtrl.signal, allowedTools, mode || 'freeform', agentPreset
+      sessionId, goal, safeTargetScore, safeIterations, abortCtrl.signal, enforcedTools, safeMode, agentPreset, runGate.imagePass
     );
     console.log(`[timing] ai.agent engine-connect=${Date.now() - tConnect}ms (request+${Date.now() - tReq}ms)`);
 
@@ -1792,8 +1973,16 @@ const agent = async (req, res) => {
         // document_diff, then drop the connection" must never refund — but a
         // declared revert also restores the ENGINE document below.
         const revertNow = !!myRunEntry.revertIntent;
-        const wroteBeforeAbort = usageTap.snapshot().docWrites > 0;
-        if (creditTxId && (!wroteBeforeAbort || revertNow)) {
+        const abortTotals = usageTap.snapshot();
+        const wroteBeforeAbort = abortTotals.docWrites > 0;
+        // Images already generated are spend we cannot take back, and they
+        // are billed PER IMAGE by the provider. A slash command generates
+        // every image BEFORE it embeds any, so "no document write yet" was
+        // true for a run that had already bought eight images — stopping
+        // there refunded the credits in full. A revert restores the document;
+        // it cannot un-buy an image, so it does not excuse this either.
+        const spentImages = (abortTotals.images || 0) > 0;
+        if (creditTxId && (!wroteBeforeAbort || revertNow) && !spentImages) {
           creditService.refund(creditTxId).catch((e) =>
             console.error('[credit] agent abort refund failed:', e.message)
           );
@@ -2775,7 +2964,7 @@ const runStatus = async (req, res) => {
     const entry = activeAgentRuns.get(content._id.toString());
     const last = await AgentUsageLog.findOne({ contentId: content._id })
       .sort({ createdAt: -1 })
-      .select('source sessionId runId stopReason docWrites aborted completedAt createdAt')
+      .select('source sessionId runId stopReason docWrites images aborted completedAt createdAt')
       .lean();
     return res.json({
       // `entry.sessionId` is null between the slot reservation and setupSession

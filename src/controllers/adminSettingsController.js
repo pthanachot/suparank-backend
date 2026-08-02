@@ -16,7 +16,7 @@ const getSystemSettings = async (req, res) => {
 
 const updateSystemSettings = async (req, res) => {
   try {
-    const { maintenanceMode, emailNotificationsEnabled, rateLimit, backup } = req.body || {};
+    const { maintenanceMode, emailNotificationsEnabled, rateLimit, backup, disabledAgentCommands } = req.body || {};
     const patch = {};
 
     if (maintenanceMode !== undefined) {
@@ -58,6 +58,30 @@ const updateSystemSettings = async (req, res) => {
       }
       if (directory !== undefined) patch['backup.directory'] = directory === null ? null : directory.trim();
       if (retentionCount !== undefined) patch['backup.retentionCount'] = retentionCount;
+    }
+
+    if (disabledAgentCommands !== undefined) {
+      // null resets to the built-in default; an array (even []) is an explicit
+      // admin decision. Names are validated against the server command
+      // registry so a typo can't silently disable nothing.
+      if (disabledAgentCommands !== null) {
+        if (!Array.isArray(disabledAgentCommands) || disabledAgentCommands.some((c) => typeof c !== 'string')) {
+          return res.status(400).json({ error: 'disabledAgentCommands must be an array of command names, or null for the default' });
+        }
+        if (disabledAgentCommands.length > 100) {
+          return res.status(400).json({ error: 'disabledAgentCommands is too long' });
+        }
+        const { COMMAND_TOOLS } = require('../config/agentBilling');
+        // Own-property check: a bare lookup accepts inherited keys, so
+        // "constructor" would validate as a real command name.
+        const unknown = disabledAgentCommands.filter(
+          (c) => !Object.prototype.hasOwnProperty.call(COMMAND_TOOLS, c)
+        );
+        if (unknown.length > 0) {
+          return res.status(400).json({ error: `Unknown command name(s): ${unknown.join(', ')}` });
+        }
+      }
+      patch.disabledAgentCommands = disabledAgentCommands;
     }
 
     if (Object.keys(patch).length === 0) {

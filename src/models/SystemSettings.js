@@ -22,6 +22,11 @@ const systemSettingsSchema = new mongoose.Schema(
       directory: { type: String, default: null }, // null → <backend>/backups
       retentionCount: { type: Number, default: 7 }, // newest N archives kept on disk
     },
+    // Phase 2 (agent enforcement): slash commands the backend refuses with 403.
+    // `default: undefined` is load-bearing — mongoose would otherwise default
+    // the array to [], which reads as "admin enabled everything" instead of
+    // "unset, use DEFAULT_DISABLED_AGENT_COMMANDS". Store null to reset.
+    disabledAgentCommands: { type: [String], default: undefined },
   },
   { timestamps: true }
 );

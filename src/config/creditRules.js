@@ -94,7 +94,15 @@ function toFiniteUnits(n) {
 }
 
 function resolveCredits(action, ctx = {}) {
-  const spec = CREDIT_COSTS[action];
+  // Own-property lookup: `CREDIT_COSTS['constructor']` on an object literal
+  // returns a truthy FUNCTION, so `!spec` passes and `spec.active` then throws
+  // — and since the credit gate fails open on an estimator throw, that path
+  // runs the action for free. No caller passes a caller-controlled action
+  // today (classifyAgentRun is string-and-own-property-only), but this is the
+  // primitive that made an earlier bug free rather than merely mispriced.
+  const spec = Object.prototype.hasOwnProperty.call(CREDIT_COSTS, action)
+    ? CREDIT_COSTS[action]
+    : undefined;
   if (!spec) throw new Error(`Unknown credit action: ${action}`);
 
   // Safety guard: never bill an action that isn't wired end-to-end. Catches a

@@ -52,6 +52,10 @@ const agentUsageLogSchema = new mongoose.Schema(
     stopReason: { type: String, default: '' },
     // Server-observed document_diff count for this run.
     docWrites: { type: Number, default: 0 },
+    // Images generated during the run (engine `image_usage` event). Billed
+    // per image by the provider, so this is NOT derivable from the token
+    // counts above — without it, image spend has no run-level record.
+    images: { type: Number, default: 0, min: 0 },
     // True when the client disconnected/stopped before stream end.
     aborted: { type: Boolean, default: false },
     completedAt: { type: Date },

@@ -103,6 +103,14 @@ function costFor(modelId, tokensIn = 0, tokensOut = 0, opts = {}) {
     const images = opts.images != null ? opts.images : 1;
     costUsd = m.flat * images;
   } else {
+    // Images charged against a model with no flat price would silently record
+    // $0 AND report known:true — a drifted image role (the engine reports
+    // whatever models.json resolved) would under-report COGS with no alarm.
+    // Report it as unknown so the ledger's existing unknown-model warning
+    // fires instead of booking a confident zero.
+    if (opts.images) {
+      return { costUsd: 0, provider: m.provider, resolved: key, known: false };
+    }
     costUsd = (tokensIn / 1e6) * (m.in || 0) + (tokensOut / 1e6) * (m.out || 0);
   }
   return { costUsd, provider: m.provider, resolved: key, known: true };

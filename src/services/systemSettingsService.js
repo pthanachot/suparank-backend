@@ -6,6 +6,7 @@
  * the cache, and notifies listeners (e.g. the rate-limiter rebuild in index.js).
  */
 const SystemSettings = require('../models/SystemSettings');
+const { DEFAULT_DISABLED_AGENT_COMMANDS } = require('../config/agentBilling');
 
 const DEFAULTS = Object.freeze({
   maintenanceMode: false,
@@ -13,6 +14,7 @@ const DEFAULTS = Object.freeze({
   rateLimit: { windowMs: null, max: null },
   adminEmails: [],
   backup: { directory: null, retentionCount: 7 },
+  disabledAgentCommands: DEFAULT_DISABLED_AGENT_COMMANDS,
 });
 
 let cache = { ...DEFAULTS };
@@ -31,6 +33,11 @@ function toPlain(doc) {
       directory: doc.backup?.directory ?? null,
       retentionCount: doc.backup?.retentionCount ?? DEFAULTS.backup.retentionCount,
     },
+    // Absent/null → built-in default; an explicit array (even []) is an admin
+    // decision and wins.
+    disabledAgentCommands: Array.isArray(doc.disabledAgentCommands)
+      ? doc.disabledAgentCommands
+      : DEFAULTS.disabledAgentCommands,
   };
 }
 

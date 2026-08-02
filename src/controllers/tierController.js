@@ -10,6 +10,7 @@ const UserCredit = require('../models/UserCredit');
 const UserUsageTracker = require('../models/UserUsageTracker');
 const tierService = require('../services/tierService');
 const seatService = require('../services/seatService');
+const systemSettings = require('../services/systemSettingsService');
 const { ACTIVE_ACTIONS } = require('../config/creditCosts');
 const { resolveCredits } = require('../config/creditRules');
 
@@ -194,7 +195,14 @@ const getTierInfo = async (req, res) => {
       try { creditCosts[action] = resolveCredits(action, { tier }); } catch { /* skip unresolvable */ }
     }
 
-    res.json({ tier, config, usage, creditBalance, freeQuotaSlots, creditCosts });
+    // Slash commands the server refuses (403 COMMAND_DISABLED). Read from the
+    // SAME in-memory settings cache the enforcement gate reads, so the palette
+    // and the gate cannot disagree — before this, the editor's list was a
+    // build-time literal and an admin toggle needed a frontend rebuild to
+    // become visible. Sync, no DB hit.
+    const disabledCommands = systemSettings.getSettings().disabledAgentCommands;
+
+    res.json({ tier, config, usage, creditBalance, freeQuotaSlots, creditCosts, disabledCommands });
   } catch (err) {
     console.error('getTierInfo error:', err.message);
     res.status(500).json({ error: 'Failed to get tier info' });

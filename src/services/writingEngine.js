@@ -183,13 +183,18 @@ async function sendChatMessageStream(sessionId, prompt, signal, preset) {
  * @param {string[]} [allowedTools] - restrict agent to only these tools (e.g. ["EditTool"])
  * @returns {Promise<Response>} The raw fetch response (SSE stream)
  */
-async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5, signal, allowedTools, mode, preset) {
+async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5, signal, allowedTools, mode, preset, imagePass = false) {
   const payload = { goal, targetScore, maxIterations };
   if (allowedTools?.length > 0) {
     payload.allowedTools = allowedTools;
   }
   if (mode) {
     payload.mode = mode;
+  }
+  // Only sent when a command opts in (COMMAND_IMAGE_PASS — empty today). The
+  // engine treats an absent flag as off, so omitting it is the safe default.
+  if (imagePass) {
+    payload.imagePass = true;
   }
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/agent`, {
     method: 'POST',
@@ -600,9 +605,55 @@ async function checkEngineHealth() {
   }
 }
 
+// Cached engine capability read. /health also reports image_storage ("b2" =
+// durable, "memory" = images expire within the hour), which the agent route
+// needs BEFORE starting an image-capable run — but it must not add a round
+// trip per request, and a health blip must not block writing.
+let engineCapsCache = { at: 0, caps: null };
+const ENGINE_CAPS_TTL_MS = 60 * 1000;
+
+/**
+ * @returns {Promise<{imageStorage: string|null}>} imageStorage is null when
+ *   the engine could not be reached or did not report — callers must treat
+ *   that as "unknown", never as "not durable", or a health blip would start
+ *   refusing legitimate work.
+ */
+async function getEngineCapabilities() {
+  const now = Date.now();
+  if (engineCapsCache.caps && now - engineCapsCache.at < ENGINE_CAPS_TTL_MS) {
+    return engineCapsCache.caps;
+  }
+  let caps = { imageStorage: null };
+  try {
+    const res = await fetch(`${WRITING_ENGINE_URL}/health`, { signal: AbortSignal.timeout(1500) });
+    if (res.ok) {
+      const body = await res.json();
+      if (typeof body?.image_storage === 'string') {
+        caps = { imageStorage: body.image_storage };
+      }
+    }
+  } catch { /* unknown — cached briefly so a flapping engine isn't hammered */ }
+  // Stamped AFTER the fetch, not from `now`: starting the TTL at request time
+  // silently shortens the window by the round trip, and under concurrent cold
+  // misses the SLOWEST response would otherwise install itself last carrying
+  // the OLDEST timestamp.
+  engineCapsCache = { at: Date.now(), caps };
+  return caps;
+}
+
+// Drops the 60s capability cache. Called by tests only — nothing wires it to a
+// route, so it is NOT an operational escape hatch today: after an operator
+// fixes B2 and restarts the engine, the choices are wait out the TTL or
+// restart the backend. Wire it to an admin/health action before relying on it.
+function __resetEngineCapsCache() {
+  engineCapsCache = { at: 0, caps: null };
+}
+
 module.exports = {
   createSession,
   checkEngineHealth,
+  getEngineCapabilities,
+  __resetEngineCapsCache,
   pushDocument,
   pushBrief,
   pushBrandVoice,

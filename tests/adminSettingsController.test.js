@@ -125,6 +125,30 @@ describe('updateSystemSettings validation', () => {
     assert.equal(res.statusCode, 200);
     assert.deepEqual(state.updateCalls[0], { maintenanceMode: true });
   });
+
+  // disabledAgentCommands is the runtime kill-switch for slash commands
+  // (Phase 2). Names are validated against the server command registry so a
+  // typo can't look like it disabled something.
+  it('accepts a valid disabledAgentCommands list, [] and null', async () => {
+    assert.equal((await put({ disabledAgentCommands: ['image', 'auto-optimize'] })).statusCode, 200);
+    assert.deepEqual(state.updateCalls[0], { disabledAgentCommands: ['image', 'auto-optimize'] });
+
+    assert.equal((await put({ disabledAgentCommands: [] })).statusCode, 200);
+    assert.deepEqual(state.updateCalls[1], { disabledAgentCommands: [] });
+
+    assert.equal((await put({ disabledAgentCommands: null })).statusCode, 200);
+    assert.deepEqual(state.updateCalls[2], { disabledAgentCommands: null });
+  });
+
+  it('rejects unknown, non-string and prototype-chain command names', async () => {
+    assert.equal((await put({ disabledAgentCommands: ['nope'] })).statusCode, 400);
+    assert.equal((await put({ disabledAgentCommands: [42] })).statusCode, 400);
+    assert.equal((await put({ disabledAgentCommands: 'image' })).statusCode, 400);
+    // A bare TABLE[c] lookup would accept these as real command names.
+    assert.equal((await put({ disabledAgentCommands: ['constructor'] })).statusCode, 400);
+    assert.equal((await put({ disabledAgentCommands: ['toString'] })).statusCode, 400);
+    assert.equal(state.updateCalls.length, 0);
+  });
 });
 
 // ── Admin accounts ─────────────────────────────────────────────

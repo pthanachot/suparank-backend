@@ -12,7 +12,7 @@ const tierService = require('../services/tierService');
 const seatService = require('../services/seatService');
 const systemSettings = require('../services/systemSettingsService');
 const { ACTIVE_ACTIONS } = require('../config/creditCosts');
-const { resolveCredits } = require('../config/creditRules');
+const { resolveCredits, agentRunCostShape } = require('../config/creditRules');
 
 /**
  * GET /api/org/tier-info?orgId=...
@@ -195,6 +195,23 @@ const getTierInfo = async (req, res) => {
       try { creditCosts[action] = resolveCredits(action, { tier }); } catch { /* skip unresolvable */ }
     }
 
+    // Phase 3: actions whose AGENT-RUN price is not the single number above.
+    // /image is base + per-image, so creditCosts.imageGenerate (10) is the
+    // per-image price — right for the one-shot generate-image endpoint, but
+    // neither what an /image run costs nor what it reserves. Published as a
+    // sibling map rather than by making creditCosts polymorphic: every
+    // existing consumer keeps reading a number, and the ones that care render
+    // the shape ("2 + 10 ⚡/image") and pre-flight against worstCase — which is
+    // exactly the reservation, so a client that gates on it never starts a run
+    // the deduction then refuses.
+    const creditCostShapes = {};
+    for (const action of ACTIVE_ACTIONS) {
+      try {
+        const shape = agentRunCostShape(action, { tier });
+        if (shape) creditCostShapes[action] = shape;
+      } catch { /* skip unresolvable */ }
+    }
+
     // Slash commands the server refuses (403 COMMAND_DISABLED). Read from the
     // SAME in-memory settings cache the enforcement gate reads, so the palette
     // and the gate cannot disagree — before this, the editor's list was a
@@ -202,7 +219,10 @@ const getTierInfo = async (req, res) => {
     // become visible. Sync, no DB hit.
     const disabledCommands = systemSettings.getSettings().disabledAgentCommands;
 
-    res.json({ tier, config, usage, creditBalance, freeQuotaSlots, creditCosts, disabledCommands });
+    res.json({
+      tier, config, usage, creditBalance, freeQuotaSlots,
+      creditCosts, creditCostShapes, disabledCommands,
+    });
   } catch (err) {
     console.error('getTierInfo error:', err.message);
     res.status(500).json({ error: 'Failed to get tier info' });

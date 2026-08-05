@@ -17,7 +17,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
 const aiController = require('../src/controllers/aiController');
-const { classifyAgentRun, isPlanArticleWrite } = require('../src/config/agentBilling');
+const { classifyAgentRun, isPlanArticleWrite, IMAGE_BUDGET_PER_RUN } = require('../src/config/agentBilling');
 const writingEngine = require('../src/services/writingEngine');
 const imageStorage = require('../src/services/imageStorage');
 const systemSettings = require('../src/services/systemSettingsService');
@@ -162,6 +162,121 @@ test('a stopped run that already generated images is NOT refunded', async () => 
   });
   assert.equal(captured.refunded, 0,
     'images are unrecoverable spend — a stop after generating them must not refund');
+});
+
+// ─── Phase 3: an image run settles to the images it actually made ───
+//
+// The reservation is the worst case (run base + the full image allowance),
+// because settle() can only refund. Every one of these pins a different way
+// the settle could fall back to the wrong number: `reserved` (bills four
+// images to a run that made one), or the flat inlineAction price (hands back
+// images the provider already charged us for).
+
+const IMAGE_RUN = {
+  body: { goal: 'illustrate it', mode: 'sequential', commandName: 'image' },
+  disabledCommands: [], // /image ships off on price; enable it for these tests
+  creditContext: { estimatedCredits: 42, tier: 'professional' },
+};
+const imageUsage = (n) => ({
+  type: 'image_usage', fullText: JSON.stringify({ images: n, model: 'google/gemini-2.5-flash-image' }),
+});
+
+test('a completed image run is billed per image, not the whole reservation', async () => {
+  const { captured } = await runAgent({
+    content: baseContent({ mode: 'draft', activePlanId: null }),
+    quota: { tier: 'professional', limit: 50, limitType: 'monthly', used: 1 },
+    ...IMAGE_RUN,
+    events: [
+      { type: 'usage', usage: { input_tokens: 100, output_tokens: 50 } },
+      imageUsage(1),
+      { type: 'document_diff', patches: [] },
+      { type: 'complete', completion: { stopReason: 'done' } },
+    ],
+  });
+  assert.equal(captured.preDeduct, 42, 'the worst case is what gets held');
+  assert.equal(captured.settle.actual, 2 + 10,
+    'one image must settle to base + one image — not to the four-image reservation');
+});
+
+test('an image run that made nothing settles to the run base alone', async () => {
+  const { captured } = await runAgent({
+    content: baseContent({ mode: 'draft', activePlanId: null }),
+    quota: { tier: 'professional', limit: 50, limitType: 'monthly', used: 1 },
+    ...IMAGE_RUN,
+    events: [
+      { type: 'usage', usage: { input_tokens: 100, output_tokens: 50 } },
+      { type: 'complete', completion: { stopReason: 'done' } },
+    ],
+  });
+  assert.equal(captured.settle.actual, 2,
+    'no images means no per-image charge — only the turns it took');
+});
+
+test('a run that spends the whole allowance settles at the reservation', async () => {
+  const { captured } = await runAgent({
+    content: baseContent({ mode: 'draft', activePlanId: null }),
+    quota: { tier: 'professional', limit: 50, limitType: 'monthly', used: 1 },
+    ...IMAGE_RUN,
+    events: [
+      { type: 'usage', usage: { input_tokens: 100, output_tokens: 50 } },
+      imageUsage(4),
+      { type: 'document_diff', patches: [] },
+      { type: 'complete', completion: { stopReason: 'done' } },
+    ],
+  });
+  assert.equal(captured.settle.actual, 42,
+    'four images is exactly the reservation — nothing is refunded and nothing is lost');
+});
+
+test('a stopped image run pays for the images it already bought', async () => {
+  // The stop path used to fall through to the flat inlineAction price, which
+  // handed back three images the provider had already billed.
+  const { captured } = await runAgent({
+    content: baseContent({ mode: 'draft', activePlanId: null }),
+    quota: { tier: 'professional', limit: 50, limitType: 'monthly', used: 1 },
+    ...IMAGE_RUN,
+    events: [
+      { type: 'usage', usage: { input_tokens: 100, output_tokens: 50 } },
+      imageUsage(3),
+    ],
+    abortAfterLast: true,
+  });
+  assert.equal(captured.refunded, 0, 'unrecoverable spend must not be refunded');
+  assert.equal(captured.settle.actual, 2 + 30,
+    'a stop settles to the images bought, not to the inlineAction floor');
+});
+
+test('a reverted image run still pays for its images', async () => {
+  // Reverting restores the document. It cannot un-buy an image.
+  //
+  // The audit line is asserted because without it this test is vacuous: the
+  // image branch returns 22 whether or not the revert flag was ever set, so a
+  // harness that silently failed to mark the run would still pass. The line
+  // only prints on the revert path, so it proves the branch was live.
+  const logged = [];
+  const realLog = console.log;
+  console.log = (...a) => { logged.push(a.join(' ')); };
+  let captured;
+  try {
+    ({ captured } = await runAgent({
+      content: baseContent({ mode: 'draft', activePlanId: null }),
+      quota: { tier: 'professional', limit: 50, limitType: 'monthly', used: 1 },
+      ...IMAGE_RUN,
+      events: [
+        { type: 'usage', usage: { input_tokens: 100, output_tokens: 50 } },
+        imageUsage(2),
+        { type: 'document_diff', patches: [] },
+        { type: 'complete', completion: { stopReason: 'done' } },
+      ],
+      revertIntent: true,
+    }));
+  } finally {
+    console.log = realLog;
+  }
+  assert.ok(logged.some((l) => l.includes('[audit] stop-revert')),
+    'the run was not actually treated as a revert — the assertion below would prove nothing');
+  assert.equal(captured.settle.actual, 2 + 20,
+    'a revert must not refund images the provider already charged for');
 });
 
 test('a stopped run that generated nothing is still refunded', async () => {
@@ -397,7 +512,7 @@ function makeRes() {
  * @param {Array}  opts.events      SSE events the fake engine emits
  * @param {object} opts.creditContext overrides (estimatedCredits, tier…)
  */
-async function runAgent({ content, quota, events, creditContext, body, abortAfterLast, disabledCommands, holdStream, userId, engineCaps }) {
+async function runAgent({ content, quota, events, creditContext, body, abortAfterLast, disabledCommands, holdStream, userId, engineCaps, revertIntent }) {
   // Array, NOT a name-keyed map: mongoose models are all functions, so
   // constructor-name keys collide (UsageTracker/UserUsageTracker both
   // 'Function.getCount') and the first original would never be restored,
@@ -448,11 +563,21 @@ async function runAgent({ content, quota, events, creditContext, body, abortAfte
     return engineCaps || { imageStorage: 'b2' };
   });
   let closeCb = null;
-  stub(writingEngine, 'startAgent', async (sessionId, goal, targetScore, maxIterations, signal, allowedTools, mode, preset, imagePass) => {
+  stub(writingEngine, 'startAgent', async (sessionId, goal, targetScore, maxIterations, signal, allowedTools, mode, preset, imagePass, imageBudget) => {
     // Phase 2/4: the enforced whitelist, canonical mode and image-pass opt-in
     // are what actually reach the engine. Capturing them is how the wiring
     // (not just the pure gate) stays pinned.
-    captured.startAgent = { allowedTools, mode, imagePass };
+    captured.startAgent = { allowedTools, mode, imagePass, imageBudget };
+    // Stand in for a stop-&-revert POST landing mid-run: that handler flips
+    // this flag on the live registry entry, and the controller re-reads it
+    // after the stream ends. Set here because the entry is registered before
+    // startAgent and the controller reads it after — the same window the real
+    // request lands in.
+    if (revertIntent) {
+      const entry = aiController.activeAgentRuns.get(content._id.toString());
+      assert.ok(entry, 'no in-flight registry entry to mark for revert');
+      entry.revertIntent = true;
+    }
     return { body: makeSseBody(events, { abortAfterLast, onAbort: () => closeCb?.(), hold: holdStream }) };
   });
 
@@ -681,6 +806,33 @@ test('E2E: the engine receives the SERVER whitelist, not the body\'s', async () 
   // Phase 4: the autonomous image pass is opt-in per command, and no command
   // opts in — so the engine must never be asked for it.
   assert.equal(captured.startAgent.imagePass, false);
+  // Phase 2 of the follow-up: /grammar does not bill for images, so it must
+  // be granted none. The engine grants nothing it was not asked for.
+  assert.equal(captured.startAgent.imageBudget, 0);
+});
+
+test('E2E: the image command is granted an image budget, and it reaches the engine', async () => {
+  const { captured } = await runAgent({
+    content: baseContent({ mode: 'draft', activePlanId: null }),
+    quota: { tier: 'professional', limit: 50, limitType: 'monthly', used: 1 },
+    body: { goal: 'illustrate it', mode: 'sequential', commandName: 'image' },
+    disabledCommands: [], // /image ships off on price; enable it for this test
+    events: [{ type: 'document_diff', patches: [] }],
+  });
+  assert.equal(captured.startAgent.imageBudget, IMAGE_BUDGET_PER_RUN,
+    'the tier that reserves the credit is the tier that sets the allowance');
+});
+
+test('E2E: a freeform run is granted no image budget', async () => {
+  // Auto-write reaches the engine's widest image surface — its tool filter is
+  // a blacklist that never hides the image tools — and bills 2 credits.
+  const { captured } = await runAgent({
+    content: baseContent({ mode: 'draft', activePlanId: null }),
+    quota: { tier: 'professional', limit: 50, limitType: 'monthly', used: 1 },
+    body: { goal: 'write the article', mode: 'freeform' },
+    events: [{ type: 'document_diff', patches: [] }],
+  });
+  assert.ok(!captured.startAgent.imageBudget, 'nothing bills freeform for images, so it gets none');
 });
 
 test('E2E: a non-canonical mode cannot skip the command gate', async () => {

@@ -14,7 +14,7 @@ const writingEngine = require('../services/writingEngine');
 const { toGoPlan } = require('../services/planSerializer');
 const imageStorage = require('../services/imageStorage');
 const creditService = require('../services/creditService');
-const { resolveCredits } = require('../config/creditRules');
+const { resolveCredits, agentRunCredits } = require('../config/creditRules');
 const { classifyAgentRun, isPlanArticleWrite, resolveAgentRun } = require('../config/agentBilling');
 const systemSettings = require('../services/systemSettingsService');
 const UsageTracker = require('../models/UsageTracker');
@@ -463,13 +463,17 @@ async function persistUsage(req, content, tap, source, runMeta = {}) {
         workspaceId: content.workspaceId,
         userId: req?.user?.userId || null,
         tier,
-        // The COUNT must live in the permanent record, not only in the price.
-        // AiCostLedger has no `images` column, and every previous action:'image'
-        // row was exactly one image — so `calls` was a usable image counter
-        // until this row could carry 8. Without the count here it is
-        // recoverable only as costUsd/unit-price, which breaks the moment the
-        // price changes, and AgentUsageLog (the only other record) is pruned
-        // at 90 days and carries no join key. runId makes the two joinable.
+        // Phase 6: the count now has a real `images` column on the ledger, so
+        // it aggregates (imageSpendByOrg) instead of being recoverable only as
+        // costUsd/unit-price — which broke the moment the price changed. The
+        // metadata copy stays: it predates the column, so it is the only count
+        // on rows written before it existed, and re-deriving those from cost is
+        // exactly the fragile step the column removes.
+        //
+        // The mismatch this row still carries: one-shot /ai/generate-image
+        // writes ONE row per image, while this writes one row for a whole run —
+        // so `rows` is not an image count on either path, and the column is.
+        // runId keeps this joinable to AgentUsageLog, which is pruned at 90 days.
         metadata: {
           contentId: content._id?.toString(),
           source,
@@ -1592,6 +1596,11 @@ const agent = async (req, res) => {
   // can identity-check before deleting (a shadowing same-content run must stay).
   let runRegistryKey = null;
   let myRunEntry = null;
+  // Phase 3: hoisted for the same reason — the catch settles an image run to
+  // the images it already bought instead of refunding them, and needs both the
+  // billing class and the stream's observed image count to do it.
+  let billingAction = null;
+  let usageTap = null;
   let threadLockKey = null; // P4: released in the finally
   const tReq = Date.now(); // W0: request-start reference for [timing] lines
   // Threads Phase 1: backend-minted run identifier (see chat).
@@ -1636,9 +1645,10 @@ const agent = async (req, res) => {
     // default config NOTHING reaches it. /image is the only command whose
     // whitelist carries an image tool, it ships disabled and is 403'd above,
     // COMMAND_IMAGE_PASS is empty, and freeform/plan-write forward no tools at
-    // all. The paths that DO mint images today — freeform (the editor's
-    // Auto-write), chat, skills, actions, the parallel runner — never reach
-    // this line. The engine's REQUIRE_DURABLE_IMAGES, which removes the image
+    // all. Those other paths — freeform (the editor's Auto-write), chat,
+    // skills, actions, the parallel runner — no longer mint images either:
+    // they are granted an image budget of zero, so the engine hides the image
+    // tools from them entirely. The engine's REQUIRE_DURABLE_IMAGES, which removes the image
     // tools from the registry at startup, is the control that covers all six
     // TOOL paths — not POST /ai/generate-image, which mints an image directly
     // and is deliberately left ungated as a per-image-billed user action;
@@ -1680,7 +1690,7 @@ const agent = async (req, res) => {
     // write path hard-blocks past the allowance regardless of credit balance;
     // the finite-pool pricing is only the spoof backstop (AT-2). The slot is
     // consumed at COMPLETION and only if the run actually wrote the document.
-    const billingAction = classifyAgentRun(req.body, content);
+    billingAction = classifyAgentRun(req.body, content);
     // SLOT enforcement is decoupled from the client-declared billing class
     // (review BLOCKER-1): a spoofed mode/commandName can lower the PRICE — an
     // accepted, pool-bounded floor — but must NEVER bypass the article
@@ -1892,7 +1902,7 @@ const agent = async (req, res) => {
     const { safeIterations, safeTargetScore } = clampAgentBudget(maxIterations, targetScore);
     const tConnect = Date.now();
     const agentRes = await writingEngine.startAgent(
-      sessionId, goal, safeTargetScore, safeIterations, abortCtrl.signal, enforcedTools, safeMode, agentPreset, runGate.imagePass
+      sessionId, goal, safeTargetScore, safeIterations, abortCtrl.signal, enforcedTools, safeMode, agentPreset, runGate.imagePass, runGate.imageBudget
     );
     console.log(`[timing] ai.agent engine-connect=${Date.now() - tConnect}ms (request+${Date.now() - tReq}ms)`);
 
@@ -1916,7 +1926,7 @@ const agent = async (req, res) => {
     // client-side in EditorChatBar.tsx. This eliminates per-event JSON
     // parse/serialize overhead for text_delta and thinking_delta events.
     const reader = agentRes.body.getReader();
-    const usageTap = makeUsageTap();
+    usageTap = makeUsageTap();
 
     let firstByteAt = 0; // W0: time-to-first-engine-byte
     const processEvents = async () => {
@@ -2003,15 +2013,18 @@ const agent = async (req, res) => {
     // same-content run that shadowed it (and is still live) is left intact.
     if (activeAgentRuns.get(runRegistryKey) === myRunEntry) activeAgentRuns.delete(runRegistryKey);
 
-    // Stream completed — settle the deduction. Agent cost is fixed per mode
-    // (== the reserved estimate), so settle() refunds 0 — but it must be settle(),
+    // Stream completed — settle the deduction. Most agent runs cost a fixed
+    // amount per mode (== the reserved estimate), so settle() refunds 0; an
+    // /image run is the exception and settles DOWN to the images it produced
+    // (Phase 3). Either way it must be settle(),
     // NOT a direct findByIdAndUpdate on the primary tx: a multi-pool deduction
     // (e.g. 100 credits spanning subscription+general) creates sibling pending
     // txs sharing a groupId; marking only the primary leaves the siblings
     // 'pending' for the orphan-sweep to later REFUND — silently under-charging.
     // settle() claims the whole group and fires the low-balance check.
     // Did this run actually write the document? Server-observed from the SSE
-    // stream (document_diff/document_update/draft events) — an articleGenerate
+    // stream — document_diff ONLY, never document_update or draft, which mean
+    // the mutating tool ran and changed nothing (see makeUsageTap) — an articleGenerate
     // run that only talked (e.g. a question asked in execute mode before "write
     // it") settles down to inlineAction cost and never consumes a slot.
     const wroteDocument = usageTap.snapshot().docWrites > 0;
@@ -2026,8 +2039,25 @@ const agent = async (req, res) => {
       // credit pool) while keeping the honest revert cheap. A reverted run that
       // never wrote is a plain stop → also inlineAction (matches the no-write
       // articleGenerate branch). No article slot is consumed either way.
+      // Phase 3 exempts image runs: see the branch below.
       let actual;
-      if (revertFinal) {
+      if (billingAction === 'imageGenerate') {
+        // Phase 3: priced on the images the engine actually produced, which is
+        // the ONLY branch that can settle an image run — it must come before
+        // the revert and no-write branches, not after.
+        //
+        // The reservation is the worst case (run base + the full allowance),
+        // so charging `reserved` would bill four images to a run that made
+        // one. Equally, a stop or a revert cannot fall through to the flat
+        // inlineAction price: reverting restores the document but cannot
+        // un-buy an image the provider already charged us for. Pricing off the
+        // count settles both — it floors at the run base when no image was
+        // made and rises only with real spend.
+        const imagesMade = usageTap.snapshot().images || 0;
+        actual = agentRunCredits('imageGenerate', {
+          tier: req.creditContext?.tier, images: imagesMade,
+        });
+      } else if (revertFinal) {
         actual = resolveCredits('inlineAction', { tier: req.creditContext?.tier });
       } else {
         actual = (billingAction === 'articleGenerate' && !wroteDocument)
@@ -2048,7 +2078,10 @@ const agent = async (req, res) => {
       await commitArticleGeneration(content, articleGate);
     }
     if (revertFinal && wroteDocument) {
-      console.log(`[audit] stop-revert billed as inlineAction content=${content.contentNumber} session=${sessionId}`);
+      // Names the class rather than asserting inlineAction: an /image revert is
+      // billed base + images (Phase 3), so the old wording told operators a
+      // price that was no longer charged.
+      console.log(`[audit] stop-revert content=${content.contentNumber} session=${sessionId} billed=${billingAction}`);
     }
     // Conversations Phase 7 (decision §4 #6): MEASURE the post-stamp path, do
     // not reprice it.
@@ -2155,11 +2188,29 @@ const agent = async (req, res) => {
   } catch (err) {
     // W4-b/c: never leave a stale in-flight entry behind a thrown stream.
     if (runRegistryKey && activeAgentRuns.get(runRegistryKey) === myRunEntry) activeAgentRuns.delete(runRegistryKey);
-    // Refund credits on error
+    // Refund credits on error — EXCEPT what the run already spent on images.
+    // A thrown stream is usually our fault and the user should not pay for it,
+    // but images are bought from the provider per image and are not returned
+    // when the run that ordered them dies. Refunding those in full made a
+    // failing run cheaper than a working one; settling to the images made
+    // charges for the spend and forgives the rest. Mirrors the abort path.
     if (creditTxId) {
-      creditService.refund(creditTxId).catch((e) =>
-        console.error('[credit] agent error refund failed:', e.message)
-      );
+      // usageTap is null when the throw beat the stream (bad content, engine
+      // unreachable) — nothing was generated, so the full refund is right.
+      const imagesMade = usageTap ? (usageTap.snapshot().images || 0) : 0;
+      if (billingAction === 'imageGenerate' && imagesMade > 0) {
+        const reserved = req.creditContext?.estimatedCredits ?? 0;
+        const actual = agentRunCredits('imageGenerate', {
+          tier: req.creditContext?.tier, images: imagesMade,
+        });
+        creditService.settle(creditTxId, Math.min(actual, reserved)).catch((e) =>
+          console.error('[credit] agent error settle failed:', e.message)
+        );
+      } else {
+        creditService.refund(creditTxId).catch((e) =>
+          console.error('[credit] agent error refund failed:', e.message)
+        );
+      }
     }
 
     // AbortError from fetch when client disconnected — silent.
@@ -2366,7 +2417,12 @@ const generateImage = async (req, res) => {
       try {
         if (result.dataUri && result.dataUri.startsWith('data:image/')) {
           result.dataUri = await imageStorage.uploadFromDataUri(result.dataUri, wsId, cn);
-        } else if (result.dataUri && result.dataUri.includes('/api/images/img_')) {
+        } else if (imageStorage.looksLikeEngineImageUrl(result.dataUri)) {
+          // Origin-checked like the save path. This URL comes from the engine's
+          // own response rather than a request body, so it is a weaker position
+          // to attack from — but the pre-filter should agree with the guard
+          // that uploadFromUrl now enforces, or the only signal of a refused
+          // origin is a generic upload failure.
           result.dataUri = await imageStorage.uploadFromUrl(result.dataUri, wsId, cn);
         }
         if (result.svg) {
@@ -2410,10 +2466,15 @@ const generateImage = async (req, res) => {
       }
     })();
 
-    // Phase 6: finalize the flat image charge (10; Free draws from the 200 sample
-    // pool). preDeduct+settle so the orphan-sweep can't refund it. Best-effort —
-    // the image already generated and is being returned. Stock-image search is a
+    // Phase 6: finalize the image charge (Free draws from the 200 sample pool).
+    // preDeduct+settle so the orphan-sweep can't refund it. Best-effort — the
+    // image already generated and is being returned. Stock-image search is a
     // separate zero-credit path; this endpoint is always the AI generator.
+    //
+    // Phase 3: imageGenerate became a PER-IMAGE price. This endpoint makes
+    // exactly one image per call and passes no count, so the resolver's default
+    // of one unit keeps it at the same flat charge it has always had — the run
+    // base belongs to agent runs, which take turns and write the document.
     await creditService.deductForRequest(req, { metadata: { contentId: content._id?.toString() } });
 
     return res.json(result);

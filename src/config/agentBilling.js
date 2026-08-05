@@ -38,6 +38,9 @@
  *    Auto-write (intent), plan-execute (server state), and slash commands.
  */
 
+// Price table only — creditCosts requires nothing, so this stays acyclic.
+const { IMAGE_MAX_BILLED_IMAGES } = require('./creditCosts');
+
 // Every agent-invoking slash command in suparank/components/editor/commands/
 // registry.ts MUST appear here (conformance-tested). chatMode commands (e.g.
 // meta-description) route through /ai/chat and are billed as chat — not listed.
@@ -59,7 +62,9 @@ const COMMAND_BILLING = {
   grammar: 'inlineAction',
   'alt-text': 'inlineAction',
 
-  // Image generation command → imageGenerate (10)
+  // Image generation command → imageGenerate. Priced per IMAGE as a run (a run
+  // base plus 10 each, capped) — see creditRules.agentRunCredits, not the flat
+  // spec number, which prices the one-shot generate-image endpoint.
   image: 'imageGenerate',
 };
 
@@ -157,6 +162,35 @@ const COMMAND_TOOLS = {
  */
 const COMMAND_IMAGE_PASS = new Set([]);
 
+/**
+ * Images a single run may generate. THIS TIER OWNS THE NUMBER.
+ *
+ * It used to live only in the engine's environment, which made two things
+ * impossible: this tier could not reserve credit for a run without knowing how
+ * many images it might buy, and the engine handed the same allowance to every
+ * run shape — so a chat turn billed at 1-2 credits could generate as many
+ * images as the one command that charges for them. The engine now treats its
+ * IMAGE_BUDGET_PER_RUN as a CEILING and grants what the request asks for.
+ *
+ * Four, not eight: the reservation a run must be able to afford is
+ * base + budget × per-image, and eight put that at 82 credits — 40% of a Free
+ * account's whole sample pool, held for one run. Four covers what /image
+ * actually asks for (its first question offers 3-4 sections) and halves both
+ * the reservation and the worst-case spend.
+ *
+ * Taken from the PRICE table rather than restated here: an allowance above the
+ * billable cap would silently give away every image past the cap, and two
+ * literals in two files is exactly how that drift happens.
+ */
+const IMAGE_BUDGET_PER_RUN = IMAGE_MAX_BILLED_IMAGES;
+
+/**
+ * Commands whose price covers generated images. Only these are granted an
+ * allowance; every other run — freeform, chat, skills, actions, the parallel
+ * runner — gets zero, because nothing bills them for images.
+ */
+const COMMAND_IMAGE_BUDGET = new Set(['image']);
+
 // Default server-side disabled set. Mirrors the frontend registry's compiled
 // default (NEXT_PUBLIC_DISABLED_COMMANDS fallback) and is conformance-tested
 // against it. Admin-tunable at runtime via SystemSettings
@@ -164,15 +198,18 @@ const COMMAND_IMAGE_PASS = new Set([]);
 // COMMANDS, the admin setting must be updated to match or the backend will
 // 403 commands the UI offers (that mismatch is loud by design).
 const DEFAULT_DISABLED_AGENT_COMMANDS = Object.freeze([
-  // /image is SAFE to run now (per-run image budget, per-image COGS metering,
-  // the autonomous post-agent pass behind an opt-in nobody sets, a
-  // durable-storage refusal, and no free-images-on-stop hole) — but it is not
-  // yet PRICED to run. At the flat 10-credit charge (~$0.10 of credit value)
-  // a run that generates 3 images costs ~$0.18 in provider spend, and the
-  // default budget of 8 costs ~$0.48. Break-even is roughly one image.
+  // /image is now both SAFE and PRICED. Safe: a per-run image budget, per-image
+  // COGS metering, the autonomous post-agent pass behind an opt-in nobody sets,
+  // a durable-storage refusal, and no free-images-on-stop hole. Priced: the
+  // flat 10-per-RUN charge became a run base plus 10 per IMAGE, capped at the
+  // same allowance the engine grants, so revenue now tracks provider spend
+  // instead of going inverse to it (a 4-image run was ~$0.24 of COGS against
+  // ~$0.10 of credit value; it is ~$0.42 now).
   //
-  // Enabling is a runtime admin setting (SystemSettings.disabledAgentCommands
-  // — no deploy). Do it once the price and IMAGE_BUDGET_PER_RUN agree, and on
+  // What still keeps it off is the SAVE path, not the price: the image URL the
+  // model emits is fetched and stored without an origin allowlist, timeout or
+  // size cap. Enabling is a runtime admin setting (SystemSettings.
+  // disabledAgentCommands — no deploy), to be done once that is closed and on
   // a deployment where the ENGINE has B2 configured.
   'image', 'alt-text', 'title', 'auto-optimize',
 ]);
@@ -248,7 +285,7 @@ function resolveAgentRun(body = {}, content = null, disabledCommands = DEFAULT_D
     };
   }
   if (mode !== 'sequential') {
-    return { ok: true, mode, allowedTools: undefined };
+    return { ok: true, mode, allowedTools: undefined, imagePass: false, imageBudget: 0 };
   }
   // User-facing copy rule: these strings are rendered VERBATIM as an assistant
   // bubble in the editor chat (EditorChatBar reads `error` off the JSON body),
@@ -258,7 +295,7 @@ function resolveAgentRun(body = {}, content = null, disabledCommands = DEFAULT_D
   const name = body.commandName;
   if (name === undefined || name === null || name === '') {
     if (isPlanArticleWrite(content)) {
-      return { ok: true, mode, allowedTools: undefined };
+      return { ok: true, mode, allowedTools: undefined, imagePass: false, imageBudget: 0 };
     }
     return {
       ok: false, status: 400, code: 'UNKNOWN_COMMAND',
@@ -300,10 +337,17 @@ function resolveAgentRun(body = {}, content = null, disabledCommands = DEFAULT_D
   }
   // A copy, not the live registry array: a downstream mutation of this value
   // would otherwise rewrite the whitelist process-wide for every tenant.
-  return { ok: true, mode, allowedTools: tools.slice(), imagePass: COMMAND_IMAGE_PASS.has(name) };
+  return {
+    ok: true,
+    mode,
+    allowedTools: tools.slice(),
+    imagePass: COMMAND_IMAGE_PASS.has(name),
+    imageBudget: COMMAND_IMAGE_BUDGET.has(name) ? IMAGE_BUDGET_PER_RUN : 0,
+  };
 }
 
 module.exports = {
-  COMMAND_BILLING, COMMAND_TOOLS, COMMAND_IMAGE_PASS, DEFAULT_DISABLED_AGENT_COMMANDS,
+  COMMAND_BILLING, COMMAND_TOOLS, COMMAND_IMAGE_PASS, COMMAND_IMAGE_BUDGET,
+  IMAGE_BUDGET_PER_RUN, DEFAULT_DISABLED_AGENT_COMMANDS,
   classifyAgentRun, isPlanArticleWrite, resolveAgentRun, canonicalMode,
 };

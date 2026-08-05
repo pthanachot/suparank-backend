@@ -127,3 +127,31 @@ describe('getTierInfo — org credit balance redaction', () => {
     assert.equal(r.statusCode, 403);
   });
 });
+
+// ─── Phase 3: the per-image price shape reaches the client ───────
+//
+// The editor gates /image on creditCostShapes.imageGenerate.worstCase. If the
+// field never made it into the response the UI would silently fall back to the
+// flat per-image number and start runs the deduction refuses with a 402 — so
+// the arithmetic being right elsewhere is not enough; it has to be PUBLISHED.
+describe('getTierInfo — credit cost shapes', () => {
+  it('publishes the /image run shape alongside the flat cost map', async () => {
+    const r = res();
+    await tierController.getTierInfo(reqFor(OWNER), r);
+    const shape = r.body.creditCostShapes?.imageGenerate;
+    assert.ok(shape, 'creditCostShapes.imageGenerate must be published');
+    assert.equal(shape.unit, 'image');
+    assert.equal(shape.worstCase, shape.base + shape.perUnit * shape.max);
+    // The flat map still carries the per-image price for the one-shot endpoint.
+    assert.equal(r.body.creditCosts.imageGenerate, shape.perUnit);
+  });
+
+  it('publishes no shape for flat-priced actions', async () => {
+    const r = res();
+    await tierController.getTierInfo(reqFor(OWNER), r);
+    for (const flat of ['articleGenerate', 'fullDocPass', 'inlineAction']) {
+      assert.equal(r.body.creditCostShapes[flat], undefined,
+        `${flat} prices as one number and must not publish a shape`);
+    }
+  });
+});

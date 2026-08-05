@@ -127,10 +127,59 @@ function resolveCredits(action, ctx = {}) {
   let units = 1;
   if (spec.perRow) units = ctx.rows ?? ctx.count ?? 1;
   else if (spec.perActivePrompt) units = ctx.activePrompts ?? ctx.count ?? 1;
+  // `?? 1` and not `|| 1`: an agent run that generated ZERO images must price
+  // at zero images, and `0 || 1` would quietly bill one. The single-image
+  // endpoint passes no count at all and still defaults to 1.
+  else if (spec.perImage) units = ctx.images ?? ctx.count ?? 1;
   units = toFiniteUnits(units); // coerce non-numeric / NaN / negative → safe
   if (spec.cap != null) units = Math.min(units, spec.cap);
 
   return spec.credits * units;
+}
+
+/**
+ * Credits for one AGENT RUN of `action` — what POST /ai/agent reserves and
+ * settles. Identical to resolveCredits for every action except imageGenerate.
+ *
+ * An /image run is priced as a small run base (the inlineAction price — the
+ * turns, tokens and document write happen whether or not an image lands) plus
+ * the per-image price of the images it actually produced. Composing two
+ * existing actions rather than minting a third keeps the direct
+ * /ai/generate-image endpoint at its flat per-image price with no run base,
+ * and keeps creditActionPermissions total (every billable key still maps to a
+ * permission).
+ *
+ * Pass ctx.images = the run's image ALLOWANCE to get the worst case (what the
+ * reservation must be — settle can only refund, never top up), or the images
+ * actually generated to get what the run owes.
+ */
+function agentRunCredits(action, ctx = {}) {
+  if (action !== 'imageGenerate') return resolveCredits(action, ctx);
+  return resolveCredits('inlineAction', ctx) + resolveCredits('imageGenerate', ctx);
+}
+
+/**
+ * The published price SHAPE for an agent run of `action`, for the UI to render
+ * ("2 + 10 ⚡/image") and to pre-flight against — or null for the flat actions,
+ * whose single tier-info number already says everything.
+ *
+ * worstCase is the authority for affordability: it is exactly what the server
+ * reserves, so a client that gates on it never starts a run the deduction then
+ * refuses.
+ */
+function agentRunCostShape(action, ctx = {}) {
+  const spec = Object.prototype.hasOwnProperty.call(CREDIT_COSTS, action)
+    ? CREDIT_COSTS[action]
+    : undefined;
+  if (!spec?.perImage) return null;
+  const max = spec.cap ?? 1;
+  return {
+    base: resolveCredits('inlineAction', ctx),
+    perUnit: resolveCredits(action, { ...ctx, images: 1 }),
+    unit: 'image',
+    max,
+    worstCase: agentRunCredits(action, { ...ctx, images: max }),
+  };
 }
 
 /** True if the action exists end-to-end and may be billed today. */
@@ -146,5 +195,7 @@ module.exports = {
   FREE_SAMPLE_POOL_CREDITS,
   MARKUP_CLASSES,
   resolveCredits,
+  agentRunCredits,
+  agentRunCostShape,
   isActive,
 };

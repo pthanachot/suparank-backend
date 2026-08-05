@@ -19,7 +19,7 @@ const { resolveWorkspaceWithRole: rwr, requirePermission: rp, requireFeature: rf
 const { requirePermission } = require('../middleware/permissions.policy');
 const { requireQuota: rq } = require('../middleware/tierEnforcement');
 const { requireCredits: rc } = require('../middleware/creditGate');
-const { resolveCredits } = require('../config/creditRules');
+const { resolveCredits, agentRunCredits } = require('../config/creditRules');
 const { rejectIfLocked, contentLockResolver } = require('../middleware/lockGuard');
 const rateLimit = require('express-rate-limit');
 
@@ -47,12 +47,12 @@ const autocompleteLimiter = rateLimit({
 const estAudit = (_req, { tier }) => resolveCredits('contentAudit', { tier });
 const estChat = (_req, { tier }) => resolveCredits('aiChatMessage', { tier, tokens: 8001 }); // reserve 2, settle down
 // Agent runs are classified per-command (see agentBilling.js): slash commands
-// price as their mapped action (edit passes 25/2, image 10); Auto-write,
+// price as their mapped action (edit passes 25/2, image per-image); Auto-write,
 // unknown commands, and plan-execute writes price as articleGenerate (100,
 // count-gated in aiController). Plan-execute detection needs the content's
 // server-side mode/plan state — a minimal lean fetch (fail-open to the body
 // classification: the controller re-classifies authoritatively anyway).
-const { classifyAgentRun } = require('../config/agentBilling');
+const { classifyAgentRun, IMAGE_BUDGET_PER_RUN } = require('../config/agentBilling');
 const Content = require('../models/Content');
 const estAgent = async (req, { tier }) => {
   let content = null;
@@ -64,7 +64,12 @@ const estAgent = async (req, { tier }) => {
     content = await Content.findByNumber(req.workspace._id, req.params.contentNumber);
     if (content) req._prefetchedContent = content;
   } catch { /* fall back to body-only classification */ }
-  return resolveCredits(classifyAgentRun(req.body, content), { tier });
+  // Reserve the WORST case — the full image allowance, not the images this run
+  // will turn out to need. settle() can only refund down (Math.min(actual,
+  // reserved)); anything it could not top up later would be an image the
+  // provider billed us for and the user never paid for. aiController settles
+  // to the count the engine actually reported.
+  return agentRunCredits(classifyAgentRun(req.body, content), { tier, images: IMAGE_BUDGET_PER_RUN });
 };
 // Phase 6 flat à-la-carte estimators (image, import, re-score, brief/outline,
 // internal-links). None is a fixed-bundle-free action, so resolveCredits returns

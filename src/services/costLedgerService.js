@@ -79,6 +79,10 @@ async function record(p) {
       provider: priced.provider || '',
       tokensIn,
       tokensOut,
+      // Clamped like the token counts: this is multiplied into per-org totals
+      // an operator acts on, and it originates (via the agent path) in an SSE
+      // payload. Non-finite or negative would corrupt every sum over the window.
+      images: Number.isFinite(Number(p.images)) ? Math.max(0, Math.round(Number(p.images))) : 0,
       costUsd,
       unknownModel: !priced.known && !hasOverride,
       tier: p.tier || '',

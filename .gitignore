@@ -12,8 +12,22 @@ yarn-error.log
 
 # dev-only (local tools, not deployed)
 src/routes/devRoutes.js
-/scripts/
 .env.bak
+
+# scripts/ is dev-only BY DEFAULT, but the test-plan ops artifacts must ship:
+# the daily vendor smoke, the nightly ledger reconciliation, the chaos drills
+# and the E2E seeder are all referenced by package.json scripts, docs/cron and
+# the Playwright harness. With the old blanket `/scripts/` rule they existed
+# only on one laptop — a clone + the documented cron produced
+# "Cannot find module". Note the trailing `*`: a blanket directory exclude
+# cannot be undone by a negation, so the contents are excluded individually
+# and the keepers re-included.
+/scripts/*
+!/scripts/smokeVendors.js
+!/scripts/reconcileTrackerCredits.js
+!/scripts/e2eSeed.js
+!/scripts/chaos/
+!/scripts/preflightImage.js
 
 # Database backup archives (admin-triggered mongodump output)
 /backups/

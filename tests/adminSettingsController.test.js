@@ -184,3 +184,121 @@ describe('listAdmins (env-only, read-only)', () => {
     assert.equal(typeof controller.removeAdmin, 'undefined');
   });
 });
+
+// ── Settings GET: what the admin console needs to render ───────
+//
+// Command availability used to be a build-time constant, so the console has no
+// list of its own. It renders whatever this endpoint reports, which is the
+// point: the same registry the PUT validates against, so the UI can never
+// offer a toggle the API then rejects as unknown — nor hide one that is
+// switched off in production and would otherwise be unreachable from here.
+describe('getSystemSettings — admin console payload', () => {
+  async function get() {
+    const res = mockRes();
+    await controller.getSystemSettings(asAdmin(), res);
+    return res;
+  }
+
+  it('returns the settings document', async () => {
+    const res = await get();
+    assert.equal(res.statusCode, 200);
+    assert.ok(res.body.settings, 'settings must still be returned');
+  });
+
+  it('lists every command the PUT would accept', async () => {
+    const { COMMAND_TOOLS } = require('../src/config/agentBilling');
+    const res = await get();
+    assert.deepEqual(
+      [...res.body.knownAgentCommands].sort(),
+      Object.keys(COMMAND_TOOLS).sort(),
+      'the console renders this list — a command missing here cannot be toggled at all',
+    );
+  });
+
+  it('every advertised command actually validates on PUT', async () => {
+    // The two halves of the contract, checked against each other rather than
+    // against a copied literal: offering a name the PUT rejects would give the
+    // operator a toggle that always errors.
+    const res = await get();
+    const put = mockRes();
+    await controller.updateSystemSettings(
+      { ...asAdmin(), body: { disabledAgentCommands: res.body.knownAgentCommands } },
+      put,
+    );
+    assert.equal(put.statusCode, 200, `PUT rejected its own advertised list: ${put.body?.error}`);
+  });
+
+  it('reports which commands are off by DEFAULT, not just which are off', async () => {
+    // `disabledAgentCommands: null` means "use the default". Without this the
+    // console would show an empty selection and report /image as enabled when
+    // it is not.
+    const { DEFAULT_DISABLED_AGENT_COMMANDS } = require('../src/config/agentBilling');
+    const res = await get();
+    assert.deepEqual(
+      [...res.body.defaultDisabledAgentCommands].sort(),
+      [...DEFAULT_DISABLED_AGENT_COMMANDS].sort(),
+    );
+    assert.ok(res.body.defaultDisabledAgentCommands.includes('image'),
+      '/image ships off; a console that showed it on would be lying about production');
+  });
+
+  it('the default set is itself a subset of the known commands', async () => {
+    // A default naming a command the registry does not have would render a
+    // toggle for something that cannot exist.
+    const res = await get();
+    for (const name of res.body.defaultDisabledAgentCommands) {
+      assert.ok(res.body.knownAgentCommands.includes(name),
+        `default-disabled "${name}" is not a known command`);
+    }
+  });
+});
+
+// ── Provenance for the command kill-switch ─────────────────────
+//
+// Enabling /image makes a money-spending command available to every workspace
+// at once, with no deploy and no per-tenant rollout. "Who turned this on, and
+// when" therefore has to survive in the audit trail — it is the only record,
+// since the setting itself stores just the resulting array.
+describe('command-availability changes are audited', () => {
+  const adminAudit = require('../src/services/adminAuditService');
+
+  it('records the command patch, not just that settings changed', async () => {
+    const calls = [];
+    const real = adminAudit.fromReq;
+    adminAudit.fromReq = (req, entry) => { calls.push({ email: req.user?.email, entry }); };
+    try {
+      const res = mockRes();
+      await controller.updateSystemSettings(
+        { ...asAdmin('operator@suparank.ai'), body: { disabledAgentCommands: ['alt-text'] } },
+        res,
+      );
+      assert.equal(res.statusCode, 200);
+      assert.equal(calls.length, 1, 'a command change must leave an audit entry');
+      assert.equal(calls[0].email, 'operator@suparank.ai');
+      assert.deepEqual(
+        calls[0].entry.meta.patch.disabledAgentCommands,
+        ['alt-text'],
+        'the audit must carry WHICH commands, or it cannot answer who enabled /image',
+      );
+    } finally {
+      adminAudit.fromReq = real;
+    }
+  });
+
+  it('a rejected change is not audited as if it happened', async () => {
+    const calls = [];
+    const real = adminAudit.fromReq;
+    adminAudit.fromReq = (req, entry) => { calls.push(entry); };
+    try {
+      const res = mockRes();
+      await controller.updateSystemSettings(
+        { ...asAdmin(), body: { disabledAgentCommands: ['not-a-real-command'] } },
+        res,
+      );
+      assert.equal(res.statusCode, 400);
+      assert.equal(calls.length, 0, 'a 400 must not leave an audit trail suggesting a change landed');
+    } finally {
+      adminAudit.fromReq = real;
+    }
+  });
+});

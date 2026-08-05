@@ -183,7 +183,7 @@ async function sendChatMessageStream(sessionId, prompt, signal, preset) {
  * @param {string[]} [allowedTools] - restrict agent to only these tools (e.g. ["EditTool"])
  * @returns {Promise<Response>} The raw fetch response (SSE stream)
  */
-async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5, signal, allowedTools, mode, preset, imagePass = false) {
+async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5, signal, allowedTools, mode, preset, imagePass = false, imageBudget = 0) {
   const payload = { goal, targetScore, maxIterations };
   if (allowedTools?.length > 0) {
     payload.allowedTools = allowedTools;
@@ -195,6 +195,12 @@ async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5, 
   // engine treats an absent flag as off, so omitting it is the safe default.
   if (imagePass) {
     payload.imagePass = true;
+  }
+  // How many images this run may generate. The engine grants NOTHING unless
+  // asked, and clamps what we ask for, so omitting this is the safe default
+  // for every run nobody is billing for images.
+  if (imageBudget > 0) {
+    payload.imageBudget = imageBudget;
   }
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/agent`, {
     method: 'POST',

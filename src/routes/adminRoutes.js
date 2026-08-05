@@ -27,6 +27,10 @@ router.put('/settings', adminMiddleware, adminSettingsController.updateSystemSet
 // Admin identity is env-only (Phase 2): managed via ADMIN_EMAILS / ADMIN_EMAILS_2..5
 // in Railway. Listing stays read-only; the add/remove endpoints are retired (410).
 router.get('/settings/admins', adminMiddleware, adminSettingsController.listAdmins);
+// Per-org image COGS — the view that says whether /image is behaving after it
+// is switched on. Images bill per unit, so a runaway tenant is invisible on
+// every token-based chart.
+router.get('/image-spend', adminMiddleware, adminSettingsController.getImageSpend);
 const adminEmailsGone = (req, res) =>
   res.status(410).json({
     error:

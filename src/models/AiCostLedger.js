@@ -46,6 +46,14 @@ const aiCostLedgerSchema = new mongoose.Schema(
     provider: { type: String, default: '' },
     tokensIn: { type: Number, default: 0, min: 0 },
     tokensOut: { type: Number, default: 0, min: 0 },
+    // Images bought on this row. Already fed the costUsd calculation but was
+    // never stored, which left the count unqueryable — and `calls` cannot stand
+    // in for it, because the one-shot endpoint writes one row per image while
+    // an agent run writes ONE row carrying the whole run's total. Recorded so
+    // "which org is generating hundreds of images" is answerable at all.
+    // Rows written before this field exists read back as 0, so any total is a
+    // lower bound over a window that spans the deploy.
+    images: { type: Number, default: 0, min: 0 },
     // Computed USD cost from modelRegistry.costFor(). 0 when the model is not
     // in the registry (unknown=true flags that so it can be back-filled).
     costUsd: { type: Number, default: 0, min: 0 },
@@ -90,6 +98,42 @@ aiCostLedgerSchema.statics.cogsBy = async function (
       },
     },
     { $sort: { costUsd: -1 } },
+  ]);
+};
+
+/**
+ * Image spend per organisation, worst first — the monitoring view for /image.
+ *
+ * Images are the only thing the engine buys per UNIT rather than per token, so
+ * they are the one cost that a single tenant can run up quickly without moving
+ * any token-based dashboard. cogsBy('organizationId') cannot answer this: it
+ * sums every action together, so image spend hides inside a much larger article
+ * and chat total.
+ *
+ * `images` is 0 on rows written before that field existed, so a window spanning
+ * the deploy under-reports the count. costUsd is correct throughout — it was
+ * always computed from the image count even when the count was not stored — so
+ * prefer cost when the two disagree.
+ *
+ * @returns [{ organizationId, costUsd, images, rows }] sorted by costUsd desc
+ */
+aiCostLedgerSchema.statics.imageSpendByOrg = async function (
+  { sinceMs = 7 * 24 * 60 * 60 * 1000, limit = 20 } = {}
+) {
+  const capped = Math.max(1, Math.min(100, Number(limit) || 20));
+  return this.aggregate([
+    { $match: { action: 'image', createdAt: { $gte: new Date(Date.now() - sinceMs) } } },
+    {
+      $group: {
+        _id: '$organizationId',
+        costUsd: { $sum: '$costUsd' },
+        images: { $sum: '$images' },
+        rows: { $sum: 1 },
+      },
+    },
+    { $sort: { costUsd: -1 } },
+    { $limit: capped },
+    { $project: { _id: 0, organizationId: '$_id', costUsd: 1, images: 1, rows: 1 } },
   ]);
 };
 

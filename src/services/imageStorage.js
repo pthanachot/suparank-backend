@@ -175,29 +175,22 @@ async function uploadFromDataUri(dataUri, workspaceId, contentNumber) {
   return uploadImage(buffer, contentType, workspaceId, contentNumber);
 }
 
-/**
- * Fetch a URL (e.g. temporary engine URL) and upload to B2.
- * @param {string} url - The URL to fetch
- * @param {string} workspaceId
- * @param {string|number} contentNumber
- * @returns {Promise<string>} Public URL, or the original URL if B2 is not enabled
- */
-async function uploadFromUrl(url, workspaceId, contentNumber) {
-  if (!isEnabled()) return url;
 
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to fetch image: ${res.status}`);
-
-  const buffer = Buffer.from(await res.arrayBuffer());
-  const contentType = res.headers.get('content-type') || 'image/png';
-  return uploadImage(buffer, contentType, workspaceId, contentNumber);
-}
-
-// ─── R18: SSRF-hardened rehost of UNTRUSTED image URLs ────────
-// uploadFromUrl above is for TRUSTED internal URLs (the writing engine's own
-// temp image host, which is localhost/private and must NOT be blocked). The
-// helpers below are for user-supplied search-result URLs, which are hostile
-// input and must be validated against SSRF before we fetch them server-side.
+// ─── Server-side image fetching: two guards, opposite directions ──
+//
+// Everything below fetches a URL server-side, so every entry point is guarded.
+// The two guards are NOT interchangeable:
+//
+//   assertSafeImageURL   (R18) — user-supplied search-result URLs. Hostile
+//     input: allow the public internet, reject our own network (loopback,
+//     private ranges, link-local, DNS-rebinding).
+//   assertEngineImageURL (Phase 4) — generated-image URLs that arrive in a
+//     content save. Also client-controlled, but the legitimate origin is the
+//     ENGINE, which normally IS loopback — so the SSRF guard would reject every
+//     valid URL. Allow that one origin, reject everything else.
+//
+// Using either in the other's place fails: one blocks all real traffic, the
+// other admits the whole internet.
 
 /** Thrown when an untrusted URL fails SSRF validation (→ HTTP 400). */
 class UrlValidationError extends Error {
@@ -209,53 +202,9 @@ const REHOST_MAX_BYTES = 10 * 1024 * 1024; // 10MB
 const REHOST_MAX_REDIRECTS = 3;
 const REHOST_TIMEOUT_MS = 15000;
 
-const BLOCKED_HOSTNAMES = new Set([
-  'localhost', 'metadata.google.internal', 'metadata', 'instance-data',
-]);
-
-// Private / loopback / link-local / reserved ranges (IPv4 + IPv6).
-function isPrivateIp(ip) {
-  const kind = net.isIP(ip);
-  if (kind === 4) {
-    const p = ip.split('.').map(Number);
-    if (p[0] === 0) return true;                              // 0.0.0.0/8
-    if (p[0] === 10) return true;                             // 10/8 private
-    if (p[0] === 127) return true;                            // loopback
-    if (p[0] === 169 && p[1] === 254) return true;            // link-local
-    if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true; // 172.16/12
-    if (p[0] === 192 && p[1] === 168) return true;           // 192.168/16
-    if (p[0] === 100 && p[1] >= 64 && p[1] <= 127) return true; // CGNAT 100.64/10
-    if (p[0] >= 224) return true;                            // multicast/reserved
-    return false;
-  }
-  if (kind === 6) {
-    const h = ip.toLowerCase();
-    if (h === '::1' || h === '::') return true;              // loopback / unspecified
-    if (/^fe[89ab]/.test(h)) return true;                   // link-local fe80::/10
-    if (h.startsWith('fc') || h.startsWith('fd')) return true; // ULA fc00::/7
-    // IPv4-mapped ::ffff:a.b.c.d — new URL rewrites the dotted form to hex
-    // (::ffff:7f00:1), so decode BOTH forms and defer to the IPv4 rules. An
-    // unrecognized mapped form fails closed (returns true) rather than leak.
-    if (h.startsWith('::ffff:')) {
-      const tail = h.slice(7);
-      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(tail)) return isPrivateIp(tail);
-      const m = tail.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
-      if (m) {
-        const hi = parseInt(m[1], 16), lo = parseInt(m[2], 16);
-        return isPrivateIp(`${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`);
-      }
-      return true; // unrecognized ::ffff: form — fail closed
-    }
-    return false;
-  }
-  return false; // not an IP literal
-}
-
-function isBlockedHostname(host) {
-  const h = host.toLowerCase().replace(/\.$/, '');
-  if (BLOCKED_HOSTNAMES.has(h)) return true;
-  return h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.localhost');
-}
+// Canonical IP/hostname classification lives in ssrfGuard so the crawler and any
+// other server-side fetcher share one implementation (no drift).
+const { isPrivateIp, isBlockedHostname } = require('./ssrfGuard');
 
 /**
  * Validate an untrusted URL is safe to fetch server-side. Rejects non-http(s)
@@ -371,6 +320,143 @@ async function readBodyWithCap(res, maxBytes) {
   }
   return Buffer.concat(chunks);
 }
+
+/**
+ * Fetch a generated image from the WRITING ENGINE and upload it to B2.
+ *
+ * The URL reaches us inside a `blocks[].src` on a content save, so it is
+ * CLIENT-CONTROLLED even though it normally originates from the engine. It is
+ * therefore checked against an origin allowlist (assertEngineImageURL) rather
+ * than trusted, and the fetch is bounded exactly like the untrusted-rehost path
+ * below — timeout, no redirects, content-type allowlist, streaming size cap.
+ *
+ * This is NOT assertSafeImageURL: that one rejects private/loopback addresses,
+ * which is precisely where the engine lives in the default deployment. The two
+ * guards defend opposite directions — "anywhere except our own network" for
+ * user-supplied URLs, "our engine and nowhere else" for this one.
+ *
+ * @param {string} url - engine image URL (validated against the allowlist)
+ * @param {string} workspaceId
+ * @param {string|number} contentNumber
+ * @param {object} [opts]
+ * @param {Function} [opts.fetchImpl] - injectable fetch (tests); defaults to global fetch
+ * @returns {Promise<string>} Public URL, or the original URL if B2 is not enabled
+ * @throws {UrlValidationError} the URL is not an engine image URL, or the
+ *   response is the wrong type / too large
+ */
+async function uploadFromUrl(url, workspaceId, contentNumber, { fetchImpl = fetch } = {}) {
+  if (!isEnabled()) return url;
+
+  assertEngineImageURL(url);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REHOST_TIMEOUT_MS);
+  try {
+    // redirect:'manual' and NO hop loop: the engine serves image bytes
+    // directly, so a redirect here is either a misconfiguration or an attempt
+    // to bounce us off the allowlisted origin. Refuse rather than follow.
+    const res = await fetchImpl(url, { redirect: 'manual', signal: controller.signal });
+    if (res.status >= 300 && res.status < 400) {
+      throw new UrlValidationError(`engine image URL redirected (${res.status})`);
+    }
+    if (!res.ok) throw new Error(`Failed to fetch image: ${res.status}`);
+
+    // No `|| 'image/png'` default: an absent content-type used to be relabelled
+    // as a PNG, so whatever bytes came back were stored and served as an image.
+    const contentType = (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    if (!REHOST_ALLOWED_TYPES.has(contentType)) {
+      throw new UrlValidationError(`disallowed content-type: ${contentType || 'none'}`);
+    }
+    const declared = Number(res.headers.get('content-length'));
+    if (declared && declared > REHOST_MAX_BYTES) throw new UrlValidationError('image exceeds size limit');
+
+    const buffer = await readBodyWithCap(res, REHOST_MAX_BYTES);
+    return uploadImage(buffer, contentType, workspaceId, contentNumber);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Origins the engine may serve generated images from, as `protocol//host:port`.
+ *
+ * WRITING_ENGINE_URL is the backend→engine address. The engine bakes its own
+ * IMAGE_BASE_URL into the markdown it emits, and in a split deploy that is the
+ * engine's PUBLIC address, which is a different origin — so it is configurable
+ * here too. If they differ and ENGINE_IMAGE_BASE_URL is unset, generated images
+ * simply are not re-hosted (they keep working from the engine until it expires
+ * them) and a warning names the origin that was refused.
+ *
+ * Read per call, not cached at module load: tests and config reloads change
+ * these, and a stale snapshot would silently allow or refuse the wrong origin.
+ */
+function engineImageOrigins() {
+  // WRITING_ENGINE_URL comes from its owning module, never from process.env
+  // here: engineFetchContainment.test.js confines those reads to the engine
+  // client modules so a second copy cannot drift from the one used to call the
+  // engine. It is therefore fixed at module load, like every other consumer of
+  // that value; ENGINE_IMAGE_BASE_URL is local to this guard and read live.
+  const { WRITING_ENGINE_URL } = require('./writingEngine');
+  const raw = [
+    WRITING_ENGINE_URL,
+    process.env.ENGINE_IMAGE_BASE_URL || '',
+  ];
+  const origins = new Set();
+  for (const r of raw) {
+    if (!r) continue;
+    try { origins.add(new URL(r).origin); } catch { /* malformed env — ignore */ }
+  }
+  return origins;
+}
+
+/**
+ * Assert a URL is a generated-image URL served by our own writing engine.
+ *
+ * The check this replaced was `src.includes('/api/images/img_')` — a substring
+ * match anywhere in a client-supplied string. `https://evil.test/api/images/img_`
+ * passed it, and so did `http://169.254.169.254/latest/meta-data/?/api/images/img_`:
+ * the body of whatever we fetched was uploaded to B2 and its URL written back
+ * into the document, which turned an authenticated content save into an SSRF
+ * read primitive against cloud metadata.
+ *
+ * Origin is compared exactly (protocol + host + port) and the path must START
+ * with the image prefix, so neither a lookalike host nor a query/fragment can
+ * smuggle the marker in.
+ */
+function assertEngineImageURL(urlStr) {
+  let u;
+  try { u = new URL(urlStr); } catch { throw new UrlValidationError('invalid URL'); }
+  if (u.username || u.password) throw new UrlValidationError('credentials in URL not allowed');
+  if (!u.pathname.startsWith(ENGINE_IMAGE_PATH_PREFIX)) {
+    throw new UrlValidationError(`not an engine image path: ${u.pathname}`);
+  }
+  const allowed = engineImageOrigins();
+  if (!allowed.has(u.origin)) {
+    // Names the env var deliberately: in a split deploy the engine's public
+    // IMAGE_BASE_URL is a different origin from WRITING_ENGINE_URL, and the
+    // only symptom is that generated images stop being copied to B2. Without
+    // this the operator sees an upload failure with no way to tell a
+    // misconfiguration from an attack.
+    throw new UrlValidationError(
+      `not an engine image origin: ${u.origin} (allowed: ${[...allowed].join(', ') || 'none'}`
+      + ' — set ENGINE_IMAGE_BASE_URL if the engine serves images from another origin)',
+    );
+  }
+}
+
+/** True if `src` even claims to be an engine image URL — the cheap pre-filter
+ *  the save path uses to decide whether re-hosting is worth attempting.
+ *  Authoritative validation is assertEngineImageURL; this only avoids throwing
+ *  on the ordinary case of an already-B2 or plain external image. */
+function looksLikeEngineImageUrl(src) {
+  if (!src || typeof src !== 'string') return false;
+  try {
+    const u = new URL(src);
+    return u.pathname.startsWith(ENGINE_IMAGE_PATH_PREFIX) && engineImageOrigins().has(u.origin);
+  } catch { return false; }
+}
+
+const ENGINE_IMAGE_PATH_PREFIX = '/api/images/';
 
 /**
  * Upload a buffer to B2 with a custom key.
@@ -489,6 +575,8 @@ module.exports = {
   uploadImage,
   uploadFromDataUri,
   uploadFromUrl,
+  looksLikeEngineImageUrl,
+  assertEngineImageURL,
   uploadFromExternalUrl,
   assertSafeImageURL,
   UrlValidationError,

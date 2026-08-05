@@ -17,7 +17,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const {
-  COMMAND_BILLING, COMMAND_TOOLS, COMMAND_IMAGE_PASS, DEFAULT_DISABLED_AGENT_COMMANDS,
+  COMMAND_BILLING, COMMAND_TOOLS, COMMAND_IMAGE_PASS, COMMAND_IMAGE_BUDGET,
+  IMAGE_BUDGET_PER_RUN, DEFAULT_DISABLED_AGENT_COMMANDS,
   classifyAgentRun, resolveAgentRun, canonicalMode,
 } = require('../src/config/agentBilling');
 const { CREDIT_COSTS } = require('../src/config/creditCosts');
@@ -291,6 +292,74 @@ test('resolveAgentRun: no command requests the post-agent image pass', () => {
   const img = resolveAgentRun({ mode: 'sequential', commandName: 'image' }, null, []);
   assert.deepEqual(img.allowedTools, ['AskUserTool', 'ImageSearchTool', 'ImageGenTool', 'EditTool']);
   assert.equal(img.imagePass, false);
+});
+
+// The image allowance is granted by THIS tier, not assumed by the engine.
+// It used to live only in the engine's env, so this tier could not reserve
+// credit for a run without knowing how many images it might buy — and every
+// run shape got the same allowance, which is how a 1-2 credit chat turn could
+// generate as many images as the command that charges for them.
+test('resolveAgentRun: only a command that pays for images is granted a budget', () => {
+  const paid = resolveAgentRun({ mode: 'sequential', commandName: 'image' }, null, []);
+  assert.equal(paid.imageBudget, IMAGE_BUDGET_PER_RUN);
+  assert.ok(IMAGE_BUDGET_PER_RUN > 0 && IMAGE_BUDGET_PER_RUN <= 8,
+    'the budget doubles as the worst case a user must be able to afford — keep it small');
+
+  for (const name of Object.keys(COMMAND_TOOLS)) {
+    if (COMMAND_IMAGE_BUDGET.has(name)) continue;
+    const gate = resolveAgentRun({ mode: 'sequential', commandName: name }, null, []);
+    assert.equal(gate.imageBudget, 0, `/${name} does not bill for images, so it must be granted none`);
+  }
+
+  // Freeform (the editor's Auto-write) and the plan-approve write reach the
+  // engine's widest image surface and neither is billed for images. Asserted
+  // as an explicit 0, not an absent key: relying on the key being missing
+  // pinned an accident and blocked the clearer implementation.
+  assert.equal(resolveAgentRun({ mode: 'freeform' }, null, []).imageBudget, 0);
+  assert.equal(
+    resolveAgentRun({ mode: 'sequential' }, { mode: 'execute', activePlanId: 'p1' }, []).imageBudget,
+    0,
+  );
+});
+
+// The converse of the test above, and the one that catches a FUTURE command:
+// anything shipping with image tools must be listed as paying for them, or it
+// silently cannot make images and surfaces only as a confused user.
+test('resolveAgentRun: a command with image tools must be granted a budget', () => {
+  for (const [name, tools] of Object.entries(COMMAND_TOOLS)) {
+    const hasImageTool = tools.some((t) => t === 'ImageGenTool' || t === 'ImageSearchTool');
+    if (!hasImageTool) continue;
+    assert.ok(COMMAND_IMAGE_BUDGET.has(name),
+      `/${name} ships with image tools but is not in COMMAND_IMAGE_BUDGET — it could never make one`);
+  }
+});
+
+test('resolveAgentRun: every command granted a budget can actually make images', () => {
+  // A grant without the tools would reserve credit for images that can never
+  // be produced; the tools without a grant is the hole this closes.
+  for (const name of COMMAND_IMAGE_BUDGET) {
+    const tools = COMMAND_TOOLS[name] || [];
+    assert.ok(tools.some((t) => t === 'ImageGenTool' || t === 'ImageSearchTool'),
+      `/${name} is granted an image budget but its whitelist has no image tool`);
+  }
+});
+
+test('every command granted an image budget is PRICED per image', () => {
+  // The two tests above tie the budget to the TOOLS in both directions. Neither
+  // ties it to the PRICE, and that is the gap Phase 3 exists to close.
+  //
+  // A new image-capable command must be added to COMMAND_IMAGE_BUDGET (the
+  // inverse test forces it) — but nothing forced its COMMAND_BILLING entry to
+  // be an action that charges per image. Classify it as fullDocPass and it is
+  // granted four images, reserves the flat 25, settles to 25, and produces
+  // four images of provider spend at zero per-image revenue. Silently: every
+  // other test in this file stays green.
+  for (const name of COMMAND_IMAGE_BUDGET) {
+    const action = classifyAgentRun({ mode: 'sequential', commandName: name });
+    assert.ok(CREDIT_COSTS[action]?.perImage === true,
+      `/${name} is granted images but bills as "${action}", which has no per-image price — `
+      + 'its images would be free');
+  }
 });
 
 test('resolveAgentRun: plan-write billing is preserved (still articleGenerate)', () => {

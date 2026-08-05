@@ -11,7 +11,23 @@ const adminAudit = require('../services/adminAuditService');
 const AUDIT = require('../services/adminAuditActions');
 
 const getSystemSettings = async (req, res) => {
-  res.json({ settings: getSettings() });
+  // knownAgentCommands is the SAME registry the PUT validates against, so the
+  // admin UI renders exactly the toggles the server will accept. Without it the
+  // UI would need its own copy of the command list, which is how you get a
+  // console offering a command the API then rejects as unknown — or worse,
+  // quietly omitting one that is disabled in production and cannot be re-enabled
+  // from the console at all.
+  //
+  // `defaultDisabled` ships alongside so the UI can label which commands are off
+  // because nobody has touched the setting, versus off by an admin's decision:
+  // `disabledAgentCommands: null` means "use the default", and showing that as
+  // an empty selection would misreport /image (and three others) as enabled.
+  const { COMMAND_TOOLS, DEFAULT_DISABLED_AGENT_COMMANDS } = require('../config/agentBilling');
+  res.json({
+    settings: getSettings(),
+    knownAgentCommands: Object.keys(COMMAND_TOOLS).sort(),
+    defaultDisabledAgentCommands: [...DEFAULT_DISABLED_AGENT_COMMANDS].sort(),
+  });
 };
 
 const updateSystemSettings = async (req, res) => {
@@ -128,4 +144,42 @@ const listAdmins = async (req, res) => {
   }
 };
 
-module.exports = { getSystemSettings, updateSystemSettings, listAdmins };
+/**
+ * GET /api/admin/image-spend — per-org image COGS, worst first.
+ *
+ * Images are the only thing the engine buys per UNIT rather than per token, so
+ * one tenant can run up real money without moving any token-based dashboard.
+ * This is the view an operator checks after enabling /image, and the one that
+ * says whether to switch it back off.
+ *
+ * Read-only and admin-gated like the rest of this controller; deliberately NOT
+ * audit-logged (reading a cost total changes nothing, and the audit trail is
+ * for actions).
+ */
+const getImageSpend = async (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(90, parseInt(req.query.days, 10) || 7));
+    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit, 10) || 20));
+    const AiCostLedger = require('../models/AiCostLedger');
+    const rows = await AiCostLedger.imageSpendByOrg({
+      sinceMs: days * 24 * 60 * 60 * 1000,
+      limit,
+    });
+    res.json({
+      days,
+      orgs: rows,
+      totals: {
+        costUsd: rows.reduce((s, r) => s + (r.costUsd || 0), 0),
+        images: rows.reduce((s, r) => s + (r.images || 0), 0),
+      },
+      // Named so the reader knows a low count over an old window is a recording
+      // gap, not a quiet month — the column is newer than the ledger.
+      note: 'images is 0 on ledger rows written before the images column shipped; costUsd is accurate throughout.',
+    });
+  } catch (err) {
+    console.error('[admin] image spend query failed:', err.message);
+    res.status(500).json({ error: 'Failed to load image spend' });
+  }
+};
+
+module.exports = { getSystemSettings, updateSystemSettings, listAdmins, getImageSpend };

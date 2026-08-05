@@ -206,22 +206,86 @@ const updateContent = async (req, res) => {
       updates.versions = pruneVersions(updates.versions, config?.contentVersionHistoryDays);
     }
 
-    // Upload any remaining base64/temp-URL images to B2 before saving
-    if (updates.blocks && Array.isArray(updates.blocks) && imageStorage.isEnabled()) {
-      for (const block of updates.blocks) {
-        if (block.type !== 'img' || !block.src) continue;
+    // Copy any base64 / engine-hosted images to B2 before saving.
+    if (imageStorage.isEnabled()) {
+      // One cache per request, keyed by the ORIGINAL src. The same image
+      // usually appears in the live blocks AND in several version snapshots;
+      // without this each occurrence would be fetched and uploaded again under
+      // a fresh timestamped key, so one save could store the same bytes a dozen
+      // times. A failure is cached too (as null) so a dead engine URL is
+      // attempted once per save, not once per block that references it.
+      const rehosted = new Map();
+
+      // Ceiling on DISTINCT fetches per save. `blocks` has no length limit and
+      // versions multiply it, so a crafted save could name hundreds of unique
+      // engine URLs and we would fetch them one after another, each with a 15s
+      // timeout — an authenticated way to tie up a request handler for hours.
+      // Well above any real article (the cache below collapses repeats, which
+      // is what a genuine document is made of), and the excess keeps its
+      // existing src rather than failing the save.
+      const MAX_REHOSTS_PER_SAVE = 60;
+      let rehostBudgetLogged = false;
+
+      const rehostOne = async (block) => {
+        if (!block || block.type !== 'img' || !block.src || typeof block.src !== 'string') return;
+        const original = block.src;
+        if (rehosted.has(original)) {
+          const cached = rehosted.get(original);
+          if (cached) block.src = cached;
+          return;
+        }
+        if (rehosted.size >= MAX_REHOSTS_PER_SAVE) {
+          if (!rehostBudgetLogged) {
+            rehostBudgetLogged = true;
+            console.warn(`[images] save for content ${req.params.contentNumber} named more than `
+              + `${MAX_REHOSTS_PER_SAVE} distinct images; the rest keep their original src`);
+          }
+          return;
+        }
         try {
-          if (block.src.startsWith('data:image/')) {
-            block.src = await imageStorage.uploadFromDataUri(
-              block.src, workspace._id.toString(), req.params.contentNumber,
+          let next = null;
+          if (original.startsWith('data:image/')) {
+            next = await imageStorage.uploadFromDataUri(
+              original, workspace._id.toString(), req.params.contentNumber,
             );
-          } else if (block.src.includes('/api/images/img_')) {
-            block.src = await imageStorage.uploadFromUrl(
-              block.src, workspace._id.toString(), req.params.contentNumber,
+          } else if (imageStorage.looksLikeEngineImageUrl(original)) {
+            // NOT `src.includes('/api/images/img_')`. That was a substring test
+            // on a client-supplied string, so any URL carrying those characters
+            // anywhere — `http://169.254.169.254/latest/meta-data/?/api/images/img_`
+            // — was fetched server-side and its body stored in B2 under a URL
+            // the caller could then read. looksLikeEngineImageUrl compares the
+            // parsed origin against the engine allowlist, and uploadFromUrl
+            // re-asserts it authoritatively before fetching.
+            next = await imageStorage.uploadFromUrl(
+              original, workspace._id.toString(), req.params.contentNumber,
             );
           }
+          rehosted.set(original, next);
+          if (next) block.src = next;
         } catch (err) {
-          console.error(`B2 upload failed for block ${block.id} (non-fatal):`, err.message);
+          rehosted.set(original, null);
+          // A rejected URL is left in place, not saved as an image we fetched:
+          // the block keeps pointing at whatever it named and no bytes of ours
+          // are involved. Logged apart from transport failures so a refused
+          // origin is greppable rather than looking like a flaky network.
+          const why = err instanceof imageStorage.UrlValidationError ? 'refused' : 'failed';
+          console.error(`B2 upload ${why} for block ${block.id} (non-fatal):`, err.message);
+        }
+      };
+
+      if (Array.isArray(updates.blocks)) {
+        for (const block of updates.blocks) await rehostOne(block);
+      }
+      // Version snapshots hold their own copies of the blocks. They were never
+      // walked, so a snapshot taken while an image was still on the engine's
+      // temporary URL kept that URL forever — restoring that version showed a
+      // dead image once the engine expired it. Bounded by the schema (≤10
+      // snapshots) and by the cache above, which collapses the common case
+      // where every snapshot references images the live blocks already hold.
+      if (Array.isArray(updates.versions)) {
+        for (const version of updates.versions) {
+          if (!Array.isArray(version?.blocks)) continue;
+          for (const block of version.blocks) await rehostOne(block);
         }
       }
     }

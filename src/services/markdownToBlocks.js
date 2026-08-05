@@ -25,7 +25,19 @@ function mdInlineToHtml(md) {
   let s = md;
 
   // Links: [text](url) → <a href="url">text</a>
-  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+  //
+  // The lookbehind is load-bearing: without it this rule matches the
+  // `[alt](src)` half of an image, so `![alt](src)` became `!<a href="src">alt</a>`
+  // — a paid image silently downgraded to a hyperlink with a stray "!".
+  //
+  // Paragraphs never reach here with an image in them (pushParagraph promotes
+  // those to img blocks first). Everywhere else — list items, headings,
+  // blockquotes, table cells — an image cannot be promoted without destroying
+  // the container, so the markdown is left LITERAL. That is deliberate: it
+  // preserves the src, round-trips byte-for-byte through htmlInlineToMd (which
+  // has no tags to strip), and shows the author something is wrong rather than
+  // quietly publishing a wrong link.
+  s = s.replace(/(?<!!)\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
 
   // Bold: **text** or __text__
   s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
@@ -39,6 +51,51 @@ function mdInlineToHtml(md) {
   s = s.replace(/~~(.+?)~~/g, '<del>$1</del>');
 
   return s;
+}
+
+/** Matches an inline image anywhere in a line: ![alt](src) or ![alt](src "title"). */
+const INLINE_IMAGE_RE = /!\[([^\]]*)\]\((\S+?)(?:\s+"((?:[^"\\]|\\.)*)")?\)/g;
+
+/**
+ * Push a paragraph, promoting any inline images inside it to their own `img`
+ * blocks and keeping the surrounding prose as paragraphs around them.
+ *
+ * Without this an inline image was DESTROYED: mdInlineToHtml's link rule
+ * matches the `[alt](src)` half of `![alt](src)` and leaves the `!` stranded,
+ * so `see ![chart](url) here` became `see !<a href="url">chart</a> here` — the
+ * image silently downgraded to a hyperlink. It also stopped being an `img`
+ * block, so the save path never re-hosted it to B2 and the engine's temporary
+ * URL expired into a dead link an hour later.
+ *
+ * Promotion (rather than an inline <img> tag) is the only representation that
+ * survives a round trip: blocksToMarkdown's htmlInlineToMd strips every tag it
+ * has no rule for, so an <img> embedded in paragraph HTML would serialize to
+ * nothing at all.
+ */
+function pushParagraph(blocks, text, nextId) {
+  // Defensive only: exec() already resets lastIndex when it returns null, and
+  // the loop below always runs to exhaustion. This matters only if a future
+  // edit adds an early break — at which point a module-level /g regex would
+  // start every subsequent call mid-string.
+  INLINE_IMAGE_RE.lastIndex = 0;
+  let last = 0;
+  let m;
+  let found = false;
+  while ((m = INLINE_IMAGE_RE.exec(text)) !== null) {
+    found = true;
+    const before = text.slice(last, m.index).trim();
+    if (before) blocks.push({ id: nextId(), type: 'p', text: mdInlineToHtml(before) });
+    const img = { id: nextId(), type: 'img', text: '', alt: m[1], src: m[2] };
+    if (m[3]) img.caption = m[3].replace(/\\(.)/g, '$1');
+    blocks.push(img);
+    last = m.index + m[0].length;
+  }
+  if (!found) {
+    blocks.push({ id: nextId(), type: 'p', text: mdInlineToHtml(text) });
+    return;
+  }
+  const after = text.slice(last).trim();
+  if (after) blocks.push({ id: nextId(), type: 'p', text: mdInlineToHtml(after) });
 }
 
 /**
@@ -60,6 +117,16 @@ function markdownToBlocks(markdown) {
 
     // Skip blank lines
     if (trimmed === '') {
+      i++;
+      continue;
+    }
+
+    // Phase 10 (CHANGE-PERCEPTION plan): <!-- sr:* --> anchor tokens carry
+    // editor blocks (CTA, table of contents). This parser's one production
+    // consumer is conformance.js, which COUNTS WORDS — an anchor parsed as a
+    // paragraph would add its JSON tokens to a section's word count and skew
+    // drift checks. Zero words is the honest value for an anchor: skip it.
+    if (/^<!--\s*sr:\/?(toc|cta|faq)\b.*-->\s*$/.test(trimmed)) {
       i++;
       continue;
     }
@@ -155,6 +222,30 @@ function markdownToBlocks(markdown) {
       continue;
     }
 
+    // Image line: ![alt](src) or ![alt](src "title"). MUST consume the line
+    // unconditionally: the paragraph collector below EXCLUDES `![` lines, and
+    // with no branch owning them the outer while never advanced — an
+    // image-bearing document hung this parser (and conformance.js with it) in
+    // an infinite loop. Pre-existing; surfaced by the Phase 12 parity fixture,
+    // the first test input containing an image.
+    if (trimmed.startsWith('![')) {
+      const imgMatch = trimmed.match(/^!\[([^\]]*)\]\((\S+?)(?:\s+"((?:[^"\\]|\\.)*)")?\)$/);
+      if (imgMatch) {
+        blocks.push({ id: nextId(), type: 'img', text: '', alt: imgMatch[1], src: imgMatch[2] });
+      } else {
+        // Not a WHOLE-line image — most often a real image with prose after it
+        // (`![a](src) and here is why`). The strict regex above is anchored, so
+        // this branch owns that case, and pushing a plain paragraph would drop
+        // the image: no img block means the save path never re-hosts it.
+        // pushParagraph promotes any image it finds and otherwise degrades to
+        // exactly the paragraph this used to emit, so genuinely mangled syntax
+        // still stays visible rather than looping or vanishing.
+        pushParagraph(blocks, trimmed, nextId);
+      }
+      i++;
+      continue;
+    }
+
     // Table: | header | header |
     if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
       const tableLines = [];
@@ -197,11 +288,7 @@ function markdownToBlocks(markdown) {
     }
 
     if (paraLines.length > 0) {
-      blocks.push({
-        id: nextId(),
-        type: 'p',
-        text: mdInlineToHtml(paraLines.join(' ')),
-      });
+      pushParagraph(blocks, paraLines.join(' '), nextId);
     }
   }
 

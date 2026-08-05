@@ -32,6 +32,14 @@
  * zero-credit list are all applied consistently.
  */
 
+/**
+ * Most images one agent run may generate — the BILLING ceiling and, because
+ * agentBilling derives IMAGE_BUDGET_PER_RUN from it, the engine's per-run
+ * allowance. Keeping it one number is the invariant: were the allowance ever
+ * raised above the billable cap, the images past the cap would be free.
+ */
+const IMAGE_MAX_BILLED_IMAGES = 4;
+
 // ─── Content Editor ──────────────────────────────────────────
 const CONTENT = {
   articleGenerate: {
@@ -59,9 +67,24 @@ const CONTENT = {
     credits: 25, active: true, markupClass: 'platform_ai',
     note: 'Full-doc pass: voice rewrite / humanize. (translate NOT built — see inventory #5.) Cap 40K.',
   },
+  // Phase 3 (image economics): a PER-IMAGE price, not a per-call one. Two
+  // callers, deliberately priced by the same unit:
+  //   - POST …/ai/generate-image makes exactly one image and passes no count,
+  //     so units defaults to 1 and it still costs a flat 10 (unchanged).
+  //   - the /image agent run passes ctx.images and is priced through
+  //     creditRules.agentRunCredits, which adds the small inlineAction run
+  //     base on top — a run that produced nothing still pays for its turns.
+  // `cap` is the billing ceiling AND the source of the engine's per-run image
+  // allowance (agentBilling.IMAGE_BUDGET_PER_RUN), one number on purpose: an
+  // allowance larger than the billable maximum would hand out free images.
+  // Only PAID provider calls are counted — the engine claims its budget for
+  // raster generation and AI restyle, never for plain stock search (free) or
+  // SVG (an LLM token call, already billed as tokens).
   imageGenerate: {
     credits: 10, active: true, markupClass: 'platform_ai',
-    note: 'AI image generation (flash-image). Stock images (Pexels/Openverse) = 0 (zero-credit list).',
+    perImage: true, cap: IMAGE_MAX_BILLED_IMAGES,
+    note: 'AI image generation (flash-image), 10 PER IMAGE. Agent runs add the inlineAction '
+      + 'run base and cap at 4/run. Stock images (Pexels/Openverse) = 0 (zero-credit list).',
   },
   reScore: {
     credits: 10, active: true, markupClass: 'platform_ai',
@@ -183,4 +206,6 @@ const ACTIVE_ACTIONS = Object.keys(CREDIT_COSTS).filter((k) => CREDIT_COSTS[k].a
 /** The Free "core loop" fixed-bundle actions (deduct 0 for Free, count-gated). */
 const FIXED_BUNDLE_ACTIONS = Object.keys(CREDIT_COSTS).filter((k) => CREDIT_COSTS[k].fixedBundleFree);
 
-module.exports = { CREDIT_COSTS, ACTIVE_ACTIONS, FIXED_BUNDLE_ACTIONS };
+module.exports = {
+  CREDIT_COSTS, ACTIVE_ACTIONS, FIXED_BUNDLE_ACTIONS, IMAGE_MAX_BILLED_IMAGES,
+};

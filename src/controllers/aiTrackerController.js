@@ -1162,6 +1162,55 @@ function scanProducedResults(results) {
   return Array.isArray(results) && results.some((r) => r.platforms && r.platforms.length > 0);
 }
 
+// ── Fixed-rate scheduler math ────────────────────────────────────────────────
+// Pure helpers extracted from executeScan so the scheduling contract is
+// property-testable (test plan Phase 2). Behavior-identical to the previous
+// inline code — executeScan calls these for its due-set and timer advance.
+
+const FREQ_DAYS = { 'Daily': 1, 'Weekly': 7, 'Bi-weekly': 14, 'Monthly': 30 };
+
+/** Frequency interval in ms, scaled by the dev time scale. Unknown → Weekly. */
+function freqMsOf(frequency, timeScale) {
+  return ((FREQ_DAYS[frequency] || 7) / timeScale) * 24 * 60 * 60 * 1000;
+}
+
+// Tolerance absorbs cron's 1-minute real-time granularity so prompts with
+// harmonically related frequencies (weekly + bi-weekly) always land in the
+// same scan. Capped at 10% of the shortest interval to prevent high time
+// scales from making everything appear due (e.g. at 10000x, Daily=8.6s, a
+// fixed 2-min tolerance > interval). Empty prompt list → the 2-min cap.
+function cronToleranceMs(activePrompts, timeScale) {
+  const shortestIntervalMs = Math.min(...activePrompts.map((p) => freqMsOf(p.frequency, timeScale)));
+  return Math.min(2 * 60 * 1000, shortestIntervalMs * 0.1);
+}
+
+function isPromptDue(p, scanStart, timeScale, toleranceMs) {
+  if (!p.lastScannedAt) return true; // never scanned → always due
+  const dueAt = p.lastScannedAt.getTime() + freqMsOf(p.frequency, timeScale);
+  return scanStart.getTime() + toleranceMs >= dueAt;
+}
+
+// Fixed-rate timer advance. Three cases, in priority order:
+//  - singlePrompt: the prompt was scanned NOW on demand — anchor to `now`;
+//    jumping to the interval boundary would push a not-yet-due prompt's
+//    lastScannedAt into the FUTURE (elapsed < interval → intervals = 1).
+//  - past-dated history: jump to the most recent interval boundary at or
+//    before scanStart — prevents drift AND catches up when multiple
+//    intervals have passed (server downtime).
+//  - no history OR future-dated lastScannedAt (clock skew / manual DB edit):
+//    normalize to `now` rather than honoring anomalous future dates that the
+//    Math.max(1, …) floor would push even further into the future.
+function advanceLastScannedAt(p, { scanStart, now, timeScale, singlePrompt = false }) {
+  if (singlePrompt) return now;
+  if (p.lastScannedAt && p.lastScannedAt <= scanStart) {
+    const freqMs = freqMsOf(p.frequency, timeScale);
+    const elapsed = scanStart.getTime() - p.lastScannedAt.getTime();
+    const intervals = Math.max(1, Math.floor(elapsed / freqMs));
+    return new Date(p.lastScannedAt.getTime() + intervals * freqMs);
+  }
+  return now;
+}
+
 async function executeScan(trackerId, userId = null, { force = false, promptIds = null, costAction = 'trackerRefreshAll', bill = true } = {}) {
   // promptIds  → restrict this run to specific prompts (Phase 8 single on-demand
   //              refresh). Implies force semantics for those prompts.
@@ -1172,6 +1221,9 @@ async function executeScan(trackerId, userId = null, { force = false, promptIds 
   //              never bills regardless. Default true (safe: only an explicit
   //              disable suppresses the charge).
   const singlePrompt = Array.isArray(promptIds) && promptIds.length > 0;
+  const executeStartedAt = Date.now(); // Phase 9: end-to-end scan wall-clock
+  let settledCredits = 0;
+  let resultsSaved = false; // P4-01: did the user actually get their results?
   let creditTxId = null;
   let orgId = null;
   let scanDocId = null; // hoisted so Phase H can mark the AiTrackerScan failed
@@ -1263,22 +1315,9 @@ async function executeScan(trackerId, userId = null, { force = false, promptIds 
     // ── 3b. Filter prompts by frequency — only scan prompts that are due
     //        Manual scans (force=true) scan all prompts but only reset timers for due ones
     const scanStart = new Date();
-    const FREQ_DAYS = { 'Daily': 1, 'Weekly': 7, 'Bi-weekly': 14, 'Monthly': 30 };
     const timeScale = _devTimeScale; // >1 in dev accelerated mode, 1 = real time
-    // Tolerance absorbs cron's 1-minute real-time granularity so prompts with harmonically
-    // related frequencies (weekly + bi-weekly) always land in the same scan.
-    // Capped at 10% of the shortest interval to prevent high time scales from making
-    // everything appear due (e.g. at 10000x, Daily=8.6s, old 2-min tolerance > interval).
-    const shortestIntervalMs = Math.min(...allActivePrompts.map(p =>
-      ((FREQ_DAYS[p.frequency] || 7) / timeScale) * 24 * 60 * 60 * 1000
-    ));
-    const CRON_TOLERANCE_MS = Math.min(2 * 60 * 1000, shortestIntervalMs * 0.1);
-    const isDuePrompt = (p) => {
-      if (!p.lastScannedAt) return true; // never scanned → always due
-      const freqDays = (FREQ_DAYS[p.frequency] || 7) / timeScale;
-      const dueAt = new Date(p.lastScannedAt.getTime() + freqDays * 24 * 60 * 60 * 1000);
-      return scanStart.getTime() + CRON_TOLERANCE_MS >= dueAt.getTime();
-    };
+    const CRON_TOLERANCE_MS = cronToleranceMs(allActivePrompts, timeScale);
+    const isDuePrompt = (p) => isPromptDue(p, scanStart, timeScale, CRON_TOLERANCE_MS);
     // Manual scans scan all prompts (user gets fresh data) but track which were due
     // so we only reset lastScannedAt on due ones (preserving cooldown timers)
     const duePromptIds = new Set(allActivePrompts.filter(isDuePrompt).map((p) => p._id.toString()));
@@ -1304,8 +1343,7 @@ async function executeScan(trackerId, userId = null, { force = false, promptIds 
       let nextDueAt = null;
       for (const p of allActivePrompts) {
         if (!p.lastScannedAt) { nextDueAt = scanStart; break; } // should not happen (would have been included)
-        const freqDays = (FREQ_DAYS[p.frequency] || 7) / timeScale;
-        const due = new Date(p.lastScannedAt.getTime() + freqDays * 24 * 60 * 60 * 1000);
+        const due = new Date(p.lastScannedAt.getTime() + freqMsOf(p.frequency, timeScale));
         if (!nextDueAt || due < nextDueAt) nextDueAt = due;
       }
       // Fallback: if no active prompts at all, schedule 1 day out (scaled)
@@ -1381,7 +1419,7 @@ async function executeScan(trackerId, userId = null, { force = false, promptIds 
       trackerId: trackerId?.toString(),
     };
 
-    const { results, competitorResults, detectedBrands, totalAnswerWords, availablePlatformIds } = await runScan(
+    const { results, competitorResults, detectedBrands, totalAnswerWords, availablePlatformIds, telemetry } = await runScan(
       tracker,
       prompts,
       [], // competitors auto-detected by scan engine
@@ -1411,6 +1449,7 @@ async function executeScan(trackerId, userId = null, { force = false, promptIds 
         }
         await creditService.settle(creditTxId, actualCredits);
         console.log(`[ai-tracker-scan] settled ${costAction} credits for tracker ${trackerId}: actual ${actualCredits} (${prompts.length} prompt(s))`);
+        settledCredits = actualCredits;
         creditTxId = null; // Mark as settled so outer catch doesn't double-refund
       } catch (settleErr) {
         console.error(`[ai-tracker-scan] settle failed for tracker ${trackerId}, refunding:`, settleErr.message);
@@ -1443,6 +1482,11 @@ async function executeScan(trackerId, userId = null, { force = false, promptIds 
     await AiTrackerScan.findByIdAndUpdate(scan._id, {
       $set: { status: 'ready', completedAt: now, results, competitorResults, detectedBrands: detectedBrands || [] },
     });
+    // From here on the user HAS their results. Steps 8b-10 (timer advance,
+    // tier lookup, tracker-ready write) can still throw into Phase H — this
+    // flag stops the P4-01 compensation firing then, which would hand back
+    // credits for a scan that was actually delivered.
+    resultsSaved = true;
 
     // ── 8b. Fixed-rate scheduling: advance lastScannedAt by exactly one frequency
     //        interval instead of setting it to "now". This prevents scan execution
@@ -1460,28 +1504,11 @@ async function executeScan(trackerId, userId = null, { force = false, promptIds 
     );
     let earliestNextDue = null;
     for (const p of promptsToResetTimer) {
-      const freqMs = ((FREQ_DAYS[p.frequency] || 7) / timeScale) * 24 * 60 * 60 * 1000;
-      let newLastScannedAt;
-      if (singlePrompt) {
-        // Manual on-demand single refresh: the prompt was scanned NOW. Anchor its
-        // cadence to `now` — do NOT jump to the fixed-rate interval boundary, which
-        // for a not-yet-due prompt (elapsed < interval → intervals=max(1,0)=1)
-        // would push lastScannedAt into the FUTURE, skip its next scheduled scan,
-        // and render a future "last checked" date on the dashboard.
-        newLastScannedAt = now;
-      } else if (p.lastScannedAt && p.lastScannedAt <= scanStart) {
-        // Fixed-rate: jump to the most recent interval boundary before scanStart.
-        // This prevents drift AND handles catch-up when multiple intervals have passed.
-        const elapsed = scanStart.getTime() - p.lastScannedAt.getTime();
-        const intervals = Math.max(1, Math.floor(elapsed / freqMs));
-        newLastScannedAt = new Date(p.lastScannedAt.getTime() + intervals * freqMs);
-      } else {
-        // No history OR future-dated lastScannedAt (clock skew / manual DB edit).
-        // Normalize to scanStart — refusing to honor anomalous future dates that
-        // would otherwise be pushed even further into the future by the Math.max(1, …)
-        // floor on intervals.
-        newLastScannedAt = now;
-      }
+      const freqMs = freqMsOf(p.frequency, timeScale);
+      // Case rationale lives on advanceLastScannedAt: single-refresh anchors
+      // to now; past-dated history jumps to the fixed-rate boundary; missing
+      // or future-dated (clock skew) history normalizes to now.
+      const newLastScannedAt = advanceLastScannedAt(p, { scanStart, now, timeScale, singlePrompt });
       await AiTrackerPrompt.findByIdAndUpdate(p._id, { $set: { lastScannedAt: newLastScannedAt } });
       // Track earliest next-due prompt to set tracker nextScanAt precisely
       const nextDue = new Date(newLastScannedAt.getTime() + freqMs);
@@ -1506,8 +1533,7 @@ async function executeScan(trackerId, userId = null, { force = false, promptIds 
         if (!earliestNextDue || scanStart < earliestNextDue) earliestNextDue = scanStart;
         continue;
       }
-      const freqMs = ((FREQ_DAYS[p.frequency] || 7) / timeScale) * 24 * 60 * 60 * 1000;
-      const nextDue = new Date(p.lastScannedAt.getTime() + freqMs);
+      const nextDue = new Date(p.lastScannedAt.getTime() + freqMsOf(p.frequency, timeScale));
       if (!earliestNextDue || nextDue < earliestNextDue) earliestNextDue = nextDue;
     }
 
@@ -1545,6 +1571,18 @@ async function executeScan(trackerId, userId = null, { force = false, promptIds 
         })),
       },
     });
+
+    // Phase 9 — the ONE line that says a scan finished, and at what cost.
+    // Before this, success was silent (F4 §8.1 "no success log"): you could
+    // not answer "did the 3 AM sweep run?" or "why did billing spike?" from
+    // logs alone. Alert conditions: docs/ai-tracker-observability.md.
+    console.log(
+      `[ai-tracker-scan] COMPLETE tracker=${trackerId} action=${costAction} ` +
+      `durationMs=${Date.now() - executeStartedAt} prompts=${prompts.length} ` +
+      `platforms=${completedPlatforms.length} errors=${telemetry?.errorCount ?? 0} ` +
+      `fallbackRate=${telemetry?.fallbackRate ?? 0}% credits=${settledCredits} ` +
+      `scanId=${scanDocId}`
+    );
 
     // ── 11. Send scan summary email to workspace owner
     try {
@@ -1750,6 +1788,30 @@ async function executeScan(trackerId, userId = null, { force = false, promptIds 
       await creditService.refund(creditTxId).catch((refundErr) => {
         console.error(`[ai-tracker-scan] refund failed for tracker ${trackerId}:`, refundErr.message);
       });
+    }
+
+    // P4-01: CHARGE-WITHOUT-DELIVERY COMPENSATION.
+    // Settle (step 7) runs BEFORE the results write (step 8) — the S74
+    // ordering that stops us publishing results we couldn't bill for. The
+    // mirror-image hazard is this path: settle succeeded, then the results
+    // write (or anything after it) threw, so the user paid for a scan whose
+    // results were never saved. refund() cannot help — the transaction group
+    // is already 'settled' and refund() correctly no-ops on settled groups
+    // (the Phase-3 idempotency contract). So we issue a NEW compensating
+    // credit instead of trying to reverse the old transaction.
+    if (settledCredits > 0 && orgId && !resultsSaved) {
+      try {
+        await creditService.grantGeneralCredits(
+          orgId,
+          settledCredits,
+          `Compensation: scan ${scanDocId || ''} charged ${settledCredits} credit(s) but its results were not saved`,
+        );
+        console.log(`[ai-tracker-scan] P4-01 compensated ${settledCredits} credit(s) for tracker ${trackerId} (settled but results unsaved)`);
+      } catch (compErr) {
+        // Log loudly: this is money the user is owed. The nightly
+        // reconciliation + the COMPLETE/settle log pair are the backstop.
+        console.error(`[ai-tracker-scan] P4-01 COMPENSATION FAILED for tracker ${trackerId} — user owed ${settledCredits} credit(s):`, compErr.message);
+      }
     }
 
     // Mark the AiTrackerScan doc failed if one was created — otherwise it
@@ -4072,4 +4134,10 @@ module.exports = {
 };
 
 // Exported for F4-17 regression tests only — not part of the runtime API.
-module.exports.__test = { htmlEscape, computeMetrics, computeTrendData, computeChanges, clampEnginesToTier, scanProducedResults };
+module.exports.__test = {
+  htmlEscape, computeMetrics, computeTrendData, computeChanges, clampEnginesToTier, scanProducedResults,
+  // Phase 2: pure scheduler + metrics seams
+  computeWeightedVisibility, FREQ_DAYS, freqMsOf, cronToleranceMs, isPromptDue, advanceLastScannedAt,
+  // Phase 4: recovery seam (also exercised through the trigger handlers)
+  recoverStuckScans,
+};

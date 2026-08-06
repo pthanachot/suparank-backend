@@ -1129,6 +1129,46 @@ async function canAffordAction(action, { orgId, userId, ctx = {} } = {}) {
     : { ok: false, reason: 'insufficient' };
 }
 
+/**
+ * F4-13 — refund orphaned pending CreditTransactions.
+ *
+ * When a scan crashes between preDeduct and settle (process kill, OOM,
+ * server restart), the pre-deducted credits stay locked in `pending`
+ * forever. This sweep refunds every pending tx older than the cutoff,
+ * releasing the debit. refund() is group-aware and idempotent (F10-01/02
+ * atomic claims), so sweeping the same orphan twice — or racing a live
+ * settle — refunds at most once.
+ *
+ * Extracted from the inline startup/cron blocks in index.js (test plan
+ * Phase 3) so the sweep is testable and single-sourced; both callers and
+ * the credits test suite invoke THIS function.
+ *
+ * @returns {{ scanned: number, refundedGroups: number, failed: number }}
+ */
+async function sweepOrphanedPendingCredits({ olderThanMs = 30 * 60 * 1000, logPrefix = '[credit-sweep]' } = {}) {
+  const cutoff = new Date(Date.now() - olderThanMs);
+  const orphans = await CreditTransaction.find({
+    status: 'pending',
+    createdAt: { $lt: cutoff },
+  }).select('_id').lean();
+
+  let refundedGroups = 0;
+  let failed = 0;
+  for (const orphan of orphans) {
+    try {
+      const result = await refund(orphan._id.toString());
+      if (result.refunded > 0) refundedGroups++;
+    } catch (e) {
+      failed++;
+      console.error(`${logPrefix} refund failed for tx ${orphan._id}:`, e.message);
+    }
+  }
+  if (refundedGroups > 0) {
+    console.log(`${logPrefix} refunded ${refundedGroups} orphaned credit transaction group(s)`);
+  }
+  return { scanned: orphans.length, refundedGroups, failed };
+}
+
 module.exports = {
   wordsToCredits,
   deductForRequest,
@@ -1141,6 +1181,7 @@ module.exports = {
   preDeduct,
   settle,
   refund,
+  sweepOrphanedPendingCredits,
   grantFreeCredits,
   grantFreeCreditsIfNew,
   grantSubscriptionCredits,

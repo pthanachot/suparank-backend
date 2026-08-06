@@ -241,11 +241,31 @@ async function fetchSerpResults(keyword, gl = 'us', hl = 'en') {
   }
 }
 
-const SUPPORTED_COUNTRIES = Object.keys(COUNTRY_LOCALES_BY_NAME);
+/**
+ * Phase C4 — countries DataForSEO Labs does not publish a location for.
+ *
+ * Validated against the live locations_and_languages endpoint on 2026-08-05:
+ * 52 of our 53 location codes resolve; China (2156) is absent. Google is
+ * blocked in mainland China, so DataForSEO has no Labs corpus for it. Offering
+ * it in the picker produced a guaranteed task error — a dead end for the user
+ * and a wasted round trip for us.
+ *
+ * This filters the KEYWORD-RESEARCH picker only. COUNTRY_LOCALES keeps CN,
+ * because other surfaces (locale resolution, tracker scans) legitimately use
+ * it — this is a DataForSEO coverage limit, not a product-wide one.
+ *
+ * Re-validate with: SMOKE=1 node scripts/smokeVendors.js (the
+ * `dataforseo-location-codes` probe).
+ */
+const DATAFORSEO_UNSUPPORTED_COUNTRIES = new Set(['China']);
+
+const SUPPORTED_COUNTRIES = Object.keys(COUNTRY_LOCALES_BY_NAME)
+  .filter((name) => !DATAFORSEO_UNSUPPORTED_COUNTRIES.has(name));
 
 module.exports = {
   resolveCountry,
   fetchRelatedKeywords,
   fetchSerpResults,
   SUPPORTED_COUNTRIES,
+  DATAFORSEO_UNSUPPORTED_COUNTRIES,
 };

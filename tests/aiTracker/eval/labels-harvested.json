@@ -1,0 +1,213 @@
+{
+  "_readme": "DRAFT labels for harvested rows — D1 session: set mentioned/cited/sentiment/brands and flip draft to false. Draft rows are excluded from all scores.",
+  "harv-01": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-02": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-03": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-04": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-05": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-06": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-07": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-08": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-09": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-10": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-11": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-12": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-13": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-14": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-15": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-16": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-17": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-18": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-19": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-20": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-21": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-22": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-23": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-24": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-25": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-26": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-27": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-28": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-29": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  },
+  "harv-30": {
+    "draft": true,
+    "mentioned": null,
+    "cited": null,
+    "sentiment": null,
+    "brands": []
+  }
+}

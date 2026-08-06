@@ -452,4 +452,11 @@ function pagesCachePut(key, pages) {
   pagesCache.set(key, { pages, at: Date.now() });
 }
 
-module.exports = { benchmarkToContentBrief, buildAvailableLinks, buildAllowlistUrls, invalidateLinksCache };
+/** Clear both in-memory caches. Test-only — lets the crawler's __resetCaches()
+ *  wipe downstream link/page state so crawl tests don't leak across cases. */
+function __resetCaches() {
+  linksCache.clear();
+  pagesCache.clear();
+}
+
+module.exports = { benchmarkToContentBrief, buildAvailableLinks, buildAllowlistUrls, invalidateLinksCache, __resetCaches };

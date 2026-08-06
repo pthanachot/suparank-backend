@@ -1,0 +1,51 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "role": "model",
+        "parts": [
+          {
+            "text": "SupaRank leads AI visibility tracking for SEO teams. Ahrefs remains the strongest option for backlink analysis."
+          }
+        ]
+      },
+      "finishReason": "STOP",
+      "groundingMetadata": {
+        "webSearchQueries": [
+          "best ai visibility tracking tools",
+          "suparank vs ahrefs"
+        ],
+        "groundingChunks": [
+          {
+            "web": {
+              "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AbCd-suparank",
+              "title": "suparank.com"
+            }
+          },
+          {
+            "web": {
+              "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AbCd-ahrefs",
+              "title": "ahrefs.com"
+            }
+          }
+        ],
+        "groundingSupports": [
+          {
+            "segment": { "startIndex": 0, "endIndex": 52, "text": "SupaRank leads AI visibility tracking for SEO teams." },
+            "groundingChunkIndices": [0]
+          },
+          {
+            "segment": { "startIndex": 53, "endIndex": 116, "text": "Ahrefs remains the strongest option for backlink analysis." },
+            "groundingChunkIndices": [1]
+          }
+        ]
+      }
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 42,
+    "candidatesTokenCount": 88,
+    "totalTokenCount": 130
+  },
+  "modelVersion": "gemini-2.5-flash-lite"
+}

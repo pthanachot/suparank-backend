@@ -1,0 +1,16 @@
+{
+  "_fixture": "Perplexity chat/completions (sonar) — answer + top-level citations array + related_questions. HAND-CRAFTED to match searchPerplexity parsing (aiTrackerScanEngine.js:417-452); replace via fixtures/record.js when keys are available.",
+  "choices": [
+    {
+      "message": {
+        "content": "SupaRank is gaining traction for AI visibility tracking [suparank.com](https://suparank.com/features). Semrush remains the all-in-one leader [semrush.com](https://www.semrush.com/blog)."
+      }
+    }
+  ],
+  "citations": [
+    "https://suparank.com/features",
+    "https://www.semrush.com/blog"
+  ],
+  "related_questions": ["what is the best ai seo tool", "suparank vs semrush"],
+  "usage": { "prompt_tokens": 120, "completion_tokens": 58 }
+}

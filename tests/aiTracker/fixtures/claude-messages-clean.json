@@ -1,0 +1,19 @@
+{
+  "_fixture": "Anthropic Messages API — text block with structured citations + one web_search server_tool_use. HAND-CRAFTED to match searchClaude parsing (aiTrackerScanEngine.js:510-577); replace via fixtures/record.js when keys are available.",
+  "content": [
+    {
+      "type": "server_tool_use",
+      "name": "web_search",
+      "input": { "query": "best seo tools 2026" }
+    },
+    {
+      "type": "text",
+      "text": "SupaRank stands out for AI-era SEO tracking. Ahrefs remains strong for backlinks.",
+      "citations": [
+        { "type": "web_search_result_location", "url": "https://suparank.com/features" },
+        { "type": "web_search_result_location", "url": "https://ahrefs.com/blog/seo-tools" }
+      ]
+    }
+  ],
+  "usage": { "input_tokens": 210, "output_tokens": 64 }
+}

@@ -14,7 +14,9 @@ const {
   resolveLocale,
   resolveCountryByName,
 } = require('../src/config/locales');
-const { resolveCountry, SUPPORTED_COUNTRIES } = require('../src/services/keywordService');
+const {
+  resolveCountry, SUPPORTED_COUNTRIES, DATAFORSEO_UNSUPPORTED_COUNTRIES,
+} = require('../src/services/keywordService');
 
 // ── Keyword-research byte-parity ──────────────────────────────────────────────
 // The pre-refactor COUNTRY_MAP (config/locales.js is now the source of truth).
@@ -85,8 +87,53 @@ test('keyword-research: resolveCountry byte-parity for every legacy country', ()
   }
 });
 
-test('keyword-research: SUPPORTED_COUNTRIES set + order unchanged (no additions/drops)', () => {
-  assert.deepStrictEqual(SUPPORTED_COUNTRIES, Object.keys(ORIGINAL_KW_MAP));
+// Phase C4: the ONE intentional divergence from the original map. Validated
+// against DataForSEO's live locations_and_languages list on 2026-08-05 — 52 of
+// our 53 codes resolve, China (2156) is not published (Google is blocked in
+// mainland China, so DataForSEO has no Labs corpus). Offering it guaranteed a
+// task error. The country stays in COUNTRY_LOCALES for every other surface;
+// only the keyword-research picker drops it.
+test('keyword-research: SUPPORTED_COUNTRIES matches the original map minus DataForSEO-unsupported', () => {
+  const expected = Object.keys(ORIGINAL_KW_MAP)
+    .filter((name) => !DATAFORSEO_UNSUPPORTED_COUNTRIES.has(name));
+  assert.deepStrictEqual(SUPPORTED_COUNTRIES, expected);
+});
+
+// Phase C review. Removing China from SUPPORTED_COUNTRIES was NOT enough: the
+// keyword UI ships its own hardcoded COUNTRIES array and never calls
+// GET /keywords/countries, so the picker still offered a country the backend
+// could not serve. This pins the two lists together so the next divergence
+// fails here instead of reaching a user.
+test('the frontend country picker matches the backend supported list', () => {
+  const frontendPath = path.resolve(
+    __dirname,
+    '../../suparank/app/(dashboard)/workspace/[workspaceNumber]/keyword-research/components/data.tsx',
+  );
+  if (!fs.existsSync(frontendPath)) {
+    console.log(`# SKIP keyword data.tsx not found at ${frontendPath}`);
+    return;
+  }
+  const src = fs.readFileSync(frontendPath, 'utf8');
+  const m = src.match(/export const SUPPORTED_COUNTRIES[^=]*=\s*\[([\s\S]*?)\];/);
+  assert.ok(m, 'could not locate the SUPPORTED_COUNTRIES array in data.tsx');
+  // Strip comments so a commented-out entry is not counted as offered.
+  const listBody = m[1].replace(/\/\/[^\n]*/g, '');
+  const frontendCountries = [...listBody.matchAll(/"([^"]+)"/g)].map((x) => x[1]);
+
+  assert.deepStrictEqual(
+    frontendCountries, SUPPORTED_COUNTRIES,
+    'the keyword country picker drifted from the backend supported list',
+  );
+  assert.ok(
+    !frontendCountries.includes('China'),
+    'China is offered in the UI but DataForSEO cannot serve it',
+  );
+});
+
+test('the DataForSEO exclusion list is exactly {China} — widening it needs a live re-validation', () => {
+  assert.deepStrictEqual([...DATAFORSEO_UNSUPPORTED_COUNTRIES], ['China']);
+  // CN must remain resolvable for non-keyword surfaces.
+  assert.strictEqual(resolveCountryByName('China').locationCode, 2156);
 });
 
 test('resolveCountry falls back to United States for an unknown country', () => {
@@ -102,15 +149,54 @@ test('isSupportedLanguage accepts the catalog and rejects junk', () => {
   assert.ok(!isSupportedLanguage(undefined));
 });
 
-test('isSelectableLanguage gates tier 3 (Thai/CJK) until Phase C', () => {
+// Phase C1: this test used to assert that ALL of tier 3 was non-selectable
+// ("until Phase C"). The multi-language work has since shipped segmenters for
+// Thai (mapkha) and Korean, so ENABLED_TIER3 = {th, ko} — the test was stale,
+// not the code. It now pins the ENACTED state: th/ko selectable, ja/zh still
+// gated pending their segmentation work.
+test('isSelectableLanguage: tiers 1-2 plus the enabled tier-3 set', () => {
   assert.ok(isSelectableLanguage('en'));
   assert.ok(isSelectableLanguage('de'));
   assert.ok(isSelectableLanguage('id')); // tier 2
+
   for (const t3 of ['th', 'ja', 'ko', 'zh']) {
     assert.ok(isSupportedLanguage(t3), `${t3} supported`);
-    assert.ok(!isSelectableLanguage(t3), `${t3} NOT selectable`);
+  }
+  for (const enabled of ['th', 'ko']) {
+    assert.ok(isSelectableLanguage(enabled), `${enabled} IS selectable (segmenter shipped)`);
+  }
+  for (const stillGated of ['ja', 'zh']) {
+    assert.ok(!isSelectableLanguage(stillGated), `${stillGated} NOT selectable yet`);
   }
   assert.ok(!isSelectableLanguage('xx'));
+});
+
+// The backend comment above ENABLED_TIER3 says it "MUST stay in lockstep with
+// the frontend's lib/locales.ts — the two are one enum". That was prose; this
+// makes it executable. Enabling a language on one side only would ship a
+// selector the other side rejects.
+test('ENABLED_TIER3 is byte-identical across backend and frontend', () => {
+  const backendSrc = fs.readFileSync(path.resolve(__dirname, '../src/config/locales.js'), 'utf8');
+  const frontendPath = path.resolve(__dirname, '../../suparank/lib/locales.ts');
+  if (!fs.existsSync(frontendPath)) {
+    // The frontend repo is not always checked out beside the backend in CI.
+    // Skipping silently is what let this drift before, so say so loudly.
+    console.log(`# SKIP frontend locales.ts not found at ${frontendPath}`);
+    return;
+  }
+  const frontendSrc = fs.readFileSync(frontendPath, 'utf8');
+
+  const parse = (src, label) => {
+    const m = src.match(/ENABLED_TIER3\s*=\s*new Set\(\[([^\]]*)\]\)/);
+    assert.ok(m, `${label}: could not locate ENABLED_TIER3`);
+    return [...m[1].matchAll(/["']([a-z-]+)["']/g)].map((x) => x[1]).sort();
+  };
+
+  assert.deepStrictEqual(
+    parse(backendSrc, 'backend'),
+    parse(frontendSrc, 'frontend'),
+    'ENABLED_TIER3 drifted between backend/src/config/locales.js and suparank/lib/locales.ts',
+  );
 });
 
 test('every country default language is a supported language', () => {

@@ -76,7 +76,7 @@ const INPUTS = {
       layer_gaps: [{ id: 'g2', layer: 'consideration', current: 1, target: 3, score: 7, terms: ['compare'], angle: 'b' }],
       paa_gaps: [{ id: 'g3', question: 'how much?', answered_well_by_competitors: false, score: 6, terms: ['price'], angle: 'c' }],
     },
-    terms: [{ term: 'crm', score: 9, centrality: 0.8, type: 'core', layer: 'awareness', section: 'h2', uses: [2, 5], cluster: 'c1', source: 'serp', gap_ref: 'g1', guidance: 'use it', bm25: 1.2, doc_freq: 8, freq: 10, volatile: false }],
+    terms: [{ term: 'crm', score: 9, centrality: 0.8, type: 'core', layer: 'awareness', section: 'h2', uses: [2, 5], cluster: 'c1', source: 'serp', gap_ref: 'g1', guidance: 'use it', bm25: 1.2, doc_freq: 8, freq: 10, volatile: false, search_volume: 4400, difficulty: 61, serp_evidence: true, match_type: 'exact' }],
     clusters: [{ id: 'c1', label: 'features', terms: ['a'] }],
     competitor_weaknesses: ['thin content'],
     pipeline_cost: 0.42,
@@ -141,5 +141,39 @@ describe('curate* output is camelCase at the API boundary', () => {
     for (const name of Object.keys(_curators)) {
       assert.ok(name in INPUTS, `missing test input for curator ${name}`);
     }
+  });
+});
+
+// D3 (Phase C1). The engine emits per-term evidence signals that the content
+// brief mapper silently dropped, so the UI could only ever see `volatile` —
+// a term backed by 4,400 searches/month looked exactly like one backed by
+// nothing. These assert the fields survive the boundary with their VALUES,
+// which the camelCase sweep above cannot check.
+describe('D3 — engine term evidence fields reach the API', () => {
+  const term = () => _curators.curateContentBrief(INPUTS.curateContentBrief).terms[0];
+
+  it('threads search_volume / difficulty / serp_evidence / match_type', () => {
+    const t = term();
+    assert.equal(t.searchVolume, 4400, 'search_volume dropped');
+    assert.equal(t.difficulty, 61, 'difficulty dropped');
+    assert.equal(t.serpEvidence, true, 'serp_evidence dropped');
+    assert.equal(t.matchType, 'exact', 'match_type dropped');
+  });
+
+  it('keeps the previously-mapped fields intact', () => {
+    const t = term();
+    assert.equal(t.term, 'crm');
+    assert.equal(t.docFreq, 8);
+    assert.equal(t.volatile, false);
+  });
+
+  it('defaults cleanly when an older engine omits them', () => {
+    const legacy = JSON.parse(JSON.stringify(INPUTS.curateContentBrief));
+    for (const k of ['search_volume', 'difficulty', 'serp_evidence', 'match_type']) delete legacy.terms[0][k];
+    const t = _curators.curateContentBrief(legacy).terms[0];
+    assert.equal(t.searchVolume, 0);
+    assert.equal(t.difficulty, 0);
+    assert.equal(t.serpEvidence, false);
+    assert.equal(t.matchType, '');
   });
 });

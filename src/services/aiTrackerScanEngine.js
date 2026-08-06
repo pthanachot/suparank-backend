@@ -49,6 +49,10 @@ async function withRetry(fn, maxRetries = 2) {
       return await fn();
     } catch (err) {
       if (attempt === maxRetries) throw err;
+      // A deterministic refusal (safety block, content policy) will not change
+      // on a retry — retrying only burns time and records vendor cost per
+      // attempt. Callers set err.noRetry for those.
+      if (err?.noRetry) throw err;
       const delay = Math.min(1000 * Math.pow(2, attempt), 8000);
       console.log(`[ai-tracker] retry ${attempt + 1}/${maxRetries} after ${delay}ms: ${err.message}`);
       await new Promise((r) => setTimeout(r, delay));
@@ -331,10 +335,32 @@ async function searchGemini(query, ctx) {
       const chunks = candidate.groundingMetadata?.groundingChunks || [];
       groundingChunks = chunks;
       const resolvedByChunkIdx = await Promise.all(chunks.map((chunk) => {
-        const uri = chunk.web?.uri || '';
+        // G7: `chunk.web?.uri` guarded `.web` but not `chunk` — a null entry
+        // in groundingChunks threw a bare TypeError out of Promise.all.
+        const uri = chunk?.web?.uri || '';
         if (!uri) return Promise.resolve(null);
+        // G2: this used to fall back to `uri` — the Google grounding-redirect
+        // WRAPPER — whenever resolution failed (HEAD error, 5s timeout, no
+        // Location, or an unsafe Location). That wrapper passes the safety
+        // check but its hostname is vertexaisearch.cloud.google.com, so
+        // urlMatchesDomain can never match it: a genuine citation to the
+        // customer's own site was recorded as `cited: false`, and citationCount
+        // became a count of un-attributable wrappers. It also created a
+        // click-through hole (G4) — when the Location was UNSAFE we kept the
+        // safe-LOOKING wrapper and embedded it as a link that 302s the viewer
+        // to the unsafe destination.
+        //
+        // An unresolved wrapper is worth less than nothing: it cannot be
+        // attributed to any domain and it is a live redirect. Drop it and log,
+        // so the failure is visible rather than silently miscounted.
         return uri.includes('vertexaisearch.cloud.google.com/grounding-api-redirect')
-          ? resolveRedirectURL(uri).then((r) => r || uri).catch(() => uri)
+          ? resolveRedirectURL(uri).then((r) => {
+            if (!r) console.warn('[gemini-citations] unresolved grounding redirect, dropping citation');
+            return r || null;
+          }).catch(() => {
+            console.warn('[gemini-citations] grounding redirect threw, dropping citation');
+            return null;
+          })
           : Promise.resolve(uri);
       }));
       for (let i = 0; i < resolvedByChunkIdx.length; i++) {
@@ -367,7 +393,29 @@ async function searchGemini(query, ctx) {
     });
 
     if (!answer || answer.trim().length === 0) {
+      // G5: a blocked response has a specific shape that we were collapsing
+      // into a generic "empty response". Two consequences: operators got no
+      // reason, and withRetry then retried a DETERMINISTIC refusal three
+      // times, recording vendor cost on each attempt. Surface the reason, and
+      // mark safety blocks non-retryable so we stop paying to be refused.
+      const blockReason = data.promptFeedback?.blockReason;
+      const finishReason = data.candidates?.[0]?.finishReason;
+      if (blockReason || (finishReason && finishReason !== 'STOP')) {
+        const why = blockReason ? `prompt blocked: ${blockReason}` : `finishReason: ${finishReason}`;
+        const err = new Error(`Gemini returned no usable text (${why})`);
+        // withRetry honours this flag; a SAFETY/RECITATION refusal will not
+        // change on a retry.
+        if (blockReason || ['SAFETY', 'RECITATION', 'PROHIBITED_CONTENT', 'BLOCKLIST'].includes(finishReason)) {
+          err.noRetry = true;
+        }
+        throw err;
+      }
       throw new Error('Gemini returned empty response');
+    }
+    // MAX_TOKENS yields a real but TRUNCATED answer, which we would otherwise
+    // store as if it were complete.
+    if (data.candidates?.[0]?.finishReason === 'MAX_TOKENS') {
+      console.warn('[gemini] answer truncated by MAX_TOKENS — brand/citation extraction may be incomplete');
     }
     console.log(`[gemini] query_len=${query.length} answer_len=${answer.length} citations=${citations.length} fanout=${fanoutQueries.length}`);
     return { answer, citations, fanoutQueries, groundingSupports, groundingChunks, chunkUrls };
@@ -745,7 +793,11 @@ function embedClaudeCitations(answer, citations, blocks) {
       const links = [];
       for (const cite of block.citations) {
         const url = cite.url;
-        if (!url || seen.has(url)) continue;
+        // P8-01: block citations arrive RAW from the API (the collection
+        // filter only guards the separate `citations` array) — without this
+        // check a javascript:/private-net URL gets embedded as a clickable
+        // markdown link in aiResponse and rendered by the detail view.
+        if (!url || seen.has(url) || !isSafeCitationURL(url)) continue;
         seen.add(url);
         links.push(`[${extractDomainFromURL(url)}](${url})`);
       }
@@ -779,8 +831,34 @@ function embedClaudeCitations(answer, citations, blocks) {
  * Gemini: use groundingSupports for inline citation positioning.
  * Each support has segment.endIndex and groundingChunkIndices pointing to URLs.
  */
+/**
+ * G1 (Phase 9 review): append every safe citation as a `Sources:` block.
+ * Mirrors embedClaudeCitations' two fallbacks. Gemini had NONE, so whenever
+ * inline positioning was impossible the citations were dropped silently.
+ */
+function appendGeminiSources(answer, citations) {
+  if (!citations || citations.length === 0) return answer;
+  const seen = new Set();
+  const links = [];
+  for (const url of citations) {
+    if (!url || seen.has(url) || !isSafeCitationURL(url)) continue;
+    seen.add(url);
+    links.push(`[${extractDomainFromURL(url)}](${url})`);
+  }
+  if (links.length === 0) return answer;
+  return answer.trimEnd() + '\n\nSources: ' + links.join(' ');
+}
+
 function embedGeminiCitations(answer, citations, groundingSupports, chunkUrls) {
-  if (!groundingSupports || groundingSupports.length === 0) return answer;
+  // G1: these two exits used to `return answer` unchanged, dropping every
+  // citation on the floor. Stored citedUrls comes from re-extracting markdown
+  // links out of the answer text, so this function is the ONLY bridge between
+  // Gemini's structured grounding data and anything the product records — a
+  // no-op here means "mentioned but never cited", a wrong metric that looks
+  // entirely legitimate and raises no error.
+  if (!groundingSupports || groundingSupports.length === 0) {
+    return appendGeminiSources(answer, citations);
+  }
   if (!chunkUrls) chunkUrls = {};
 
   // Collect insertion points from grounding supports
@@ -796,7 +874,9 @@ function embedGeminiCitations(answer, citations, groundingSupports, chunkUrls) {
     const links = [];
     for (const idx of indices) {
       const url = chunkUrls[idx];
-      if (!url) continue;
+      // P8-01 (same class as the Claude embedder): grounding-chunk URLs are
+      // raw API data — never embed one as a clickable link unchecked.
+      if (!url || !isSafeCitationURL(url)) continue;
       const key = `${url}:${seg.endIndex}`;
       if (inserted.has(key)) continue;
       inserted.add(key);
@@ -808,13 +888,20 @@ function embedGeminiCitations(answer, citations, groundingSupports, chunkUrls) {
     }
   }
 
-  if (insertions.length === 0) return answer;
+  if (insertions.length === 0) return appendGeminiSources(answer, citations);
 
   // Sort by position descending and insert
   let result = answer;
   insertions.sort((a, b) => b.pos - a.pos);
   for (const ins of insertions) {
-    result = result.slice(0, ins.pos) + ins.link + result.slice(ins.pos);
+    // G3 (defensive): segment offsets come from the vendor and are documented
+    // as byte offsets into the UTF-8 part, while slice() indexes UTF-16 code
+    // units. For any non-ASCII answer the two diverge, so an unclamped
+    // position can exceed the string or land mid-construct. Clamping keeps the
+    // insertion in-bounds; it does NOT correct the offset units, which needs a
+    // live non-ASCII sample to settle.
+    const pos = Math.max(0, Math.min(result.length, ins.pos));
+    result = result.slice(0, pos) + ins.link + result.slice(pos);
   }
   return result;
 }
@@ -961,6 +1048,15 @@ function sanitizeForAnalyzer(text) {
     cleaned = cleaned.replace(pat, '[redacted]');
   }
   return cleaned;
+}
+
+/**
+ * Map a brand's rank within the extracted ranking to the 1-10 position scale.
+ * total <= 1 → 1 (only brand mentioned). Linear otherwise: rank 1 → 1,
+ * rank === total → 10. Pure — exported for Phase 2 property tests.
+ */
+function computePosition(rank, total) {
+  return total <= 1 ? 1 : Math.round(1 + (rank - 1) / (total - 1) * 9);
 }
 
 async function analyzeResponse(aiResponse, query, targetBrand, domain, ctx) {
@@ -1143,7 +1239,7 @@ Return ONLY valid JSON, no other text. Example:
     if (mentioned) {
       const rank = brandRanking.indexOf(targetEntry) + 1; // 1-indexed
       const total = brandRanking.length;
-      position = total <= 1 ? 1 : Math.round(1 + (rank - 1) / (total - 1) * 9);
+      position = computePosition(rank, total);
     }
 
     // Process citation URLs. F3-08 — `startsWith('http')` alone admitted
@@ -1222,7 +1318,10 @@ function _fallbackAnalysis(aiResponse, targetBrand, domain) {
   console.warn(`[ai-tracker] analyzeResponse fallback engaged (target=${targetBrand || '?'}) — regex-only analysis, position will be null`);
 
   if (!aiResponse) {
-    return { mentioned: false, position: null, cited: false, citedUrls: [], citationCount: 0, brandRanking: [], sentiment: null, sentimentScore: null };
+    // `fallback: true` is an observability marker only — runScan counts it for
+    // the scan-summary log (Phase 9); it is never persisted on PlatformResult
+    // (the assembler copies fields explicitly).
+    return { mentioned: false, position: null, cited: false, citedUrls: [], citationCount: 0, brandRanking: [], sentiment: null, sentimentScore: null, fallback: true };
   }
 
   const domainClean = cleanDomain(domain);
@@ -1277,6 +1376,7 @@ function _fallbackAnalysis(aiResponse, targetBrand, domain) {
     brandRanking: [],
     sentiment: null,
     sentimentScore: null,
+    fallback: true, // observability marker (see the early-return note above)
   };
 }
 
@@ -1447,6 +1547,12 @@ async function searchPlatform(platformId, query, ctx) {
  * @returns {Promise<{ results: Array, competitorResults: Array }>}
  */
 async function runScan(tracker, prompts, competitors, onProgress, ctx) {
+  // Phase 9 observability: wall-clock + analyzer-fallback rate per scan.
+  // Fallback rate is the alert signal for "analyzer key dead / vendor down"
+  // — the failure mode that silently degrades every metric (F3-13).
+  const runStartedAt = Date.now();
+  let fallbackCount = 0;
+  let analyzerCalls = 0;
   let availablePlatforms = getAvailablePlatforms();
 
   // Filter to only the platforms configured on this tracker (defaultModels)
@@ -1560,6 +1666,8 @@ async function runScan(tracker, prompts, competitors, onProgress, ctx) {
 
       // Step 3: Unified analysis
       const analysis = await analyzeResponse(answer, prompt.prompt, brandName, tracker.domain, ctx);
+      analyzerCalls++;
+      if (analysis?.fallback) fallbackCount++;
 
       const extractorWords = [
         ...(analysis.brandRanking || []).map(b => b.brandName),
@@ -1759,12 +1867,23 @@ async function runScan(tracker, prompts, competitors, onProgress, ctx) {
       if (pr.error) errorCount++;
     }
   }
+  // Phase 9: durationMs + analyzer-fallback rate join the summary. Alert
+  // conditions live in docs/ai-tracker-observability.md — fallbackRate>5%
+  // means the analyzer is degraded and every downstream metric is suspect.
+  const durationMs = Date.now() - runStartedAt;
+  const fallbackRate = analyzerCalls > 0 ? Math.round((fallbackCount / analyzerCalls) * 100) : 0;
   console.log(
     `[ai-tracker] scan complete: prompts=${results.length} platforms=${availablePlatforms.length} ` +
-    `errors=${errorCount} words=${totalAnswerWords} competitors=${detectedCompetitorResults.length}`
+    `errors=${errorCount} words=${totalAnswerWords} competitors=${detectedCompetitorResults.length} ` +
+    `durationMs=${durationMs} analyzerCalls=${analyzerCalls} fallbacks=${fallbackCount} fallbackRate=${fallbackRate}%`
   );
 
-  return { results, competitorResults, detectedBrands, totalAnswerWords, availablePlatformIds: availablePlatforms.map((p) => p.id) };
+  return {
+    results, competitorResults, detectedBrands, totalAnswerWords,
+    availablePlatformIds: availablePlatforms.map((p) => p.id),
+    // Phase 9 telemetry — consumed by executeScan's completion log.
+    telemetry: { durationMs, errorCount, analyzerCalls, fallbackCount, fallbackRate },
+  };
 }
 
 module.exports = {
@@ -1789,4 +1908,9 @@ module.exports = {
   _fallbackAnalysis,
   deduplicateBrands,
   analyzeResponse, // Phase 3: exercises the Kimi/OpenRouter analyzer parse path
+  computePosition, // Phase 2: pure position-formula seam
+  // Phase 9 review: the Gemini citation embedder is reachable only through a
+  // full executeScan, so it had zero direct coverage — which is how G1 (every
+  // citation silently dropped when inline positioning failed) survived.
+  __test: { embedGeminiCitations, appendGeminiSources, resolveRedirectURL },
 };

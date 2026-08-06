@@ -1,0 +1,12 @@
+{
+  "_fixture": "OpenRouter chat/completions — Kimi returns prose instead of JSON (parse-failure path → _fallbackAnalysis). For Phase 4 failure-matrix tests.",
+  "choices": [
+    {
+      "message": {
+        "content": "I found several brands in this response. The main ones are SupaRank and Ahrefs, which both appear prominently."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": { "prompt_tokens": 310, "completion_tokens": 28 }
+}

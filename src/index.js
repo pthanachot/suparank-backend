@@ -90,28 +90,11 @@ connectDB()
 
     // F4-13: refund orphaned pending CreditTransactions. When a scan crashes
     // between preDeduct and settle (process kill, OOM, server restart), the
-    // pre-deducted credits stay locked in `pending` state forever. This sweep
-    // refunds any pending tx older than 30 min, releasing the debit.
+    // pre-deducted credits stay locked in `pending` state forever. The sweep
+    // itself lives in creditService (single-sourced + tested, Phase 3).
     try {
-      const CreditTransactionStartup = require('./models/CreditTransaction');
       const creditServiceStartup = require('./services/creditService');
-      const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000);
-      const orphans = await CreditTransactionStartup.find({
-        status: 'pending',
-        createdAt: { $lt: thirtyMinAgo },
-      }).select('_id').lean();
-      let refundedGroups = 0;
-      for (const orphan of orphans) {
-        try {
-          const result = await creditServiceStartup.refund(orphan._id.toString());
-          if (result.refunded > 0) refundedGroups++;
-        } catch (e) {
-          console.error(`[startup] refund failed for tx ${orphan._id}:`, e.message);
-        }
-      }
-      if (refundedGroups > 0) {
-        console.log(`[startup] refunded ${refundedGroups} orphaned credit transaction group(s)`);
-      }
+      await creditServiceStartup.sweepOrphanedPendingCredits({ logPrefix: '[startup]' });
     } catch (e) {
       console.error('[startup] orphan credit sweep failed:', e.message);
     }
@@ -342,26 +325,11 @@ cron.schedule(cronSchedule, async () => {
     // F4-13: refund orphan pending CreditTransactions (>30 min old). Catches
     // crashes that the startup sweep missed (e.g., scan completed but settle
     // never marked the tx). Wrapped in its own try so cred-system issues
-    // don't break the tracker scheduler.
+    // don't break the tracker scheduler. Sweep lives in creditService
+    // (single-sourced + tested, Phase 3).
     try {
-      const CreditTransactionCron = require('./models/CreditTransaction');
       const creditServiceCron = require('./services/creditService');
-      const orphans = await CreditTransactionCron.find({
-        status: 'pending',
-        createdAt: { $lt: thirtyMinAgo },
-      }).select('_id').lean();
-      let refundedGroups = 0;
-      for (const orphan of orphans) {
-        try {
-          const result = await creditServiceCron.refund(orphan._id.toString());
-          if (result.refunded > 0) refundedGroups++;
-        } catch (e) {
-          console.error(`[cron] orphan refund failed for tx ${orphan._id}:`, e.message);
-        }
-      }
-      if (refundedGroups > 0) {
-        console.log(`[cron] refunded ${refundedGroups} orphaned credit transaction group(s)`);
-      }
+      await creditServiceCron.sweepOrphanedPendingCredits({ logPrefix: '[cron]' });
     } catch (e) {
       console.error('[cron] orphan credit sweep failed:', e.message);
     }
@@ -430,7 +398,18 @@ cron.schedule(cronSchedule, async () => {
     const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000);
     await SitemapModel.updateMany(
       { crawlStatus: 'crawling', updatedAt: { $lt: thirtyMinAgo } },
-      { $set: { crawlStatus: 'error', crawlError: 'Crawl timed out (recovered by cron)' } }
+      {
+        // Apply backoff on recovery too — otherwise a crawl that chronically hangs
+        // is recovered to 'error' with its old (past) nextCrawlAt and re-fires
+        // every tick forever (the finding-J bug, for the hang path). Flat 6h here;
+        // the next attempt routes through crawlSite's exponential backoff/give-up.
+        $set: {
+          crawlStatus: 'error',
+          crawlError: 'Crawl timed out (recovered by cron)',
+          nextCrawlAt: new Date(Date.now() + 6 * 60 * 60 * 1000),
+        },
+        $inc: { crawlFailCount: 1 },
+      }
     );
 
     const dueSitemaps = await SitemapModel.find({
@@ -441,13 +420,25 @@ cron.schedule(cronSchedule, async () => {
     if (dueSitemaps.length === 0) return;
     console.log(`[cron] ${dueSitemaps.length} sitemap(s) due for crawl`);
 
-    await Promise.allSettled(dueSitemaps.map(async (s) => {
-      try {
-        const { config } = await tierServiceForCron.getOrgTierConfig(s.organizationId);
-        const maxPages = config.maxCrawlPages ?? 500;
-        await crawlSitemapSite(s._id, { maxPages });
-      } catch (err) {
-        console.error(`[cron] sitemap crawl failed for ${s._id}:`, err.message);
+    // Group by org and crawl each org's due sitemaps SEQUENTIALLY (the per-org
+    // guard allows only one active crawl per org), running different orgs in
+    // parallel. A flat concurrent fan-out would start an org's sitemaps at once,
+    // so all but the lowest-id one would defer to the next tick (finding H1).
+    const dueByOrg = new Map();
+    for (const s of dueSitemaps) {
+      const key = String(s.organizationId);
+      if (!dueByOrg.has(key)) dueByOrg.set(key, []);
+      dueByOrg.get(key).push(s);
+    }
+    await Promise.allSettled([...dueByOrg.values()].map(async (orgSitemaps) => {
+      for (const s of orgSitemaps) {
+        try {
+          const { config } = await tierServiceForCron.getOrgTierConfig(s.organizationId);
+          const maxPages = config.maxCrawlPages ?? 500;
+          await crawlSitemapSite(s._id, { maxPages });
+        } catch (err) {
+          console.error(`[cron] sitemap crawl failed for ${s._id}:`, err.message);
+        }
       }
     }));
   } catch (err) {

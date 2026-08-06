@@ -298,6 +298,12 @@ async function deleteOrgData(orgId, counts = {}) {
   await _del(counts, 'reportSnapshots', ReportSnapshot, { organizationId: orgId });
   await _del(counts, 'reportShares', ReportShare, { organizationId: orgId });
   await _del(counts, 'sites', Site, { organizationId: orgId });
+  // CrawlPage is scoped by sitemapId, so collect ids BEFORE the org-level Sitemap
+  // sweep — any sitemap reached here (rather than by the per-workspace pass, e.g.
+  // one whose workspaceId no longer maps to a live workspace) would otherwise
+  // leave its crawl pages orphaned.
+  const orgSitemapIds = (await Sitemap.find({ organizationId: orgId }).select('_id').lean()).map((s) => s._id);
+  if (orgSitemapIds.length) await _del(counts, 'crawlPages', CrawlPage, { sitemapId: { $in: orgSitemapIds } });
   await _del(counts, 'sitemaps', Sitemap, { organizationId: orgId });
   await _del(counts, 'workspaceMembers', WorkspaceMember, { organizationId: orgId });
   // Threads P5 review (BUG-1): the per-workspace ledger scrub misses rows

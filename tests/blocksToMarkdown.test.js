@@ -114,29 +114,34 @@ describe('blocksToMarkdown', () => {
     expect(md).toContain('```');
   });
 
-  test('skips TOC blocks (editor-only)', () => {
+  // Phase 10 (CHANGE-PERCEPTION plan): toc/cta now emit sr:* anchor tokens
+  // (position-carrying; the model preserves/moves/deletes them as lines).
+  // NOTE this whole file is UNREGISTERED in package.json's test script and was
+  // failing on other assertions before Phase 10 — these three pins are updated
+  // to the current contract as a courtesy to whoever revives it.
+  test('emits TOC as a position-carrying anchor token', () => {
     const blocks = [
       { id: '1', type: 'h1', text: 'Title' },
       { id: '2', type: 'toc', text: '' },
       { id: '3', type: 'p', text: 'Content' },
     ];
     const md = blocksToMarkdown(blocks);
-    expect(md).not.toContain('toc');
+    expect(md).toContain('<!-- sr:toc -->');
     expect(md).toContain('# Title');
     expect(md).toContain('Content');
   });
 
-  test('converts CTA blocks to markdown link', () => {
+  test('emits CTA as an anchor carrying the full payload', () => {
     const blocks = [{
       id: '1', type: 'cta', text: '',
       ctaData: { buttonText: 'Sign Up', url: 'https://example.com/signup' },
     }];
-    expect(blocksToMarkdown(blocks)).toBe('[Sign Up](https://example.com/signup)');
+    expect(blocksToMarkdown(blocks)).toBe('<!-- sr:cta {"buttonText":"Sign Up","url":"https://example.com/signup"} -->');
   });
 
-  test('converts CTA with missing data to defaults', () => {
+  test('CTA with empty data still emits a well-formed anchor', () => {
     const blocks = [{ id: '1', type: 'cta', text: '', ctaData: {} }];
-    expect(blocksToMarkdown(blocks)).toBe('[Click here](#)');
+    expect(blocksToMarkdown(blocks)).toBe('<!-- sr:cta {} -->');
   });
 });
 

@@ -80,8 +80,10 @@ test('li/ol indent and img caption serialize (frontend parity)', () => {
   assert.strictEqual(lines[0], '- top');
   assert.strictEqual(lines[1], '  - nested');
   assert.strictEqual(lines[2], '    1. deep');
-  assert.strictEqual(lines[3], '![A](https://x.com/a.png)');
-  assert.strictEqual(lines[4], '*A caption*');
+  // Phase 12: the caption travels as the markdown TITLE (engine-editable),
+  // not a separate italic line.
+  assert.strictEqual(lines[3], '![A](https://x.com/a.png "A caption")');
+  assert.strictEqual(lines.length, 4);
 });
 
 test('Content blockSchema preserves toggleData/embedData/caption/indent', () => {

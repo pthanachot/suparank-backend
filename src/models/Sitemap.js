@@ -69,6 +69,8 @@ const sitemapSchema = new mongoose.Schema({
     default: 'idle',
   },
   crawlError: { type: String, default: null },
+  // Consecutive-failure counter driving crawl backoff; reset to 0 on success.
+  crawlFailCount: { type: Number, default: 0 },
   crawlProgress: { type: Number, default: 0, min: 0, max: 100 },
   lastCrawlAt: { type: Date, default: null },
   nextCrawlAt: { type: Date, default: null },
@@ -92,5 +94,9 @@ const sitemapSchema = new mongoose.Schema({
 
 sitemapSchema.index({ organizationId: 1, workspaceId: 1 });
 sitemapSchema.index({ crawlStatus: 1, nextCrawlAt: 1 });
+// A workspace can track a given URL at most once. Enforced at the DB layer so the
+// read-then-create dedup in the controller can't be raced into duplicate rows.
+// Run scripts/dedupeSitemaps.js before enabling on a DB that may hold duplicates.
+sitemapSchema.index({ workspaceId: 1, url: 1 }, { unique: true });
 
 module.exports = mongoose.model('Sitemap', sitemapSchema);

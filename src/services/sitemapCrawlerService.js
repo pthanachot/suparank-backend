@@ -15,6 +15,8 @@
 
 const cheerio = require('cheerio');
 const { URL } = require('url');
+const dns = require('dns');
+const { assertUrlAllowed } = require('./ssrfGuard');
 const Sitemap = require('../models/Sitemap');
 const CrawlPage = require('../models/CrawlPage');
 
@@ -26,6 +28,9 @@ const REQUEST_DELAY_MS = 100;
 const REQUEST_TIMEOUT_MS = 20000;
 const PROGRESS_SAVE_INTERVAL = 10;
 const MAX_CRAWL_HISTORY = 10; // keep last N crawl runs
+const MAX_SITEMAP_DOCS = 50;  // cap total sitemap/index docs fetched per seed (bounds a hostile sitemapindex)
+const MAX_SITEMAP_DEPTH = 5;  // cap nested sitemapindex recursion depth
+const MAX_SITEMAP_SEEDS = 10; // cap seed sitemaps per crawl (robots may list many Sitemap: lines) → ≤ SEEDS×DOCS fetches
 
 // Increase undici's connect timeout (default 10s is too short for slow sites)
 let fetchDispatcher;
@@ -33,6 +38,71 @@ try {
   const { Agent } = require('undici');
   fetchDispatcher = new Agent({ connect: { timeout: 20000 } });
 } catch { /* undici not available as separate module, use defaults */ }
+
+// ─── Injectable dependencies (test seams) ──────────────────────────────────────
+// Production behavior is unchanged: every field defaults to the real implementation.
+// The crawler's only non-deterministic surfaces are network egress, DNS resolution,
+// and the clock — routing them through swappable module-level deps makes crawlSite()
+// hermetically testable. Tests override via __setTestDeps() and restore with
+// __resetTestDeps(). See SITE-SITEMAP-TEST-PLAN.md §0.
+const defaultDeps = {
+  // Late-bound so a globally-installed fetch mock is still honored by default.
+  fetchImpl: (url, opts) => globalThis.fetch(url, opts),
+  dispatcher: fetchDispatcher, // undici Agent, or undefined if undici is unavailable
+  resolver: (hostname) => dns.promises.lookup(hostname, { all: true }),
+  now: () => Date.now(),       // logical clock: TTLs, scheduling, timestamps (not latency)
+  delayMs: REQUEST_DELAY_MS,   // per-page politeness delay; tests override to 0 for load runs
+  // Structured metric sink (Phase 6 §12 observability). Default logs a JSON line
+  // an SLO pipeline can scrape: crawl success rate, duration p50/p99, pages/crawl,
+  // errors-by-reason. Overridable so tests assert the shape / prod ships to a real sink.
+  onMetric: (m) => console.log("[sitemap-crawler][metric]", JSON.stringify(m)),
+};
+let deps = { ...defaultDeps };
+
+// Single network egress point. All fetches in this module go through here so a test
+// can intercept every request via deps.fetchImpl, and the dispatcher-injection lives
+// in exactly one place instead of being copy-pasted across the three fetchers.
+const MAX_REDIRECTS = 5;
+
+async function httpGet(url, opts = {}) {
+  // SSRF guard: validate BEFORE every egress — including each redirect hop.
+  // Redirects are followed MANUALLY (redirect:'manual') and re-validated, so a
+  // public host that 302s to a private/internal target is refused instead of
+  // being transparently followed by fetch. Hostnames resolve through the
+  // injectable resolver seam (hermetic in tests). NOTE: the resolved IP is not
+  // pinned, so a DNS-rebinding window remains between this check and fetch's own
+  // resolution — an accepted residual risk covered by monitoring (plan §4).
+  let currentUrl = url;
+  let redirects = 0;
+  for (;;) {
+    await assertUrlAllowed(currentUrl, { resolver: deps.resolver });
+    const finalOpts = { ...opts, redirect: 'manual' };
+    if (deps.dispatcher) finalOpts.dispatcher = deps.dispatcher;
+    const res = await deps.fetchImpl(currentUrl, finalOpts);
+
+    const status = res.status || 0;
+    const location = (status >= 300 && status < 400 && res.headers && res.headers.get)
+      ? res.headers.get('location')
+      : null;
+    if (!location) return res; // not a redirect (or no Location) — hand back as-is
+
+    if (++redirects > MAX_REDIRECTS) throw new Error(`SSRF: too many redirects starting at ${url}`);
+    currentUrl = new URL(location, currentUrl).href; // resolve relative Location
+  }
+}
+
+// Logical clock. Governs cache TTLs, nextCrawlAt scheduling, and lastmod stamps —
+// NOT response-latency measurement, which stays on real Date.now() by design.
+function nowMs() {
+  return deps.now();
+}
+
+// DNS resolution seam. The SSRF guard in httpGet resolves through deps.resolver
+// (so hostname checks are hermetic in tests); this thin wrapper exposes the same
+// resolver for direct use/tests. Overriding deps.resolver controls what both see.
+function resolveHost(hostname) {
+  return deps.resolver(hostname);
+}
 
 // File extensions to skip (not HTML pages)
 const SKIP_EXTENSIONS = new Set([
@@ -56,7 +126,7 @@ const ROBOTS_TTL_MS = 24 * 60 * 60 * 1000; // 24h
  */
 async function fetchRobotsTxt(origin) {
   const cached = robotsCache.get(origin);
-  if (cached && Date.now() - cached.fetchedAt < ROBOTS_TTL_MS) {
+  if (cached && nowMs() - cached.fetchedAt < ROBOTS_TTL_MS) {
     return cached;
   }
 
@@ -65,12 +135,10 @@ async function fetchRobotsTxt(origin) {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
-    const opts = {
+    const res = await httpGet(`${origin}/robots.txt`, {
       signal: controller.signal,
       headers: { 'User-Agent': 'SupaRankBot/1.0' },
-    };
-    if (fetchDispatcher) opts.dispatcher = fetchDispatcher;
-    const res = await fetch(`${origin}/robots.txt`, opts);
+    });
     clearTimeout(timeout);
 
     if (res.ok) {
@@ -83,7 +151,7 @@ async function fetchRobotsTxt(origin) {
     // robots.txt unreachable → allow everything
   }
 
-  const entry = { rules, sitemapUrls, fetchedAt: Date.now() };
+  const entry = { rules, sitemapUrls, fetchedAt: nowMs() };
   robotsCache.set(origin, entry);
   return entry;
 }
@@ -194,19 +262,21 @@ async function fetchSitemapXml(sitemapUrl, baseDomain, maxUrls = 5000) {
   const urls = new Set();
   const visited = new Set();
 
-  async function parseSitemap(url) {
+  async function parseSitemap(url, depth) {
     if (visited.has(url) || urls.size >= maxUrls) return;
+    // Bound a hostile sitemapindex: cap total docs fetched and recursion depth so
+    // an index listing thousands of (in-domain-URL-less) children can't fan out
+    // into thousands of outbound requests.
+    if (visited.size >= MAX_SITEMAP_DOCS || depth > MAX_SITEMAP_DEPTH) return;
     visited.add(url);
 
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 15000);
-      const opts = {
+      const res = await httpGet(url, {
         signal: controller.signal,
         headers: { 'User-Agent': 'SupaRankBot/1.0', 'Accept': 'application/xml, text/xml' },
-      };
-      if (fetchDispatcher) opts.dispatcher = fetchDispatcher;
-      const res = await fetch(url, opts);
+      });
       clearTimeout(timeout);
 
       if (!res.ok) return;
@@ -219,8 +289,11 @@ async function fetchSitemapXml(sitemapUrl, baseDomain, maxUrls = 5000) {
         const childUrls = [];
         sitemapLocs.each((_, el) => childUrls.push($(el).text().trim()));
         for (const childUrl of childUrls) {
-          if (urls.size >= maxUrls) break;
-          await parseSitemap(childUrl);
+          if (urls.size >= maxUrls || visited.size >= MAX_SITEMAP_DOCS) break;
+          // Only recurse into same-domain child sitemaps — a hostile index must
+          // not steer our crawler at arbitrary third-party hosts (SSRF reflection).
+          if (!isSameDomain(childUrl, baseDomain)) continue;
+          await parseSitemap(childUrl, depth + 1);
         }
         return;
       }
@@ -241,7 +314,7 @@ async function fetchSitemapXml(sitemapUrl, baseDomain, maxUrls = 5000) {
     }
   }
 
-  await parseSitemap(sitemapUrl);
+  await parseSitemap(sitemapUrl, 0);
   return [...urls];
 }
 
@@ -262,8 +335,11 @@ function normalizeUrl(href, baseUrl, baseDomain = null, originScheme = null) {
     const parsed = new URL(href, baseUrl);
     parsed.hash = '';
     let pathname = parsed.pathname;
-    if (pathname.length > 1 && pathname.endsWith('/')) {
-      pathname = pathname.slice(0, -1);
+    // Strip ALL trailing slashes (preserving the root "/") so ".../a", ".../a/",
+    // and ".../a//" canonicalize identically. Stripping just one left normalizeUrl
+    // non-idempotent for multi-slash URLs, which caused duplicate crawl entries.
+    if (pathname.length > 1) {
+      pathname = pathname.replace(/\/+$/, '') || '/';
     }
     parsed.pathname = pathname;
     if (
@@ -330,16 +406,14 @@ async function fetchPage(url) {
   const startTime = Date.now();
 
   try {
-    const opts = {
+    const res = await httpGet(url, {
       signal: controller.signal,
       headers: {
         'User-Agent': 'Mozilla/5.0 (compatible; SupaRankBot/1.0; +https://suparank.com/bot)',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       },
       redirect: 'follow',
-    };
-    if (fetchDispatcher) opts.dispatcher = fetchDispatcher;
-    const res = await fetch(url, opts);
+    });
     const responseTimeMs = Date.now() - startTime;
 
     const contentType = res.headers.get('content-type') || '';
@@ -426,7 +500,43 @@ async function asyncPool(concurrency, items, fn) {
  * @param {number} [options.maxPages] - Max pages to crawl (from tier config)
  * @returns {object} { pagesFound, errors }
  */
+// Emit one structured crawl metric (never throws — observability must not break a
+// crawl). Every terminal produces the SAME shape via the defaults below, so an SLO
+// query for pagesFound/truncated never hits a missing key on an error/deferred row.
+// durationMs uses the REAL clock (latency), not the injectable logical clock.
+function emitCrawlMetric(sitemap, startedAtMs, fields) {
+  try {
+    deps.onMetric({
+      event: "sitemap.crawl",
+      sitemapId: sitemap ? String(sitemap._id) : null,
+      workspaceId: sitemap && sitemap.workspaceId ? String(sitemap.workspaceId) : null,
+      organizationId: sitemap && sitemap.organizationId ? String(sitemap.organizationId) : null,
+      durationMs: Date.now() - startedAtMs,
+      status: null,
+      reason: null,
+      pagesFound: 0,
+      newUrls: 0,
+      removedUrls: 0,
+      errors: 0,
+      truncated: false,
+      ...fields,
+    });
+  } catch { /* observability must never fail the crawl */ }
+}
+
+// Exponential backoff for a failed crawl. Failed crawls previously left nextCrawlAt
+// in the past, so the daily cron re-crawled a permanently-broken domain every day
+// forever. Back off 6h→12h→24h→48h→96h, then give up auto-retry (null — a manual
+// crawl still works). Reset on success.
+function backoffNextCrawl(failCount) {
+  if (failCount >= 6) return null; // give up auto-retry after 6 consecutive failures
+  const hours = 6 * 2 ** (failCount - 1); // 6, 12, 24, 48, 96
+  return new Date(nowMs() + hours * 60 * 60 * 1000);
+}
+
 async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
+  const startedAtMs = Date.now(); // real-clock latency for the crawl-duration metric
+
   // ── 1. Atomic guard: claim the crawl ──────────────────────────────────
   let sitemap = await Sitemap.findOneAndUpdate(
     { _id: sitemapId, crawlStatus: { $in: ['idle', 'completed', 'error'] } },
@@ -439,21 +549,34 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
     sitemap = await Sitemap.findOne({ _id: sitemapId, crawlStatus: 'crawling' });
     if (!sitemap) {
       console.log(`[sitemap-crawler] skipping ${sitemapId}: not found or invalid state`);
+      emitCrawlMetric(null, startedAtMs, { status: "skipped", reason: "not_claimable", sitemapId: String(sitemapId) });
       return null;
     }
   }
 
-  // ── 1b. Concurrent crawl limit: max 1 active crawl per org ────────────
-  const concurrentCount = await Sitemap.countDocuments({
+  // ── 1b. Concurrent crawl limit: at most one active crawl per org ──────
+  // Deterministic tiebreaker: defer only if a crawling sibling has a LOWER _id.
+  // The claim-then-check here is not atomic, so two sibling crawls can both claim
+  // 'crawling' before either counts. A plain "any sibling crawling?" check then
+  // makes BOTH defer — and since the cron fans out an org's due sitemaps
+  // concurrently (index.js) and they share the +7d schedule, they collide every
+  // tick and starve forever. Gating on `_id < mine` guarantees exactly the
+  // lowest-id claimant proceeds and the rest defer, so the two can never both
+  // defer (worst case both proceed, a harmless one-time overlap — never a livelock).
+  const priorCrawling = await Sitemap.countDocuments({
     organizationId: sitemap.organizationId,
     crawlStatus: 'crawling',
-    _id: { $ne: sitemap._id },
+    _id: { $lt: sitemap._id },
   });
-  if (concurrentCount > 0) {
+  if (priorCrawling > 0) {
+    // A normal queue condition, NOT an error (the old code marked it 'error',
+    // surfacing a spurious failure). Release the claim to 'idle' and make it due
+    // so the next cron pass picks it up once the in-flight crawl finishes.
     await Sitemap.updateOne({ _id: sitemapId }, {
-      $set: { crawlStatus: 'error', crawlError: 'Another crawl is already running. Please wait for it to finish.' },
+      $set: { crawlStatus: 'idle', crawlProgress: 0, crawlError: null, nextCrawlAt: new Date(nowMs()) },
     });
-    console.log(`[sitemap-crawler] skipping ${sitemapId}: concurrent crawl limit (org ${sitemap.organizationId})`);
+    console.log(`[sitemap-crawler] deferring ${sitemapId}: another crawl running for org ${sitemap.organizationId}`);
+    emitCrawlMetric(sitemap, startedAtMs, { status: "deferred", reason: "concurrent_org_crawl" });
     return null;
   }
 
@@ -484,10 +607,26 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
     }
 
     // ── 3. Seed from sitemap.xml ─────────────────────────────────────────
-    // Try robots.txt Sitemap: directives first, then default /sitemap.xml
-    const sitemapSeedUrls = robotsSitemapUrls.length > 0
-      ? robotsSitemapUrls
-      : [`${origin}/sitemap.xml`];
+    // Resolve robots.txt Sitemap: directives against the origin so RELATIVE
+    // directives (e.g. "Sitemap: /sitemap.xml") work. Previously a raw relative
+    // value was passed straight to fetch(), threw, was swallowed, and — because
+    // the directive list was non-empty — suppressed the ${origin}/sitemap.xml
+    // fallback, silently losing ALL sitemap seeding. Drop unparseable directives;
+    // fall back to the default location only when none remain usable.
+    const resolvedSitemapUrls = [];
+    for (const raw of robotsSitemapUrls) {
+      try {
+        resolvedSitemapUrls.push(new URL(raw, origin).href);
+      } catch {
+        console.warn(`[sitemap-crawler] ignoring unparseable Sitemap: directive "${raw}"`);
+      }
+    }
+    // Cap the number of seed sitemaps: robots.txt may list many Sitemap: lines,
+    // and each seed gets its own MAX_SITEMAP_DOCS budget, so an uncapped list
+    // (each pointing at a hostile index) would fan out to SEEDS×DOCS fetches.
+    const sitemapSeedUrls = (resolvedSitemapUrls.length > 0
+      ? resolvedSitemapUrls
+      : [`${origin}/sitemap.xml`]).slice(0, MAX_SITEMAP_SEEDS);
 
     let seededCount = 0;
     for (const sitemapUrl of sitemapSeedUrls) {
@@ -535,16 +674,19 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
             ? `Cannot reach ${baseDomain} — connection timed out after ${REQUEST_TIMEOUT_MS / 1000}s`
             : `Cannot reach ${baseDomain} — ${error || `HTTP ${statusCode} with no HTML content`}`;
 
+          const failCount = (sitemap.crawlFailCount || 0) + 1;
           await Sitemap.updateOne({ _id: sitemapId }, {
             $set: {
               crawlStatus: 'error',
               crawlProgress: 0,
               crawlError: reason,
-              crawlPages: [],
+              crawlFailCount: failCount,
+              nextCrawlAt: backoffNextCrawl(failCount),
               crawlStats: { totalFound: 0, newUrls: 0, removedUrls: 0, unchanged: 0, errors: 1 },
             },
           });
           console.log(`[sitemap-crawler] homepage unreachable for ${sitemap.label || startUrl}: ${reason}`);
+          emitCrawlMetric(sitemap, startedAtMs, { status: "error", reason: "homepage_unreachable", pagesFound: 0, errors: 1 });
           return null;
         }
       } else {
@@ -590,17 +732,20 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
       // sources (homepage <a> extraction AND sitemap.xml seeding) yielded
       // zero same-domain URLs.
       if (seededCount === 0 && links.length === 0) {
+        const failCount = (sitemap.crawlFailCount || 0) + 1;
         await Sitemap.updateOne({ _id: sitemapId }, {
           $set: {
             crawlStatus: 'error',
             crawlProgress: 0,
             crawlError: 'No internal links discovered. The site may be JavaScript-rendered or use non-standard navigation.',
-            crawlPages: [],
+            crawlFailCount: failCount,
+            nextCrawlAt: backoffNextCrawl(failCount),
             crawlStats: { totalFound: 0, newUrls: 0, removedUrls: 0, unchanged: 0, errors: 1 },
           },
         });
         await CrawlPage.deleteMany({ sitemapId: sitemap._id });
         console.log(`[sitemap-crawler] no internal links discovered for ${sitemap.label || startUrl}`);
+        emitCrawlMetric(sitemap, startedAtMs, { status: "error", reason: "no_internal_links", pagesFound: 0, errors: 1 });
         return null;
       }
       }
@@ -619,7 +764,7 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
       if (batch.length === 0) break;
 
       const batchResults = await asyncPool(CONCURRENCY, batch, async (item) => {
-        await new Promise((r) => setTimeout(r, REQUEST_DELAY_MS));
+        await new Promise((r) => setTimeout(r, deps.delayMs));
         const { html, statusCode, error, responseTimeMs } = await fetchPage(item.url);
 
         // ok requires THREE things: no network error, response had HTML body,
@@ -733,7 +878,7 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
     };
 
     // ── 7. Save results to CrawlPage collection + update Sitemap ──────
-    const now = new Date();
+    const now = new Date(nowMs());
     const nextCrawlAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
 
     // Delete all old CrawlPages for this sitemap
@@ -775,6 +920,7 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
         crawlStatus: 'completed',
         crawlProgress: 100,
         crawlError: null,
+        crawlFailCount: 0,
         lastCrawlAt: now,
         nextCrawlAt,
         crawlStats: stats,
@@ -794,16 +940,25 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
     } catch (cacheErr) {
       console.warn('[sitemap-crawler] links cache invalidation failed:', cacheErr.message);
     }
+    emitCrawlMetric(sitemap, startedAtMs, {
+      status: "completed", reason: null,
+      pagesFound: stats.totalFound, newUrls: stats.newUrls, removedUrls: stats.removedUrls,
+      errors: errorCount, truncated: stats.truncated,
+    });
     return stats;
   } catch (err) {
     console.error(`[sitemap-crawler] error crawling ${sitemapId}:`, err.message);
+    const failCount = (sitemap.crawlFailCount || 0) + 1;
     await Sitemap.updateOne({ _id: sitemapId }, {
       $set: {
         crawlStatus: 'error',
         crawlProgress: 0,
         crawlError: err.message,
+        crawlFailCount: failCount,
+        nextCrawlAt: backoffNextCrawl(failCount),
       },
     });
+    emitCrawlMetric(sitemap, startedAtMs, { status: "error", reason: "exception", errors: errorCount });
     return null;
   }
 }
@@ -811,7 +966,7 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
 // ─── XML generation ───────────────────────────────────────────────────────────
 
 function generateSitemapXml(pages) {
-  const today = new Date().toISOString().split('T')[0];
+  const today = new Date(nowMs()).toISOString().split('T')[0];
 
   let xml = '<?xml version="1.0" encoding="UTF-8"?>\n';
   xml += '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n';
@@ -838,9 +993,41 @@ function escapeXml(str) {
     .replace(/'/g, '&apos;');
 }
 
+// ─── Test seams ─────────────────────────────────────────────────────────────
+// No effect on production behavior — these exist so crawlSite() and the fetchers
+// can be driven hermetically and so caches don't leak across cases. Plan §0.
+
+/** Override injectable deps for a test. Accepts any subset of
+ *  { fetchImpl, dispatcher, resolver, now, delayMs, onMetric }. Pair with __resetTestDeps(). */
+function __setTestDeps(overrides = {}) {
+  deps = { ...deps, ...overrides };
+}
+
+/** Restore every injectable dep to its real default. */
+function __resetTestDeps() {
+  deps = { ...defaultDeps };
+}
+
+/** Clear module-global caches so state doesn't leak between tests. Resets this
+ *  module's robots cache and the downstream link/page inventory caches. */
+function __resetCaches() {
+  robotsCache.clear();
+  try {
+    require('./benchmarkToContentBrief').__resetCaches();
+  } catch { /* downstream reset is best-effort */ }
+}
+
 module.exports = {
   crawlSite,
   generateSitemapXml,
   // Exposed for unit testing. Not intended for external use.
-  _internals: { normalizeUrl, shouldSkipUrl, extractLinksAndTitle, isSameDomain, parseRobotsTxt, isAllowedByRobots },
+  _internals: {
+    normalizeUrl, shouldSkipUrl, extractLinksAndTitle, isSameDomain,
+    parseRobotsTxt, isAllowedByRobots,
+    fetchRobotsTxt, fetchSitemapXml, fetchPage, httpGet, resolveHost, nowMs,
+    backoffNextCrawl, MAX_SITEMAP_DOCS, MAX_SITEMAP_DEPTH, MAX_SITEMAP_SEEDS,
+  },
+  __setTestDeps,
+  __resetTestDeps,
+  __resetCaches,
 };

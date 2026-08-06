@@ -1,0 +1,68 @@
+{
+  "mode": "mocked",
+  "generatedAt": "2026-08-02T21:25:50.107Z",
+  "scored": 39,
+  "skippedNoLabel": 0,
+  "skippedDraft": 30,
+  "skippedNoRecording": 0,
+  "knownLimitations": [
+    {
+      "id": "adv-05",
+      "limitation": "slice-8000",
+      "note": "not exercisable in mocked mode"
+    }
+  ],
+  "failures": [
+    {
+      "id": "syn-04",
+      "field": "mentioned",
+      "expected": false,
+      "got": true
+    },
+    {
+      "id": "syn-11",
+      "field": "sentiment",
+      "expected": "positive",
+      "got": "neutral"
+    },
+    {
+      "id": "syn-21",
+      "field": "sentiment",
+      "expected": "positive",
+      "got": "neutral"
+    },
+    {
+      "id": "adv-02",
+      "field": "sentiment",
+      "expected": "neutral",
+      "got": "positive"
+    },
+    {
+      "id": "adv-13",
+      "field": "sentiment",
+      "expected": "negative",
+      "got": "neutral"
+    },
+    {
+      "id": "adv-14",
+      "field": "mentioned",
+      "expected": false,
+      "got": true
+    },
+    {
+      "id": "adv-18",
+      "field": "mentioned",
+      "expected": false,
+      "got": true
+    }
+  ],
+  "scores": {
+    "mentionedAcc": 92.3,
+    "citedAcc": 100,
+    "sentimentAcc": 86.2,
+    "brandRecall": 100,
+    "brandPrecision": 85.3,
+    "positionPresent": 100,
+    "unsafeLeakRows": 0
+  }
+}

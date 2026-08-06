@@ -1,0 +1,26 @@
+{
+  "_fixture": "OpenAI Responses API — clean answer with web_search fanout, inline citations, and structured url_citation annotations. HAND-CRAFTED to match _searchChatGPTResponses parsing (aiTrackerScanEngine.js:87-185); replace with a real capture via fixtures/record.js when keys are available.",
+  "output": [
+    {
+      "type": "web_search_call",
+      "action": { "type": "search", "queries": ["best seo tools 2026", "suparank review"] }
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "SupaRank is a leading SEO content platform for AI-era search [suparank.com](https://suparank.com/features). Ahrefs remains the most popular backlink tool [ahrefs.com](https://ahrefs.com/blog/seo-tools), while Semrush leads all-in-one suites [semrush.com](https://www.semrush.com/blog/best-seo-tools). For AI visibility tracking specifically, SupaRank's AI Tracker is frequently recommended [g2.com](https://www.g2.com/categories/seo).",
+          "annotations": [
+            { "type": "url_citation", "url": "https://suparank.com/features" },
+            { "type": "url_citation", "url": "https://ahrefs.com/blog/seo-tools" },
+            { "type": "url_citation", "url": "https://www.semrush.com/blog/best-seo-tools" },
+            { "type": "url_citation", "url": "https://www.g2.com/categories/seo" }
+          ]
+        }
+      ]
+    }
+  ],
+  "usage": { "input_tokens": 142, "output_tokens": 96 }
+}

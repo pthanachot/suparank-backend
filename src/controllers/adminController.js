@@ -23,6 +23,8 @@ const AiTrackerScan = require('../models/AiTrackerScan');
 const AgentUsageLog = require('../models/AgentUsageLog');
 const KeywordResearchHistory = require('../models/KeywordResearchHistory');
 const Site = require('../models/Site');
+const Sitemap = require('../models/Sitemap');
+const CrawlPage = require('../models/CrawlPage');
 const Session = require('../models/Session');
 const ResetToken = require('../models/ResetToken');
 const BrandVoiceTestLog = require('../models/BrandVoiceTestLog');
@@ -1714,6 +1716,12 @@ async function cascadeDeleteWorkspaces(workspaceIds) {
     ]);
   }
 
+  // Sitemap children (CrawlPage keyed by sitemapId) — collect ids and delete the
+  // pages before the sitemaps. Omitting these orphaned crawl pages on admin-side
+  // workspace deletion, mirroring the workspaceController bug.
+  const sitemapIds = (await Sitemap.find({ workspaceId: { $in: workspaceIds } }).select('_id').lean()).map((s) => s._id);
+  if (sitemapIds.length) await CrawlPage.deleteMany({ sitemapId: { $in: sitemapIds } });
+
   // Delete workspace-level data
   await Promise.all([
     AiTracker.deleteMany({ workspaceId: { $in: workspaceIds } }),
@@ -1721,6 +1729,7 @@ async function cascadeDeleteWorkspaces(workspaceIds) {
     AgentUsageLog.deleteMany({ workspaceId: { $in: workspaceIds } }),
     KeywordResearchHistory.deleteMany({ workspaceId: { $in: workspaceIds } }),
     Site.deleteMany({ workspaceId: { $in: workspaceIds } }),
+    Sitemap.deleteMany({ workspaceId: { $in: workspaceIds } }),
   ]);
 
   const wsResult = await Workspace.deleteMany({ _id: { $in: workspaceIds } });

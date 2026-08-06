@@ -1,0 +1,14 @@
+{
+  "comment": "Phase 10/11/12 (CHANGE-PERCEPTION-AND-CRUD-PLAN): serializer parity between suparank components/editor/utils.ts blocksToMarkdown (ENGINE audience) and backend src/services/blocksToMarkdown.js. IDENTICAL COPY lives at backend/tests/fixtures/serializerParity/serializer-parity.json — separate git repos; edit BOTH or the parity silently stops being checked. Deliberate spice: the cta url contains '->' (pins the '>'-escape), the faq answer is multi-line with a list (pins raw-line answers + the sr:/faq terminator), the img caption contains quotes (pins title escaping), the table has a piped header cell and explicit alignment (pins cell escaping + the separator row).",
+  "blocks": [
+    { "id": "f1", "type": "h1", "text": "Guide" },
+    { "id": "f2", "type": "p", "text": "Intro text" },
+    { "id": "f3", "type": "toc", "text": "Table of Contents" },
+    { "id": "f4", "type": "cta", "text": "", "ctaData": { "buttonText": "Get started", "url": "https://x.com/a?b=1&c->2" } },
+    { "id": "f5", "type": "p", "text": "Outro" },
+    { "id": "f6", "type": "faq", "text": "", "faqItems": [ { "question": "Is it free?", "answer": "Yes, the basic plan is free.\n\n- One seat included" } ] },
+    { "id": "f7", "type": "img", "text": "", "src": "/chart.png", "alt": "revenue", "caption": "Q1 \"gross\" revenue" },
+    { "id": "f8", "type": "table", "text": "", "tableData": { "headers": ["Plan", "Cost | seat"], "rows": [["Basic", "0"]], "columnAligns": ["left", "right"] } }
+  ],
+  "engineMarkdown": "# Guide\n\nIntro text\n\n<!-- sr:toc -->\n\n<!-- sr:cta {\"buttonText\":\"Get started\",\"url\":\"https://x.com/a?b=1&c-\\u003e2\"} -->\n\nOutro\n\n<!-- sr:faq -->\n\n## FAQ\n\n### Is it free?\n\nYes, the basic plan is free.\n\n- One seat included\n\n<!-- sr:/faq -->\n\n![revenue](/chart.png \"Q1 \\\"gross\\\" revenue\")\n\n| Plan | Cost \\| seat |\n| :--- | ---: |\n| Basic | 0 |"
+}

@@ -139,3 +139,6 @@ router.post('/:workspaceNumber/ai-tracker/monitors/:monitorId/competitors', ...r
 router.delete('/:workspaceNumber/ai-tracker/monitors/:monitorId/competitors/:competitorId', ...rwrAiTracker, requirePermission('tracker.managePrompts'), aiTrackerController.removeMonitorCompetitor);
 
 module.exports = router;
+
+// Exported for test coverage (plan Phase 2) — not part of the runtime API.
+module.exports.__test = { estimateScanCredits };

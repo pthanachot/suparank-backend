@@ -322,6 +322,16 @@ const deleteWorkspace = async (req, res) => {
       if (AiTrackerScan) await AiTrackerScan.deleteMany({ trackerId: { $in: trackerIds } });
       await AiTracker.deleteMany({ workspaceId });
     }
+    // Sitemap children (CrawlPage is scoped by sitemapId, not workspaceId) must
+    // be collected and deleted BEFORE the sitemaps, mirroring deletionService.
+    // Omitting these orphaned every crawl page on workspace deletion.
+    const Sitemap = mongoose.models.Sitemap;
+    const CrawlPage = mongoose.models.CrawlPage;
+    if (Sitemap) {
+      const sitemapIds = (await Sitemap.find({ workspaceId }, '_id').lean()).map((s) => s._id);
+      if (CrawlPage && sitemapIds.length) await CrawlPage.deleteMany({ sitemapId: { $in: sitemapIds } });
+      await Sitemap.deleteMany({ workspaceId });
+    }
     const cascadeModels = [
       { model: 'Content',                filter: { workspaceId } },
       { model: 'KeywordResearchHistory', filter: { workspaceId } },

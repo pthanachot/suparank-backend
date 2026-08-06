@@ -80,8 +80,16 @@ function blocksToMarkdown(blocks) {
       case 'img': {
         const alt = b.alt || '';
         const src = b.src || '';
-        lines.push(`![${alt}](${src})`);
-        if (b.caption) lines.push(`*${b.caption}*`);
+        // Phase 12: caption as the markdown TITLE — the engine can edit it,
+        // and the old separate `*caption*` line (with its stray-paragraph
+        // side effects) is retired. Mirror of the frontend serializer; the
+        // parity fixture pins the escaping.
+        if (b.caption) {
+          const title = String(b.caption).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\s*\n\s*/g, ' ');
+          lines.push(`![${alt}](${src} "${title}")`);
+        } else {
+          lines.push(`![${alt}](${src})`);
+        }
         break;
       }
 
@@ -91,6 +99,12 @@ function blocksToMarkdown(blocks) {
 
       case 'faq':
         if (b.faqItems && b.faqItems.length > 0) {
+          // Phase 11: the anchor announces "an faq block starts here" — the
+          // frontend rebuild keys on it (creation from scratch becomes
+          // possible; hand-written "## FAQ" sections stay untouched). Mirror
+          // of the frontend's engine audience; the parity fixture pins it.
+          lines.push('<!-- sr:faq -->');
+          lines.push('');
           lines.push('## FAQ');
           lines.push('');
           b.faqItems.forEach((item) => {
@@ -99,20 +113,35 @@ function blocksToMarkdown(blocks) {
             lines.push(item.answer || '');
             lines.push('');
           });
+          // Phase 11 (review fix): the terminator bounds the section — the
+          // frontend parser's last answer would otherwise absorb whatever
+          // follows the faq. Mirror of the frontend's engine audience.
+          lines.push('<!-- sr:/faq -->');
         }
         break;
 
       case 'table':
         if (b.tableData) {
-          const { headers, rows } = b.tableData;
+          const { headers, rows, columnAligns } = b.tableData;
           if (headers && headers.length > 0) {
-            lines.push('| ' + headers.join(' | ') + ' |');
-            lines.push('| ' + headers.map(() => '---').join(' | ') + ' |');
+            // Phase 12: pipe-escaped cells + per-column alignment in the
+            // separator row. Mirror of the frontend serializer. The ` | `
+            // padding in the joins is LOAD-BEARING (see the frontend's
+            // comment): it guarantees delimiters are space-preceded, which is
+            // what keeps a trailing-backslash cell from swallowing its
+            // delimiter under the frontend's escape-aware split.
+            const cell = (c) => String(c == null ? '' : c).replace(/\|/g, '\\|');
+            const sep = (idx) => {
+              const a = columnAligns && columnAligns[idx];
+              return a === 'center' ? ':---:' : a === 'right' ? '---:' : a === 'left' ? ':---' : '---';
+            };
+            lines.push('| ' + headers.map(cell).join(' | ') + ' |');
+            lines.push('| ' + headers.map((_, idx) => sep(idx)).join(' | ') + ' |');
             if (rows) {
               rows.forEach((row) => {
                 // Guard null/non-array rows — Mongoose can persist a null slot in
                 // a [[String]] array, which would otherwise throw on .join.
-                lines.push('| ' + (Array.isArray(row) ? row : []).join(' | ') + ' |');
+                lines.push('| ' + (Array.isArray(row) ? row : []).map(cell).join(' | ') + ' |');
               });
             }
           }
@@ -128,13 +157,23 @@ function blocksToMarkdown(blocks) {
         break;
 
       case 'toc':
-        // Table of contents is an editor-only feature, skip in markdown
+        // Phase 10 (CHANGE-PERCEPTION plan): a position-carrying anchor token
+        // the model preserves verbatim / moves / omits-to-delete, so a rewrite
+        // keeps the TOC where the author put it. This is the ENGINE-audience
+        // form ONLY — this serializer never produces user-facing markdown.
+        // MUST stay byte-identical with the frontend's engine audience
+        // (components/editor/utils.ts) — the serializer-parity fixture in both
+        // repos pins it.
+        lines.push('<!-- sr:toc -->');
         break;
 
       case 'cta':
-        // CTA is an editor-only feature, render as link
+        // Phase 10: full payload in the anchor JSON so the engine can move,
+        // edit or delete the block like any other line. ">" is emitted as its
+        // unicode escape so no payload can close the comment early. Mirror of
+        // the frontend's engine audience — see the toc note above.
         if (b.ctaData) {
-          lines.push(`[${b.ctaData.buttonText || 'Click here'}](${b.ctaData.url || '#'})`);
+          lines.push(`<!-- sr:cta ${JSON.stringify(b.ctaData).replace(/>/g, '\\u003e')} -->`);
         }
         break;
 

@@ -156,6 +156,15 @@ function curateContentBrief(brief) {
       guidance: t.guidance || '', bm25: t.bm25 || 0,
       docFreq: t.doc_freq || 0, freq: t.freq || 0,
       volatile: t.volatile || false,
+      // D3 (Phase C1): the engine has always emitted these, but the mapper
+      // dropped them, so `volatile` was the only evidence signal the UI could
+      // see — a term backed by real search volume or SERP evidence looked
+      // identical to one backed by nothing. All optional: older engines and
+      // terms without the signal omit them, hence the zero/false defaults.
+      searchVolume: t.search_volume || 0,
+      difficulty: t.difficulty || 0,
+      serpEvidence: t.serp_evidence || false,
+      matchType: t.match_type || '',
     })),
     clusters: (brief.clusters || []).map((c) => ({
       id: c.id, label: c.label, terms: c.terms || [],

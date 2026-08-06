@@ -26,6 +26,11 @@ function handleMongooseError(res, err) {
   return false;
 }
 
+/** Escape regex metacharacters so a user string is matched literally. */
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 // ─── CRUD ─────────────────────────────────────────────────────────────────────
 
 const createSitemap = async (req, res) => {
@@ -87,6 +92,11 @@ const createSitemap = async (req, res) => {
 
     res.status(201).json({ sitemap });
   } catch (err) {
+    // Unique {workspaceId, url} index: a create that races past the findOne dedup
+    // above lands here — surface the same 409 as the non-racing path, not a 500.
+    if (err && err.code === 11000) {
+      return res.status(409).json({ error: 'This URL is already added' });
+    }
     if (handleMongooseError(res, err)) return;
     console.error('createSitemap error:', err.message);
     res.status(500).json({ error: 'Failed to create sitemap' });
@@ -176,9 +186,12 @@ const getSitemapPages = async (req, res) => {
       query.diffStatus = filter;
     }
     if (search) {
+      // Escape metacharacters (match literally) and cap length. An unescaped,
+      // unbounded term is both a regex-injection and a ReDoS vector against Mongo.
+      const safe = escapeRegExp(search.slice(0, 200));
       query.$or = [
-        { url: { $regex: search, $options: 'i' } },
-        { title: { $regex: search, $options: 'i' } },
+        { url: { $regex: safe, $options: 'i' } },
+        { title: { $regex: safe, $options: 'i' } },
       ];
     }
 

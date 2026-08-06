@@ -1,0 +1,12 @@
+{
+  "_fixture": "OpenRouter chat/completions — Kimi K2 analyzer returning valid extraction JSON. HAND-CRAFTED to match analyzeResponse parsing (aiTrackerScanEngine.js:1054-1084, choices[0].message.content); replace with a real capture via fixtures/record.js when keys are available.",
+  "choices": [
+    {
+      "message": {
+        "content": "{\"brands\":[\"SupaRank\",\"Ahrefs\",\"Semrush\"],\"citationUrls\":[\"https://suparank.com/features\",\"https://ahrefs.com/blog/seo-tools\",\"https://www.semrush.com/blog/best-seo-tools\",\"https://www.g2.com/categories/seo\"],\"sentiment\":{\"label\":\"positive\",\"score\":85}}"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": { "prompt_tokens": 310, "completion_tokens": 74 }
+}

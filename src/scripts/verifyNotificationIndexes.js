@@ -38,7 +38,7 @@ async function liveIndexes(Model) {
 async function run() {
   const uri = process.env.MONGODB_URI;
   if (!uri) throw new Error('MONGODB_URI not set');
-  await mongoose.connect(uri, { dbName: 'suparank' });
+  await mongoose.connect(uri, { dbName: process.env.DB_NAME || 'suparank' });
   console.log('Connected to MongoDB\n');
 
   if (process.argv.includes('--sync')) {

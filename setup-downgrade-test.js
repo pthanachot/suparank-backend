@@ -13,10 +13,15 @@
  * Run:  node setup-downgrade-test.js
  */
 
+require('dotenv').config();
 const mongoose = require('mongoose');
 const http = require('http');
 
-const MONGO_URI = 'mongodb+srv://octgram-staging:MHhBWiVGyrXwNkPn@acequiz-staging.ot3bg1v.mongodb.net/suparank?retryWrites=true&w=majority';
+const MONGO_URI = process.env.MONGODB_URI;
+if (!MONGO_URI) {
+  console.error('Set MONGODB_URI to run this script.');
+  process.exit(1);
+}
 const API_PORT = 4001;
 
 const ACCT = {
@@ -65,7 +70,7 @@ async function main() {
 
   // ── 2. MongoDB setup ──────────────────────────────────────
   console.log('\n=== 2. MongoDB ===');
-  await mongoose.connect(MONGO_URI);
+  await mongoose.connect(MONGO_URI, { dbName: process.env.DB_NAME || 'suparank' });
   const db = mongoose.connection.db;
   const users       = db.collection('users');
   const orgs        = db.collection('organizations');

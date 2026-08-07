@@ -4,9 +4,9 @@
  * These exercise real Mongoose behavior (cascade hooks, status reconciliation,
  * activePlanId integrity). They require a MongoDB the test process can write
  * to. To keep the test suite runnable without infrastructure, the whole file
- * is skipped when MONGODB_TEST_URI is unset.
+ * is skipped when MONGO_TEST_URI is unset.
  *
- *   MONGODB_TEST_URI=mongodb://localhost:27017/suparank-test node --test tests/planModel.test.js
+ *   MONGO_TEST_URI=mongodb://localhost:27017/suparank-test node --test tests/planModel.test.js
  *
  * Each test uses a unique workspaceNumber+contentNumber pair (current millis
  * + a small random) so parallel runs don't collide.
@@ -15,7 +15,7 @@ const { describe, it, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const mongoose = require('mongoose');
 
-const TEST_URI = process.env.MONGODB_TEST_URI;
+const TEST_URI = process.env.MONGO_TEST_URI;
 const RUN = !!TEST_URI;
 
 const Plan = RUN ? require('../src/models/Plan') : null;
@@ -80,7 +80,7 @@ if (RUN) {
     await Content.deleteMany({ workspaceId: workspace._id });
   });
 } else {
-  describe('Plan model (skipped — set MONGODB_TEST_URI to run)', () => {
+  describe('Plan model (skipped — set MONGO_TEST_URI to run)', () => {
     it('skip', () => assert.ok(true));
   });
 }

@@ -6,7 +6,7 @@
  * the most recently updated/created — and deletes the rest along with their
  * CrawlPage children. Idempotent: a second run finds no groups and removes nothing.
  *
- *   node src/scripts/dedupeSitemaps.js        # uses MONGODB_URI / MONGO_URI
+ *   node src/scripts/dedupeSitemaps.js        # uses MONGODB_URI / DB_NAME
  */
 
 const mongoose = require('mongoose');
@@ -44,9 +44,9 @@ module.exports = { dedupeSitemaps };
 
 if (require.main === module) {
   (async () => {
-    const uri = process.env.MONGODB_URI || process.env.MONGO_URI;
-    if (!uri) { console.error('Set MONGODB_URI (or MONGO_URI) to run this migration.'); process.exit(1); }
-    await mongoose.connect(uri);
+    const uri = process.env.MONGODB_URI;
+    if (!uri) { console.error('Set MONGODB_URI to run this migration.'); process.exit(1); }
+    await mongoose.connect(uri, { dbName: process.env.DB_NAME || 'suparank' });
     const result = await dedupeSitemaps();
     console.log('[dedupeSitemaps]', result);
     // Build the unique index now that duplicates are gone.

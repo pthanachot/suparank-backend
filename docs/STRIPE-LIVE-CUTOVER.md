@@ -128,6 +128,8 @@ unmapped — check the webhook endpoint's delivery log and re-run step 4's `veri
 
 ## Rollback
 
-Revert `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_CONNECT_WEBHOOK_SECRET` and the 11
-price vars to their test values (see `backend/.env.pre-stripe-test.bak`) and redeploy. Test-mode
-subscriptions are unaffected by live-mode objects.
+Revert `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_CONNECT_WEBHOOK_SECRET` to their
+test values (retrieve from the Stripe Dashboard in test mode) and UNSET the 11 price vars —
+the test-mode price ids are the hardcoded fallbacks in `src/config/stripePrices.js`, used
+whenever the env vars are unset. Redeploy. Test-mode subscriptions are unaffected by
+live-mode objects.

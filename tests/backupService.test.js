@@ -107,6 +107,30 @@ describe('runBackup', () => {
     assert.ok(args.includes('--gzip'));
   });
 
+  it('passes a path-less URI to mongodump even when MONGODB_URI carries a db path', async () => {
+    process.env.MONGODB_URI = 'mongodb+srv://testuser:secretpass@example.mongodb.net/otherdb?retryWrites=true';
+    const rec = await backupService.runBackup('tester@x.com');
+    assert.equal(rec.status, 'success');
+    const args = execState.calls[0].args;
+    const uriIdx = args.indexOf('--uri');
+    assert.equal(
+      args[uriIdx + 1],
+      'mongodb+srv://testuser:secretpass@example.mongodb.net/?retryWrites=true',
+      'URI path must be stripped so --db stays valid'
+    );
+  });
+
+  it('names the archive after DB_NAME so per-database dumps stay distinguishable', async () => {
+    process.env.DB_NAME = 'cutovertest';
+    const rec = await backupService.runBackup('tester@x.com');
+    assert.ok(
+      path.basename(rec.path).startsWith('cutovertest-'),
+      `archive should be named after the db, got ${path.basename(rec.path)}`
+    );
+    const args = execState.calls[0].args;
+    assert.ok(args.includes('--db') && args.includes('cutovertest'), 'dump scoped to DB_NAME');
+  });
+
   it('marks failures, removes the partial file, and sanitizes credentials', async () => {
     execState.fail = new Error(
       `connection refused for mongodb+srv://testuser:secretpass@example.mongodb.net/ (auth failed)`
@@ -140,6 +164,32 @@ describe('runBackup', () => {
     execState.fail = null;
     const rec = await backupService.runBackup('b@x.com');
     assert.equal(rec.status, 'success');
+  });
+});
+
+describe('stripUriPath', () => {
+  const { stripUriPath } = backupService;
+
+  it('strips a database path while preserving the query string', () => {
+    assert.equal(
+      stripUriPath('mongodb+srv://u:p@example.mongodb.net/somedb?retryWrites=true'),
+      'mongodb+srv://u:p@example.mongodb.net/?retryWrites=true'
+    );
+  });
+
+  it('leaves a path-less URI unchanged', () => {
+    assert.equal(
+      stripUriPath('mongodb+srv://u:p@example.mongodb.net/?retryWrites=true'),
+      'mongodb+srv://u:p@example.mongodb.net/?retryWrites=true'
+    );
+    assert.equal(stripUriPath('mongodb://localhost:27017'), 'mongodb://localhost:27017');
+  });
+
+  it('handles multi-host mongodb:// URIs', () => {
+    assert.equal(
+      stripUriPath('mongodb://h1:27017,h2:27018/mydb?replicaSet=rs0'),
+      'mongodb://h1:27017,h2:27018/?replicaSet=rs0'
+    );
   });
 });
 

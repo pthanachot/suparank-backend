@@ -6,6 +6,8 @@ node_modules/
 .env.*
 *.env
 .env*.bak
+# …except the placeholder template, which SHOULD ship with the repo
+!.env.example
 npm-debug.log
 yarn-error.log
 .DS_Store
@@ -28,6 +30,7 @@ src/routes/devRoutes.js
 !/scripts/e2eSeed.js
 !/scripts/chaos/
 !/scripts/preflightImage.js
+!/scripts/preflightDb.js
 
 # Database backup archives (admin-triggered mongodump output)
 /backups/

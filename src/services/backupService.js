@@ -39,6 +39,18 @@ function sanitize(text) {
   return String(text).replace(/mongodb(\+srv)?:\/\/\S+/g, '<mongodb-uri>');
 }
 
+// Normalize a connection string to path-less form (query string preserved).
+// The app ignores any database in the URI path (the dbName connect option
+// wins), but mongodump errors when --db names a DIFFERENT database than the
+// URI path — so a URI like mongodb+srv://host/otherdb?x would break backups
+// while the app itself runs fine. Stripping the path keeps the dump pinned to
+// the same database the app actually uses (mismatches are warned about at the
+// call site, since stripping also removes mongodump's own mismatch error).
+function stripUriPath(uri) {
+  if (!uri) return uri;
+  return String(uri).replace(/^((mongodb(?:\+srv)?):\/\/[^/?]+)\/[^?]*/, '$1/');
+}
+
 async function markStaleRunning() {
   // Records are only created after `running` flips true and settle before it
   // flips back — so when this process is idle, a 'running' record can only be
@@ -78,8 +90,12 @@ async function runBackup(triggeredBy) {
   running = true;
 
   const dir = effectiveDirectory();
+  const dbName = process.env.DB_NAME || 'suparank';
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const file = path.join(dir, `suparank-${stamp}.archive.gz`);
+  // db name in the filename so archives from different databases/clusters
+  // stay distinguishable on disk (e.g. across a DB migration); basename() so
+  // a mis-set DB_NAME (e.g. 'a/b') can never write outside the backup dir.
+  const file = path.join(dir, `${path.basename(dbName)}-${stamp}.archive.gz`);
   const record = await BackupRecord.create({
     status: 'running',
     startedAt: new Date(),
@@ -90,10 +106,14 @@ async function runBackup(triggeredBy) {
   try {
     fs.mkdirSync(dir, { recursive: true });
 
-    const dbName = process.env.DB_NAME || 'suparank';
-    // --db narrows the dump to the app database; valid alongside --uri
-    // because MONGODB_URI carries no database path.
-    const args = ['--uri', process.env.MONGODB_URI, '--db', dbName, `--archive=${file}`, '--gzip'];
+    // --db pins the dump to the app database. The URI is normalized to
+    // path-less form first (see stripUriPath) so --db stays valid even if
+    // someone sets a URI with a database path.
+    const uriDb = (process.env.MONGODB_URI || '').match(/^mongodb(?:\+srv)?:\/\/[^/?]+\/([^?]+)/);
+    if (uriDb && uriDb[1] !== dbName) {
+      console.warn(`[backup] MONGODB_URI path names '${uriDb[1]}' but DB_NAME is '${dbName}' — dumping '${dbName}', the database the app uses`);
+    }
+    const args = ['--uri', stripUriPath(process.env.MONGODB_URI), '--db', dbName, `--archive=${file}`, '--gzip'];
     await execFileAsync('mongodump', args, { timeout: DUMP_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 });
 
     record.status = 'success';
@@ -131,4 +151,4 @@ async function listBackups(limit = 10) {
   return BackupRecord.find().sort({ startedAt: -1 }).limit(limit).lean();
 }
 
-module.exports = { runBackup, listBackups, effectiveDirectory, isRunning, pruneOldBackups };
+module.exports = { runBackup, listBackups, effectiveDirectory, isRunning, pruneOldBackups, stripUriPath };

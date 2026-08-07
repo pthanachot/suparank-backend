@@ -197,7 +197,10 @@ async function main() {
   try {
     const mongoose = require('mongoose');
     if (process.env.MONGODB_URI) {
-      await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 3000 });
+      await mongoose.connect(process.env.MONGODB_URI, {
+        dbName: process.env.DB_NAME || 'suparank',
+        serverSelectionTimeoutMS: 3000,
+      });
       // findOne, NOT systemSettingsService.loadSettings(): that helper upserts
       // the singleton, so calling it here would make this pre-flight WRITE to
       // the production settings collection. Harmless in effect, but a script

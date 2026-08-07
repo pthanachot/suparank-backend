@@ -19,7 +19,7 @@ const Organization = require('../models/Organization');
 const User = require('../models/User');
 
 async function migrate() {
-  await mongoose.connect(process.env.MONGODB_URI);
+  await mongoose.connect(process.env.MONGODB_URI, { dbName: process.env.DB_NAME || 'suparank' });
   console.log('Connected to MongoDB');
 
   const subscriptions = await Subscription.find({

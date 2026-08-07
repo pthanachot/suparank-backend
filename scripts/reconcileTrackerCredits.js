@@ -12,7 +12,7 @@
  *      applied twice or a deduction raced past its guard.
  *
  * Usage:
- *   node scripts/reconcileTrackerCredits.js          # uses MONGODB_URI/MONGO_URI
+ *   node scripts/reconcileTrackerCredits.js          # uses MONGODB_URI / DB_NAME
  *   MONGODB_URI=... node scripts/reconcileTrackerCredits.js
  *
  * Exits 0 when clean, 1 when any anomaly is found, 2 on connection failure.
@@ -136,13 +136,13 @@ async function reconcile({ now = Date.now() } = {}) {
 }
 
 async function main() {
-  const uri = process.env.MONGODB_URI || process.env.MONGO_URI;
+  const uri = process.env.MONGODB_URI;
   if (!uri) {
-    console.error('[reconcile] no MONGODB_URI / MONGO_URI set');
+    console.error('[reconcile] no MONGODB_URI set');
     process.exit(2);
   }
   try {
-    await mongoose.connect(uri);
+    await mongoose.connect(uri, { dbName: process.env.DB_NAME || 'suparank' });
   } catch (e) {
     console.error('[reconcile] connection failed:', e.message);
     process.exit(2);

@@ -26,6 +26,7 @@ require('./utils/requireEnv')({
     'B2_KEY_ID',
     'B2_APP_KEY',
     'CHATGPT_API_KEY',
+    'EXPECTED_DB_HOST',
   ],
 });
 
@@ -775,6 +776,9 @@ app.get('/health', async (req, res) => {
   res.status(db.isConnected ? 200 : 503).json({
     status: db.isConnected ? 'ok' : 'error',
     database: db.state,
+    // Boolean only — /health is public and must not leak the cluster host;
+    // the host itself is in the boot log line "MongoDB connected: …".
+    expectedHostMatch: db.expectedHostMatch,
     engine,
     uptime: Math.floor(process.uptime()),
   });

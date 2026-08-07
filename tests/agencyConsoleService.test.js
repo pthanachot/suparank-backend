@@ -16,6 +16,8 @@ const AgencyPlan = require('../src/models/AgencyPlan');
 const Workspace = require('../src/models/Workspace');
 const WorkspaceUsageTracker = require('../src/models/WorkspaceUsageTracker');
 const Organization = require('../src/models/Organization');
+const ReportSnapshot = require('../src/models/ReportSnapshot');
+const ReportShare = require('../src/models/ReportShare');
 const creditService = require('../src/services/creditService');
 
 function leanQuery(val) {
@@ -23,11 +25,14 @@ function leanQuery(val) {
 }
 
 let subs, plans, workspaces, usage, orgLifecycle, balance;
+let reportAggRows, shareRows, reportAggError, reportAggPipeline;
 const origs = {};
 
 beforeEach(() => {
   subs = []; plans = []; workspaces = []; usage = []; orgLifecycle = 'active';
   balance = { subscription: 100, general: 50, total: 150, expiresAt: null };
+  // Phase 8 latest-report join fixtures
+  reportAggRows = []; shareRows = []; reportAggError = null;
 
   origs.csFind = ClientSubscription.find;
   origs.planFind = AgencyPlan.find;
@@ -35,6 +40,8 @@ beforeEach(() => {
   origs.utFind = WorkspaceUsageTracker.find;
   origs.orgFindById = Organization.findById;
   origs.getBalance = creditService.getBalance;
+  origs.snapAggregate = ReportSnapshot.aggregate;
+  origs.shareFind = ReportShare.find;
 
   ClientSubscription.find = () => leanQuery(subs);
   AgencyPlan.find = () => leanQuery(plans);
@@ -42,12 +49,20 @@ beforeEach(() => {
   WorkspaceUsageTracker.find = () => leanQuery(usage);
   Organization.findById = () => leanQuery({ _id: 'org1', name: 'Acme', lifecycleStatus: orgLifecycle });
   creditService.getBalance = async () => balance;
+  reportAggPipeline = null;
+  ReportSnapshot.aggregate = async (pipeline) => {
+    reportAggPipeline = pipeline;
+    if (reportAggError) throw reportAggError;
+    return reportAggRows;
+  };
+  ReportShare.find = () => leanQuery(shareRows);
 });
 
 afterEach(() => {
   ClientSubscription.find = origs.csFind; AgencyPlan.find = origs.planFind;
   Workspace.find = origs.wsFind; WorkspaceUsageTracker.find = origs.utFind;
   Organization.findById = origs.orgFindById; creditService.getBalance = origs.getBalance;
+  ReportSnapshot.aggregate = origs.snapAggregate; ReportShare.find = origs.shareFind;
 });
 
 const plan = (o) => ({ _id: 'pl1', name: 'Starter', amount: 4900, currency: 'usd', interval: 'month', limits: { creditsPerMonth: 1000 }, ...o });
@@ -189,5 +204,84 @@ describe('getAgencyOverview', () => {
     creditService.getBalance = async () => { throw new Error('down'); };
     const o = await svc.getAgencyOverview('org1', '2026-07');
     assert.equal(o.credits, null);
+  });
+});
+
+// ─── Phase 8: latest-report join ─────────────────────────────────
+
+describe('getClientRoster latestReport (Phase 8)', () => {
+  it('joins the newest snapshot headline + live-share flag per workspace', async () => {
+    subs = [sub(), sub({ _id: 's2', workspaceId: 'ws2', clientEmail: 'b@x.co' })];
+    plans = [plan()];
+    workspaces = [ws(), ws({ _id: 'ws2', workspaceNumber: 8, name: 'Client B' })];
+    reportAggRows = [
+      {
+        _id: 'ws1',
+        reportId: 'r1',
+        period: '2026-06',
+        generatedAt: new Date('2026-07-01T03:30:00Z'),
+        latest: { visibility: 62, mentionRate: 70, shareOfVoice: 40 },
+      },
+    ];
+    shareRows = [{ reportId: 'r1' }];
+
+    const roster = await svc.getClientRoster('org1', '2026-07');
+    const a = roster.clients.find((c) => c.workspaceId === 'ws1');
+    const b = roster.clients.find((c) => c.workspaceId === 'ws2');
+
+    assert.deepEqual(a.latestReport, {
+      period: '2026-06',
+      generatedAt: new Date('2026-07-01T03:30:00Z'),
+      visibility: 62,
+      shareOfVoice: 40,
+      hasShare: true,
+    });
+    // No snapshot ever generated → explicit null, not a throw
+    assert.equal(b.latestReport, null);
+  });
+
+  it('the aggregation projects slim rows BEFORE sorting (memory-safety shape)', async () => {
+    subs = [sub()];
+    plans = [plan()];
+    workspaces = [ws()];
+
+    await svc.getClientRoster('org1', '2026-07');
+
+    const stages = reportAggPipeline.map((s) => Object.keys(s)[0]);
+    // $project must precede $sort — $sort buffers whole docs, and
+    // snapshot.data carries the full enriched report.
+    assert.deepEqual(stages, ['$match', '$project', '$sort', '$group']);
+    assert.deepEqual(reportAggPipeline[0].$match.workspaceId, { $in: ['ws1'] });
+    // The projection maps the headline out of data and passes data itself no further
+    assert.equal(reportAggPipeline[1].$project.latest, '$data.tracker.latest');
+    assert.equal(reportAggPipeline[1].$project.data, undefined);
+  });
+
+  it('a snapshot with no tracker data yields null metrics, not NaN', async () => {
+    subs = [sub()];
+    plans = [plan()];
+    workspaces = [ws()];
+    reportAggRows = [
+      { _id: 'ws1', reportId: 'r1', period: '2026-06', generatedAt: null, latest: null },
+    ];
+
+    const roster = await svc.getClientRoster('org1', '2026-07');
+    const a = roster.clients[0];
+    assert.equal(a.latestReport.visibility, null);
+    assert.equal(a.latestReport.shareOfVoice, null);
+    assert.equal(a.latestReport.hasShare, false);
+  });
+
+  it('a report-side failure degrades to latestReport null — the billing roster survives', async () => {
+    subs = [sub()];
+    plans = [plan()];
+    workspaces = [ws()];
+    reportAggError = new Error('reports collection unavailable');
+
+    const roster = await svc.getClientRoster('org1', '2026-07');
+    assert.equal(roster.clients.length, 1);
+    assert.equal(roster.clients[0].latestReport, null);
+    // Billing fields intact
+    assert.equal(roster.clients[0].mrrCents, 4900);
   });
 });

@@ -30,6 +30,8 @@ const AgencyPlan = require('../models/AgencyPlan');
 const Workspace = require('../models/Workspace');
 const WorkspaceUsageTracker = require('../models/WorkspaceUsageTracker');
 const Organization = require('../models/Organization');
+const ReportSnapshot = require('../models/ReportSnapshot');
+const ReportShare = require('../models/ReportShare');
 const creditService = require('./creditService');
 const tierService = require('./tierService');
 const { BILLED_STATUSES } = require('./workspaceQuotaService');
@@ -104,6 +106,55 @@ async function getClientRoster(orgId, period) {
   const planById = new Map(plans.map((pl) => [String(pl._id), pl]));
   const usageByWs = new Map(usageRows.map((u) => [String(u.workspaceId), u]));
 
+  // Phase 8 (client reports): latest report per client workspace — the
+  // portfolio view (who's slipping, which report to lead with). Aggregation
+  // projects ONLY the headline metrics, never whole `data` docs (they carry
+  // the full enriched report). Isolated failure: a report-side error must
+  // degrade to latestReport: null, never break the billing roster.
+  let reportByWs = new Map();
+  try {
+    const [snapRows, shareRows] = await Promise.all([
+      ReportSnapshot.aggregate([
+        { $match: { workspaceId: { $in: workspaceIds } } },
+        // Project BEFORE sorting: $sort buffers whole documents, and
+        // snapshot.data now carries the full enriched report (tens of KB
+        // per month per client) — sorting slim rows keeps the stage far
+        // from Mongo's 100MB in-memory limit as history accretes.
+        { $project: { workspaceId: 1, period: 1, generatedAt: 1, latest: '$data.tracker.latest' } },
+        { $sort: { workspaceId: 1, period: -1 } },
+        {
+          $group: {
+            _id: '$workspaceId',
+            reportId: { $first: '$_id' },
+            period: { $first: '$period' },
+            generatedAt: { $first: '$generatedAt' },
+            latest: { $first: '$latest' },
+          },
+        },
+      ]),
+      ReportShare.find({
+        workspaceId: { $in: workspaceIds },
+        internal: { $ne: true },
+        expiresAt: { $gt: new Date() },
+      }).select('reportId').lean(),
+    ]);
+    const sharedReportIds = new Set(shareRows.map((r) => String(r.reportId)));
+    reportByWs = new Map(
+      snapRows.map((r) => [
+        String(r._id),
+        {
+          period: r.period,
+          generatedAt: r.generatedAt || null,
+          visibility: typeof r.latest?.visibility === 'number' ? r.latest.visibility : null,
+          shareOfVoice: typeof r.latest?.shareOfVoice === 'number' ? r.latest.shareOfVoice : null,
+          hasShare: sharedReportIds.has(String(r.reportId)),
+        },
+      ])
+    );
+  } catch (err) {
+    console.error('[agency-console] latest-report join failed:', err.message);
+  }
+
   const clients = primaries.map((sub) => {
     const ws = wsById.get(String(sub.workspaceId));
     const plan = sub.agencyPlanId ? planById.get(String(sub.agencyPlanId)) : null;
@@ -132,6 +183,7 @@ async function getClientRoster(orgId, period) {
       currentPeriodEnd: sub.currentPeriodEnd || null,
       locked: !!ws?.clientLocked,
       creditsLimit: plan?.limits?.creditsPerMonth ?? null,
+      latestReport: reportByWs.get(String(sub.workspaceId)) || null,
       usage: u
         ? {
             creditsUsed: u.creditsUsed || 0,

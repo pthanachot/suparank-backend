@@ -338,6 +338,7 @@ const deleteWorkspace = async (req, res) => {
       { model: 'BrandVoice',             filter: { workspace: workspaceId } },
       { model: 'Avatar',                 filter: { workspace: workspaceId } },
       { model: 'Site',                   filter: { workspaceId } },
+      { model: 'GscPeriodStat',          filter: { workspaceId } },
     ];
     for (const { model: name, filter } of cascadeModels) {
       const Model = mongoose.models[name];

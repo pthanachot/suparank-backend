@@ -12,6 +12,7 @@
 
 const BrandConfig = require('../models/BrandConfig');
 const tierService = require('./tierService');
+const flagService = require('./flagService');
 
 // What SupaRank looks like when nothing is configured.
 const HARDCODED_DEFAULTS = Object.freeze({
@@ -114,7 +115,11 @@ async function isSaasModeEntitled(organizationId) {
 
 /**
  * Fully-resolved brand for an org. Falls back to the platform brand when
- * the org has no config or lost the entitlement.
+ * the org has no config, lost the entitlement, or the whiteLabel launch
+ * flag is off (Phase 8: the flag is the ops kill-switch — flipping it off
+ * de-brands public reports/emails within the 5-min flag cache, same
+ * dark-ship semantics as customDomains). `entitled` still reports the TIER
+ * entitlement so settings UIs can distinguish "upgrade" from "switched off".
  * Returns { brand, entitled, hasConfig }.
  */
 async function getBrandForOrg(organizationId) {
@@ -123,14 +128,15 @@ async function getBrandForOrg(organizationId) {
     return { brand: platformBrand, entitled: false, hasConfig: false, config: null };
   }
 
-  const [platformBrand, doc, entitled] = await Promise.all([
+  const [platformBrand, doc, entitled, flagLive] = await Promise.all([
     getPlatformBrand(),
     _getDoc(BrandConfig.scopeKeyFor(organizationId)),
     isWhiteLabelEntitled(organizationId),
+    flagService.isFlagLive('whiteLabel'),
   ]);
 
   return {
-    brand: entitled ? _merge(platformBrand, doc) : platformBrand,
+    brand: entitled && flagLive ? _merge(platformBrand, doc) : platformBrand,
     entitled,
     hasConfig: Boolean(doc),
     config: doc, // raw overrides — saves callers a second findOne

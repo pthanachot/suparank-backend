@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const Site = require('../models/Site');
 const GscConnection = require('../models/GscConnection');
+const GscPeriodStat = require('../models/GscPeriodStat');
 const gscService = require('../services/gscService');
 const tierService = require('../services/tierService');
 
@@ -165,12 +166,15 @@ const updatePersistData = async (req, res) => {
       { $set: { persistData } }
     );
 
-    // When toggling OFF: clear snapshotStats from all org sites
+    // When toggling OFF: clear snapshotStats from all org sites AND the
+    // per-month period rows (Phase 2) — the opt-out means NO persisted GSC
+    // data, and a monthly history is more data than the snapshot it mirrors.
     if (!persistData) {
       await Site.updateMany(
         { organizationId: orgId },
         { $set: { snapshotStats: null, syncStatus: 'idle', syncError: null } }
       );
+      await GscPeriodStat.deleteMany({ organizationId: orgId });
     }
 
     // When toggling ON: trigger a fresh sync for all org sites
@@ -291,6 +295,8 @@ const deleteSite = async (req, res) => {
       workspaceId: req.workspace._id,
     });
     if (!site) return res.status(404).json({ error: 'Site not found' });
+    // Phase 2: per-month period rows are keyed by siteId — remove with the site
+    await GscPeriodStat.deleteMany({ siteId: site._id });
     res.json({ message: 'Site disconnected' });
   } catch (err) {
     if (handleMongooseError(res, err)) return;

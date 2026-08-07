@@ -4128,6 +4128,10 @@ module.exports = {
   dismissMonitorSuggestedCompetitor,
   // Shared (works for both legacy and multi-monitor via req.params.monitorId)
   getScanDetails,
+  // Report layer (client report "What's next" section, reportService):
+  // pure function of a prompt's scan result vs its previous result —
+  // safe to call at snapshot-generation time, no req/res involved.
+  generatePromptSuggestions,
   // Dev helpers (no-op in production since _devTimeScale defaults to 1)
   setDevTimeScale,
   getDevTimeScale,

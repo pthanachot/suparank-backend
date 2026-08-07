@@ -39,6 +39,7 @@ const WorkspaceUsageTracker = require('../models/WorkspaceUsageTracker');
 const WorkspaceMember = require('../models/WorkspaceMember');
 const ClientSubscription = require('../models/ClientSubscription');
 const Site = require('../models/Site');
+const GscPeriodStat = require('../models/GscPeriodStat');
 const Sitemap = require('../models/Sitemap');
 const CrawlPage = require('../models/CrawlPage');
 const BrandVoice = require('../models/BrandVoice');
@@ -246,6 +247,7 @@ async function deleteWorkspaceData(workspaceId, counts = {}) {
   await _del(counts, 'workspaceMembers', WorkspaceMember, { workspaceId });
   await _del(counts, 'clientSubscriptions', ClientSubscription, { workspaceId });
   await _del(counts, 'sites', Site, { workspaceId });
+  await _del(counts, 'gscPeriodStats', GscPeriodStat, { workspaceId });
   // BrandVoice & Avatar are scoped by `workspace`, NOT `workspaceId`.
   await _del(counts, 'brandVoices', BrandVoice, { workspace: workspaceId });
   await _del(counts, 'avatars', Avatar, { workspace: workspaceId });
@@ -298,6 +300,7 @@ async function deleteOrgData(orgId, counts = {}) {
   await _del(counts, 'reportSnapshots', ReportSnapshot, { organizationId: orgId });
   await _del(counts, 'reportShares', ReportShare, { organizationId: orgId });
   await _del(counts, 'sites', Site, { organizationId: orgId });
+  await _del(counts, 'gscPeriodStats', GscPeriodStat, { organizationId: orgId });
   // CrawlPage is scoped by sitemapId, so collect ids BEFORE the org-level Sitemap
   // sweep — any sitemap reached here (rather than by the per-workspace pass, e.g.
   // one whose workspaceId no longer maps to a live workspace) would otherwise

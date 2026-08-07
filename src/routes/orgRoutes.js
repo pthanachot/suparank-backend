@@ -35,10 +35,16 @@ router.delete('/organizations/:orgId/members/:memberId', orgMemberController.rem
 router.delete('/organizations/:orgId/invites/:inviteId', orgMemberController.revokeInvite);
 router.get('/organizations/:orgId/audit-log', orgMemberController.listAuditLog);
 
-// White-label brand settings
+// White-label brand settings — Phase 8: behind the whiteLabel launch flag
+// (ops kill-switch, same dark-ship semantics as customDomains below; the
+// agency-tier entitlement is enforced separately in brandService, which
+// checks :orgId's tier — see configFeatureFlags for why the flag itself
+// carries no minimumPlan).
 const brandController = require('../controllers/brandController');
-router.get('/organizations/:orgId/brand', brandController.getOrgBrand);
-router.put('/organizations/:orgId/brand', brandController.updateOrgBrand);
+const { requireFeature: rfFlag } = require('../middleware/permissions');
+const rfWhiteLabel = rfFlag('whiteLabel');
+router.get('/organizations/:orgId/brand', rfWhiteLabel, brandController.getOrgBrand);
+router.put('/organizations/:orgId/brand', rfWhiteLabel, brandController.updateOrgBrand);
 
 // Tenant custom domains — behind the 'customDomains' feature flag
 // (enabled+implemented in configFeatureFlags.js; ships dark until launch).

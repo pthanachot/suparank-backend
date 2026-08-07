@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const GscConnection = require('../models/GscConnection');
 const { encrypt, decrypt } = GscConnection;
 const Site = require('../models/Site');
+const GscPeriodStat = require('../models/GscPeriodStat');
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 const GSC_SCOPE = 'https://www.googleapis.com/auth/webmasters.readonly';
@@ -590,6 +591,15 @@ async function refreshSiteStats(siteId) {
       },
     });
 
+    // Phase 2 (client reports): persist per-calendar-month rows so report
+    // generation reads the NAMED month, not this trailing-28d snapshot.
+    // Isolated failure — period rows must never fail the sync itself.
+    try {
+      await _upsertPeriodStats(site);
+    } catch (periodErr) {
+      console.error(`[sites] period stats upsert failed for ${siteId}:`, periodErr.message);
+    }
+
     console.log(`[sites] Stats refreshed for site ${siteId}`);
   } catch (err) {
     console.error(`[sites] Stats refresh failed for ${siteId}:`, err.message);
@@ -597,6 +607,123 @@ async function refreshSiteStats(siteId) {
       $set: { syncStatus: 'error', syncError: err.message },
     });
   }
+}
+
+// ─── Per-calendar-month period stats (Phase 2 — client reports) ────────────
+
+/** 'YYYY-MM' for a Date (UTC month — matches reportService period math). */
+function _monthPeriod(d) {
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+/**
+ * GSC query range for a calendar month, clamped to the freshest data GSC
+ * exposes (now - GSC_DATA_LAG_DAYS). Returns null while a month has no
+ * queryable days yet. endDate before the month's last day marks a partial
+ * (in-progress) row — persisted as rangeEnd so readers can label it.
+ */
+function _periodDateRange(period, now = new Date()) {
+  const m = /^(\d{4})-(\d{2})$/.exec(String(period || ''));
+  if (!m) return null;
+  const monthStart = new Date(Date.UTC(+m[1], +m[2] - 1, 1));
+  const monthEnd = new Date(Date.UTC(+m[1], +m[2], 0)); // last day of month
+  const freshest = new Date(now.getTime() - GSC_DATA_LAG_DAYS * 24 * 60 * 60 * 1000);
+  const end = monthEnd < freshest ? monthEnd : freshest;
+  if (end < monthStart) return null;
+  return { startDate: formatDate(monthStart), endDate: formatDate(end) };
+}
+
+/**
+ * Upsert per-month GSC rows for the previous + current calendar month.
+ * Two months per sync is deliberately self-healing: while a month is in
+ * progress its row is partial (GSC data lag), and the first syncs of the
+ * NEXT month finalize it via the previous-month upsert. `query` and `now`
+ * are injectable for tests; production callers pass the site doc only.
+ */
+async function _upsertPeriodStats(site, { now = new Date(), query = querySearchAnalytics } = {}) {
+  const prevMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+  const periods = [_monthPeriod(prevMonth), _monthPeriod(now)];
+
+  for (const period of periods) {
+    const range = _periodDateRange(period, now);
+    if (!range) continue;
+
+    const [totalsRes, topQueriesRes] = await Promise.all([
+      query(site.organizationId, site.gscPropertyId, {
+        startDate: range.startDate,
+        endDate: range.endDate,
+        dimensions: [],
+      }),
+      query(site.organizationId, site.gscPropertyId, {
+        startDate: range.startDate,
+        endDate: range.endDate,
+        dimensions: ['query'],
+        rowLimit: 10,
+      }),
+    ]);
+
+    const totals = totalsRes.rows?.[0] || { clicks: 0, impressions: 0, ctr: 0, position: 0 };
+    await GscPeriodStat.findOneAndUpdate(
+      { siteId: site._id, period },
+      {
+        $set: {
+          workspaceId: site.workspaceId,
+          organizationId: site.organizationId || null,
+          clicks: totals.clicks || 0,
+          impressions: totals.impressions || 0,
+          ctr: +((totals.ctr || 0) * 100).toFixed(2), // percent, snapshotStats parity
+          position: +(totals.position || 0).toFixed(1),
+          topQueries: (topQueriesRes.rows || []).map((r) => ({
+            query: r.keys?.[0] || '',
+            clicks: r.clicks || 0,
+            impressions: r.impressions || 0,
+            ctr: +((r.ctr || 0) * 100).toFixed(2),
+            position: +(r.position || 0).toFixed(1),
+          })),
+          rangeStart: range.startDate,
+          rangeEnd: range.endDate,
+        },
+        $setOnInsert: { siteId: site._id, period },
+      },
+      { upsert: true }
+    );
+  }
+}
+
+/**
+ * Daily cron sweep: refresh stats for every verified site whose last sync
+ * is older than its per-site syncFrequency window (or that never synced).
+ * Pre-Phase-2, refreshSiteStats ran ONLY on user-triggered Sites visits —
+ * a workspace nobody opened all month reached the monthly report cron with
+ * stale or missing GSC data. The persistData opt-out is honored inside
+ * refreshSiteStats. Calls through module.exports so tests can stub the
+ * per-site refresh.
+ */
+async function sweepDueSiteStats({ now = new Date() } = {}) {
+  const dayMs = 24 * 60 * 60 * 1000;
+  // Tolerance keeps the fixed daily tick from skipping beats: yesterday's
+  // sweep stamps lastSyncAt minutes AFTER the tick, so a strict 24h window
+  // would find the site not-yet-due at today's tick and "daily" would
+  // degrade to every-other-day (same failure class the tracker cron guards
+  // with CRON_TOLERANCE). One hour covers any realistic sweep duration.
+  const toleranceMs = 60 * 60 * 1000;
+  const due = await Site.find({
+    verified: true,
+    gscPropertyId: { $ne: null },
+    $or: [
+      { lastSyncAt: null },
+      { syncFrequency: 'weekly', lastSyncAt: { $lte: new Date(now.getTime() - (7 * dayMs - toleranceMs)) } },
+      { syncFrequency: { $ne: 'weekly' }, lastSyncAt: { $lte: new Date(now.getTime() - (dayMs - toleranceMs)) } },
+    ],
+  })
+    .select('_id')
+    .lean();
+
+  // refreshSiteStats never throws (it records per-site sync errors), but
+  // allSettled guards the sweep against a future refactor changing that.
+  const results = await Promise.allSettled(due.map((s) => module.exports.refreshSiteStats(s._id)));
+  const refreshed = results.filter((r) => r.status === 'fulfilled').length;
+  return { due: due.length, refreshed };
 }
 
 module.exports = {
@@ -613,4 +740,9 @@ module.exports = {
   getKeywordPosition,
   getKeywordStats,
   refreshSiteStats,
+  sweepDueSiteStats,
+  // Exported as test seams (period-row unit tests inject `query`/`now`)
+  _upsertPeriodStats,
+  _periodDateRange,
+  _monthPeriod,
 };

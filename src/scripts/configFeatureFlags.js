@@ -216,13 +216,24 @@ const FLAGS = [
     },
   },
   {
+    // White-label branding (Phase 8 of the client-report work). LIVE: gates
+    // the org brand-settings routes (orgRoutes) AND brand resolution
+    // (brandService.getBrandForOrg) — flipping implemented:false de-brands
+    // public reports/emails within the 5-minute flag caches, mirroring the
+    // customDomains kill-switch semantics.
+    //
+    // Deliberately NO minimumPlan condition: the brand routes are
+    // org-scoped (no workspace context), where requireFeature's plan check
+    // would test the CALLER's personal org instead of :orgId. The
+    // agency-tier entitlement is enforced in brandService
+    // (isWhiteLabelEntitled → TierConfig custom.whiteLabel), which checks
+    // the right org and fails closed.
     key: 'whiteLabel',
     displayName: 'White Label',
     description: 'Custom branding for reports and the platform.',
     enabled: true,
-    implemented: false,
+    implemented: true,
     conditions: {
-      minimumPlan: 'agency',
       custom: {},
     },
   },

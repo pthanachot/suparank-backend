@@ -18,8 +18,20 @@ const assert = require('node:assert/strict');
 const fc = require('fast-check');
 
 const { computePosition } = require('../../src/services/aiTrackerScanEngine');
-const { __test } = require('../../src/controllers/aiTrackerController');
+const { __test, generatePromptSuggestions } = require('../../src/controllers/aiTrackerController');
 const { computeWeightedVisibility, computeMetrics } = __test;
+
+// ─── generatePromptSuggestions runtime export (report layer seam) ──────────
+// reportService (client report "What's next") consumes this at snapshot
+// generation time — it must stay a runtime export, not just a __test seam.
+describe('generatePromptSuggestions export', () => {
+  it('is a runtime export returning the 6 generic suggestions for a never-scanned prompt', () => {
+    assert.equal(typeof generatePromptSuggestions, 'function');
+    const generic = generatePromptSuggestions(null, null);
+    assert.equal(generic.length, 6);
+    assert.ok(generic.every((s) => typeof s === 'string' && s.length > 0));
+  });
+});
 
 describe('computePosition (F03 §2 Phase E table)', () => {
   it('table: dossier scenarios', () => {

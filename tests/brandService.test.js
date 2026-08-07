@@ -4,6 +4,7 @@ const mongoose = require('mongoose');
 
 const BrandConfig = require('../src/models/BrandConfig');
 const tierService = require('../src/services/tierService');
+const flagService = require('../src/services/flagService');
 const brandService = require('../src/services/brandService');
 
 const { ObjectId } = mongoose.Types;
@@ -11,6 +12,7 @@ const { ObjectId } = mongoose.Types;
 const originals = {
   findOne: BrandConfig.findOne,
   getOrgTierConfig: tierService.getOrgTierConfig,
+  isFlagLive: flagService.isFlagLive,
 };
 
 let state;
@@ -20,6 +22,7 @@ beforeEach(() => {
   state = {
     docs: {}, // scopeKey → doc
     tierCustom: {}, // orgId string → custom object
+    whiteLabelLive: true, // Phase 8: brand resolution consults the launch flag
   };
   BrandConfig.findOne = (filter) => ({
     lean: async () => state.docs[filter.scopeKey] || null,
@@ -28,11 +31,13 @@ beforeEach(() => {
     tier: 'agency',
     config: { custom: state.tierCustom[String(orgId)] || {} },
   });
+  flagService.isFlagLive = async (key) => (key === 'whiteLabel' ? state.whiteLabelLive : false);
 });
 
 afterEach(() => {
   BrandConfig.findOne = originals.findOne;
   tierService.getOrgTierConfig = originals.getOrgTierConfig;
+  flagService.isFlagLive = originals.isFlagLive;
 });
 
 const orgId = new ObjectId();
@@ -88,6 +93,33 @@ describe('brandService resolution', () => {
     const { brand, entitled } = await brandService.getBrandForOrg(orgId);
     assert.equal(entitled, false);
     assert.equal(brand.productName, 'SupaRank');
+  });
+});
+
+describe('brandService whiteLabel launch flag (Phase 8)', () => {
+  it('flag OFF forces the platform brand even for an entitled org with config', async () => {
+    state.tierCustom[String(orgId)] = { whiteLabel: true };
+    state.docs[BrandConfig.scopeKeyFor(orgId)] = { productName: 'AgencyBrand', hideAttribution: true };
+    state.whiteLabelLive = false;
+
+    const { brand, entitled, hasConfig } = await brandService.getBrandForOrg(orgId);
+
+    // Kill-switch semantics: branding reverts to platform…
+    assert.equal(brand.productName, 'SupaRank');
+    assert.equal(brand.hideAttribution, false);
+    // …but the TIER entitlement still reports true (settings UIs must be
+    // able to distinguish "upgrade needed" from "feature switched off")
+    assert.equal(entitled, true);
+    assert.equal(hasConfig, true);
+  });
+
+  it('flag ON restores the entitled merge unchanged', async () => {
+    state.tierCustom[String(orgId)] = { whiteLabel: true };
+    state.docs[BrandConfig.scopeKeyFor(orgId)] = { productName: 'AgencyBrand' };
+    state.whiteLabelLive = true;
+
+    const { brand } = await brandService.getBrandForOrg(orgId);
+    assert.equal(brand.productName, 'AgencyBrand');
   });
 });
 

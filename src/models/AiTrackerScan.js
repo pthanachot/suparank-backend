@@ -44,6 +44,12 @@ const competitorResultSchema = new mongoose.Schema({
   mentions: { type: Number, default: 0 },
   citations: { type: Number, default: 0 },
   visibility: { type: Number, default: 0 },
+  // Phase 3 (client reports): the scan engine has ALWAYS set isOwn on the
+  // own-brand row (runScan's ownBrandResult), but strict casting silently
+  // stripped it here — every isOwn read on persisted scans was dead code
+  // falling back to isSameBrand name matching. Declaring it makes new scans
+  // persist the flag; readers must keep the name fallback for older scans.
+  isOwn: { type: Boolean, default: false },
 }, { _id: false });
 
 const detectedBrandSchema = new mongoose.Schema({

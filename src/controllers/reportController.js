@@ -73,10 +73,47 @@ const listReports = async (req, res) => {
 const generateReport = async (req, res) => {
   try {
     const period = req.body?.period || reportService.currentPeriod();
+    const regenerate = req.body?.regenerate === true;
+    let commentary = req.body?.commentary;
+    if (commentary !== undefined) {
+      if (typeof commentary !== 'string') {
+        return res.status(400).json({ error: 'commentary must be a string' });
+      }
+      commentary = commentary.trim();
+      if (commentary.length > reportService.COMMENTARY_MAX_LENGTH) {
+        return res.status(400).json({
+          error: `commentary must be at most ${reportService.COMMENTARY_MAX_LENGTH} characters`,
+        });
+      }
+    }
+
+    // Phase 5 fast path: a commentary edit of an EXISTING snapshot must not
+    // re-aggregate — outcomes and the GSC fallback are current-state reads,
+    // so regenerating a past period would rewrite its numbers under the old
+    // heading. A full refresh is an explicit ask: { regenerate: true }.
+    if (commentary !== undefined && !regenerate) {
+      let updated;
+      try {
+        updated = await reportService.updateCommentary(req.workspace._id, period, commentary);
+      } catch (err) {
+        if (err.status) return res.status(err.status).json({ error: err.message });
+        throw err;
+      }
+      if (updated) {
+        auditService.fromReq(req, {
+          action: 'report.generate',
+          resourceId: updated._id,
+          meta: { period, commentaryOnly: true },
+        });
+        return res.json({ report: _serialize(updated) });
+      }
+      // No snapshot for this period yet — fall through to a full generation
+      // (which bakes the commentary alongside the fresh aggregate).
+    }
 
     let snapshot;
     try {
-      snapshot = await reportService.generateSnapshot(req.workspace._id, period);
+      snapshot = await reportService.generateSnapshot(req.workspace._id, period, { commentary });
     } catch (err) {
       if (err.status) return res.status(err.status).json({ error: err.message });
       throw err;

@@ -283,3 +283,30 @@ test('CREDIT_CASH_ACTIONS is the full must-gate set', () => {
     assert.ok(CREDIT_CASH_ACTIONS.includes(a), `${a} missing from CREDIT_CASH_ACTIONS`);
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// D. Phase 8 — client-role report access pins (workspace permission MATRIX)
+//
+// The white-label report contract: an external client reads reports and AI
+// visibility in-app, and can NEVER generate, share, or revoke. Report routes
+// map to these matrix cells (reportController header): list/get →
+// analysis:read, generate → analysis:use, share/revoke → members:manage.
+// ═══════════════════════════════════════════════════════════════════════
+
+const { MATRIX, ROLE_NAMES } = require('../src/scripts/configPermissions');
+
+test('client role: reads reports + AI visibility, can never generate or share', () => {
+  // MATRIX rows: [resource, action, owner, admin, editor, viewer, client]
+  const clientIdx = 2 + ROLE_NAMES.indexOf('client');
+  const cell = (resource, action) => {
+    const row = MATRIX.find((r) => r[0] === resource && r[1] === action);
+    assert.ok(row, `missing matrix row ${resource}:${action}`);
+    return row[clientIdx];
+  };
+
+  assert.equal(cell('analysis', 'read'), true, 'client reads reports in-app');
+  assert.equal(cell('analysis', 'use'), false, 'client cannot generate reports');
+  assert.equal(cell('members', 'manage'), false, 'client cannot share or revoke links');
+  assert.equal(cell('aiTracker', 'read'), true, 'client sees AI visibility');
+  assert.equal(cell('aiTracker', 'manage'), false, 'client cannot manage monitors');
+});

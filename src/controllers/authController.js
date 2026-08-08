@@ -64,7 +64,7 @@ const sendWelcomeEmail = async (user) => {
         // Welcome links to the platform login: sendWelcomeEmail has no
         // request context, and the whole template becomes tenant-scoped in
         // Phase 12 (per-tenant email templates) — solve it there.
-        loginUrl: `${process.env.FRONTEND_URL || 'https://app.suparank.ai'}/login`,
+        loginUrl: `${process.env.FRONTEND_URL || 'https://suparank.ai'}/login`,
       },
     };
     await applyCustomTemplate('welcome', emailOptions);

@@ -113,6 +113,16 @@ describe('logo resolution ladder', () => {
     assert.match(html, /src="https:\/\/staging\.suparank\.ai\/brand\/suparank-mark\.png"/);
   });
 
+  it('falls back to the canonical app origin when FRONTEND_URL is unset', async () => {
+    // The production origin is suparank.ai. It was app.suparank.ai here, which
+    // is a host the platform does not serve — an unset FRONTEND_URL would have
+    // put a dead logo and dead links in every email.
+    delete process.env.FRONTEND_URL;
+    const html = await render('welcome');
+    assert.match(html, /src="https:\/\/suparank\.ai\/brand\/suparank-mark\.png"/);
+    assert.doesNotMatch(html, /app\.suparank\.ai/);
+  });
+
   it("prefers the tenant's square mark over their wide lockup", async () => {
     brandService.getBrandForOrg = async () => ({
       brand: {

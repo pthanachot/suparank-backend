@@ -1211,7 +1211,7 @@ function advanceLastScannedAt(p, { scanStart, now, timeScale, singlePrompt = fal
   return now;
 }
 
-async function executeScan(trackerId, userId = null, { force = false, promptIds = null, costAction = 'trackerRefreshAll', bill = true } = {}) {
+async function executeScan(trackerId, userId = null, { force = false, promptIds = null, costAction = 'trackerRefreshAll', bill = true, trigger = null } = {}) {
   // promptIds  → restrict this run to specific prompts (Phase 8 single on-demand
   //              refresh). Implies force semantics for those prompts.
   // costAction → which credit-cost entry funds an on-demand run: 'trackerRefreshAll'
@@ -1380,7 +1380,16 @@ async function executeScan(trackerId, userId = null, { force = false, promptIds 
     }
 
     // ── 5. Create scan document
-    const scan = await AiTrackerScan.create({ trackerId, startedAt: new Date() });
+    // Wave 1 (§4c-1): trigger is passed EXPLICITLY by every caller — deriving
+    // it from userId would misclassify cron (which passes the workspace owner
+    // for credit routing) as a manual refresh. Fallback covers direct callers.
+    const scanTrigger = trigger || (promptIds ? 'single' : (userId ? 'refresh_all' : 'cron'));
+    const scan = await AiTrackerScan.create({
+      trackerId,
+      startedAt: new Date(),
+      trigger: scanTrigger,
+      triggeredBy: scanTrigger === 'cron' ? null : (userId || null),
+    });
     scanDocId = scan._id;
     await AiTracker.findByIdAndUpdate(trackerId, { $set: { currentScanId: scan._id } });
 
@@ -1655,64 +1664,29 @@ async function executeScan(trackerId, userId = null, { force = false, promptIds 
             : metrics.avgSentiment >= 40 ? `Neutral (${metrics.avgSentiment})`
             : `Negative (${metrics.avgSentiment})`;
 
-          // Per-platform rows (current scan only).
-          // platform names (p.name) come from PLATFORM_DISPLAY which is a
-          // server-controlled constant — safe — but escape anyway for
-          // defense-in-depth.
-          const platformRows = platStats.map((p) => {
-            const total = results.length - p.errorCount;
-            const errorCell = p.errorCount > 0
-              ? `<td style="padding:10px 16px;color:#ef4444;font-size:12px;">${p.errorCount} error${p.errorCount > 1 ? 's' : ''}</td>`
-              : '<td></td>';
-            return `<tr style="border-bottom:1px solid #f1f5f9;"><td style="padding:10px 16px;font-weight:600;color:#111;font-size:13px;">${htmlEscape(p.name)}</td><td style="padding:10px 16px;color:#555;font-size:13px;">${p.visibility}%</td><td style="padding:10px 16px;color:#555;font-size:13px;">${p.mentionCount} / ${total}</td><td style="padding:10px 16px;color:#555;font-size:13px;">${p.citationCount}</td>${errorCell}</tr>`;
-          }).join('');
+          // Row markup lives in utils/scanEmailRows so the preview harness can
+          // import the REAL builders instead of hand-copying them — that copy
+          // drifted out of the Phase 1 token sweep and spent a while rendering
+          // the retired palette while the shipped email rendered the new one.
+          const scanRows = require('../utils/scanEmailRows');
+          const platformRows = scanRows.buildPlatformRows(platStats, results.length);
+          const promptRows = scanRows.buildPromptRows(allEmailResults);
+          const competitorRows = scanRows.buildCompetitorRows(sortedCompetitors);
 
-          // Per-prompt rows: scanned-this-run first (green badge), then carry-forward (gray date)
-          const promptRows = allEmailResults
-            .map((r) => {
-              const valid = r.platforms.filter((p) => !p.error);
-              const mentioned = valid.filter((p) => p.mentioned).length;
-              const cited = valid.filter((p) => p.cited).length;
-              const mRate = valid.length > 0 ? Math.round((mentioned / valid.length) * 100) : 0;
-              const cRate = valid.length > 0 ? Math.round((cited / valid.length) * 100) : 0;
-              return { prompt: r.prompt, mentioned, total: valid.length, mRate, cRate, isCarryForward: r._isCarryForward, carryDate: r._carryDate };
-            })
-            .sort((a, b) => {
-              if (a.isCarryForward !== b.isCarryForward) return a.isCarryForward ? 1 : -1;
-              return b.mRate - a.mRate;
-            })
-            .map((r, i) => {
-              // r.prompt is user-controlled (set during prompt CRUD). Escape
-              // before embedding in <td> to prevent XSS via <style>, <img>,
-              // event-handler payloads, etc. (F4-23)
-              const truncated = r.prompt.length > 70 ? r.prompt.slice(0, 70) + '\u2026' : r.prompt;
-              const safeShort = htmlEscape(truncated);
-              const statusCell = r.isCarryForward
-                ? `<td style="padding:9px 14px;white-space:nowrap;"><span style="display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:600;background:#f1f5f9;color:#64748b;">${r.carryDate ? new Date(r.carryDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : 'prev'}</span></td>`
-                : `<td style="padding:9px 14px;white-space:nowrap;"><span style="display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700;background:#dcfce7;color:#15803d;">&#10003; New</span></td>`;
-              return `<tr style="border-bottom:1px solid #f1f5f9;">${statusCell}<td style="padding:9px 14px;color:#94a3b8;font-size:12px;">${i + 1}</td><td style="padding:9px 14px;color:#111;font-size:13px;">${safeShort}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.mentioned}/${r.total}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.mRate}%</td><td style="padding:9px 14px;color:#555;font-size:13px;">${r.cRate}%</td></tr>`;
-            })
-            .join('');
+          // The impact column is a brand accent, so it tracks primaryColor the
+          // same way the email's CTA does — otherwise a white-label tenant gets
+          // their blue on the button and ours in the table. Fails open to the
+          // platform blue: an accent colour is never worth losing a scan email.
+          const _brandService = require('../services/brandService');
+          let accentColor = _brandService.HARDCODED_DEFAULTS.primaryColor;
+          try {
+            const { brand } = await _brandService.getBrandForOrg(ws?.organizationId || null);
+            if (brand?.primaryColor) accentColor = brand.primaryColor;
+          } catch (err) {
+            console.error('[ai-tracker-scan] brand colour lookup failed:', err.message);
+          }
 
-          // Competitor rows (top 10). c.name is AI-extracted — Claude
-          // controls it via prompt injection (F3-07 surface) — must escape.
-          const competitorRows = sortedCompetitors.slice(0, 10).map((c, i) =>
-            `<tr style="border-bottom:1px solid #f1f5f9;"><td style="padding:9px 14px;color:#94a3b8;font-size:12px;">${i + 1}</td><td style="padding:9px 14px;color:#111;font-weight:600;font-size:13px;">${htmlEscape(c.name)}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${c.mentions}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${c.citations}</td><td style="padding:9px 14px;color:#555;font-size:13px;">${c.visibility}%</td></tr>`
-          ).join('');
-
-          // Action item rows (high priority first, max 5)
-          const priOrder = { high: 0, medium: 1, low: 2 };
-          const actionRows = actionItems
-            .sort((a, b) => (priOrder[a.priority] || 0) - (priOrder[b.priority] || 0))
-            .slice(0, 5)
-            .map((item) => {
-              // Action items are server-generated from PLATFORM_DISPLAY +
-              // hardcoded templates, but escape for defense-in-depth in case
-              // future generators incorporate user data.
-              const bg = item.priority === 'high' ? '#ef4444' : item.priority === 'medium' ? '#f59e0b' : '#22c55e';
-              return `<tr style="border-bottom:1px solid #f1f5f9;"><td style="padding:10px 14px;white-space:nowrap;"><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;text-transform:uppercase;color:#fff;background:${bg};">${htmlEscape(item.priority)}</span></td><td style="padding:10px 14px;"><div style="color:#111;font-size:13px;font-weight:600;margin-bottom:2px;">${htmlEscape(item.title)}</div><div style="color:#64748b;font-size:12px;">${htmlEscape(item.description)}</div></td><td style="padding:10px 14px;color:#4f46e5;font-size:12px;font-weight:600;white-space:nowrap;">${htmlEscape(item.impact)}</td></tr>`;
-            })
-            .join('');
+          const actionRows = scanRows.buildActionRows(actionItems, accentColor);
 
           // Invariant I1: tenant-facing links use the org's custom domain
           // when active (falls back to FRONTEND_URL for org-less workspaces).
@@ -1744,8 +1718,8 @@ async function executeScan(trackerId, userId = null, { force = false, promptIds 
               avgSentiment: avgSentimentLabel,
               platformRows,
               promptRows,
-              competitorRows: competitorRows || '<tr><td colspan="5" style="padding:12px 14px;color:#94a3b8;font-size:13px;">No competitors detected</td></tr>',
-              actionRows: actionRows || '<tr><td colspan="3" style="padding:12px 14px;color:#94a3b8;font-size:13px;">No actions at this time</td></tr>',
+              competitorRows: competitorRows || scanRows.emptyRow(5, 'No competitors detected'),
+              actionRows: actionRows || scanRows.emptyRow(3, 'No actions at this time'),
               dashboardUrl,
             },
           };
@@ -2469,9 +2443,21 @@ const setup = async (req, res) => {
     // F1-05: if prompt insertion fails (non-11000), the tracker was already
     // created — clean it up so we don't leave an orphan with zero prompts
     // that the user can't recover from. Also roll back the quota increment.
+    // Wave 1 (§4c-2): prompts the user accepted from AI suggestions carry
+    // source 'suggested' — the frontend sends suggestedPrompts alongside
+    // prompts (wired in Wave 3); absent → everything defaults 'manual'.
+    const suggestedSet = new Set(
+      (Array.isArray(req.body.suggestedPrompts) ? req.body.suggestedPrompts : [])
+        .filter((p) => typeof p === 'string')
+        .map((p) => p.trim()),
+    );
     const promptDocs = prompts
       .filter((p) => typeof p === 'string' && p.trim())
-      .map((p) => ({ trackerId: tracker._id, prompt: p.trim() }));
+      .map((p) => ({
+        trackerId: tracker._id,
+        prompt: p.trim(),
+        source: suggestedSet.has(p.trim()) ? 'suggested' : 'manual',
+      }));
     if (promptDocs.length > 0) {
       try {
         await AiTrackerPrompt.insertMany(promptDocs, { ordered: false });
@@ -2492,7 +2478,7 @@ const setup = async (req, res) => {
     // Fire-and-forget: start first scan (pass userId so user free credits can be used).
     // The .catch is a safety net for synchronous-throw paths only; once executeScan
     // returns its promise, errors are handled inside the function's outer try/catch.
-    executeScan(tracker._id, req.user?.userId, { force: true }).catch((err) => {
+    executeScan(tracker._id, req.user?.userId, { force: true, trigger: 'manual' }).catch((err) => {
       console.error('[ai-tracker-setup] scan kickoff failed:', err.message);
     });
 
@@ -2629,7 +2615,7 @@ const triggerScan = async (req, res) => {
 
     // executeScan handles its own errors via Phase H; the .catch here only
     // catches a synchronous throw before the first await (essentially never).
-    executeScan(tracker._id, req.user?.userId, { force: true, bill: req.creditContext?.deductionEnabled !== false }).catch((err) => {
+    executeScan(tracker._id, req.user?.userId, { force: true, bill: req.creditContext?.deductionEnabled !== false, trigger: 'refresh_all' }).catch((err) => {
       console.error('[ai-tracker-scan] manual scan kickoff failed:', err.message);
     });
 
@@ -2699,6 +2685,7 @@ const refreshPrompt = async (req, res) => {
       promptIds: [prompt._id.toString()],
       costAction: 'trackerRefreshSingle',
       bill: req.creditContext?.deductionEnabled !== false,
+      trigger: 'single',
     }).catch((err) => {
       console.error('[ai-tracker-scan] single-prompt refresh kickoff failed:', err.message);
     });
@@ -3323,9 +3310,21 @@ const createMonitor = async (req, res) => {
     }
 
     // Create prompts (F1-05: clean up orphan tracker + roll back quota on failure).
+    // Wave 1 (§4c-2): prompts the user accepted from AI suggestions carry
+    // source 'suggested' — the frontend sends suggestedPrompts alongside
+    // prompts (wired in Wave 3); absent → everything defaults 'manual'.
+    const suggestedSet = new Set(
+      (Array.isArray(req.body.suggestedPrompts) ? req.body.suggestedPrompts : [])
+        .filter((p) => typeof p === 'string')
+        .map((p) => p.trim()),
+    );
     const promptDocs = prompts
       .filter((p) => typeof p === 'string' && p.trim())
-      .map((p) => ({ trackerId: tracker._id, prompt: p.trim() }));
+      .map((p) => ({
+        trackerId: tracker._id,
+        prompt: p.trim(),
+        source: suggestedSet.has(p.trim()) ? 'suggested' : 'manual',
+      }));
     if (promptDocs.length > 0) {
       try {
         await AiTrackerPrompt.insertMany(promptDocs, { ordered: false });
@@ -3548,7 +3547,7 @@ const triggerMonitorScan = async (req, res) => {
     });
     // executeScan handles its own errors via Phase H; the .catch here only
     // catches a synchronous throw before the first await (essentially never).
-    executeScan(tracker._id, req.user?.userId, { force: true, bill: req.creditContext?.deductionEnabled !== false }).catch((err) => {
+    executeScan(tracker._id, req.user?.userId, { force: true, bill: req.creditContext?.deductionEnabled !== false, trigger: 'refresh_all' }).catch((err) => {
       console.error('[ai-tracker-scan] manual monitor-scan kickoff failed:', err.message);
     });
 

@@ -97,12 +97,23 @@ async function post(body) {
   return res;
 }
 
+// Mirrors the real ORIGINAL_DEFAULT_TEMPLATES.contact_submitted closely enough
+// to exercise substitution. Phase 4c deleted the controller's hardcoded
+// fallback markup, because getTemplateForTrigger now degrades to the hardcoded
+// default instead of returning null — so a resolved template is the ONLY path,
+// and `template = null` no longer models anything that can happen in
+// production (see the dedicated test below for what it does model).
+const DEFAULT_TEMPLATE = {
+  subject: '[{{brandName}} Contact] {{category}} — {{subject}}',
+  html: '<p>{{userName}} &lt;{{userEmail}}&gt;</p><p>{{message}}</p><p>{{submittedAt}}</p>',
+};
+
 function reset() {
   sent.length = 0;
   rateLimitAllowed = true;
   rateLimitCalls = 0;
   rateLimitThrows = false;
-  template = null;
+  template = DEFAULT_TEMPLATE;
 }
 
 // ── validation ──
@@ -170,13 +181,25 @@ test('a rate-limiter outage does not take contact down', async () => {
 
 // ── output safety ──
 
-test('escapes HTML in the built-in email markup', async () => {
+test('escapes HTML in the default template', async () => {
   reset();
   await post({ ...VALID, name: '<script>alert(1)</script>', message: '<img src=x onerror=alert(1)>' });
   const html = sent[0].html;
   assert.ok(!html.includes('<script>'), 'raw script tag leaked into the email');
   assert.ok(!html.includes('<img'), 'raw img tag leaked into the email');
   assert.ok(html.includes('&lt;script&gt;'));
+});
+
+test('sends nothing rather than an empty shell if resolution yields nothing', async () => {
+  // Phase 4c removed this controller's hardcoded fallback. That is only safe
+  // because resolution can no longer come back empty for a known trigger — so
+  // if it somehow does, the controller must fail loudly rather than drop a
+  // blank message into the support inbox where nobody would notice it.
+  reset();
+  template = null;
+  const res = await post(VALID);
+  assert.strictEqual(sent.length, 0, 'sent an email with no subject or body');
+  assert.strictEqual(res.statusCode, 500, 'reported success for an email it never sent');
 });
 
 test('escapes HTML on the custom-template path too', async () => {

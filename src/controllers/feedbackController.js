@@ -1,7 +1,7 @@
 const Feedback = require('../models/Feedback');
 const { sendEmail } = require('../utils/emailService');
 const { applyCustomTemplate } = require('./emailPortalController');
-const { htmlEscape, headerSafe, subjectSafe } = require('../utils/htmlEscape');
+const { htmlEscape, subjectSafe } = require('../utils/htmlEscape');
 
 const SUPPORT_EMAIL = 'support@suparank.ai';
 
@@ -49,22 +49,16 @@ const submitFeedback = async (req, res) => {
       // Undo entity escaping in the Subject only; it is plain text. See subjectSafe.
       if (emailOptions.subject) emailOptions.subject = subjectSafe(emailOptions.subject);
 
-      // Error path only, but it uses the escaped values for the same reason.
-      if (!emailOptions.subject) {
-        const d = emailOptions.data;
-        emailOptions.subject = headerSafe(`[SupaRank Feedback] ${stars} ${feature}`);
-        emailOptions.html = `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;">
-  <h2 style="color:#111;margin-bottom:4px;">New Feedback Received</h2>
-  <table style="width:100%;border-collapse:collapse;margin:24px 0;">
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;width:140px;">Feature</td><td style="padding:8px 0;color:#111;">${d.feature}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Rating</td><td style="padding:8px 0;color:#FFA163;font-size:20px;">${d.stars}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">User</td><td style="padding:8px 0;color:#111;">${d.userEmail}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;vertical-align:top;">Comment</td><td style="padding:8px 0;color:#111;">${d.comment}</td></tr>
-  </table>
-</div>`;
+      // See publicContactController. The feedback row is already persisted at
+      // this point, so skipping the notification loses only the nudge — an
+      // empty email in the support inbox would lose the signal entirely.
+      // Skipping the SEND rather than returning early: the success response is
+      // built once, below, so the two paths cannot drift apart.
+      if (!emailOptions.subject || !emailOptions.html) {
+        console.error('[feedback] template resolved to nothing — not sending an empty email');
+      } else {
+        await sendEmail(emailOptions);
       }
-
-      await sendEmail(emailOptions);
     } catch (emailErr) {
       console.error('[feedback] Failed to send notification email:', emailErr.message);
     }

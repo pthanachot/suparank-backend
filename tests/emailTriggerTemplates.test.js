@@ -59,8 +59,10 @@ function placeholdersIn(text) {
 // changes its keys, update BOTH the sender and this table — the tests below
 // prove the keys cover the template.
 // 'brandName' and 'supportEmail' are auto-injected by applyCustomTemplate
-// (Phase 12) — no call site needs to send them explicitly.
-const AUTO_INJECTED_KEYS = ['brandName', 'supportEmail'];
+// (Phase 12), as are 'logoUrl' (the brand header), 'primaryColor' (the CTA
+// fill) and 'preheader' (the inbox snippet line) — no call site needs to send
+// them explicitly.
+const AUTO_INJECTED_KEYS = ['brandName', 'supportEmail', 'logoUrl', 'primaryColor', 'preheader'];
 
 const CALLER_DATA_KEYS = {
   welcome: ['userName', 'loginUrl'], // authController.sendWelcomeEmail

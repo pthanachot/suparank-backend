@@ -63,28 +63,12 @@ const submitContact = async (req, res) => {
     // "I can&#39;t log in". See subjectSafe.
     if (emailOptions.subject) emailOptions.subject = subjectSafe(emailOptions.subject);
 
-    // Fallback if template resolution threw. In practice a template always
-    // resolves for this trigger, so this is the error path only. It still uses
-    // the escaped values: an error path is exactly where an injection would go
-    // unnoticed. The subject takes the raw text, header-safed, because a
-    // Subject is a plain-text header and should not show entities.
-    if (!emailOptions.subject) {
-      const d = emailOptions.data;
-      emailOptions.subject = headerSafe(
-        `[SupaRank Contact] ${safeCategory}: ${subject.trim()}`
-      );
-      emailOptions.html = `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;border:1px solid #e5e7eb;border-radius:8px;">
-  <h2 style="color:#111;margin-bottom:4px;">New Contact Form Submission</h2>
-  <p style="color:#6b7280;font-size:14px;margin-top:0;">SupaRank Help Center</p>
-  <table style="width:100%;border-collapse:collapse;margin:24px 0;">
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;width:140px;">User</td><td style="padding:8px 0;color:#111;">${d.userName}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Email</td><td style="padding:8px 0;color:#111;">${d.userEmail}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Category</td><td style="padding:8px 0;color:#111;">${d.category}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Subject</td><td style="padding:8px 0;color:#111;">${d.subject}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;vertical-align:top;">Message</td><td style="padding:8px 0;color:#111;white-space:pre-wrap;">${d.message}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Submitted</td><td style="padding:8px 0;color:#6b7280;font-size:13px;">${d.submittedAt}</td></tr>
-  </table>
-</div>`;
+    // See publicContactController: the hardcoded fallback is gone because
+    // resolution now degrades to the hardcoded default instead of returning
+    // null. Never ship an empty shell to the support inbox.
+    if (!emailOptions.subject || !emailOptions.html) {
+      console.error('[contact] template resolved to nothing — not sending an empty email');
+      return res.status(500).json({ error: 'Failed to send message' });
     }
 
     await sendEmail(emailOptions);

@@ -31,6 +31,10 @@ src/routes/devRoutes.js
 !/scripts/chaos/
 !/scripts/preflightImage.js
 !/scripts/preflightDb.js
+!/scripts/previewEmails.js
+
+# Rendered email previews (scripts/previewEmails.js output) — build artifact
+/.preview/
 
 # Database backup archives (admin-triggered mongodump output)
 /backups/

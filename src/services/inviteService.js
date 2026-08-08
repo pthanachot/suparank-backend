@@ -85,22 +85,12 @@ async function createInvite({ org, email, role, accessScope, workspaceIds = [], 
   // Subject is plain text and must read naturally. See utils/htmlEscape.
   if (emailOptions.subject) emailOptions.subject = subjectSafe(emailOptions.subject);
 
-  // Template resolution failing (transient DB error) must not send a
-  // subject-less shell — the invite email IS the deliverable. Hardcoded
-  // fallback mirrors the default template, and escapes for the same reason.
-  if (!emailOptions.subject) {
-    const d = emailOptions.data;
-    emailOptions.subject = subjectSafe(`You've been invited to join ${htmlEscape(org.name)}`);
-    emailOptions.html = `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;">
-  <h2 style="color:#111;margin-bottom:16px;">You're invited</h2>
-  <p style="color:#555;font-size:16px;line-height:1.6;">${d.inviterName} has invited you to join <strong>${d.orgName}</strong> as ${d.role}.</p>
-  <div style="text-align:center;margin:32px 0;">
-    <a href="${d.acceptUrl}" style="background:#111;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:bold;display:inline-block;">Accept invitation</a>
-  </div>
-  <p style="color:#888;font-size:14px;">This invitation expires in 7 days.</p>
-</div>`;
-    delete emailOptions.data;
-  }
+  // No hardcoded fallback here any more (Phase 4c). There used to be one,
+  // because a transient Mongo error made getTemplateForTrigger return null and
+  // this email IS the deliverable. That function now degrades to the hardcoded
+  // default instead, so resolution only fails for an unknown triggerId — and
+  // the fallback's own copy was an unstyled div with no logo, no shell and a
+  // black button, i.e. strictly worse than the thing it stood in for.
   await sendEmail(emailOptions);
 
   return invite;

@@ -130,7 +130,7 @@ const updateProfile = async (req, res) => {
                   <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
                     <h2 style="color: #111; margin-bottom: 16px;">Verify your new email</h2>
                     <p style="color: #555; margin-bottom: 24px;">You changed your SupaRank email to this address. Click the button below to confirm:</p>
-                    <a href="${verifyUrl}" style="display: inline-block; padding: 14px 32px; background: #4F46E5; color: white; text-decoration: none; border-radius: 12px; font-weight: bold; font-size: 14px;">Verify email</a>
+                    <a href="${verifyUrl}" style="display: inline-block; padding: 14px 32px; background-color: #2B5BE8; color: white; text-decoration: none; border-radius: 12px; font-weight: bold; font-size: 14px;">Verify email</a>
                     <p style="color: #888; font-size: 14px; margin-top: 24px;">This link expires in 24 hours. If you didn't change your email, contact support@suparank.ai immediately.</p>
                   </div>
                 `,

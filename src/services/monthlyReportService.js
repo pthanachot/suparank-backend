@@ -125,11 +125,15 @@ async function runMonthlyReports({ period = reportService.previousPeriod() } = {
           let sentCount = 0;
           for (const to of recipients) {
             try {
+              // Escaped: `ws.name` is free text an agency chooses, and this
+              // email goes to their CLIENTS. Same rationale as
+              // inviteService.createInvite — see utils/htmlEscape.
+              const { htmlEscape, subjectSafe } = require('../utils/htmlEscape');
               const emailOptions = {
                 to,
                 orgId, // Phase 11 tenant sender identity
                 data: {
-                  workspaceName: ws.name || 'Workspace',
+                  workspaceName: htmlEscape(ws.name || 'Workspace'),
                   // Human-readable for the client-facing email ('June 2026').
                   // The raw 'YYYY-MM' period is used for all DB/query work.
                   period: reportService.formatPeriodLabel(period),
@@ -137,6 +141,9 @@ async function runMonthlyReports({ period = reportService.previousPeriod() } = {
                 },
               };
               await emailPortalController.applyCustomTemplate('monthly_report', emailOptions, orgId);
+              // The default subject embeds {{workspaceName}}, so decode the
+              // entities back for the plain-text Subject header.
+              if (emailOptions.subject) emailOptions.subject = subjectSafe(emailOptions.subject);
               await emailService.sendEmail(emailOptions);
               sentCount++;
             } catch (emailErr) {

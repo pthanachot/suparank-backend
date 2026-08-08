@@ -7,6 +7,8 @@ const EmailTemplate = require('../models/EmailTemplate');
 const EmailSendLog = require('../models/EmailSendLog');
 const TriggerableEmailTemplate = require('../models/TriggerableEmailTemplate');
 const { sendEmail } = require('../utils/emailService');
+const { htmlEscape } = require('../utils/htmlEscape');
+const { FONT_STACK, TRACKING_BODY, EMAIL_WIDTH } = require('../utils/emailTheme');
 const adminAudit = require('../services/adminAuditService');
 const AUDIT = require('../services/adminAuditActions');
 // Called via module property (not destructured) so tests can stub them.
@@ -19,397 +21,630 @@ const SYSTEM_TRIGGERS = [
   // Auth
   {
     id: 'welcome',
+    preheader: 'Your workspace is ready — here is where to start.',
     name: 'Welcome Email',
     description: 'Sent when a new user signs up',
     category: 'auth',
-    variables: ['userName', 'loginUrl', 'brandName', 'supportEmail'],
+    variables: ['userName', 'loginUrl', 'brandName', 'supportEmail', 'logoUrl', 'primaryColor', 'preheader'],
     triggerCount: 0,
   },
   {
     id: 'verify_email',
+    preheader: 'Your verification code, valid for 15 minutes.',
     name: 'Email Verification',
     description: 'Verification code sent during signup',
     category: 'auth',
-    variables: ['code', 'expiresIn', 'brandName'],
+    variables: ['code', 'expiresIn', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
     triggerCount: 0,
   },
   {
     id: 'verify_email_link',
+    preheader: 'One click to confirm your email address.',
     name: 'Email Verification Link',
     description: 'Link-based email verification (signup, resend, email change)',
     category: 'auth',
-    variables: ['userName', 'verifyUrl', 'brandName'],
+    variables: ['userName', 'verifyUrl', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
     triggerCount: 0,
   },
   {
     id: 'password_reset',
+    preheader: 'Your password reset code, valid for 15 minutes.',
     name: 'Password Reset',
     description: 'Password reset code',
     category: 'auth',
-    variables: ['code', 'expiresIn', 'brandName'],
+    variables: ['code', 'expiresIn', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
     triggerCount: 0,
   },
   {
     id: 'member_invite',
+    preheader: '{{inviterName}} has invited you to {{orgName}}.',
     name: 'Member Invitation',
     description: 'Sent when someone is invited to join an organization',
     category: 'auth',
-    variables: ['inviterName', 'orgName', 'role', 'acceptUrl', 'brandName'],
+    variables: ['inviterName', 'orgName', 'role', 'acceptUrl', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
     triggerCount: 0,
   },
   // Billing
   {
     id: 'payment_confirmation',
+    preheader: 'Payment received — your {{planName}} plan is active.',
     name: 'Payment Confirmation',
     description: 'Sent after successful payment',
     category: 'billing',
-    variables: ['userName', 'planName', 'amount', 'nextBillingDate', 'brandName'],
+    variables: ['userName', 'planName', 'amount', 'nextBillingDate', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
     triggerCount: 0,
   },
   {
     id: 'subscription_canceled',
+    preheader: 'Your plan is cancelled; access continues until {{endDate}}.',
     name: 'Subscription Canceled',
     description: 'Confirmation of subscription cancellation',
     category: 'billing',
-    variables: ['userName', 'planName', 'endDate', 'brandName'],
+    variables: ['userName', 'planName', 'endDate', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
     triggerCount: 0,
   },
   {
     id: 'payment_failed',
+    preheader: 'We could not process your payment — action needed.',
     name: 'Payment Failed',
     description: 'Notification of failed payment',
     category: 'billing',
-    variables: ['userName', 'planName', 'retryDate', 'updatePaymentUrl', 'brandName'],
+    variables: ['userName', 'planName', 'retryDate', 'updatePaymentUrl', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
     triggerCount: 0,
   },
   {
     id: 'credits_low',
+    preheader: '{{remainingCredits}} credits left on your {{planName}} plan.',
     name: 'Credits Running Low',
     description: 'Notification when credits are below threshold',
     category: 'billing',
-    variables: ['userName', 'remainingCredits', 'planName', 'brandName'],
+    variables: ['userName', 'remainingCredits', 'planName', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
     triggerCount: 0,
   },
   {
     id: 'topup_requested',
+    preheader: '{{requesterName}} is asking you to top up credits.',
     name: 'Credit Top-Up Requested',
     description: 'Sent to the org owner when an admin/editor requests a credit top-up',
     category: 'billing',
-    variables: ['userName', 'requesterName', 'requesterEmail', 'amount', 'note', 'billingUrl', 'brandName'],
+    variables: ['userName', 'requesterName', 'requesterEmail', 'amount', 'note', 'billingUrl', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
     triggerCount: 0,
   },
   // Feedback
   {
     id: 'feedback_submitted',
+    preheader: 'New in-app feedback from {{userEmail}}.',
     name: 'Feedback Submitted',
     description: 'Sent to support@suparank.ai when a user submits in-app feedback',
     category: 'engagement',
-    variables: ['feature', 'rating', 'stars', 'comment', 'userEmail', 'submittedAt', 'brandName'],
+    variables: ['feature', 'rating', 'stars', 'comment', 'userEmail', 'submittedAt', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
     triggerCount: 0,
   },
   // Support
   {
     id: 'contact_submitted',
+    preheader: 'New contact form submission from {{userEmail}}.',
     name: 'Contact Form Submitted',
     description: 'Sent to support when a user submits the contact form',
     category: 'support',
-    variables: ['userName', 'userEmail', 'subject', 'category', 'message', 'submittedAt', 'brandName'],
+    variables: ['userName', 'userEmail', 'subject', 'category', 'message', 'submittedAt', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
     triggerCount: 0,
   },
   // Reports
   {
     id: 'monthly_report',
+    preheader: 'Your {{period}} performance report for {{workspaceName}}.',
     name: 'Monthly Workspace Report',
     description: "Sent on the 1st of each month with a link to the previous month's workspace report",
     category: 'reports',
-    variables: ['workspaceName', 'period', 'reportUrl', 'brandName'],
+    variables: ['workspaceName', 'period', 'reportUrl', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
     triggerCount: 0,
   },
   // AI Tracker
   {
     id: 'scan_completed',
+    preheader: '{{visibility}}% visibility across {{promptsScanned}}.',
     name: 'AI Scan Completed',
     description: 'Sent to the workspace owner when an AI Tracker scan finishes',
     category: 'ai-tracker',
-    variables: ['userName', 'trackerName', 'domain', 'scanDate', 'promptsScanned', 'visibility', 'mentionRate', 'shareOfVoice', 'citationRate', 'avgSentiment', 'platformRows', 'promptRows', 'competitorRows', 'actionRows', 'dashboardUrl', 'brandName'],
+    variables: ['userName', 'trackerName', 'domain', 'scanDate', 'promptsScanned', 'visibility', 'mentionRate', 'shareOfVoice', 'citationRate', 'avgSentiment', 'platformRows', 'promptRows', 'competitorRows', 'actionRows', 'dashboardUrl', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
     triggerCount: 0,
   },
 ];
+
+/**
+ * When the built-in default templates last changed materially.
+ *
+ * An override row is a SNAPSHOT: whoever saved it copied the default as it
+ * looked that day and edited from there. Decision D2 says we never rewrite
+ * that content — it is theirs — so the only way an agency learns their copy
+ * has fallen behind is if we tell them. Any override saved before this date
+ * predates the current defaults and is flagged stale in both editors.
+ *
+ * BUMP THIS whenever ORIGINAL_DEFAULT_TEMPLATES, wrapTemplate, BRAND_HEADER or
+ * ctaButton change in a way a tenant would want to pick up. Deliberately one
+ * date for all 14 rather than per-trigger: the shell, the brand header and the
+ * button are shared, so a change to any of them touches every template.
+ *
+ * 2026-08-08 — brand logo, design tokens, Outlook shell + dark mode,
+ * Inter/CTA typography, preheader (the four-phase alignment work).
+ */
+const DEFAULTS_REVISED_AT = new Date('2026-08-08T00:00:00.000Z');
+
+/**
+ * True when an override row was last saved before the current defaults.
+ * Rows with no timestamp are treated as stale — a row that predates
+ * `timestamps: true` is by definition older than any revision we tracked.
+ */
+const isOverrideStale = (row) => {
+  if (!row) return false; // no override — nothing to fall behind
+  if (!row.defaultSubject && !row.defaultHtml) return false; // stats-only row
+  if (!row.updatedAt) return true;
+  return new Date(row.updatedAt) < DEFAULTS_REVISED_AT;
+};
+
+// ─── Type + CTA (Phase 3) ───────────────────────────────────
+// FONT_STACK / TRACKING_BODY / EMAIL_WIDTH live in utils/emailTheme so that
+// utils/scanEmailRows can share them without a controller→controller require.
+
+/**
+ * One call-to-action button, matching `.btn--lg` from homepage.css:
+ * height 46 (13px padding + 20px line-height), 22px side padding, radius 8,
+ * 15px, weight 600, tracking -0.01em.
+ *
+ * WHY A TABLE AND NOT VML. Outlook's Word engine ignores `background-color`
+ * on an inline `<a>`, so a bare anchor renders as blue underlined text with no
+ * fill. The usual fixes are a VML `<v:roundrect>` or a table cell with the
+ * `bgcolor` ATTRIBUTE. VML buys rounded corners in Outlook specifically, but
+ * costs a hardcoded pixel WIDTH per button — which breaks the moment a label
+ * is edited or translated — plus an `xmlns:w` declaration. The table cell
+ * needs neither and sizes itself to the label; the only loss is square
+ * corners in Outlook, which is where these buttons already lose their radius
+ * today.
+ *
+ * `bgcolor` takes {{primaryColor}} because it is substituted before send and
+ * brandService validates it as /^#[0-9a-fA-F]{6}$/.
+ */
+const ctaButton = (href, label, { bg = '{{primaryColor}}' } = {}) =>
+  // `align="center"` is load-bearing, not decoration: Outlook's Word engine
+  // ignores `margin:auto` on a table exactly as it ignores it on a div (the
+  // Phase 2 bug). The buttons this replaced were inline-blocks inside a
+  // `text-align:center` div, which Outlook DID centre — so shipping margin
+  // alone would have left every button left-aligned there.
+  `<table role="presentation" align="center" cellpadding="0" cellspacing="0" border="0" style="margin:32px auto;">
+      <tr>
+        <td align="center" bgcolor="${bg}" style="font-family:${FONT_STACK};border-radius:8px;">
+          <a href="${href}" style="display:inline-block;padding:13px 22px;font-family:${FONT_STACK};font-size:15px;line-height:20px;font-weight:600;letter-spacing:-0.01em;color:#FFFFFF;text-decoration:none;border-radius:8px;">${label}</a>
+        </td>
+      </tr>
+    </table>`;
+
+// ─── Brand header ───────────────────────────────────────────
+
+/**
+ * The platform logomark, as a hosted PNG.
+ *
+ * WHY A PNG AND NOT THE HEADER'S SVG. The app header (AppTopbar → BrandLogo)
+ * renders the mark as inline <svg>. That cannot be reused here: Gmail strips
+ * <svg> and refuses `.svg` in <img src>, and Outlook's Word rendering engine
+ * has never supported SVG at all. The mark is therefore rasterized at build
+ * time by suparank/scripts/build-email-logo.mjs, from the same vector, and
+ * served from the frontend's public dir — the backend serves no static files.
+ */
+const PLATFORM_EMAIL_LOGO = () =>
+  `${process.env.FRONTEND_URL || 'https://app.suparank.ai'}/brand/suparank-mark.png`;
+
+/**
+ * The logo + wordmark lockup that opens every email, mirroring the app
+ * header's `<BrandLogo showWordmark />`.
+ *
+ * Table-based on purpose: flexbox and inline-block alignment are unreliable
+ * in Outlook, and a two-cell table is the one horizontal-alignment primitive
+ * every client renders. The image carries an explicit `height` ATTRIBUTE as
+ * well as the CSS, because Outlook ignores the style block; width is left
+ * auto so a tenant's wide lockup scales proportionally instead of being
+ * squashed into a square (same trade-off as BrandLogo's non-icon branch).
+ */
+const BRAND_HEADER = `<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;margin:0 0 28px 0;">
+    <tr>
+      <td style="padding:0 10px 0 0;vertical-align:middle;"><img src="{{logoUrl}}" alt="{{brandName}}" height="40" style="display:block;height:40px;width:auto;max-width:200px;border:0;outline:none;text-decoration:none;" /></td>
+      <td style="font-family:${FONT_STACK};vertical-align:middle;"><span style="font-family:${FONT_STACK};font-size:19px;font-weight:800;letter-spacing:-0.02em;color:#111827;">{{brandName}}</span></td>
+    </tr>
+  </table>`;
+
+/**
+ * Auto-injected brand values that MUST be escaped before they enter the HTML.
+ *
+ * These are the only substituted values that are always plain text — unlike
+ * aiTrackerController's `platformRows`/`promptRows`, which pass `<tr>`
+ * fragments on purpose and are why escaping cannot be applied to `data`
+ * wholesale (see utils/htmlEscape.js).
+ *
+ * They are also tenant-controlled and reach ATTRIBUTE contexts, which is what
+ * makes them dangerous:
+ *   - `brandName` is BrandConfig.productName, validated for LENGTH ONLY
+ *     (brandService.strField), and lands in `alt="…"` and `<title>`;
+ *   - `logoUrl` is BrandConfig.logoIconUrl/logoUrl and lands in `src="…"`.
+ *     Its validator calls `new URL()`, which happily accepts
+ *     `https://x/a"><img src=y>`, and then stores the RAW input rather than
+ *     the normalised href — and the `startsWith('/')` branch skips URL
+ *     parsing altogether.
+ *
+ * Without this, a white-label agency could put arbitrary markup in an email
+ * delivered to THEIR clients over our SPF/DKIM. Mail clients don't execute
+ * script, so this is HTML/CSS injection rather than XSS, but hidden content
+ * and forged links are quite enough. Escaping a URL inside an attribute is
+ * lossless — `&amp;` is the correct HTML spelling of `&` and every client
+ * decodes it.
+ */
+const BRAND_ESCAPED_KEYS = new Set(['brandName', 'supportEmail', 'logoUrl']);
+
+// ─── Email shell (Phase 2) ──────────────────────────────────
+
+/**
+ * Zero-width padding that follows the preheader.
+ *
+ * Without it, Gmail and Outlook.com keep reading past the preheader and pull
+ * the first line of visible body copy into the inbox snippet — so the snippet
+ * reads "Your July report is ready Your monthly report is ready The July…".
+ * A run of invisible characters fills the snippet buffer instead. They are
+ * zero-width/non-joiner, so nothing renders if a client ignores display:none.
+ */
+const PREHEADER_PAD = '&#847;&zwnj;&nbsp;'.repeat(60);
+
+/**
+ * Wrap inner content in the standard email document.
+ *
+ * WHY THE DEFAULTS STAY FULL DOCUMENTS. The obvious shape for this is to store
+ * inner content in ORIGINAL_DEFAULT_TEMPLATES and wrap at resolution time in
+ * getTemplateForTrigger. That would be wrong here, because an override row —
+ * admin or tenant — saved before this change holds a FULL `<div>` document.
+ * Wrapping at resolution time would either double-wrap those or need a
+ * heuristic ("does this look like a full document?") applied to customer HTML,
+ * which is precisely the kind of guess that fails silently in someone's inbox.
+ *
+ * Wrapping at DEFINITION time keeps `.html` a complete document exactly as it
+ * was, so resolution, the 50 000-char tenant cap, and every existing override
+ * behave identically. Old overrides keep rendering as the bare divs they are —
+ * degraded, but no worse than today, and D2 says we never rewrite them.
+ *
+ * The markup itself is the conventional bulletproof shell:
+ *   - a 100%-width outer table, because `margin:0 auto` on a div does not
+ *     centre in Outlook's Word engine;
+ *   - an mso conditional fixing the inner table to a hard 600px, because
+ *     Outlook ignores `max-width`;
+ *   - explicit background-color on BOTH tables — the templates set text
+ *     colours with no background, so a dark-mode client that inverts the
+ *     canvas but not the inline colour renders dark text on a dark card;
+ *   - `color-scheme` / `supported-color-schemes`, the declarative opt-out of
+ *     that auto-inversion in Apple Mail, iOS and Outlook.com.
+ *
+ * `font-family` is Arial here only because that is what the templates already
+ * used; Phase 3 swaps the stack in this one place instead of 14.
+ */
+const wrapTemplate = (inner) => `<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" lang="en">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="light" />
+<meta name="supported-color-schemes" content="light" />
+<title>{{brandName}}</title>
+<!--[if mso]><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml><![endif]-->
+<style>
+  body { margin:0 !important; padding:0 !important; width:100% !important; }
+  table { border-collapse:collapse; }
+  img { border:0; outline:none; text-decoration:none; -ms-interpolation-mode:bicubic; }
+  body, table, td { -webkit-text-size-adjust:100%; -ms-text-size-adjust:100%; }
+  @media only screen and (max-width:${EMAIL_WIDTH}px) {
+    .sr-card { width:100% !important; }
+    .sr-pad { padding:24px 20px !important; }
+  }
+</style>
+</head>
+<body style="margin:0;padding:0;background-color:#F7F8FA;">
+<div class="sr-preheader" style="display:none;font-size:1px;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;mso-hide:all;color:#F7F8FA;">{{preheader}}${PREHEADER_PAD}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#F7F8FA;">
+  <tr>
+    <td align="center" style="padding:24px 12px;">
+      <!--[if mso]><table role="presentation" width="${EMAIL_WIDTH}" cellpadding="0" cellspacing="0" border="0"><tr><td><![endif]-->
+      <table role="presentation" class="sr-card" width="${EMAIL_WIDTH}" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:${EMAIL_WIDTH}px;background-color:#FFFFFF;border:1px solid #E5E7EB;border-radius:12px;">
+        <tr>
+          <!-- No line-height here on purpose. A unitless value inherits as a
+               FACTOR, so 1.6 on this cell reaches every nested table cell in
+               the scan report and inflates dense rows, and reaches headings
+               that want their own tighter leading. Body copy declares
+               line-height:1.6 on its own <p>, which is where it belongs. -->
+          <td class="sr-pad" style="padding:32px;font-family:${FONT_STACK};font-size:16px;letter-spacing:${TRACKING_BODY};color:#111827;">
+${inner}
+          </td>
+        </tr>
+      </table>
+      <!--[if mso]></td></tr></table><![endif]-->
+    </td>
+  </tr>
+</table>
+</body>
+</html>`;
 
 // ─── Original default templates (hardcoded, used as fallback) ─
 
 const ORIGINAL_DEFAULT_TEMPLATES = {
   welcome: {
     subject: 'Welcome to {{brandName}}!',
-    html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;">
-  <h1 style="color:#111;font-size:24px;margin-bottom:16px;">Welcome to {{brandName}}!</h1>
-  <p style="color:#555;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
-  <p style="color:#555;font-size:16px;line-height:1.6;">We're excited to have you on board. {{brandName}} helps you track your AI visibility, optimize your brand voice, and stay ahead of the competition.</p>
-  <div style="text-align:center;margin:32px 0;">
-    <a href="{{loginUrl}}" style="background:#111;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:bold;display:inline-block;">Get Started</a>
-  </div>
-  <p style="color:#888;font-size:14px;">If you have any questions, feel free to reach out to our support team at {{supportEmail}}.</p>
-</div>`,
-    variables: ['userName', 'loginUrl', 'brandName', 'supportEmail'],
+    html: wrapTemplate(`
+  ${BRAND_HEADER}
+  <h1 style="color:#111827;font-size:24px;margin-bottom:16px;">Welcome to {{brandName}}!</h1>
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;">We're excited to have you on board. {{brandName}} helps you track your AI visibility, optimize your brand voice, and stay ahead of the competition.</p>
+  ${ctaButton('{{loginUrl}}', 'Get Started')}
+  <p style="color:#9CA3AF;font-size:14px;">If you have any questions, feel free to reach out to our support team at {{supportEmail}}.</p>
+`),
+    variables: ['userName', 'loginUrl', 'brandName', 'supportEmail', 'logoUrl', 'primaryColor', 'preheader'],
   },
   verify_email: {
     subject: '{{brandName}} — Verify your email',
-    html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;">
-  <h2 style="color:#111;margin-bottom:16px;">Verify your email</h2>
-  <p style="color:#555;margin-bottom:24px;">Enter this code to verify your email address:</p>
-  <div style="background:#f5f5f5;border-radius:8px;padding:20px;text-align:center;margin-bottom:24px;">
-    <span style="font-size:32px;font-weight:bold;letter-spacing:8px;color:#111;">{{code}}</span>
+    html: wrapTemplate(`
+  ${BRAND_HEADER}
+  <h2 style="color:#111827;margin-bottom:16px;">Verify your email</h2>
+  <p style="color:#4B5563;margin-bottom:24px;">Enter this code to verify your email address:</p>
+  <div style="background:#F3F4F6;border-radius:8px;padding:20px;text-align:center;margin-bottom:24px;">
+    <span style="font-size:32px;font-weight:700;letter-spacing:8px;color:#111827;">{{code}}</span>
   </div>
-  <p style="color:#888;font-size:14px;">This code expires in {{expiresIn}}.</p>
-  <p style="color:#888;font-size:14px;">If you didn't request this, you can safely ignore this email.</p>
-</div>`,
-    variables: ['code', 'expiresIn', 'brandName'],
+  <p style="color:#9CA3AF;font-size:14px;">This code expires in {{expiresIn}}.</p>
+  <p style="color:#9CA3AF;font-size:14px;">If you didn't request this, you can safely ignore this email.</p>
+`),
+    variables: ['code', 'expiresIn', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
   },
   verify_email_link: {
     subject: '{{brandName}} — Verify your email',
-    html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;">
-  <h2 style="color:#111;margin-bottom:16px;">Verify your email</h2>
-  <p style="color:#555;margin-bottom:24px;">Hi {{userName}}, click the button below to verify your email address:</p>
-  <a href="{{verifyUrl}}" style="display:inline-block;padding:14px 32px;background:#4F46E5;color:white;text-decoration:none;border-radius:12px;font-weight:bold;font-size:14px;">Verify Email</a>
-  <p style="color:#888;font-size:14px;margin-top:24px;">This link expires in 24 hours.</p>
-  <p style="color:#888;font-size:14px;">If you didn't request this, you can safely ignore this email.</p>
-</div>`,
-    variables: ['userName', 'verifyUrl', 'brandName'],
+    html: wrapTemplate(`
+  ${BRAND_HEADER}
+  <h2 style="color:#111827;margin-bottom:16px;">Verify your email</h2>
+  <p style="color:#4B5563;margin-bottom:24px;">Hi {{userName}}, click the button below to verify your email address:</p>
+  ${ctaButton('{{verifyUrl}}', 'Verify Email')}
+  <p style="color:#9CA3AF;font-size:14px;margin-top:24px;">This link expires in 24 hours.</p>
+  <p style="color:#9CA3AF;font-size:14px;">If you didn't request this, you can safely ignore this email.</p>
+`),
+    variables: ['userName', 'verifyUrl', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
   },
   password_reset: {
     subject: '{{brandName}} — Reset your password',
-    html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;">
-  <h2 style="color:#111;margin-bottom:16px;">Reset your password</h2>
-  <p style="color:#555;margin-bottom:24px;">Enter this code to reset your password:</p>
-  <div style="background:#f5f5f5;border-radius:8px;padding:20px;text-align:center;margin-bottom:24px;">
-    <span style="font-size:32px;font-weight:bold;letter-spacing:8px;color:#111;">{{code}}</span>
+    html: wrapTemplate(`
+  ${BRAND_HEADER}
+  <h2 style="color:#111827;margin-bottom:16px;">Reset your password</h2>
+  <p style="color:#4B5563;margin-bottom:24px;">Enter this code to reset your password:</p>
+  <div style="background:#F3F4F6;border-radius:8px;padding:20px;text-align:center;margin-bottom:24px;">
+    <span style="font-size:32px;font-weight:700;letter-spacing:8px;color:#111827;">{{code}}</span>
   </div>
-  <p style="color:#888;font-size:14px;">This code expires in {{expiresIn}}.</p>
-  <p style="color:#888;font-size:14px;">If you didn't request this, you can safely ignore this email.</p>
-</div>`,
-    variables: ['code', 'expiresIn', 'brandName'],
+  <p style="color:#9CA3AF;font-size:14px;">This code expires in {{expiresIn}}.</p>
+  <p style="color:#9CA3AF;font-size:14px;">If you didn't request this, you can safely ignore this email.</p>
+`),
+    variables: ['code', 'expiresIn', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
   },
   member_invite: {
     subject: "You've been invited to join {{orgName}}",
-    html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;">
-  <h2 style="color:#111;margin-bottom:16px;">You're invited</h2>
-  <p style="color:#555;font-size:16px;line-height:1.6;">{{inviterName}} has invited you to join <strong>{{orgName}}</strong> as {{role}}.</p>
-  <div style="text-align:center;margin:32px 0;">
-    <a href="{{acceptUrl}}" style="background:#111;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:bold;display:inline-block;">Accept invitation</a>
-  </div>
-  <p style="color:#888;font-size:14px;">This invitation expires in 7 days.</p>
-  <p style="color:#888;font-size:14px;">If you weren't expecting this, you can safely ignore this email.</p>
-</div>`,
-    variables: ['inviterName', 'orgName', 'role', 'acceptUrl', 'brandName'],
+    html: wrapTemplate(`
+  ${BRAND_HEADER}
+  <h2 style="color:#111827;margin-bottom:16px;">You're invited</h2>
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;">{{inviterName}} has invited you to join <strong>{{orgName}}</strong> as {{role}}.</p>
+  ${ctaButton('{{acceptUrl}}', 'Accept invitation')}
+  <p style="color:#9CA3AF;font-size:14px;">This invitation expires in 7 days.</p>
+  <p style="color:#9CA3AF;font-size:14px;">If you weren't expecting this, you can safely ignore this email.</p>
+`),
+    variables: ['inviterName', 'orgName', 'role', 'acceptUrl', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
   },
   payment_confirmation: {
     subject: 'Payment Confirmed - {{planName}}',
-    html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;">
-  <h1 style="color:#111;font-size:24px;margin-bottom:16px;">Payment Confirmed</h1>
-  <p style="color:#555;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
-  <p style="color:#555;font-size:16px;line-height:1.6;">Your payment of <strong>{{amount}}</strong> for <strong>{{planName}}</strong> has been processed successfully.</p>
-  <div style="background:#f5f5f5;border-radius:8px;padding:16px;margin:24px 0;">
-    <p style="color:#555;margin:4px 0;"><strong>Plan:</strong> {{planName}}</p>
-    <p style="color:#555;margin:4px 0;"><strong>Next billing date:</strong> {{nextBillingDate}}</p>
+    html: wrapTemplate(`
+  ${BRAND_HEADER}
+  <h1 style="color:#111827;font-size:24px;margin-bottom:16px;">Payment Confirmed</h1>
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;">Your payment of <strong>{{amount}}</strong> for <strong>{{planName}}</strong> has been processed successfully.</p>
+  <div style="background:#F3F4F6;border-radius:8px;padding:16px;margin:24px 0;">
+    <p style="color:#4B5563;margin:4px 0;"><strong>Plan:</strong> {{planName}}</p>
+    <p style="color:#4B5563;margin:4px 0;"><strong>Next billing date:</strong> {{nextBillingDate}}</p>
   </div>
-  <p style="color:#888;font-size:14px;">Thank you for your continued support!</p>
-</div>`,
-    variables: ['userName', 'planName', 'amount', 'nextBillingDate', 'brandName'],
+  <p style="color:#9CA3AF;font-size:14px;">Thank you for your continued support!</p>
+`),
+    variables: ['userName', 'planName', 'amount', 'nextBillingDate', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
   },
   subscription_canceled: {
     subject: 'Subscription Canceled - {{brandName}}',
-    html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;">
-  <h1 style="color:#111;font-size:24px;margin-bottom:16px;">Subscription Canceled</h1>
-  <p style="color:#555;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
-  <p style="color:#555;font-size:16px;line-height:1.6;">Your <strong>{{planName}}</strong> subscription has been canceled.</p>
-  <div style="background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:16px;margin:24px 0;">
-    <p style="color:#92400e;margin:0;">Your access continues until <strong>{{endDate}}</strong>. After that, your account will revert to the free plan.</p>
+    html: wrapTemplate(`
+  ${BRAND_HEADER}
+  <h1 style="color:#111827;font-size:24px;margin-bottom:16px;">Subscription Canceled</h1>
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;">Your <strong>{{planName}}</strong> subscription has been canceled.</p>
+  <div style="background:#FFFBEB;border:1px solid #D97706;border-radius:8px;padding:16px;margin:24px 0;">
+    <p style="color:#B45309;margin:0;">Your access continues until <strong>{{endDate}}</strong>. After that, your account will revert to the free plan.</p>
   </div>
-  <p style="color:#555;font-size:16px;line-height:1.6;">If you change your mind, you can re-subscribe at any time from your billing settings.</p>
-  <p style="color:#888;font-size:14px;">We hope to see you back soon!</p>
-</div>`,
-    variables: ['userName', 'planName', 'endDate', 'brandName'],
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;">If you change your mind, you can re-subscribe at any time from your billing settings.</p>
+  <p style="color:#9CA3AF;font-size:14px;">We hope to see you back soon!</p>
+`),
+    variables: ['userName', 'planName', 'endDate', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
   },
   payment_failed: {
     subject: 'Payment Failed - Action Required',
-    html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;">
-  <h1 style="color:#dc2626;font-size:24px;margin-bottom:16px;">Payment Failed</h1>
-  <p style="color:#555;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
-  <p style="color:#555;font-size:16px;line-height:1.6;">We were unable to process your payment for <strong>{{planName}}</strong>.</p>
-  <div style="background:#fef2f2;border:1px solid #ef4444;border-radius:8px;padding:16px;margin:24px 0;">
-    <p style="color:#991b1b;margin:0;">We'll retry your payment on <strong>{{retryDate}}</strong>. Please update your payment method to avoid interruption.</p>
+    html: wrapTemplate(`
+  ${BRAND_HEADER}
+  <h1 style="color:#DC2626;font-size:24px;margin-bottom:16px;">Payment Failed</h1>
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;">We were unable to process your payment for <strong>{{planName}}</strong>.</p>
+  <div style="background:#FEF2F2;border:1px solid #EF4444;border-radius:8px;padding:16px;margin:24px 0;">
+    <p style="color:#B91C1C;margin:0;">We'll retry your payment on <strong>{{retryDate}}</strong>. Please update your payment method to avoid interruption.</p>
   </div>
-  <div style="text-align:center;margin:32px 0;">
-    <a href="{{updatePaymentUrl}}" style="background:#dc2626;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:bold;display:inline-block;">Update Payment Method</a>
-  </div>
-</div>`,
-    variables: ['userName', 'planName', 'retryDate', 'updatePaymentUrl', 'brandName'],
+  ${ctaButton('{{updatePaymentUrl}}', 'Update Payment Method', { bg: '#DC2626' })}
+`),
+    variables: ['userName', 'planName', 'retryDate', 'updatePaymentUrl', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
   },
   credits_low: {
     subject: 'Credits Running Low - {{brandName}}',
-    html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;">
-  <h1 style="color:#f59e0b;font-size:24px;margin-bottom:16px;">Credits Running Low</h1>
-  <p style="color:#555;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
-  <p style="color:#555;font-size:16px;line-height:1.6;">You have <strong>{{remainingCredits}}</strong> credits remaining on your <strong>{{planName}}</strong> plan.</p>
-  <p style="color:#555;font-size:16px;line-height:1.6;">Consider upgrading your plan to get more credits and continue using all features without interruption.</p>
-</div>`,
-    variables: ['userName', 'remainingCredits', 'planName', 'brandName'],
+    html: wrapTemplate(`
+  ${BRAND_HEADER}
+  <h1 style="color:#D97706;font-size:24px;margin-bottom:16px;">Credits Running Low</h1>
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;">You have <strong>{{remainingCredits}}</strong> credits remaining on your <strong>{{planName}}</strong> plan.</p>
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;">Consider upgrading your plan to get more credits and continue using all features without interruption.</p>
+`),
+    variables: ['userName', 'remainingCredits', 'planName', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
   },
   topup_requested: {
     subject: 'Credit top-up requested by {{requesterName}}',
-    html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;">
-  <h1 style="color:#111;font-size:24px;margin-bottom:16px;">Credit Top-Up Requested</h1>
-  <p style="color:#555;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
-  <p style="color:#555;font-size:16px;line-height:1.6;"><strong>{{requesterName}}</strong> ({{requesterEmail}}) has requested a credit top-up for your organization.</p>
-  <div style="background:#f5f5f5;border-radius:8px;padding:16px;margin:24px 0;">
-    <p style="color:#555;margin:4px 0;"><strong>Requested amount:</strong> {{amount}}</p>
-    <p style="color:#555;margin:4px 0;"><strong>Note:</strong> {{note}}</p>
+    html: wrapTemplate(`
+  ${BRAND_HEADER}
+  <h1 style="color:#111827;font-size:24px;margin-bottom:16px;">Credit Top-Up Requested</h1>
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;"><strong>{{requesterName}}</strong> ({{requesterEmail}}) has requested a credit top-up for your organization.</p>
+  <div style="background:#F3F4F6;border-radius:8px;padding:16px;margin:24px 0;">
+    <p style="color:#4B5563;margin:4px 0;"><strong>Requested amount:</strong> {{amount}}</p>
+    <p style="color:#4B5563;margin:4px 0;"><strong>Note:</strong> {{note}}</p>
   </div>
-  <div style="text-align:center;margin:32px 0;">
-    <a href="{{billingUrl}}" style="background:#111;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:bold;display:inline-block;">Buy Credits</a>
-  </div>
-  <p style="color:#888;font-size:14px;">Only you (the owner) can purchase credits for the organization.</p>
-</div>`,
-    variables: ['userName', 'requesterName', 'requesterEmail', 'amount', 'note', 'billingUrl', 'brandName'],
+  ${ctaButton('{{billingUrl}}', 'Buy Credits')}
+  <p style="color:#9CA3AF;font-size:14px;">Only you (the owner) can purchase credits for the organization.</p>
+`),
+    variables: ['userName', 'requesterName', 'requesterEmail', 'amount', 'note', 'billingUrl', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
   },
   feedback_submitted: {
     subject: '[{{brandName}} Feedback] {{stars}} — {{feature}}',
-    html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;border:1px solid #e5e7eb;border-radius:8px;">
-  <h2 style="color:#111;margin-bottom:4px;">New Feedback Received</h2>
-  <p style="color:#6b7280;font-size:14px;margin-top:0;">{{brandName}} In-App Feedback</p>
+    html: wrapTemplate(`
+  ${BRAND_HEADER}
+  <h2 style="color:#111827;margin-bottom:4px;">New Feedback Received</h2>
+  <p style="color:#6B7280;font-size:14px;margin-top:0;">{{brandName}} In-App Feedback</p>
   <table style="width:100%;border-collapse:collapse;margin:24px 0;">
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;width:140px;">Feature</td><td style="padding:8px 0;color:#111;">{{feature}}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Rating</td><td style="padding:8px 0;color:#FFA163;font-size:20px;">{{stars}}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">User</td><td style="padding:8px 0;color:#111;">{{userEmail}}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;vertical-align:top;">Comment</td><td style="padding:8px 0;color:#111;">{{comment}}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Submitted</td><td style="padding:8px 0;color:#6b7280;font-size:13px;">{{submittedAt}}</td></tr>
+    <tr><td style="font-family:${FONT_STACK};padding:8px 0;color:#374151;font-weight:600;width:140px;">Feature</td><td style="font-family:${FONT_STACK};padding:8px 0;color:#111827;">{{feature}}</td></tr>
+    <tr><td style="font-family:${FONT_STACK};padding:8px 0;color:#374151;font-weight:600;">Rating</td><td style="font-family:${FONT_STACK};padding:8px 0;color:#D97706;font-size:20px;">{{stars}}</td></tr>
+    <tr><td style="font-family:${FONT_STACK};padding:8px 0;color:#374151;font-weight:600;">User</td><td style="font-family:${FONT_STACK};padding:8px 0;color:#111827;">{{userEmail}}</td></tr>
+    <tr><td style="font-family:${FONT_STACK};padding:8px 0;color:#374151;font-weight:600;vertical-align:top;">Comment</td><td style="font-family:${FONT_STACK};padding:8px 0;color:#111827;">{{comment}}</td></tr>
+    <tr><td style="font-family:${FONT_STACK};padding:8px 0;color:#374151;font-weight:600;">Submitted</td><td style="font-family:${FONT_STACK};padding:8px 0;color:#6B7280;font-size:13px;">{{submittedAt}}</td></tr>
   </table>
-</div>`,
-    variables: ['feature', 'rating', 'stars', 'comment', 'userEmail', 'submittedAt', 'brandName'],
+`),
+    variables: ['feature', 'rating', 'stars', 'comment', 'userEmail', 'submittedAt', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
   },
   contact_submitted: {
     subject: '[{{brandName}} Contact] {{category}} — {{subject}}',
-    html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;border:1px solid #e5e7eb;border-radius:8px;">
-  <h2 style="color:#111;margin-bottom:4px;">New Contact Form Submission</h2>
-  <p style="color:#6b7280;font-size:14px;margin-top:0;">{{brandName}} Help Center</p>
+    html: wrapTemplate(`
+  ${BRAND_HEADER}
+  <h2 style="color:#111827;margin-bottom:4px;">New Contact Form Submission</h2>
+  <p style="color:#6B7280;font-size:14px;margin-top:0;">{{brandName}} Help Center</p>
   <table style="width:100%;border-collapse:collapse;margin:24px 0;">
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;width:140px;">User</td><td style="padding:8px 0;color:#111;">{{userName}}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Email</td><td style="padding:8px 0;color:#111;">{{userEmail}}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Category</td><td style="padding:8px 0;color:#111;">{{category}}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Subject</td><td style="padding:8px 0;color:#111;">{{subject}}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;vertical-align:top;">Message</td><td style="padding:8px 0;color:#111;white-space:pre-wrap;">{{message}}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Submitted</td><td style="padding:8px 0;color:#6b7280;font-size:13px;">{{submittedAt}}</td></tr>
+    <tr><td style="font-family:${FONT_STACK};padding:8px 0;color:#374151;font-weight:600;width:140px;">User</td><td style="font-family:${FONT_STACK};padding:8px 0;color:#111827;">{{userName}}</td></tr>
+    <tr><td style="font-family:${FONT_STACK};padding:8px 0;color:#374151;font-weight:600;">Email</td><td style="font-family:${FONT_STACK};padding:8px 0;color:#111827;">{{userEmail}}</td></tr>
+    <tr><td style="font-family:${FONT_STACK};padding:8px 0;color:#374151;font-weight:600;">Category</td><td style="font-family:${FONT_STACK};padding:8px 0;color:#111827;">{{category}}</td></tr>
+    <tr><td style="font-family:${FONT_STACK};padding:8px 0;color:#374151;font-weight:600;">Subject</td><td style="font-family:${FONT_STACK};padding:8px 0;color:#111827;">{{subject}}</td></tr>
+    <tr><td style="font-family:${FONT_STACK};padding:8px 0;color:#374151;font-weight:600;vertical-align:top;">Message</td><td style="font-family:${FONT_STACK};padding:8px 0;color:#111827;white-space:pre-wrap;">{{message}}</td></tr>
+    <tr><td style="font-family:${FONT_STACK};padding:8px 0;color:#374151;font-weight:600;">Submitted</td><td style="font-family:${FONT_STACK};padding:8px 0;color:#6B7280;font-size:13px;">{{submittedAt}}</td></tr>
   </table>
-</div>`,
-    variables: ['userName', 'userEmail', 'subject', 'category', 'message', 'submittedAt', 'brandName'],
+`),
+    variables: ['userName', 'userEmail', 'subject', 'category', 'message', 'submittedAt', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
   },
   monthly_report: {
     subject: 'Your {{period}} report for {{workspaceName}} is ready',
-    html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;">
-  <h1 style="color:#111;font-size:24px;margin-bottom:16px;">Your monthly report is ready</h1>
-  <p style="color:#555;font-size:16px;line-height:1.6;">The <strong>{{period}}</strong> performance report for <strong>{{workspaceName}}</strong> has been generated.</p>
-  <p style="color:#555;font-size:16px;line-height:1.6;">It covers content production, on-page scores, AI visibility and search performance for the month.</p>
-  <div style="text-align:center;margin:32px 0;">
-    <a href="{{reportUrl}}" style="background:#111;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:bold;display:inline-block;">View Report</a>
-  </div>
-  <p style="color:#888;font-size:14px;">This link expires in 90 days. You're receiving this because you're part of this workspace on {{brandName}}.</p>
-</div>`,
-    variables: ['workspaceName', 'period', 'reportUrl', 'brandName'],
+    html: wrapTemplate(`
+  ${BRAND_HEADER}
+  <h1 style="color:#111827;font-size:24px;margin-bottom:16px;">Your monthly report is ready</h1>
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;">The <strong>{{period}}</strong> performance report for <strong>{{workspaceName}}</strong> has been generated.</p>
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;">It covers content production, on-page scores, AI visibility and search performance for the month.</p>
+  ${ctaButton('{{reportUrl}}', 'View Report')}
+  <p style="color:#9CA3AF;font-size:14px;">This link expires in 90 days. You're receiving this because you're part of this workspace on {{brandName}}.</p>
+`),
+    variables: ['workspaceName', 'period', 'reportUrl', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
   },
   scan_completed: {
     subject: 'AI Scan Complete – {{trackerName}}',
-    html: `<div style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto;padding:24px 16px;color:#111;">
+    html: wrapTemplate(`
+
+  <!-- Brand -->
+  ${BRAND_HEADER}
 
   <!-- Header -->
   <h1 style="font-size:20px;font-weight:700;margin:0 0 6px 0;">AI Tracker Scan Complete</h1>
-  <p style="color:#64748b;font-size:14px;margin:0 0 24px 0;">Hi {{userName}} &mdash; <strong>{{domain}}</strong> was scanned on {{scanDate}}.</p>
+  <p style="color:#6B7280;font-size:14px;margin:0 0 24px 0;">Hi {{userName}} &mdash; <strong>{{domain}}</strong> was scanned on {{scanDate}}.</p>
 
   <!-- Key Metrics -->
-  <h2 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#4f46e5;margin:0 0 8px 0;padding-bottom:6px;border-bottom:2px solid #4f46e5;">Key Metrics</h2>
-  <table style="width:100%;border-collapse:collapse;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;margin-bottom:24px;">
+  <h2 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:{{primaryColor}};margin:0 0 8px 0;padding-bottom:6px;border-bottom:2px solid {{primaryColor}};">Key Metrics</h2>
+  <table style="width:100%;border-collapse:collapse;border:1px solid #E5E7EB;border-radius:8px;overflow:hidden;margin-bottom:24px;">
     <tr>
-      <td style="padding:14px;text-align:center;border-right:1px solid #e2e8f0;background:#f8fafc;">
-        <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Visibility</div>
+      <td style="font-family:${FONT_STACK};padding:14px;text-align:center;border-right:1px solid #E5E7EB;background:#F9FAFB;">
+        <div style="color:#6B7280;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Visibility</div>
         <div style="font-size:22px;font-weight:700;">{{visibility}}</div>
       </td>
-      <td style="padding:14px;text-align:center;border-right:1px solid #e2e8f0;background:#f8fafc;">
-        <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Mention Rate</div>
+      <td style="font-family:${FONT_STACK};padding:14px;text-align:center;border-right:1px solid #E5E7EB;background:#F9FAFB;">
+        <div style="color:#6B7280;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Mention Rate</div>
         <div style="font-size:22px;font-weight:700;">{{mentionRate}}%</div>
       </td>
-      <td style="padding:14px;text-align:center;border-right:1px solid #e2e8f0;background:#f8fafc;">
-        <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Share of Voice</div>
+      <td style="font-family:${FONT_STACK};padding:14px;text-align:center;border-right:1px solid #E5E7EB;background:#F9FAFB;">
+        <div style="color:#6B7280;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Share of Voice</div>
         <div style="font-size:22px;font-weight:700;">{{shareOfVoice}}%</div>
       </td>
-      <td style="padding:14px;text-align:center;border-right:1px solid #e2e8f0;background:#f8fafc;">
-        <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Citation Rate</div>
+      <td style="font-family:${FONT_STACK};padding:14px;text-align:center;border-right:1px solid #E5E7EB;background:#F9FAFB;">
+        <div style="color:#6B7280;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Citation Rate</div>
         <div style="font-size:22px;font-weight:700;">{{citationRate}}%</div>
       </td>
-      <td style="padding:14px;text-align:center;background:#f8fafc;">
-        <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Sentiment</div>
+      <td style="font-family:${FONT_STACK};padding:14px;text-align:center;background:#F9FAFB;">
+        <div style="color:#6B7280;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Sentiment</div>
         <div style="font-size:14px;font-weight:600;">{{avgSentiment}}</div>
       </td>
     </tr>
   </table>
 
   <!-- Platform Breakdown -->
-  <h2 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#374151;margin:0 0 8px 0;padding-bottom:6px;border-bottom:2px solid #e2e8f0;">Platform Breakdown</h2>
-  <table style="width:100%;border-collapse:collapse;border:1px solid #e2e8f0;margin-bottom:24px;">
+  <h2 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#374151;margin:0 0 8px 0;padding-bottom:6px;border-bottom:2px solid #E5E7EB;">Platform Breakdown</h2>
+  <table style="width:100%;border-collapse:collapse;border:1px solid #E5E7EB;margin-bottom:24px;">
     <thead>
-      <tr style="background:#f8fafc;">
-        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Platform</th>
-        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Visibility</th>
-        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Mentions</th>
-        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Citations</th>
-        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;"></th>
+      <tr style="background:#F9FAFB;">
+        <th style="font-family:${FONT_STACK};padding:8px 14px;text-align:left;color:#6B7280;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #E5E7EB;">Platform</th>
+        <th style="font-family:${FONT_STACK};padding:8px 14px;text-align:left;color:#6B7280;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #E5E7EB;">Visibility</th>
+        <th style="font-family:${FONT_STACK};padding:8px 14px;text-align:left;color:#6B7280;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #E5E7EB;">Mentions</th>
+        <th style="font-family:${FONT_STACK};padding:8px 14px;text-align:left;color:#6B7280;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #E5E7EB;">Citations</th>
+        <th style="font-family:${FONT_STACK};padding:8px 14px;text-align:left;color:#6B7280;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #E5E7EB;"></th>
       </tr>
     </thead>
     <tbody>{{platformRows}}</tbody>
   </table>
 
   <!-- Tracked Prompts -->
-  <h2 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#374151;margin:0 0 8px 0;padding-bottom:6px;border-bottom:2px solid #e2e8f0;">Tracked Prompts ({{promptsScanned}})</h2>
-  <table style="width:100%;border-collapse:collapse;border:1px solid #e2e8f0;margin-bottom:24px;">
+  <h2 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#374151;margin:0 0 8px 0;padding-bottom:6px;border-bottom:2px solid #E5E7EB;">Tracked Prompts ({{promptsScanned}})</h2>
+  <table style="width:100%;border-collapse:collapse;border:1px solid #E5E7EB;margin-bottom:24px;">
     <thead>
-      <tr style="background:#f8fafc;">
-        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Status</th>
-        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">#</th>
-        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Prompt</th>
-        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Platforms</th>
-        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Mention</th>
-        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Citation</th>
+      <tr style="background:#F9FAFB;">
+        <th style="font-family:${FONT_STACK};padding:8px 14px;text-align:left;color:#6B7280;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #E5E7EB;">Status</th>
+        <th style="font-family:${FONT_STACK};padding:8px 14px;text-align:left;color:#6B7280;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #E5E7EB;">#</th>
+        <th style="font-family:${FONT_STACK};padding:8px 14px;text-align:left;color:#6B7280;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #E5E7EB;">Prompt</th>
+        <th style="font-family:${FONT_STACK};padding:8px 14px;text-align:left;color:#6B7280;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #E5E7EB;">Platforms</th>
+        <th style="font-family:${FONT_STACK};padding:8px 14px;text-align:left;color:#6B7280;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #E5E7EB;">Mention</th>
+        <th style="font-family:${FONT_STACK};padding:8px 14px;text-align:left;color:#6B7280;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #E5E7EB;">Citation</th>
       </tr>
     </thead>
     <tbody>{{promptRows}}</tbody>
   </table>
 
   <!-- Competitors -->
-  <h2 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#374151;margin:0 0 8px 0;padding-bottom:6px;border-bottom:2px solid #e2e8f0;">Top Competitors</h2>
-  <table style="width:100%;border-collapse:collapse;border:1px solid #e2e8f0;margin-bottom:24px;">
+  <h2 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#374151;margin:0 0 8px 0;padding-bottom:6px;border-bottom:2px solid #E5E7EB;">Top Competitors</h2>
+  <table style="width:100%;border-collapse:collapse;border:1px solid #E5E7EB;margin-bottom:24px;">
     <thead>
-      <tr style="background:#f8fafc;">
-        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">#</th>
-        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Brand</th>
-        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Mentions</th>
-        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Citations</th>
-        <th style="padding:8px 14px;text-align:left;color:#64748b;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;">Visibility</th>
+      <tr style="background:#F9FAFB;">
+        <th style="font-family:${FONT_STACK};padding:8px 14px;text-align:left;color:#6B7280;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #E5E7EB;">#</th>
+        <th style="font-family:${FONT_STACK};padding:8px 14px;text-align:left;color:#6B7280;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #E5E7EB;">Brand</th>
+        <th style="font-family:${FONT_STACK};padding:8px 14px;text-align:left;color:#6B7280;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #E5E7EB;">Mentions</th>
+        <th style="font-family:${FONT_STACK};padding:8px 14px;text-align:left;color:#6B7280;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #E5E7EB;">Citations</th>
+        <th style="font-family:${FONT_STACK};padding:8px 14px;text-align:left;color:#6B7280;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #E5E7EB;">Visibility</th>
       </tr>
     </thead>
     <tbody>{{competitorRows}}</tbody>
   </table>
 
   <!-- Recommended Actions -->
-  <h2 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#374151;margin:0 0 8px 0;padding-bottom:6px;border-bottom:2px solid #e2e8f0;">Recommended Actions</h2>
-  <table style="width:100%;border-collapse:collapse;border:1px solid #e2e8f0;margin-bottom:28px;">
+  <h2 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#374151;margin:0 0 8px 0;padding-bottom:6px;border-bottom:2px solid #E5E7EB;">Recommended Actions</h2>
+  <table style="width:100%;border-collapse:collapse;border:1px solid #E5E7EB;margin-bottom:28px;">
     <tbody>{{actionRows}}</tbody>
   </table>
 
   <!-- CTA -->
-  <div style="text-align:center;margin-bottom:24px;">
-    <a href="{{dashboardUrl}}" style="background:#4f46e5;color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:700;font-size:14px;display:inline-block;">View Full Dashboard</a>
-  </div>
-  <p style="color:#94a3b8;font-size:11px;text-align:center;margin:0;">You&rsquo;re receiving this because email notifications are enabled on your {{brandName}} account.</p>
-</div>`,
-    variables: ['userName', 'trackerName', 'domain', 'scanDate', 'promptsScanned', 'visibility', 'mentionRate', 'shareOfVoice', 'citationRate', 'avgSentiment', 'platformRows', 'promptRows', 'competitorRows', 'actionRows', 'dashboardUrl', 'brandName'],
+  ${ctaButton('{{dashboardUrl}}', 'View Full Dashboard')}
+  <p style="color:#9CA3AF;font-size:11px;text-align:center;margin:0;">You&rsquo;re receiving this because email notifications are enabled on your {{brandName}} account.</p>
+`),
+    variables: ['userName', 'trackerName', 'domain', 'scanDate', 'promptsScanned', 'visibility', 'mentionRate', 'shareOfVoice', 'citationRate', 'avgSentiment', 'platformRows', 'promptRows', 'competitorRows', 'actionRows', 'dashboardUrl', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
   },
 };
 
@@ -431,15 +666,24 @@ const _globalRowFilter = (triggerId) => ({
  *   (c) hardcoded original default.
  * Also increments trigger stats (triggerCount, lastTriggered) on the
  * GLOBAL row — never creates tenant rows as a side effect.
+ *
+ * DATABASE FAILURE DEGRADES TO THE HARDCODED DEFAULT (Phase 4). It used to
+ * return null: one try/catch wrapped the whole body, so a transient Mongo
+ * error while reading an OVERRIDE discarded the perfectly good hardcoded
+ * template too. Every caller then fell through to its own duplicate
+ * unstyled copy of the email — no logo, no shell, no brand colour — which is
+ * also why those copies existed. Overrides need the database; defaults never
+ * did. Now only the override lookup is at risk, so this returns null solely
+ * for an unknown triggerId.
  */
 const getTemplateForTrigger = async (triggerId, organizationId = null) => {
-  try {
-    const originalDefault = ORIGINAL_DEFAULT_TEMPLATES[triggerId];
-    if (!originalDefault) {
-      console.warn(`[triggers] No original template for triggerId=${triggerId}`);
-      return null;
-    }
+  const originalDefault = ORIGINAL_DEFAULT_TEMPLATES[triggerId];
+  if (!originalDefault) {
+    console.warn(`[triggers] No original template for triggerId=${triggerId}`);
+    return null;
+  }
 
+  try {
     let tenant = null;
     if (organizationId && (await flagService.isFlagLive('whiteLabelEmail'))) {
       // Downgrade semantics match brandService: the override row is retained
@@ -477,16 +721,24 @@ const getTemplateForTrigger = async (triggerId, organizationId = null) => {
       html: tenant?.defaultHtml || saved?.defaultHtml || originalDefault.html,
     };
   } catch (error) {
-    console.error(`[triggers] getTemplateForTrigger error for ${triggerId}:`, error.message);
-    return null;
+    // Overrides unreachable (DB down, index missing, timeout). The hardcoded
+    // default is right here in memory and needs nothing — ship it rather than
+    // failing the send. Stats are lost for this one email; that is the cheaper
+    // half of the trade.
+    console.error(
+      `[triggers] override lookup failed for ${triggerId}, using hardcoded default:`,
+      error.message
+    );
+    return { subject: originalDefault.subject, html: originalDefault.html };
   }
 };
 
 /**
  * Resolve a trigger template and apply {{variable}} substitution.
  * Mutates emailOptions in place — sets .subject and .html, removes .data.
- * `brandName` / `supportEmail` are auto-injected into data (resolved brand
- * of `organizationId`, or the platform brand) unless the caller set them.
+ * `brandName` / `supportEmail` / `logoUrl` / `primaryColor` are auto-injected
+ * into data (resolved brand of `organizationId`, or the platform brand)
+ * unless the caller set them.
  *
  * Usage:
  *   const emailOptions = { to: user.email, data: { userName: 'John', planName: 'Pro' } };
@@ -499,30 +751,83 @@ const applyCustomTemplate = async (triggerId, emailOptions, organizationId = nul
     if (template && emailOptions.data) {
       // Enrich with brand variables before substitution. Emails must never
       // fail on brand lookups — fall back to the platform identity.
-      if (emailOptions.data.brandName === undefined || emailOptions.data.supportEmail === undefined) {
+      if (
+        emailOptions.data.brandName === undefined ||
+        emailOptions.data.supportEmail === undefined ||
+        emailOptions.data.logoUrl === undefined ||
+        emailOptions.data.primaryColor === undefined
+      ) {
         let brandName = 'SupaRank';
         let supportEmail = 'support@suparank.ai';
+        // Same degradation ladder as the app header's <BrandLogo icon>:
+        // the tenant's square mark, else their wide lockup, else ours. A
+        // tenant's own logo at any shape beats showing them SupaRank's.
+        let logoUrl = PLATFORM_EMAIL_LOGO();
+        // Solid, not the app's --sr-grad-cta gradient: Outlook's Word engine
+        // drops background-image, which would leave a white button with white
+        // text. brand-600 is the midpoint of that gradient and is already the
+        // platform primaryColor default, so a solid fill reads as the same CTA.
+        // Safe to interpolate into a style attribute — brandService validates
+        // primaryColor against /^#[0-9a-fA-F]{6}$/ on save.
+        let primaryColor = brandService.HARDCODED_DEFAULTS.primaryColor;
         try {
           const brand = organizationId
             ? (await brandService.getBrandForOrg(organizationId)).brand
             : await brandService.getPlatformBrand();
           if (brand?.productName) brandName = brand.productName;
           if (brand?.supportEmail) supportEmail = brand.supportEmail;
+          if (brand?.logoIconUrl || brand?.logoUrl) logoUrl = brand.logoIconUrl || brand.logoUrl;
+          if (brand?.primaryColor) primaryColor = brand.primaryColor;
         } catch (err) {
           console.error(`[triggers] brand lookup failed for ${triggerId}:`, err.message);
         }
         if (emailOptions.data.brandName === undefined) emailOptions.data.brandName = brandName;
         if (emailOptions.data.supportEmail === undefined) emailOptions.data.supportEmail = supportEmail;
+        if (emailOptions.data.logoUrl === undefined) emailOptions.data.logoUrl = logoUrl;
+        if (emailOptions.data.primaryColor === undefined) emailOptions.data.primaryColor = primaryColor;
       }
 
+      /**
+       * Preheader — the inbox snippet line.
+       *
+       * Resolved HERE rather than left to the main substitution loop below,
+       * because the copy itself contains placeholders ("{{inviterName}} has
+       * invited you to {{orgName}}"). That loop walks Object.entries in
+       * insertion order, so leaving nested placeholders to it would only work
+       * while `preheader` happened to be substituted before the keys it
+       * references — order-dependent, and silently wrong the day someone
+       * reorders the data bag.
+       *
+       * NOT escaped. Every value it interpolates is already in `data`, escaped
+       * (or not) exactly as the body will render it; escaping again would
+       * double-encode the callers that correctly pre-escape.
+       */
+      if (emailOptions.data.preheader === undefined) {
+        const def = SYSTEM_TRIGGERS.find((t) => t.id === triggerId);
+        let text = def?.preheader || '';
+        for (const [key, value] of Object.entries(emailOptions.data)) {
+          text = text.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), String(value ?? ''));
+        }
+        // A placeholder with no matching data would otherwise ship literally
+        // into the inbox snippet, which is worse than a shorter preheader.
+        emailOptions.data.preheader = text.replace(/\{\{\w+\}\}/g, '').replace(/\s+/g, ' ').trim();
+      }
+
+      // The Subject is a plain-text header (RFC 5322) and is never parsed as
+      // HTML, so it takes the RAW values — escaping here would put "Smith
+      // &amp; Co" in an agency's subject line.
       emailOptions.subject = Object.entries(emailOptions.data).reduce(
         (subj, [key, value]) =>
           subj.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), String(value ?? '')),
         template.subject
       );
+      // The body does NOT. See BRAND_ESCAPED_KEYS.
       emailOptions.html = Object.entries(emailOptions.data).reduce(
         (html, [key, value]) =>
-          html.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), String(value ?? '')),
+          html.replace(
+            new RegExp(`\\{\\{${key}\\}\\}`, 'g'),
+            BRAND_ESCAPED_KEYS.has(key) ? htmlEscape(value) : String(value ?? '')
+          ),
         template.html
       );
       delete emailOptions.data;
@@ -763,6 +1068,10 @@ const getTriggers = async (req, res) => {
         triggerCount: saved?.triggerCount || 0,
         hasDefaultTemplate: !!originalDefault,
         hasCustomDefault: !!saved?.defaultHtml,
+        // D2: this override was copied from an older default and has not been
+        // refreshed. We never rewrite it, so flagging it is the only way the
+        // admin finds out.
+        overrideStale: isOverrideStale(saved),
         variables: originalDefault?.variables || def.variables || [],
       };
     });
@@ -793,6 +1102,10 @@ const getDefaultTemplate = async (req, res) => {
         html: savedTrigger?.defaultHtml || originalDefault.html,
         variables: originalDefault.variables,
         isCustomized: !!savedTrigger?.defaultHtml,
+        // D2 — see isOverrideStale. `originalHtml` below is the current
+        // built-in default, so the editor can offer a one-click refresh.
+        overrideStale: isOverrideStale(savedTrigger),
+        defaultsRevisedAt: DEFAULTS_REVISED_AT.toISOString(),
         originalSubject: originalDefault.subject,
         originalHtml: originalDefault.html,
       },
@@ -855,4 +1168,14 @@ module.exports = {
   // Exported for tests: template/variable contract verification
   SYSTEM_TRIGGERS,
   ORIGINAL_DEFAULT_TEMPLATES,
+  // Exported for tests: the override-vs-default resolution path, which the
+  // Phase 2 shell must leave untouched for pre-shell override rows.
+  getTemplateForTrigger,
+  wrapTemplate,
+  EMAIL_WIDTH,
+  ctaButton,
+  FONT_STACK,
+  // D2 staleness signal, shared with tenantEmailTemplateController.
+  isOverrideStale,
+  DEFAULTS_REVISED_AT,
 };

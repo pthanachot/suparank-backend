@@ -320,6 +320,14 @@ const createCheckoutSession = async (req, res) => {
       });
     }
 
+    // Wave 1 (§4c-9): the upgrade surface that led here, threaded into Stripe
+    // metadata so a completed subscription can be attributed to the surface
+    // that sold it — client events alone stop at checkout-start. Strictly
+    // sanitized: client-supplied, and Stripe metadata is forever.
+    const surface = typeof req.body?.surface === 'string' && /^[a-z0-9][a-z0-9-]{0,39}$/.test(req.body.surface)
+      ? req.body.surface
+      : null;
+
     const session = await stripe.checkout.sessions.create({
       customer: customerId,
       mode: 'subscription',
@@ -331,16 +339,18 @@ const createCheckoutSession = async (req, res) => {
       metadata: {
         organizationId: orgId.toString(),
         userId: user._id.toString(),
+        ...(surface ? { surface } : {}),
       },
       subscription_data: {
         metadata: {
           organizationId: orgId.toString(),
           userId: user._id.toString(),
+          ...(surface ? { surface } : {}),
         },
       },
     });
 
-    auditBilling(req, org, 'billing.checkout_started', { priceId, plan: PRICE_TO_PLAN[priceId] || null });
+    auditBilling(req, org, 'billing.checkout_started', { priceId, plan: PRICE_TO_PLAN[priceId] || null, surface });
     res.json({ url: session.url, sessionId: session.id });
   } catch (error) {
     console.error('Create checkout session error:', error);
@@ -867,13 +877,17 @@ async function notifyOwner(organizationId, triggerId, data) {
     const owner = org?.ownerId ? await User.findById(org.ownerId).lean() : null;
     if (!owner?.email || owner.preferences?.emailNotifications === false) return;
 
+    const { htmlEscape, subjectSafe } = require('../utils/htmlEscape');
     const emailOptions = {
       to: owner.email,
       orgId: organizationId,
-      data: { userName: owner.profile?.name || 'there', ...data },
+      data: { userName: htmlEscape(owner.profile?.name || 'there'), ...data },
     };
     await applyCustomTemplate(triggerId, emailOptions, organizationId);
     if (!emailOptions.subject) return; // template resolved to nothing — skip
+    // Escaped values reach the Subject too, and a Subject is plain text —
+    // "Top-up requested by O&#39;Brien" is not acceptable. See subjectSafe.
+    emailOptions.subject = subjectSafe(emailOptions.subject);
     await sendEmail(emailOptions);
     console.log(`[email] ${triggerId} email sent to owner of org=${organizationId}`);
   } catch (err) {
@@ -911,14 +925,19 @@ const requestTopup = async (req, res) => {
     }
 
     const requester = await User.findById(req.user.userId).lean();
-    const requesterName = requester?.profile?.name || requester?.email || 'A team member';
+    // Escaped for the same reason as inviteService.createInvite: these are
+    // free text the REQUESTER controls, substituted raw into a template that
+    // is delivered to someone else (the org owner). `note` especially — it is
+    // 500 characters of arbitrary input. See utils/htmlEscape.
+    const { htmlEscape } = require('../utils/htmlEscape');
+    const requesterName = htmlEscape(requester?.profile?.name || requester?.email || 'A team member');
     // amount is free-form context (credits or $), not a charge — sanitize to a short string.
-    const amountStr = amount != null ? String(amount).slice(0, 40) : 'unspecified';
-    const noteStr = typeof note === 'string' ? note.slice(0, 500) : '';
+    const amountStr = htmlEscape(amount != null ? String(amount).slice(0, 40) : 'unspecified');
+    const noteStr = htmlEscape(typeof note === 'string' ? note.slice(0, 500) : '');
 
     await notifyOwner(orgId, 'topup_requested', {
       requesterName,
-      requesterEmail: requester?.email || '',
+      requesterEmail: htmlEscape(requester?.email || ''),
       amount: amountStr,
       note: noteStr,
       billingUrl: `${APP_URL}/settings/billing`,

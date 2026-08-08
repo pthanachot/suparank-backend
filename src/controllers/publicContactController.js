@@ -129,24 +129,15 @@ const submitPublicContact = async (req, res) => {
     // should not read "I can&#39;t log in". See subjectSafe.
     if (emailOptions.subject) emailOptions.subject = subjectSafe(emailOptions.subject);
 
-    if (!emailOptions.subject) {
-      // Subject is a header, so it takes the raw (header-safe) subject rather
-      // than the HTML-escaped one: no entities in the support inbox.
-      emailOptions.subject = headerSafe(
-        `[SupaRank Contact] ${safeCategory}: ${safeSubject}`
-      );
-      emailOptions.html = `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:32px;border:1px solid #e5e7eb;border-radius:8px;">
-  <h2 style="color:#111;margin-bottom:4px;">New Contact Form Submission</h2>
-  <p style="color:#6b7280;font-size:14px;margin-top:0;">Sent from the public contact page (visitor was not signed in)</p>
-  <table style="width:100%;border-collapse:collapse;margin:24px 0;">
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;width:140px;">Name</td><td style="padding:8px 0;color:#111;">${d.userName}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Email</td><td style="padding:8px 0;color:#111;">${d.userEmail}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Category</td><td style="padding:8px 0;color:#111;">${d.category}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Subject</td><td style="padding:8px 0;color:#111;">${d.subject}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;vertical-align:top;">Message</td><td style="padding:8px 0;color:#111;white-space:pre-wrap;">${d.message}</td></tr>
-    <tr><td style="padding:8px 0;color:#374151;font-weight:600;">Submitted</td><td style="padding:8px 0;color:#6b7280;font-size:13px;">${d.submittedAt}</td></tr>
-  </table>
-</div>`;
+    // Phase 4c removed the hardcoded fallback that used to stand in here,
+    // because getTemplateForTrigger now degrades to the hardcoded default
+    // rather than returning null. Resolution can therefore only come back
+    // empty for an unknown triggerId — a coding error, not a runtime one.
+    // Guard anyway: a subject-less, body-less shell in the support inbox is
+    // worse than a logged failure, because nobody would know to look.
+    if (!emailOptions.subject || !emailOptions.html) {
+      console.error('[public-contact] template resolved to nothing — not sending an empty email');
+      return res.status(500).json({ error: 'Failed to send message' });
     }
 
     await sendEmail(emailOptions);

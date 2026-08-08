@@ -13,7 +13,12 @@ const TriggerableEmailTemplate = require('../models/TriggerableEmailTemplate');
 const brandService = require('../services/brandService');
 const auditService = require('../services/auditService');
 const { resolveOrgWithAccess } = require('./orgMemberController');
-const { SYSTEM_TRIGGERS, ORIGINAL_DEFAULT_TEMPLATES } = require('./emailPortalController');
+const {
+  SYSTEM_TRIGGERS,
+  ORIGINAL_DEFAULT_TEMPLATES,
+  isOverrideStale,
+  DEFAULTS_REVISED_AT,
+} = require('./emailPortalController');
 
 // Platform-only triggers a tenant may not view or override.
 const EXCLUDED_TRIGGERS = new Set(['feedback_submitted', 'contact_submitted']);
@@ -95,6 +100,11 @@ const listEmailTemplates = async (req, res) => {
         hasTenantOverride: Boolean(tenant?.defaultSubject || tenant?.defaultHtml),
         tenantSubject: tenant?.defaultSubject || null,
         tenantHtml: tenant?.defaultHtml || null,
+        // D2: their override is a snapshot of an older default. We never
+        // rewrite it (it is their content), so this flag is the only way they
+        // learn a newer default exists — otherwise an agency keeps sending the
+        // pre-alignment email, with no logo and no brand colour, indefinitely.
+        overrideStale: isOverrideStale(tenant),
         // What the tenant would get without an override: global admin
         // override when set, else the hardcoded original.
         defaultSubject: global?.defaultSubject || original?.subject || '',
@@ -102,7 +112,7 @@ const listEmailTemplates = async (req, res) => {
       };
     });
 
-    res.json({ triggers });
+    res.json({ triggers, defaultsRevisedAt: DEFAULTS_REVISED_AT.toISOString() });
   } catch (error) {
     console.error('List tenant email templates error:', error);
     res.status(500).json({ error: 'Failed to load email templates' });

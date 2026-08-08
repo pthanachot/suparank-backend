@@ -42,7 +42,7 @@ transporter.verify().then(() => {
  * fail-open — identity problems fall back to the platform default and the
  * email still goes out.
  */
-const sendEmail = async ({ to, subject, html, fromName, replyTo, orgId }) => {
+const sendEmail = async ({ to, subject, html, text, fromName, replyTo, orgId }) => {
   const defaultFrom = process.env.EMAIL_FROM || 'SupaRank <no-reply@suparank.com>';
   let from = fromName
     ? `${fromName} <${defaultFrom.match(/<(.+)>/)?.[1] || 'no-reply@suparank.ai'}>`
@@ -60,11 +60,26 @@ const sendEmail = async ({ to, subject, html, fromName, replyTo, orgId }) => {
   const useSupportTransport =
     supportTransporter && typeof to === 'string' && to.includes('support@suparank.ai');
 
+  // Derive the text/plain alternative unless the caller supplied one. Every
+  // email here was HTML-only before this, which is a spam-score penalty on a
+  // domain that also carries password resets and receipts. Never let this
+  // break a send: a missing text part is a deliverability problem, a thrown
+  // exception is a lost email.
+  let textBody = text;
+  if (!textBody && html) {
+    try {
+      textBody = require('./htmlToText').htmlToText(html);
+    } catch (err) {
+      console.error('[email] text/plain derivation failed:', err.message);
+    }
+  }
+
   const mailOptions = {
     from: useSupportTransport ? `SupaRank <${process.env.SUPPORT_SMTP_USER}>` : from,
     to,
     subject,
     html,
+    ...(textBody && { text: textBody }),
     ...(replyTo && { replyTo }),
   };
 

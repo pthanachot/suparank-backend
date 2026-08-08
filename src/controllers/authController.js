@@ -208,7 +208,7 @@ const emailSignup = async (req, res) => {
             <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
               <h2 style="color: #111; margin-bottom: 16px;">Welcome to SupaRank!</h2>
               <p style="color: #555; margin-bottom: 24px;">Click the button below to verify your email address:</p>
-              <a href="${verifyUrl}" style="display: inline-block; padding: 14px 32px; background: #4F46E5; color: white; text-decoration: none; border-radius: 12px; font-weight: bold; font-size: 14px;">Verify Email</a>
+              <a href="${verifyUrl}" style="display: inline-block; padding: 14px 32px; background-color: #2B5BE8; color: white; text-decoration: none; border-radius: 12px; font-weight: bold; font-size: 14px;">Verify Email</a>
               <p style="color: #888; font-size: 14px; margin-top: 24px;">This link expires in 24 hours.</p>
               <p style="color: #888; font-size: 14px;">If you didn't create an account, you can safely ignore this email.</p>
             </div>
@@ -406,7 +406,7 @@ const resendVerification = async (req, res) => {
           <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
             <h2 style="color: #111; margin-bottom: 16px;">Verify your email</h2>
             <p style="color: #555; margin-bottom: 24px;">Click the button below to verify your email address:</p>
-            <a href="${verifyUrl}" style="display: inline-block; padding: 14px 32px; background: #4F46E5; color: white; text-decoration: none; border-radius: 12px; font-weight: bold; font-size: 14px;">Verify Email</a>
+            <a href="${verifyUrl}" style="display: inline-block; padding: 14px 32px; background-color: #2B5BE8; color: white; text-decoration: none; border-radius: 12px; font-weight: bold; font-size: 14px;">Verify Email</a>
             <p style="color: #888; font-size: 14px; margin-top: 24px;">This link expires in 24 hours.</p>
           </div>
         `,

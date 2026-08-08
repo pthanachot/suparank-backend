@@ -121,6 +121,8 @@ const SAMPLE = {
   citationRate: '31',
   avgSentiment: 'Positive (72)',
   dashboardUrl: 'https://app.suparank.ai/workspace/1/ai-tracker',
+  contentTitle: 'How to rank in AI answers in 2026',
+  editorUrl: 'https://app.suparank.ai/workspace/12/drafts/34',
 };
 
 // The scan email's four row variables are <tr> fragments. These come from the

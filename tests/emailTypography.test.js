@@ -89,6 +89,7 @@ describe('one CTA spec', () => {
     'member_invite',
     'payment_failed',
     'topup_requested',
+    'analysis_ready',
     'monthly_report',
     'scan_completed',
   ];

@@ -75,6 +75,7 @@ const CALLER_DATA_KEYS = {
   credits_low: ['userName', 'remainingCredits', 'planName'], // creditService.maybeNotifyLowBalance
   feedback_submitted: ['feature', 'rating', 'stars', 'comment', 'userEmail', 'submittedAt'], // feedbackController
   contact_submitted: ['userName', 'userEmail', 'subject', 'category', 'message', 'submittedAt'], // contactController
+  analysis_ready: ['userName', 'contentTitle', 'workspaceName', 'editorUrl'], // analysisController.notifyAnalysisOutcome
   // scan_completed's rich payload is asserted structurally below, not key-by-key
 };
 

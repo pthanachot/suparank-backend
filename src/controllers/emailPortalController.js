@@ -130,6 +130,26 @@ const SYSTEM_TRIGGERS = [
     variables: ['userName', 'userEmail', 'subject', 'category', 'message', 'submittedAt', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
     triggerCount: 0,
   },
+  // Content
+  {
+    id: 'analysis_ready',
+    preheader: 'Your on-page score for “{{contentTitle}}” is ready.',
+    name: 'Content Analysis Ready',
+    description:
+      'Sent when the first analysis of a newly created piece finishes. Re-scores notify in-app only — the person who pressed re-score is already in the app.',
+    category: 'content',
+    variables: [
+      'userName',
+      'contentTitle',
+      'workspaceName',
+      'editorUrl',
+      'brandName',
+      'logoUrl',
+      'primaryColor',
+      'preheader',
+    ],
+    triggerCount: 0,
+  },
   // Reports
   {
     id: 'monthly_report',
@@ -537,6 +557,27 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
   </table>
 `),
     variables: ['userName', 'userEmail', 'subject', 'category', 'message', 'submittedAt', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
+  },
+  analysis_ready: {
+    subject: '“{{contentTitle}}” is ready to optimize',
+    html: wrapTemplate(`
+  ${BRAND_HEADER}
+  <h1 style="color:#111827;font-size:24px;margin-bottom:16px;">Your content editor is ready</h1>
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;">Hi {{userName}},</p>
+  <p style="color:#4B5563;font-size:16px;line-height:1.6;">We finished analyzing <strong>{{contentTitle}}</strong> in {{workspaceName}}. Your on-page score, keyword coverage and recommendations are waiting in the editor.</p>
+  ${ctaButton('{{editorUrl}}', 'Open the editor')}
+  <p style="color:#9CA3AF;font-size:14px;">You're receiving this because email notifications are enabled on your {{brandName}} account.</p>
+`),
+    variables: [
+      'userName',
+      'contentTitle',
+      'workspaceName',
+      'editorUrl',
+      'brandName',
+      'logoUrl',
+      'primaryColor',
+      'preheader',
+    ],
   },
   monthly_report: {
     subject: 'Your {{period}} report for {{workspaceName}} is ready',

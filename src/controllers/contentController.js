@@ -149,7 +149,10 @@ const createContent = async (req, res) => {
     // billing exactly. Every other creation path keeps the auto-trigger.
     if (!deferAnalysis && content.targetKeywords && content.targetKeywords.length > 0) {
       await Content.findByIdAndUpdate(content._id, { $set: { analysisStatus: 'pending' } });
-      startAnalysis(content._id);
+      // firstRun: this analysis was started FOR the user, not BY them, so they
+      // may well have navigated away — it is the one analysis that also emails.
+      // Every other entry point is a button they just pressed.
+      startAnalysis(content._id, { firstRun: true });
     }
 
     // Track article creation against tier quota
@@ -318,7 +321,11 @@ const updateContent = async (req, res) => {
         { _id: content._id, analysisStatus: 'idle' },
         { $set: { analysisStatus: 'pending' } },
       );
-      if (claimed) startAnalysis(content._id);
+      // firstRun for the same reason as the creation auto-trigger above: this
+      // IS that analysis, just deferred by the wizard. The idle→pending claim
+      // is atomic and the auto-trigger only fires when it did NOT defer, so
+      // exactly one of the two paths ever runs per piece — no double email.
+      if (claimed) startAnalysis(content._id, { firstRun: true });
     }
 
     // Autosave fires every ~1.5s while typing — dedupe to one entry per

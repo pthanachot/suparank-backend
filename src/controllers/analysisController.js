@@ -485,6 +485,62 @@ async function analyzeWithRetry(analyzeBody, preset, meta = {}) {
   throw lastErr;
 }
 
+/**
+ * Email the "analysis ready" notice. Best-effort; never throws.
+ *
+ * Called only for the FIRST analysis of a piece — see the call site for why.
+ * Gates, in the order every other transactional email applies them:
+ *   1. the system-wide kill switch (admin Settings),
+ *   2. the recipient's own emailNotifications preference,
+ *   3. an address to send to.
+ *
+ * `orgId` drives the Phase 11 sender identity and the Invariant I1 base URL, so
+ * a white-label agency's client gets their branding and their domain, not ours.
+ */
+async function emailAnalysisReady(content, userId, link, ws) {
+  try {
+    const { getSettings } = require('../services/systemSettingsService');
+    if (getSettings().emailNotificationsEnabled === false) return;
+
+    const User = require('../models/User');
+    const recipient = await User.findById(userId).select('email profile preferences').lean();
+    if (!recipient?.email || recipient.preferences?.emailNotifications === false) return;
+
+    const orgId = ws?.organizationId || null;
+
+    // Invariant I1: tenant-facing links use the org's custom domain when active.
+    const baseUrl = await require('../services/domainService').resolveBaseUrl(orgId);
+
+    const { htmlEscape, subjectSafe } = require('../utils/htmlEscape');
+    const { applyCustomTemplate } = require('./emailPortalController');
+    const { sendEmail } = require('../utils/emailService');
+
+    // content.title and the workspace name are user-authored free text
+    // substituted into an admin- or tenant-editable template. Escape at the
+    // call site, as every other sender does — see utils/htmlEscape.
+    const emailOptions = {
+      to: recipient.email,
+      orgId,
+      data: {
+        userName: htmlEscape(recipient.profile?.name || 'there'),
+        contentTitle: htmlEscape(content.title || 'Untitled'),
+        workspaceName: htmlEscape(ws?.name || 'your workspace'),
+        editorUrl: htmlEscape(`${baseUrl}${link}`),
+      },
+    };
+    await applyCustomTemplate('analysis_ready', emailOptions, orgId);
+    // The subject embeds the escaped title; a Subject is plain text and must
+    // read "“Alex's post” is ready", not "“Alex&#39;s post”".
+    if (emailOptions.subject) emailOptions.subject = subjectSafe(emailOptions.subject);
+    if (!emailOptions.subject || !emailOptions.html) return;
+
+    await sendEmail(emailOptions);
+    console.log(`[analysis] analysis_ready email sent to ${recipient.email} for ${content._id}`);
+  } catch (err) {
+    console.error('[analysis] analysis_ready email failed (non-fatal):', err.message);
+  }
+}
+
 // Best-effort in-app notification for an analysis outcome. NEVER throws — a
 // notification hiccup must never affect the analysis (mirrors the outcome-
 // snapshot block below). Recipient = the actor who triggered it (only the
@@ -497,7 +553,11 @@ async function notifyAnalysisOutcome(content, opts, ready) {
     if (!content) return; // outer catch may fire before content is loaded
     const userId = opts?.bill?.userId || content.userId;
     if (!userId) return;
-    const ws = await Workspace.findById(content.workspaceId).select('workspaceNumber').lean();
+    // `name` and `organizationId` are here for the email path only — one lookup
+    // rather than a second identical round-trip inside emailAnalysisReady.
+    const ws = await Workspace.findById(content.workspaceId)
+      .select('workspaceNumber name organizationId')
+      .lean();
     if (!ws?.workspaceNumber) return;
     const link = `/workspace/${ws.workspaceNumber}/drafts/${content.contentNumber}`;
     const title = content.title || 'Untitled';
@@ -509,6 +569,25 @@ async function notifyAnalysisOutcome(content, opts, ready) {
         body: `Analysis finished for “${title}”. Open it to start optimizing.`,
         link,
       });
+      // Second channel, deliberately NOT inside notificationService.emit() —
+      // the notification plan is explicit that email must not be bolted onto
+      // the in-app write path. This is the same shape as every other
+      // transactional email (webhook, credits, scan): same source event, its
+      // own delivery, its own gates.
+      //
+      // ONLY the analysis that runs automatically on content creation emails.
+      // The two creation paths opt in explicitly with `firstRun`; every other
+      // entry point is a button the user just pressed (POST /analyze, re-score,
+      // free retry) and is therefore someone sitting in the editor watching the
+      // score. Emailing those would put several messages a day in an active
+      // writer's inbox — the fastest way to get the sending domain filtered,
+      // which would take password resets down with it.
+      //
+      // This is opt-IN rather than inferred on purpose. The first cut keyed off
+      // `!opts.bill`, which is wrong: `bill` means "charge for this", not "the
+      // user asked for this", so POST /analyze and the free transient-retry
+      // both slipped through as auto-runs.
+      if (opts?.firstRun) await emailAnalysisReady(content, userId, link, ws);
     } else {
       await notificationService.emit({
         userId,

@@ -11,8 +11,10 @@ const UserUsageTracker = require('../models/UserUsageTracker');
 const tierService = require('../services/tierService');
 const seatService = require('../services/seatService');
 const systemSettings = require('../services/systemSettingsService');
+const Site = require('../models/Site');
+const Sitemap = require('../models/Sitemap');
 const { ACTIVE_ACTIONS } = require('../config/creditCosts');
-const { resolveCredits, agentRunCostShape } = require('../config/creditRules');
+const { resolveCredits, agentRunCostShape, FREE_SAMPLE_POOL_CREDITS } = require('../config/creditRules');
 
 /**
  * GET /api/org/tier-info?orgId=...
@@ -95,13 +97,17 @@ const getTierInfo = async (req, res) => {
 
     // Total counts (live from documents, unlocked only for consistency with creation checks)
     const wsIds = await Workspace.find({ organizationId: orgId }).distinct('_id');
-    const [seatUsage, avatarCount, brandVoiceCount, wsCount] = await Promise.all([
+    const [seatUsage, avatarCount, brandVoiceCount, wsCount, siteCount, sitemapCount] = await Promise.all([
       // Phase 9: editor seats (org-wide) vs free client viewers (assigned) —
       // counted separately, both include pending invites.
       seatService.getSeatUsage(orgId),
       Avatar.countDocuments({ workspace: { $in: wsIds }, locked: { $ne: true } }),
       BrandVoice.countDocuments({ workspace: { $in: wsIds }, locked: { $ne: true } }),
       Workspace.countDocuments({ organizationId: orgId, locked: { $ne: true } }),
+      // Same plain org-scoped counts the creation gates use (sitesController /
+      // sitemapController) — the meter must never disagree with the 429.
+      Site.countDocuments({ organizationId: orgId }),
+      Sitemap.countDocuments({ organizationId: orgId }),
     ]);
 
     // Build usage response keyed by counter name
@@ -137,6 +143,11 @@ const getTierInfo = async (req, res) => {
       brandVoices: { used: brandVoiceCount, limit: config.maxBrandVoices },
       avatars: { used: avatarCount, limit: config.maxAvatars },
       workspaces: { used: wsCount, limit: config.maxWorkspaces },
+      // Previously enforced-but-invisible: users met these caps as a bare 429.
+      // The `?? 3` mirrors sitemapController's own fallback for a missing
+      // config value — entry and gate must state the same number.
+      sites: { used: siteCount, limit: config.maxSites },
+      sitemaps: { used: sitemapCount, limit: config.maxSitemaps ?? 3 },
     };
 
     // ── Credit balance (org + user free) ──
@@ -148,16 +159,23 @@ const getTierInfo = async (req, res) => {
     // Editor+ see the full org balance; viewers/clients see only their own
     // user_free sample pool (org subscription/general balances are redacted — a
     // viewer must not learn the org's billing posture). Mirrors creditController.
+    // The one-time sample-pool grant size, so the UI can draw a denominator it
+    // doesn't have to invent (the settings card once hardcoded 300 against this
+    // 200). Balances can legitimately EXCEED the cap — admins top up user_free
+    // directly — so consumers must clamp, never assume used = cap - balance.
+    const userFreeCap = FREE_SAMPLE_POOL_CREDITS;
     const creditBalance = canViewOrgCredits ? {
       subscription: creditDoc?.subscriptionCredits || 0,
       general: creditDoc?.generalCredits || 0,
       userFree,
+      userFreeCap,
       total: (creditDoc?.subscriptionCredits || 0) + userFree + (creditDoc?.generalCredits || 0),
       expiresAt: creditDoc?.subscriptionCreditsExpireAt || null,
     } : {
       subscription: null,
       general: null,
       userFree,
+      userFreeCap,
       total: userFree,
       expiresAt: null,
     };

@@ -1315,6 +1315,19 @@ const importUrl = async (req, res) => {
     // (review MINOR). Phase 6: charge import (5, Scrappey infra) on success only.
     const parsed = JSON.parse(body);
     await creditService.deductForRequest(req, { metadata: { contentId: content._id.toString() } });
+    // Wave 1 (§4b): authoritative import record — the credit row above is
+    // suppressed for zero-cost/free-tier orgs, so it cannot be the source.
+    recordObservation('import_url_succeeded', {
+      workspaceNumber: req.workspace?.workspaceNumber,
+      contentNumber: content.contentNumber,
+    }, req.user?.userId, req.user?.impersonatedBy);
+    // Wave 1 (§4c-5): import is a separate POST onto existing content, so
+    // 'url' origin is stamped here — only when the origin is still 'blank'
+    // (a keyword-created article that later imports stays 'keyword').
+    Content.updateOne(
+      { _id: content._id, $or: [{ createdVia: 'blank' }, { createdVia: null }] },
+      { $set: { createdVia: 'url' } },
+    ).catch(() => {});
     res.json(parsed);
   } catch (err) {
     if (err.name === 'TimeoutError' || err.name === 'AbortError') {
@@ -1424,6 +1437,12 @@ const readabilityCheck = async (req, res) => {
     }
 
     const result = await engineRes.json();
+    // Wave 1 (§4b): this route has no quota counter and no credit row — the
+    // check was completely invisible server-side.
+    recordObservation('readability_check_run', {
+      workspaceNumber: req.workspace?.workspaceNumber,
+      contentNumber: content.contentNumber,
+    }, req.user?.userId, req.user?.impersonatedBy);
     res.json(result);
   } catch (err) {
     console.error('readabilityCheck error:', err.message);

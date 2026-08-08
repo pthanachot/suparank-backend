@@ -139,6 +139,10 @@ const createContent = async (req, res) => {
       platform,
       versions: retainedVersions,
       createdOnPlan,
+      // Wave 1 (§4c-5): entry-path attribution, enum-guarded (client-supplied).
+      createdVia: ['blank', 'url', 'keyword', 'template'].includes(req.body.createdVia)
+        ? req.body.createdVia
+        : 'blank',
     });
 
     // Auto-trigger analysis if keywords are provided — unless the caller defers

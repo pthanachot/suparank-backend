@@ -221,6 +221,10 @@ const TRUNCATED_STOPS = new Set([
 ]);
 
 function makeUsageTap() {
+  // Wave 0 (§4c-3): the tap is created at request entry, so this is the run's
+  // start time — persisted on AgentUsageLog, whose row is otherwise created at
+  // stream end (createdAt ≈ completedAt, duration lost).
+  const startedAt = new Date();
   let buffer = '';
   let inputTokens = 0;
   let outputTokens = 0;
@@ -395,6 +399,8 @@ function makeUsageTap() {
     turnCount() {
       return turns;
     },
+    // Wave 0 (§4c-3): exposed for persistUsage — see startedAt above.
+    startedAt,
   };
 }
 
@@ -407,7 +413,24 @@ async function persistUsage(req, content, tap, source, runMeta = {}) {
   // `|| images` : image calls bill per image and carry no tokens, so a run
   // whose only measurable spend was images would otherwise return here and
   // record nothing at all — the exact blind spot this phase closes.
-  if (totals.inputTokens === 0 && totals.outputTokens === 0 && !totals.images) return;
+  // Wave 0 (§4c-3): `|| aborted` — a run stopped/died before ANY tokens
+  // streamed previously vanished entirely, hiding instant failures and early
+  // user-stops from run-health metrics. Aborted zero-output runs now leave a
+  // row (aborted=true, zeros); truly empty non-aborted snapshots still skip.
+  if (totals.inputTokens === 0 && totals.outputTokens === 0 && !totals.images && !runMeta.aborted) return;
+
+  // Wave 1 (§4c-4): persona attribution — the only way to measure whether
+  // brand voices/avatars are actually used in content. avatarId is the
+  // client's per-run selection; voiceId is the workspace's active voice at
+  // stream end (same voice pushed at setup seconds earlier). Best-effort.
+  let voiceId = null;
+  try {
+    const v = await BrandVoice.findOne({ workspace: content.workspaceId, active: true })
+      .select('_id')
+      .lean();
+    voiceId = v ? String(v._id) : null;
+  } catch { /* attribution must never block the usage write */ }
+
   AgentUsageLog.create({
     workspaceId: content.workspaceId,
     contentId: content._id,
@@ -424,11 +447,24 @@ async function persistUsage(req, content, tap, source, runMeta = {}) {
     docWrites: totals.docWrites || 0,
     images: totals.images || 0,
     aborted: !!runMeta.aborted,
+    startedAt: tap.startedAt || null, // Wave 0 (§4c-3): run duration = completedAt − startedAt
+    // Wave 0 review (F5): run-health metrics read this collection — tag
+    // impersonation-session runs the same way ObservationEvent rows are tagged
+    // so admin "browse as" activity can be excluded from tenant metrics.
+    impersonatedBy: req?.user?.impersonatedBy ? String(req.user.impersonatedBy) : null,
+    voiceId, // Wave 1 (§4c-4)
+    avatarId: req?.body?.avatarId ? String(req.body.avatarId) : null,
     completedAt: new Date(),
   }).catch((err) => {
     // Never throw past the SSE response — observability hygiene only.
     console.warn('[usage-tap] persist failed', err.message);
   });
+
+  // Wave 0 review (F3): the aborted-zero rows admitted above must NOT reach
+  // the COGS ledger — a $0 'chat'/'agent' row inflates cogsBy().calls and
+  // drags per-call averages. Skipping when nothing measurable was spent
+  // restores the exact pre-Wave-0 ledger behavior.
+  if (totals.inputTokens === 0 && totals.outputTokens === 0 && !totals.images) return;
 
   // AI cost ledger (Phase 1): our real COGS for this chat/agent turn.
   try {

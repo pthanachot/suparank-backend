@@ -991,6 +991,19 @@ async function resolvePublicReport(rawToken) {
   const snapshot = await ReportSnapshot.findById(share.reportId).lean();
   if (!snapshot) return null;
 
+  // Wave 1 (§4b): the ONLY place an end-client open can be measured — the
+  // public page is logged out, so the client observe pipeline can never see
+  // it. internal:true shares are the PDF renderer's own headless loads and
+  // MUST be excluded or every PDF export inflates the open count. shareId
+  // enables opens-per-link. Fire-and-forget; no user identity exists here.
+  if (!share.internal) {
+    const { recordObservation } = require('../controllers/observeController');
+    recordObservation('report_share_opened', {
+      shareId: String(share._id),
+      orgId: share.organizationId || null,
+    });
+  }
+
   let brand = null;
   try {
     const resolved = await brandService.getBrandForOrg(snapshot.organizationId || null);

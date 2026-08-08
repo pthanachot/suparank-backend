@@ -32,6 +32,34 @@ async function _resolveOrgId(workspace) {
   return org?._id || null;
 }
 
+// ─── Deny telemetry (Wave 1, §4b quota_denied) ────────────────────
+// Denials were HTTP responses recorded NOWHERE, yet the free→paid "first
+// wall" analysis (which cap converts a signup) depends entirely on them.
+// Fire-and-forget via the server-lane observation sink; flows into the
+// durable daily rollup. Must never affect the response.
+function denyTelemetry(req, { action, tier, quotaSource, limitKey, limitType, scope, orgId }) {
+  try {
+    const { recordObservation } = require('../controllers/observeController');
+    recordObservation('quota_denied', {
+      action,
+      gate: '429_quota',
+      // W5: ALWAYS the org's real tier — a paid user denied on a free lifetime
+      // slot (quotaSource='free') must not poison the Free facet of the
+      // blocked-actions panel. quotaSource carries the slot distinction.
+      tier: tier || '',
+      ...(quotaSource === 'free' ? { quotaSource: 'free' } : {}),
+      limitKey: limitKey || '',
+      limitType: limitType || '',
+      scope: scope || 'org',
+      workspaceNumber: req.workspace?.workspaceNumber,
+      // W2: the RESOLVED org (personal-org fallback included) — reading
+      // req.workspace.organizationId dropped attribution for exactly the
+      // legacy/personal-workspace cohort the first-wall analysis is about.
+      orgId: orgId || req.workspace?.organizationId || null,
+    }, req.user?.userId, req.user?.impersonatedBy); // W7
+  } catch { /* telemetry must never break a deny response */ }
+}
+
 // ─── requireQuota ─────────────────────────────────────────────────
 
 /**
@@ -90,6 +118,7 @@ function requireQuota(counterKey, tierLimitKey, tierLimitTypeKey) {
         if (wsLimit != null) {
           const wsUsed = await WorkspaceUsageTracker.getCount(req.workspace._id, counterKey, wsPeriod);
           if (wsUsed >= wsLimit) {
+            denyTelemetry(req, { action: counterKey, tier, quotaSource, limitKey: tierLimitKey, scope: 'workspace', orgId });
             return res.status(429).json({
               error: 'Client plan limit reached for this workspace',
               code: 'QUOTA_EXCEEDED',
@@ -122,6 +151,7 @@ function requireQuota(counterKey, tierLimitKey, tierLimitTypeKey) {
         : await UsageTracker.getCount(orgId, counterKey, period);
 
       if (used >= limit) {
+        denyTelemetry(req, { action: counterKey, tier, quotaSource, limitKey: tierLimitKey, limitType, orgId });
         return res.status(429).json({
           error: quotaSource === 'free'
             ? 'No free lifetime slots remaining for this feature'

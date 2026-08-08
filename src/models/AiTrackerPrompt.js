@@ -18,6 +18,13 @@ const aiTrackerPromptSchema = new mongoose.Schema({
   active: { type: Boolean, default: true },
   lastScannedAt: { type: Date, default: null },
 
+  // Wave 1 (§4c-2): where the prompt text came from — 'suggested' when the
+  // user accepted an AI-suggested prompt during setup, 'manual' otherwise.
+  // Measures suggestion quality (accepted/offered lives client-side; this is
+  // the durable per-prompt half). Frontend sends suggestedPrompts in Wave 3;
+  // until then everything defaults 'manual'.
+  source: { type: String, enum: ['manual', 'suggested'], default: 'manual' },
+
   // Downgrade locking
   locked: { type: Boolean, default: false },
   createdOnPlan: { type: String, enum: ['free', 'paid'], default: 'free' },

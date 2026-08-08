@@ -65,6 +65,11 @@ const aiTrackerScanSchema = new mongoose.Schema({
   },
   startedAt: { type: Date, default: Date.now },
   completedAt: { type: Date, default: null },
+  // Wave 1 (§4c-1): how this scan was invoked. Previously only inferable from
+  // credit rows — which the free tier never writes. Set explicitly by every
+  // executeScan caller; null on rows written before the field existed.
+  trigger: { type: String, enum: ['manual', 'refresh_all', 'cron', 'single'], default: null },
+  triggeredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   status: {
     type: String,
     enum: ['running', 'ready', 'failed'],

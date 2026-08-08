@@ -31,6 +31,15 @@ router.get('/settings/admins', adminMiddleware, adminSettingsController.listAdmi
 // is switched on. Images bill per unit, so a runaway tenant is invisible on
 // every token-based chart.
 router.get('/image-spend', adminMiddleware, adminSettingsController.getImageSpend);
+// Wave 0 (§3.6): first reader for the durable telemetry rollups.
+// ?days=30&event=&orgId= — newest first, capped.
+const { getUsageRollups } = require('../controllers/observeController');
+router.get('/usage-rollups', adminMiddleware, getUsageRollups);
+// Wave 4 (§7): the Usage dashboard's read endpoints.
+const adminUsageController = require('../controllers/adminUsageController');
+router.get('/usage/overview', adminMiddleware, adminUsageController.getUsageOverview);
+router.get('/usage/funnels', adminMiddleware, adminUsageController.getUsageFunnels);
+router.get('/usage/series', adminMiddleware, adminUsageController.getUsageSeries);
 const adminEmailsGone = (req, res) =>
   res.status(410).json({
     error:

@@ -196,6 +196,11 @@ function buildApiLimiter() {
       // limiter (notificationRoutes) — counting it in this per-IP bucket would
       // 429 a whole NATed office for one active user.
       req.originalUrl.startsWith('/api/notifications') ||
+      // Wave 0 (§3.1): telemetry batches all arrive via the Next proxy on ONE
+      // shared IP — one busy editor session would burn this bucket and 429 the
+      // whole app for every user. /api/observe has its own per-user limiter in
+      // observeRoutes (observeLimiter), same pattern as the bell.
+      req.originalUrl.startsWith('/api/observe') ||
       /\/ai\/autocomplete(?:\?|$)/.test(req.originalUrl),
   });
 }
@@ -377,7 +382,9 @@ cron.schedule(cronSchedule, async () => {
       const ws = await Workspace.findById(tracker.workspaceId);
       const userId = ws?.userId?.toString() || null;
       try {
-        await executeScan(tracker._id, userId);
+        // Wave 1 (§4c-1): explicit trigger — userId here is the workspace
+        // owner (credit routing), so derivation would misread cron as manual.
+        await executeScan(tracker._id, userId, { trigger: 'cron' });
       } catch (err) {
         // Per-tracker handler errors are NEVER muted — that's the F4-26 fix.
         // A handler bug would have hidden for days under the old shared
@@ -654,6 +661,23 @@ cron.schedule('10 4 * * *', async () => {
     }
   } catch (err) {
     console.error('[cron] thread prune scheduler error:', err.message);
+  }
+}, { timezone: 'Etc/UTC' });
+
+// ─── Wave 0 (§3.6): nightly observation rollups ────────────────────────────
+// ObservationEvent TTLs at 90d and AuditLog at 180d; per-day aggregates
+// (event × org × workspace) are folded into the no-TTL ObservationDailyRollup
+// BEFORE the raw rows expire — retention/cohort history is unrecoverable once
+// they do. Re-rolls the last 3 complete UTC days each run (idempotent upserts)
+// so late-arriving unload beacons are absorbed without double counting.
+// 03:40 UTC: inside the existing overnight cron band, colliding with nothing.
+const observationRollupForCron = require('./services/observationRollupService');
+cron.schedule('40 3 * * *', async () => {
+  try {
+    const r = await observationRollupForCron.runDailyRollup({ days: 3 });
+    console.log(`[cron] observe rollup COMPLETE: ${r.rows} row(s) across ${r.days} day(s)`);
+  } catch (err) {
+    console.error('[cron] observe rollup error:', err.message);
   }
 }, { timezone: 'Etc/UTC' });
 

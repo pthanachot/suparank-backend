@@ -58,6 +58,22 @@ const agentUsageLogSchema = new mongoose.Schema(
     images: { type: Number, default: 0, min: 0 },
     // True when the client disconnected/stopped before stream end.
     aborted: { type: Boolean, default: false },
+    // Wave 0 (§4c-3): request-entry timestamp, captured when the usage tap is
+    // created. The row itself is written at STREAM END, so createdAt ≈
+    // completedAt and run duration was previously unrecoverable from this
+    // collection. Null on rows written before the field existed.
+    startedAt: { type: Date, default: null },
+    // Wave 0 review (F5): real-admin id when the run was made through an
+    // impersonation session — run-health metrics filter { impersonatedBy: null }
+    // like ObservationEvent. String for the same cast-safety reason.
+    impersonatedBy: { type: String, default: null },
+    // Wave 1 (§4c-4): persona attribution. Both were resolved at session setup
+    // and then DISCARDED — the only way to measure whether brand voices are
+    // actually used in content. avatarId is the client's per-run selection
+    // (req.body); voiceId is the workspace's active voice at stream end.
+    // Strings for cast-safety in the fire-and-forget write path.
+    voiceId: { type: String, default: null },
+    avatarId: { type: String, default: null },
     completedAt: { type: Date },
   },
   { timestamps: true }

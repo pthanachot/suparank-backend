@@ -14,6 +14,12 @@ const observationEventSchema = new mongoose.Schema(
     // Client-side epoch-ms when the event fired (may differ from createdAt due
     // to the 5s batch window / offline queue).
     ts: { type: Number, default: null },
+    // Wave 0 (§3.5): the real admin's userId when this event was recorded by an
+    // impersonation session (middleware swaps session_token → impersonation_token,
+    // so `userId` above is the impersonated tenant). String, not ObjectId — a
+    // cast error inside the swallowed insertMany would drop the whole batch.
+    // Analytics queries filter { impersonatedBy: null } (matches missing too).
+    impersonatedBy: { type: String, default: null },
   },
   { timestamps: true }
 );

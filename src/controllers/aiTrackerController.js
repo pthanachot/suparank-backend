@@ -3344,7 +3344,7 @@ const createMonitor = async (req, res) => {
 
     // Fire-and-forget: start first scan. The .catch is a safety net for
     // synchronous-throw paths only.
-    executeScan(tracker._id, req.user?.userId, { force: true }).catch((err) => {
+    executeScan(tracker._id, req.user?.userId, { force: true, trigger: 'manual' }).catch((err) => {
       console.error('[ai-tracker-monitor] scan kickoff failed:', err.message);
     });
 

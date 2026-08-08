@@ -9,6 +9,9 @@ const {
 const tierService = require('../services/tierService');
 const creditService = require('../services/creditService');
 const { resolveCredits } = require('../config/creditRules');
+// Wave 1 (§4b): server-lane usage telemetry — cache hits previously left ZERO
+// trace, and credit-derived counts silently lose the free tier. Fire-and-forget.
+const { recordObservation } = require('./observeController');
 
 // Phase 6: bill a keyword search at 1 credit per row DELIVERED (cap 50). Cache
 // hits deliver rows too, so they bill identically to fresh fetches — the user
@@ -157,6 +160,13 @@ async function searchKeywords(req, res) {
 
       await chargeKeywordRows(req, (cached.relatedKeywords || []).length);
 
+      recordObservation('keyword_search', {
+        workspaceNumber: workspace.workspaceNumber,
+        country: countryCode,
+        rows: (cached.relatedKeywords || []).length,
+        cacheHit: true,
+      }, req.user?.userId, req.user?.impersonatedBy);
+
       return res.json({
         seedMetrics: cached.seedMetrics,
         relatedKeywords: cached.relatedKeywords,
@@ -216,6 +226,13 @@ async function searchKeywords(req, res) {
 
     await chargeKeywordRows(req, totalCount);
 
+    recordObservation('keyword_search', {
+      workspaceNumber: workspace.workspaceNumber,
+      country: countryCode,
+      rows: totalCount,
+      cacheHit: false,
+    }, req.user?.userId, req.user?.impersonatedBy);
+
     return res.json({
       seedMetrics: seed,
       relatedKeywords: related,
@@ -264,6 +281,10 @@ async function getKeywordDetail(req, res) {
       // API call) burn quota. The /cached endpoint enforces the same rule
       // and customers expect parity. Smoking gun: the smoke test showed
       // /detail incrementing quota even when no Serper call was made.
+      recordObservation('keyword_detail_opened', {
+        workspaceNumber: workspace.workspaceNumber,
+        cacheHit: true,
+      }, req.user?.userId, req.user?.impersonatedBy);
       return res.json({
         keyword: cached.keyword,
         serpResults: cached.serpResults,
@@ -290,6 +311,11 @@ async function getKeywordDetail(req, res) {
     if (req.tierQuota) {
       await tierService.incrementQuota(req.tierQuota);
     }
+
+    recordObservation('keyword_detail_opened', {
+      workspaceNumber: workspace.workspaceNumber,
+      cacheHit: false,
+    }, req.user?.userId, req.user?.impersonatedBy);
 
     return res.json({
       keyword,
@@ -366,6 +392,10 @@ async function deleteSearchHistory(req, res) {
       return res.status(404).json({ error: 'History entry not found' });
     }
 
+    recordObservation('keyword_history_deleted', {
+      workspaceNumber: workspace.workspaceNumber,
+    }, req.user?.userId, req.user?.impersonatedBy);
+
     return res.json({ success: true });
   } catch (err) {
     if (err instanceof mongoose.Error.CastError) {
@@ -436,6 +466,10 @@ async function getCachedResults(req, res) {
     if (!cached) {
       return res.status(404).json({ error: 'No cached results found' });
     }
+
+    recordObservation('keyword_history_replayed', {
+      workspaceNumber: workspace.workspaceNumber,
+    }, req.user?.userId, req.user?.impersonatedBy);
 
     return res.json({
       seedMetrics: cached.seedMetrics,

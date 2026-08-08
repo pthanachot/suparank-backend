@@ -30,6 +30,25 @@ async function _resolveOrgId(workspace) {
   return org?._id || null;
 }
 
+// ─── Deny telemetry (Wave 1, §4b quota_denied) ───────────────
+// Same contract as tierEnforcement.denyTelemetry: denials previously left
+// zero server-side trace; the 402 lane is the credit half of the free→paid
+// first-wall analysis. Fire-and-forget, never affects the response.
+function denyTelemetry(req, { featureKey, tier, scope, orgId }) {
+  try {
+    const { recordObservation } = require('../controllers/observeController');
+    recordObservation('quota_denied', {
+      action: featureKey,
+      gate: '402_credits',
+      tier: tier || '',
+      scope: scope || 'org',
+      workspaceNumber: req.workspace?.workspaceNumber,
+      // W2: the RESOLVED org (personal-org fallback included).
+      orgId: orgId || req.workspace?.organizationId || null,
+    }, req.user?.userId, req.user?.impersonatedBy); // W7
+  } catch { /* telemetry must never break a deny response */ }
+}
+
 // ─── requireCredits ──────────────────────────────────────────
 
 /**
@@ -90,6 +109,7 @@ function requireCredits(featureKey, estimateCredits) {
       const affordable = wsBilled ? balance.subscription + balance.general : balance.total;
 
       if (affordable < estimated) {
+        denyTelemetry(req, { featureKey, tier, orgId });
         return res.status(402).json({
           error: `Insufficient credits. You have ${affordable} but need ${estimated}.`,
           code: 'INSUFFICIENT_CREDITS',
@@ -108,6 +128,7 @@ function requireCredits(featureKey, estimateCredits) {
         const wsPeriod = tierService.getPeriod('monthly');
         const wsUsed = await WorkspaceUsageTracker.getCount(req.workspace._id, 'creditsUsed', wsPeriod);
         if (wsUsed + estimated > wsLimits.creditsPerMonth) {
+          denyTelemetry(req, { featureKey, tier, scope: 'workspace', orgId });
           return res.status(402).json({
             error: `Client plan monthly credit limit reached (${wsUsed}/${wsLimits.creditsPerMonth}).`,
             code: 'INSUFFICIENT_CREDITS',

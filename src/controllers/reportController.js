@@ -213,6 +213,16 @@ const downloadPdf = async (req, res) => {
       throw err;
     }
 
+    // Wave 1 (§4b): PDF exports left no trace anywhere (no audit, no credit
+    // row, no counter) — the only artifact was the renderer's transient
+    // internal share token, deleted right after render.
+    const { recordObservation } = require('./observeController');
+    recordObservation('report_pdf_exported', {
+      workspaceNumber: req.workspace.workspaceNumber,
+      period: snapshot.period,
+      orgId: req.workspace.organizationId || null,
+    }, req.user?.userId, req.user?.impersonatedBy);
+
     const filename = `report-${req.workspace.workspaceNumber}-${snapshot.period}.pdf`;
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);

@@ -347,6 +347,13 @@ const contentSchema = new mongoose.Schema(
     // On downgrade to free, paid-created resources are locked.
     createdOnPlan: { type: String, enum: ['free', 'paid'], default: 'free' },
 
+    // Wave 1 (§4c-5): which entry path created this content. 'keyword' =
+    // keyword-research handoff, 'template' = wizard template, 'url' = set by
+    // the import-url success path when still 'blank' (import is a separate
+    // POST onto existing content, not a create-time fact). Client-supplied
+    // values are enum-validated in the controller; default 'blank'.
+    createdVia: { type: String, enum: ['blank', 'url', 'keyword', 'template'], default: 'blank' },
+
     // Plan mode (v4 spec). mode is the persistent source of truth — frontend
     // reads it on load and disables incompatible UI. Per-request mode is NOT
     // threaded through; conflicts are surfaced as 409 at the application layer.

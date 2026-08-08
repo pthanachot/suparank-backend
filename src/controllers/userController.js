@@ -383,6 +383,18 @@ const saveOnboarding = async (req, res) => {
 
     await user.save();
 
+    // Wave 1 (§4b): answers become durable segmentation properties (rollups
+    // outlive the 90d raw TTL); skip is its own event so "skipped but still
+    // activated" is measurable.
+    const { recordObservation } = require('./observeController');
+    if (skip) {
+      recordObservation('onboarding_skipped', {}, req.user.userId, req.user.impersonatedBy);
+    } else {
+      recordObservation('onboarding_completed', {
+        answers: { businessType, teamSize, role, interests, referralSources },
+      }, req.user.userId, req.user.impersonatedBy);
+    }
+
     res.json({ success: true });
   } catch (error) {
     console.error('Save onboarding error:', error);

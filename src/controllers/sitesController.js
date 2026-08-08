@@ -4,6 +4,7 @@ const GscConnection = require('../models/GscConnection');
 const GscPeriodStat = require('../models/GscPeriodStat');
 const gscService = require('../services/gscService');
 const tierService = require('../services/tierService');
+const auditService = require('../services/auditService');
 
 // ─── Shared helpers ────────────────────────────────────────────────────────
 
@@ -146,6 +147,10 @@ const disconnectGsc = async (req, res) => {
     await gscService.revokeAndDisconnect(orgId);
     // Lock all sites — they become read-only placeholders until reconnect
     await Site.updateMany({ organizationId: orgId }, { $set: { locked: true } });
+    // Wave 1 (§4c-6): revokeAndDisconnect DELETES the GscConnection record,
+    // so without this entry disconnects are entirely invisible (the only
+    // residue was undated Site.locked=true). Fire-and-forget.
+    auditService.fromReq(req, { action: 'gsc.disconnect', resource: 'integration' });
     res.json({ message: 'GSC disconnected', connected: false });
   } catch (err) {
     console.error('disconnectGsc error:', err.message);

@@ -77,8 +77,9 @@ const FUNNELS = [
       { label: 'Exported PDF', events: ['report_pdf_exported'] },
     ],
     // share opens carry no user identity (logged-out end clients) — event
-    // count only, never an actor stage.
-    annotations: [{ label: 'End-client opens', events: ['report_share_opened'] }],
+    // count only, never an actor stage. countOnly tells the UI to render the
+    // event count (V4-4: keying on the label string was silent-breakage bait).
+    annotations: [{ label: 'End-client opens', events: ['report_share_opened'], countOnly: true }],
   },
   {
     id: 'conversion', title: 'Free → Paid intent', denom: 'users',
@@ -129,7 +130,10 @@ async function getOverview({ days = 28 } = {}) {
       { $sort: { count: -1 } },
     ]),
     ObservationEvent.aggregate([
-      { $match: { createdAt: { $gte: from }, event: 'consent_choice' } },
+      // V4-2 review fix: same impersonation filter as every other query —
+      // this is the one metric whose entire job is precision about who is
+      // being counted, and it was the only aggregation missing the filter.
+      { $match: { createdAt: { $gte: from }, event: 'consent_choice', impersonatedBy: null } },
       { $group: { _id: '$payload.analytics', count: { $sum: 1 } } },
     ]),
   ]);
@@ -189,7 +193,12 @@ async function getFunnels({ days = 28 } = {}) {
       title: f.title,
       denom: f.denom,
       stages: f.stages.map((s) => ({ label: s.label, actors: actorCount(s.events), events: eventCount(s.events) })),
-      annotations: (f.annotations ?? []).map((a) => ({ label: a.label, actors: actorCount(a.events), events: eventCount(a.events) })),
+      annotations: (f.annotations ?? []).map((a) => ({
+        label: a.label,
+        actors: actorCount(a.events),
+        events: eventCount(a.events),
+        ...(a.countOnly ? { countOnly: true } : {}),
+      })),
     });
   }
   return { days, mode: 'stage-reach', funnels: results };
@@ -198,7 +207,10 @@ async function getFunnels({ days = 28 } = {}) {
 /** Daily activity series from the durable rollups (optionally one event). */
 async function getSeries({ days = 28, event = null } = {}) {
   const from = since(days);
-  const match = { day: { $gte: from } };
+  // V4-3 review fix: the rollup collection also carries the AuditLog
+  // billing/lifecycle lane (source:'audit') — "daily events" must not quietly
+  // include billing bookkeeping. The audit lane gets its own view later.
+  const match = { day: { $gte: from }, source: 'observation' };
   if (event) match.event = event;
   const rows = await ObservationDailyRollup.aggregate([
     { $match: match },

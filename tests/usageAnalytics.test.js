@@ -89,6 +89,8 @@ test('overview: window stats, prior window, lanes, consent, topEvents', async ()
   await seed('editor_opened', { userId: u1, ws: 1, ago: 10 });         // prior window (days=7)
   await seed('consent_choice', { userId: u1, payload: { analytics: true }, ago: 1 });
   await seed('consent_choice', { userId: u2, payload: { analytics: false }, ago: 1 });
+  // V4-2: an impersonating admin's banner choice must not pollute the denominator.
+  await seed('consent_choice', { userId: u1, payload: { analytics: true }, ago: 1, impersonatedBy: String(oid()) });
 
   const o = await getOverview({ days: 7 });
   assert.equal(o.current.activeWorkspaces, 2);
@@ -108,6 +110,8 @@ test('series reads the durable rollups (optionally filtered by event)', async ()
     { day: day1, event: 'editor_opened', organizationId: null, workspaceNumber: 1, count: 5, uniqueUsers: 2, source: 'observation' },
     { day: day1, event: 'keyword_search', organizationId: null, workspaceNumber: 1, count: 3, uniqueUsers: 1, source: 'observation' },
     { day: day2, event: 'editor_opened', organizationId: null, workspaceNumber: 1, count: 4, uniqueUsers: 2, source: 'observation' },
+    // V4-3: the AuditLog billing lane must NOT appear in "daily events".
+    { day: day1, event: 'billing.plan_change', organizationId: null, workspaceNumber: null, count: 99, uniqueUsers: 1, source: 'audit' },
   ]);
 
   const all = await getSeries({ days: 7 });

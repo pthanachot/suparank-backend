@@ -14,6 +14,7 @@
 
 const usageAnalytics = require('../services/usageAnalyticsService');
 const conversionAnalytics = require('../services/conversionAnalyticsService');
+const retentionAnalytics = require('../services/retentionAnalyticsService');
 
 /** Only forward a query param when it was actually supplied. */
 const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
@@ -60,4 +61,14 @@ async function getUsageConversion(req, res) {
   }
 }
 
-module.exports = { getUsageOverview, getUsageFunnels, getUsageSeries, getUsageConversion };
+async function getUsageRetention(req, res) {
+  try {
+    // Retention is week-denominated and reads the no-TTL rollup, so it takes a
+    // week count rather than the shared day range.
+    res.json(await retentionAnalytics.getRetention({ weeks: req.query.weeks }));
+  } catch (err) {
+    fail(res, err, 'retention');
+  }
+}
+
+module.exports = { getUsageOverview, getUsageFunnels, getUsageSeries, getUsageConversion, getUsageRetention };

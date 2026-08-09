@@ -44,6 +44,9 @@ flagService.isFlagLive = async () => false;
 const PLATFORM_BRAND = { productName: 'SupaRank', supportEmail: 'support@suparank.ai' };
 
 beforeEach(() => {
+  // APP_URL wins over FRONTEND_URL in src/config/appUrl.js, so it must be
+  // cleared or these cases depend on the developer's shell.
+  delete process.env.APP_URL;
   process.env.FRONTEND_URL = 'https://app.suparank.ai';
   brandService.getPlatformBrand = async () => ({ ...PLATFORM_BRAND });
   brandService.getBrandForOrg = async () => ({ brand: { ...PLATFORM_BRAND } });

@@ -14,6 +14,7 @@
 const fs = require('fs');
 const ReportShare = require('../models/ReportShare');
 const reportService = require('./reportService');
+const { appUrl, isConfigured } = require('../config/appUrl');
 
 const INTERNAL_TOKEN_TTL_DAYS = 15 / (24 * 60); // 15 minutes
 const NAV_TIMEOUT_MS = 60 * 1000;
@@ -92,16 +93,17 @@ async function _generatePdf(reportId) {
   if (!(await isAvailable())) throw _unavailableError(_loadError);
   const puppeteer = _loadPuppeteer();
 
-  // Refuse to silently target localhost in production — a missing
-  // FRONTEND_URL would render somebody's dev box (or nothing) into the PDF.
-  const baseUrl = process.env.FRONTEND_URL;
-  if (!baseUrl) {
+  // Refuse to silently guess the origin — an unconfigured host would render
+  // somebody's dev box (or nothing) into the PDF. This gates on "was an origin
+  // explicitly configured", not on one specific var, so APP_URL satisfies it too.
+  if (!isConfigured()) {
     const err = new Error(
-      'PDF export is not configured on this server: FRONTEND_URL is unset.'
+      'PDF export is not configured on this server: neither APP_URL nor FRONTEND_URL is set.'
     );
     err.status = 501;
     throw err;
   }
+  const baseUrl = appUrl();
 
   // Internal 15-minute token so the headless browser can load the page
   // without auth. Marked internal so it never shows up as a "shared" state

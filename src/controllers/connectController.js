@@ -22,7 +22,11 @@ const ClientSubscription = require('../models/ClientSubscription');
 const AgencyPlan = require('../models/AgencyPlan');
 const User = require('../models/User');
 
-const APP_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+const { appUrl } = require('../config/appUrl');
+
+// The canonical app origin (APP_URL, else FRONTEND_URL) for Connect
+// onboarding refresh/return URLs.
+const APP_URL = appUrl();
 
 /**
  * Shared gate: owner or org-wide admin, SaaS-mode-entitled org, Stripe configured.

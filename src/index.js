@@ -112,9 +112,14 @@ connectDB()
 app.use(helmet({ crossOriginEmbedderPolicy: false, crossOriginResourcePolicy: false }));
 app.use(cookieParser());
 
-// CORS
+// CORS — the canonical app origin, plus FRONTEND_URL while it still names a
+// different host (survivable domain cutover without a third env var). See
+// src/config/appUrl.js.
+const { allowedOrigins, warnOnAmbiguousConfig } = require('./config/appUrl');
+warnOnAmbiguousConfig();
+
 const corsOptions = {
-  origin: [process.env.FRONTEND_URL || 'http://localhost:3000'],
+  origin: allowedOrigins(),
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,

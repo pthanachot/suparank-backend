@@ -5,7 +5,9 @@ const { encrypt, decrypt } = GscConnection;
 const Site = require('../models/Site');
 const GscPeriodStat = require('../models/GscPeriodStat');
 
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+const { appUrl } = require('../config/appUrl');
+
+const FRONTEND_URL = appUrl();
 const GSC_SCOPE = 'https://www.googleapis.com/auth/webmasters.readonly';
 const EMAIL_SCOPES = ['openid', 'email'];
 const STATE_SECRET = process.env.GSC_TOKEN_ENCRYPTION_KEY; // reuse for HMAC

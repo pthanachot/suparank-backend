@@ -409,7 +409,7 @@ async function fetchPage(url) {
     const res = await httpGet(url, {
       signal: controller.signal,
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; SupaRankBot/1.0; +https://suparank.com/bot)',
+        'User-Agent': 'Mozilla/5.0 (compatible; SupaRankBot/1.0; +https://suparank.ai/bot)',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       },
       redirect: 'follow',

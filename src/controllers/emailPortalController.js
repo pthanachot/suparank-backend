@@ -3,6 +3,7 @@
  */
 
 const User = require('../models/User');
+const { appUrl } = require('../config/appUrl');
 const EmailTemplate = require('../models/EmailTemplate');
 const EmailSendLog = require('../models/EmailSendLog');
 const TriggerableEmailTemplate = require('../models/TriggerableEmailTemplate');
@@ -251,8 +252,7 @@ const ctaButton = (href, label, { bg = '{{primaryColor}}' } = {}) =>
  * time by suparank/scripts/build-email-logo.mjs, from the same vector, and
  * served from the frontend's public dir — the backend serves no static files.
  */
-const PLATFORM_EMAIL_LOGO = () =>
-  `${process.env.FRONTEND_URL || 'https://suparank.ai'}/brand/suparank-mark.png`;
+const PLATFORM_EMAIL_LOGO = () => `${appUrl()}/brand/suparank-mark.png`;
 
 /**
  * The logo + wordmark lockup that opens every email, mirroring the app

@@ -17,6 +17,7 @@ const originals = {
   flagFindOne: FeatureFlag.findOne,
   getBrandForOrg: brandService.getBrandForOrg,
   env: {
+    APP_URL: process.env.APP_URL,
     FRONTEND_URL: process.env.FRONTEND_URL,
     CF_FALLBACK_ORIGIN: process.env.CF_FALLBACK_ORIGIN,
     PLATFORM_HOSTS: process.env.PLATFORM_HOSTS,
@@ -48,6 +49,10 @@ beforeEach(() => {
     select: () => ({ lean: async () => flagState }),
   });
   brandService.getBrandForOrg = async () => ({ config: brandConfigState });
+  // APP_URL is preferred over FRONTEND_URL by src/config/appUrl.js, so it must
+  // be cleared too — otherwise a developer with APP_URL exported in their shell
+  // sees these cases fail for reasons that have nothing to do with the code.
+  delete process.env.APP_URL;
   delete process.env.FRONTEND_URL;
   delete process.env.PLATFORM_HOSTS;
   delete process.env.CLOUDFLARE_API_TOKEN;
@@ -145,10 +150,26 @@ describe('domainService.resolveBaseUrl', () => {
     assert.equal(await domainService.resolveBaseUrl(orgId), 'https://app.suparank.ai');
   });
 
-  it('falls back to localhost without FRONTEND_URL, and for a null org', async () => {
+  // Was 'http://localhost:3000'. A production backend with no origin configured
+  // used to put localhost links into real emails; the canonical apex is the only
+  // safe last resort. Mirrors the same decision in tests/emailBrandLogo.test.js.
+  it('falls back to the canonical app origin with neither var set, and for a null org', async () => {
     stubFindOne(() => null);
-    assert.equal(await domainService.resolveBaseUrl(orgId), 'http://localhost:3000');
-    assert.equal(await domainService.resolveBaseUrl(null), 'http://localhost:3000');
+    assert.equal(await domainService.resolveBaseUrl(orgId), 'https://suparank.ai');
+    assert.equal(await domainService.resolveBaseUrl(null), 'https://suparank.ai');
+  });
+
+  it('prefers APP_URL over FRONTEND_URL', async () => {
+    process.env.FRONTEND_URL = 'https://old-host.example';
+    process.env.APP_URL = 'https://suparank.ai';
+    stubFindOne(() => null);
+    assert.equal(await domainService.resolveBaseUrl(orgId), 'https://suparank.ai');
+  });
+
+  it('strips a trailing slash so link concatenation stays well-formed', async () => {
+    process.env.APP_URL = 'https://suparank.ai/';
+    stubFindOne(() => null);
+    assert.equal(await domainService.resolveBaseUrl(orgId), 'https://suparank.ai');
   });
 
   it('caches per org and clearDomainCache invalidates', async () => {
@@ -174,7 +195,9 @@ describe('domainService.resolveBaseUrl', () => {
         },
       }),
     });
-    assert.equal(await domainService.resolveBaseUrl(orgId), 'http://localhost:3000');
+    // Was localhost — the fallback is now the canonical app origin, so a DB
+    // outage degrades to a real, servable link rather than a dead one.
+    assert.equal(await domainService.resolveBaseUrl(orgId), 'https://suparank.ai');
   });
 });
 

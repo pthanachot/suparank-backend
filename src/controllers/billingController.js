@@ -27,7 +27,11 @@ function auditBilling(req, org, action, meta = null) {
   });
 }
 
-const APP_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+const { appUrl } = require('../config/appUrl');
+
+// The canonical app origin (APP_URL, else FRONTEND_URL). Every Stripe
+// success/cancel/return URL below is built from it.
+const APP_URL = appUrl();
 
 // Convert Stripe Unix timestamps (seconds) to Date objects
 function parseStripeDate(ts) {

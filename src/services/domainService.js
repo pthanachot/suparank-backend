@@ -22,6 +22,7 @@ const crypto = require('crypto');
 const dns = require('dns');
 const Domain = require('../models/Domain');
 const cloudflareService = require('./cloudflareService');
+const { appUrl } = require('../config/appUrl');
 
 const DEFAULT_PLATFORM_HOSTS = 'app.suparank.ai,suparank.ai,www.suparank.ai';
 const DEFAULT_FALLBACK_ORIGIN = 'wl.suparank.ai';
@@ -394,7 +395,7 @@ async function resolveOrgByHost(host) {
  * platform frontend. Cached per org (5 min).
  */
 async function resolveBaseUrl(orgId) {
-  const fallback = process.env.FRONTEND_URL || 'http://localhost:3000';
+  const fallback = appUrl();
   if (!orgId) return fallback;
   if (!(await isCustomDomainsEnabled())) return fallback;
 
@@ -440,7 +441,7 @@ async function resolveBaseUrl(orgId) {
  * that know the user's orgs should prefer resolveBaseUrl(orgId).
  */
 async function resolveBaseUrlFromRequest(req) {
-  const fallback = process.env.FRONTEND_URL || 'http://localhost:3000';
+  const fallback = appUrl();
   try {
     const header = String(req.headers['x-tenant-host'] || '').trim().toLowerCase();
     if (!header) return fallback;

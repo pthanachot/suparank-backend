@@ -1,5 +1,14 @@
 const mongoose = require('mongoose');
 
+/**
+ * How long raw observations survive. The model owns this because the TTL index
+ * below is what actually enforces it — analytics services that clamp a window
+ * to "what raw events can still answer" import this rather than repeating the
+ * literal, so changing retention can't leave a clamp quietly lying about
+ * coverage. Same pattern as AdminAuditLog.RETENTION_DAYS.
+ */
+const RAW_HORIZON_DAYS = 90;
+
 // Phase 7.3 — durable sink for product-metric observations batched from the
 // editor (POST /api/observe). Append-only, TTL-expired at 90 days. Identity is
 // the authenticated user; workspace/content/org come from the event payload.
@@ -29,7 +38,8 @@ observationEventSchema.index({ event: 1, createdAt: -1 });
 // TTL: observations are aggregate signal, not records — expire after 90 days.
 observationEventSchema.index(
   { createdAt: 1 },
-  { expireAfterSeconds: 90 * 24 * 60 * 60, name: 'createdAt_ttl_90d' }
+  { expireAfterSeconds: RAW_HORIZON_DAYS * 24 * 60 * 60, name: 'createdAt_ttl_90d' }
 );
 
 module.exports = mongoose.model('ObservationEvent', observationEventSchema);
+module.exports.RAW_HORIZON_DAYS = RAW_HORIZON_DAYS;

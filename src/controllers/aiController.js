@@ -469,7 +469,13 @@ async function persistUsage(req, content, tap, source, runMeta = {}) {
   GenerationSnapshot.create({
     contentId: content._id,
     workspaceId: content.workspaceId,
-    organizationId: content.organizationId || null,
+    // NOT content.organizationId — the Content schema declares no such path, so
+    // mongoose returns undefined for it (and strips it on write), which made
+    // every snapshot's org null. Both call sites run resolveWorkspaceWithRole,
+    // so the workspace is already hydrated in memory; creditContext is
+    // preferred because it adds the personal-org fallback, but it is absent
+    // whenever credits are disabled for the feature. Neither costs a query.
+    organizationId: req?.creditContext?.orgId || req?.workspace?.organizationId || null,
     userId: req?.user?.userId || null,
     impersonatedBy: req?.user?.impersonatedBy ? String(req.user.impersonatedBy) : null,
     voiceId,

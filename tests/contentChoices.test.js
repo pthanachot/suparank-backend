@@ -21,6 +21,9 @@ const {
 } = require('../src/services/contentChoicesService');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+// Content has no workspaceNumber path — seed the real field, else these tests
+// re-create the masking that hid the ledger's always-zero workspaces column.
+const WS = (n) => new mongoose.Types.ObjectId(String(n).padStart(24, '0'));
 // The service treats anything created before this as pre-tracking.
 const AFTER = new Date('2026-08-08T12:00:00.000Z');
 const BEFORE = new Date('2026-07-01T12:00:00.000Z');
@@ -32,7 +35,7 @@ beforeEach(async () => { await clear(); });
 let n = 5000;
 async function article(fields = {}) {
   await Content.collection.insertOne({
-    contentNumber: n++, title: `a${n}`, workspaceNumber: fields.ws ?? 1,
+    contentNumber: n++, title: `a${n}`, workspaceId: WS(fields.ws ?? 1),
     targetKeywords: fields.keywords ?? [], createdVia: fields.createdVia ?? 'blank',
     contentType: fields.contentType ?? '', language: fields.language ?? 'en',
     country: fields.country ?? 'US', device: fields.device ?? 'desktop',

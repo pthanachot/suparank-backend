@@ -14,18 +14,18 @@
  * does are reported as definite gaps. Within the raw TTL horizon that check is
  * exact; beyond it neither source survives and the block says so.
  *
- * Week buckets are computed in JS rather than with $dateTrunc: that operator
- * needs MongoDB 5.0+ and nothing else in this codebase relies on it, so the
- * retention read model deliberately doesn't add that requirement.
- *
  * Weeks start MONDAY, UTC — matching the UTC day boundary the rollups are
- * keyed on.
+ * keyed on. Bucketing is done with $dayOfWeek arithmetic rather than
+ * $dateTrunc, whose week buckets start on SUNDAY by default: the consent trend
+ * renders directly above these panels, and two different week definitions on
+ * one screen is worse than either definition alone.
  */
 
 const User = require('../models/User');
 const ObservationEvent = require('../models/ObservationEvent');
 const UserActivityRollup = require('../models/UserActivityRollup');
-const { RAW_HORIZON_DAYS } = require('./usageAnalyticsService');
+const { RAW_HORIZON_DAYS } = require('../models/ObservationEvent');
+const { excludedUserFilter } = require('./analyticsExclusions');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
@@ -47,11 +47,12 @@ function weekStart(d) {
  * Which days in the window actually have rollup rows, and which are provably
  * missing (raw events exist for that day, the rollup has nothing).
  */
-async function getCoverage(from, to) {
+async function getCoverage(from, to, now, excludedUsers) {
+  const userMatch = { impersonatedBy: null, userId: excludedUsers ? { $ne: null, ...excludedUsers } : { $ne: null } };
   const [rolledDays, rawDays] = await Promise.all([
     UserActivityRollup.distinct('day', { day: { $gte: from, $lt: to } }),
     ObservationEvent.aggregate([
-      { $match: { createdAt: { $gte: from, $lt: to }, impersonatedBy: null, userId: { $ne: null } } },
+      { $match: { ...userMatch, createdAt: { $gte: from, $lt: to } } },
       {
         $group: {
           _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
@@ -65,20 +66,43 @@ async function getCoverage(from, to) {
 
   // Only meaningful inside the raw horizon: past it the raw side is gone too,
   // so an absent rollup row is indistinguishable from a genuinely quiet day.
-  const horizonStart = utcDayStart(new Date(Date.now() - RAW_HORIZON_DAYS * DAY_MS));
+  const today = utcDayStart(now);
+  const horizonStart = utcDayStart(new Date(now.getTime() - RAW_HORIZON_DAYS * DAY_MS));
   const checkableFrom = from > horizonStart ? from : horizonStart;
+  // The nightly job rolls only COMPLETE days, yesterday backwards, at 03:40
+  // UTC. Today can never have a row, and yesterday has none until tonight's
+  // tick — so neither is evidence of a gap. Checking through the day before
+  // yesterday gives the cron a full tick of slack. Without this the banner
+  // fires every single day on a healthy system, and a warning that is always
+  // on is a warning nobody reads — which would defeat the only mechanism that
+  // makes a real rollup gap visible.
+  const checkableTo = new Date(today.getTime() - DAY_MS);
 
   const gaps = raw
-    .filter((d) => new Date(`${d}T00:00:00.000Z`) >= checkableFrom && !rolled.has(d))
+    .filter((d) => {
+      const at = new Date(`${d}T00:00:00.000Z`);
+      return at >= checkableFrom && at < checkableTo && !rolled.has(d);
+    })
     .sort();
+
+  // Complete days in the window — today can never be rolled, so counting it
+  // would make the ratio permanently short of full.
+  const windowEnd = to < today ? to : today;
+  const expectedDays = Math.max(0, Math.round((windowEnd - from) / DAY_MS));
 
   return {
     daysWithRollup: rolled.size,
+    // Context, not a health signal: a genuinely quiet day legitimately has no
+    // row, so daysWithRollup < expectedDays is not by itself evidence of loss.
+    // missingDays is the authoritative signal — it is cross-checked against
+    // raw events that still exist.
+    expectedDays,
     // A day the rollup missed even though raw events for it still exist. Each
     // one is activity the retention math below cannot see.
     missingDays: gaps,
-    // Cross-checking is only possible where raw events still exist.
+    // The window gap-detection could actually verify, both ends.
     verifiableFrom: checkableFrom,
+    verifiableTo: checkableTo,
     complete: gaps.length === 0,
   };
 }
@@ -90,14 +114,14 @@ async function getCoverage(from, to) {
  * whose week has not finished are marked immature rather than being rendered
  * as a dip — the difference between "they stopped" and "the week isn't over".
  */
-async function getCohorts(cohortCount, now) {
+async function getCohorts(cohortCount, now, excludedUsers) {
   const thisWeek = weekStart(now);
   const firstCohort = new Date(thisWeek.getTime() - (cohortCount - 1) * WEEK_MS);
 
   const [users, activity] = await Promise.all([
-    User.find({ createdAt: { $gte: firstCohort } }, { _id: 1, createdAt: 1 }).lean(),
+    User.find({ createdAt: { $gte: firstCohort }, ...(excludedUsers ? { _id: excludedUsers } : {}) }, { _id: 1, createdAt: 1 }).lean(),
     UserActivityRollup.aggregate([
-      { $match: { day: { $gte: firstCohort } } },
+      { $match: { day: { $gte: firstCohort }, ...(excludedUsers ? { userId: excludedUsers } : {}) } },
       // One row per user per day per org — collapse to user × day first so a
       // user active in two organisations isn't counted twice.
       { $group: { _id: { user: '$userId', day: '$day' } } },
@@ -139,23 +163,38 @@ async function getCohorts(cohortCount, now) {
 }
 
 /** Distinct active users per week across the whole product. */
-async function getWeeklyActive(from, now) {
+async function getWeeklyActive(from, now, excludedUsers) {
+  // Bucketed server-side: the previous shape returned one document per user
+  // per active day to Node (users × days — tens of thousands at modest scale)
+  // and folded them here. $dayOfWeek gives Sunday=1, so shifting by
+  // (dayOfWeek + 5) mod 7 lands on the Monday that starts the week, matching
+  // weekStart() exactly. Deliberately not $dateTrunc, whose week buckets start
+  // on Sunday by default and would disagree with the cohort grid on the same
+  // screen.
   const rows = await UserActivityRollup.aggregate([
-    { $match: { day: { $gte: from } } },
-    { $group: { _id: { user: '$userId', day: '$day' } } },
+    { $match: { day: { $gte: from }, ...(excludedUsers ? { userId: excludedUsers } : {}) } },
+    {
+      $addFields: {
+        week: {
+          $subtract: [
+            '$day',
+            { $multiply: [{ $mod: [{ $add: [{ $dayOfWeek: '$day' }, 5] }, 7] }, DAY_MS] },
+          ],
+        },
+      },
+    },
+    // Collapse to one row per user per week first, so a user active five days
+    // counts once.
+    { $group: { _id: { week: '$week', user: '$userId' } } },
+    { $group: { _id: '$_id.week', activeUsers: { $sum: 1 } } },
+    { $sort: { _id: 1 } },
   ]);
 
-  const byWeek = new Map();
-  for (const r of rows) {
-    const wk = weekStart(r._id.day).getTime();
-    if (!byWeek.has(wk)) byWeek.set(wk, new Set());
-    byWeek.get(wk).add(String(r._id.user));
-  }
   const thisWeek = weekStart(now).getTime();
-  return [...byWeek.keys()].sort().map((wk) => ({
-    week: new Date(wk),
-    activeUsers: byWeek.get(wk).size,
-    immature: wk === thisWeek,
+  return rows.map((r) => ({
+    week: r._id,
+    activeUsers: r.activeUsers,
+    immature: new Date(r._id).getTime() === thisWeek,
   }));
 }
 
@@ -188,16 +227,21 @@ async function getRetention({ weeks = 8, now = new Date() } = {}) {
   const thisWeek = weekStart(now);
   const from = new Date(thisWeek.getTime() - (count - 1) * WEEK_MS);
 
+  // Staff are excluded per plan §7.0 — resolved once and threaded so the
+  // roster, the activity side and the coverage check all agree.
+  const excludedUsers = await excludedUserFilter();
+
   const [cohorts, weekly, coverage] = await Promise.all([
-    getCohorts(count, now),
-    getWeeklyActive(from, now),
-    getCoverage(from, now),
+    getCohorts(count, now, excludedUsers),
+    getWeeklyActive(from, now, excludedUsers),
+    getCoverage(from, now, now, excludedUsers),
   ]);
 
   return {
     weeks: count,
     from,
     weekStartsOn: 'monday-utc',
+    staffExcluded: true,
     coverage,
     cohorts,
     weeklyActive: weekly,

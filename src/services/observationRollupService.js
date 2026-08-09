@@ -19,9 +19,9 @@ const ObservationDailyRollup = require('../models/ObservationDailyRollup');
 const UserActivityRollup = require('../models/UserActivityRollup');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-// Raw ObservationEvent TTL. Nothing older can be rolled, so a backfill that
-// reaches past it is wasted work rather than recovered history.
-const RAW_HORIZON_DAYS = 90;
+// Raw ObservationEvent TTL, owned by the model that enforces it. Nothing older
+// can be rolled, so a backfill reaching past it is wasted work, not recovery.
+const { RAW_HORIZON_DAYS } = require('../models/ObservationEvent');
 
 /** UTC midnight of the day containing `d`. */
 function utcDayStart(d) {
@@ -140,35 +140,68 @@ async function rollupUserActivityDay(dayStart) {
   return ops.length;
 }
 
+/** `YYYY-MM-DD` keys for complete days inside the horizon that still have raw
+ *  events matching `match` but no rollup row in `existingDays`. */
+async function findUnrolledDays(match, existingDays, today) {
+  const horizonStart = new Date(today.getTime() - RAW_HORIZON_DAYS * DAY_MS);
+  const rawDays = await ObservationEvent.aggregate([
+    { $match: { ...match, createdAt: { $gte: horizonStart, $lt: today } } },
+    { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } } } },
+  ]);
+  const have = new Set(existingDays.map((d) => utcDayStart(d).toISOString().slice(0, 10)));
+  return rawDays.map((r) => r._id).filter((d) => !have.has(d)).sort();
+}
+
 /**
  * Nightly entry point: re-roll the last `days` COMPLETE UTC days (yesterday
  * backwards). The trailing window absorbs unload beacons that landed after a
  * prior run; idempotent upserts make the overlap free.
  *
- * `backfillIfEmpty` (default on) covers the first run after UserActivityRollup
- * was introduced: with an empty collection it reaches back over the whole raw
- * TTL horizon instead of 3 days, so the retention history that still exists in
- * ObservationEvent is captured before it expires. Idempotent, so a repeat run
- * after the collection is populated costs nothing.
+ * SELF-HEALING. On top of the trailing window, each run repairs any day inside
+ * the raw horizon that has rollable events but no rollup row. That covers the
+ * first run after a lane was introduced (everything is unrolled), an outage
+ * longer than the trailing window, and — the case an emptiness check got wrong —
+ * a backfill that died partway, where the rows it managed to write would
+ * otherwise mark the job "already done" and strand the rest until they expired.
+ *
+ * The repair query uses the SAME filter as the lane it repairs, so a day whose
+ * only events are impersonated (or user-less, for the user lane) is correctly
+ * seen as "nothing to roll" rather than being re-detected as a gap every night.
+ *
+ * `maxRepairDays` bounds one tick; the oldest gaps go first because they are
+ * nearest to expiring out of the raw TTL.
  */
-async function runDailyRollup({ days = 3, now = new Date(), backfillIfEmpty = true } = {}) {
+async function runDailyRollup({ days = 3, now = new Date(), maxRepairDays = RAW_HORIZON_DAYS } = {}) {
   const today = utcDayStart(now);
+  const horizonStart = new Date(today.getTime() - RAW_HORIZON_DAYS * DAY_MS);
+  const dayOf = (key) => new Date(`${key}T00:00:00.000Z`);
+
+  const trailing = [];
+  for (let i = 1; i <= days; i++) trailing.push(new Date(today.getTime() - i * DAY_MS));
+
+  // ── event lane ──
   let rows = 0;
-  for (let i = 1; i <= days; i++) {
-    rows += await rollupDay(new Date(today.getTime() - i * DAY_MS));
-  }
+  for (const d of trailing) rows += await rollupDay(d);
+  const eventGaps = (await findUnrolledDays(
+    { impersonatedBy: null },
+    await ObservationDailyRollup.distinct('day', { day: { $gte: horizonStart }, source: 'observation' }),
+    today
+  )).slice(0, maxRepairDays);
+  if (eventGaps.length) console.log(`[rollup] repairing ${eventGaps.length} unrolled event day(s), oldest ${eventGaps[0]}`);
+  for (const key of eventGaps) rows += await rollupDay(dayOf(key));
 
-  let userDays = days;
-  if (backfillIfEmpty && (await UserActivityRollup.estimatedDocumentCount()) === 0) {
-    userDays = RAW_HORIZON_DAYS;
-    console.log(`[rollup] UserActivityRollup empty — backfilling ${userDays} days from raw events`);
-  }
+  // ── user-activity lane ──
   let userRows = 0;
-  for (let i = 1; i <= userDays; i++) {
-    userRows += await rollupUserActivityDay(new Date(today.getTime() - i * DAY_MS));
-  }
+  for (const d of trailing) userRows += await rollupUserActivityDay(d);
+  const userGaps = (await findUnrolledDays(
+    { impersonatedBy: null, userId: { $ne: null } },
+    await UserActivityRollup.distinct('day', { day: { $gte: horizonStart } }),
+    today
+  )).slice(0, maxRepairDays);
+  if (userGaps.length) console.log(`[rollup] repairing ${userGaps.length} unrolled user day(s), oldest ${userGaps[0]}`);
+  for (const key of userGaps) userRows += await rollupUserActivityDay(dayOf(key));
 
-  return { days, rows, userDays, userRows };
+  return { days, rows, userRows, repairedEventDays: eventGaps.length, repairedUserDays: userGaps.length };
 }
 
 /** Reader for GET /api/admin/usage-rollups. Newest first, capped. */

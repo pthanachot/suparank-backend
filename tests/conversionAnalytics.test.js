@@ -123,7 +123,7 @@ test('surface attribution pairs intent with revenue', async () => {
   assert.equal(editor.checkoutsStarted, 1);
   assert.equal(editor.subscribed, 1);
 
-  const uncaptured = surfaces.find((s) => s.surface === '(not captured)');
+  const uncaptured = surfaces.find((s) => s.surface === '(unknown)');
   assert.equal(uncaptured.subscribed, 1, 'missing attribution is named, not dropped');
 });
 

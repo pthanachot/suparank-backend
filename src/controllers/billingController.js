@@ -355,6 +355,25 @@ const createCheckoutSession = async (req, res) => {
     });
 
     auditBilling(req, org, 'billing.checkout_started', { priceId, plan: PRICE_TO_PLAN[priceId] || null, surface });
+
+    // Wave 5 (§9 P3-1): recorded SERVER-side. The client also emits this, but
+    // only from /pricing and /settings/billing — routes with no
+    // /workspace/<n>/ segment, so the ingest path (which derives org from the
+    // workspace and correctly refuses to trust a client-supplied one) leaves
+    // organizationId null and the org-denominated funnel stage reads zero.
+    // Here the org is already resolved AND ownership-checked, and it is the
+    // same id that goes into Stripe metadata above — so this stage and the
+    // subscription stage denominate identically.
+    try {
+      const { recordObservation } = require('./observeController');
+      recordObservation(
+        'checkout_started',
+        { orgId, surface, plan: PRICE_TO_PLAN[priceId] || null },
+        req.user?.userId,
+        req.user?.impersonatedBy
+      );
+    } catch { /* telemetry must never break a checkout */ }
+
     res.json({ url: session.url, sessionId: session.id });
   } catch (error) {
     console.error('Create checkout session error:', error);

@@ -91,14 +91,11 @@ const FUNNELS = [
   },
 ];
 
-function since(days) {
-  return new Date(Date.now() - days * DAY_MS);
-}
-
-// Raw ObservationEvent TTLs at 90 days; ObservationDailyRollup never expires.
-// A window is therefore only "complete" for raw-backed panels if it starts
-// inside the horizon — see resolveRange.
-const RAW_HORIZON_DAYS = 90;
+// Raw ObservationEvent TTLs; ObservationDailyRollup never expires. A window is
+// therefore only "complete" for raw-backed panels if it starts inside the
+// horizon — see resolveRange. Sourced from the model that enforces the TTL so
+// the clamp can never disagree with actual retention.
+const { RAW_HORIZON_DAYS } = require('../models/ObservationEvent');
 
 /**
  * Resolve a requested window into concrete bounds plus honest coverage info
@@ -135,17 +132,28 @@ function resolveRange({ days, from, to, source = 'raw', now = new Date() } = {})
 
   const requestedFrom = start;
   const horizonStart = new Date(now.getTime() - RAW_HORIZON_DAYS * DAY_MS);
-  const truncated = source === 'raw' && requestedFrom < horizonStart;
-  if (truncated) start = horizonStart;
+
+  // A window that ENDS before the horizon can't be partially covered — raw
+  // events for it are entirely gone. Clamping `from` up past `to` would leave
+  // an inverted window (from > to), which matches nothing, reports days:1, and
+  // inverts the comparison window too, so every panel would render zeros as if
+  // they were measurements. Collapse to zero-width and say so instead.
+  const outsideRetention = source === 'raw' && horizonStart >= end;
+  const truncated = source === 'raw' && !outsideRetention && requestedFrom < horizonStart;
+  if (outsideRetention) start = end;
+  else if (truncated) start = horizonStart;
 
   return {
     from: start,
     to: end,
     requestedFrom,
-    days: Math.max(1, Math.round((end - start) / DAY_MS)),
+    days: outsideRetention ? 0 : Math.max(1, Math.round((end - start) / DAY_MS)),
     source,
     // The UI hatches the uncovered span and the export writes a `partial:` note.
     truncated,
+    // Nothing to hatch — the whole window predates retention. Callers must
+    // render "no raw data exists for this window", never zeros.
+    outsideRetention,
     rawAvailableFrom: source === 'raw' ? horizonStart : null,
   };
 }
@@ -211,6 +219,7 @@ async function getOverview({ days = 28, from: rawFrom, to: rawTo } = {}) {
   return {
     days: range.days,
     range,
+    rawHorizonDays: RAW_HORIZON_DAYS,
     current,
     previous,
     lanes,

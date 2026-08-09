@@ -59,7 +59,17 @@ const CONTENT_TYPES = [
  * field shipped with Wave 1 on 2026-08-08. Overridable so the boundary is
  * testable and adjustable if the deploy date is ever corrected.
  */
-const CREATED_VIA_SINCE = new Date(process.env.CREATED_VIA_SINCE || '2026-08-08T00:00:00.000Z');
+const CREATED_VIA_DEFAULT = '2026-08-08T00:00:00.000Z';
+const _createdViaParsed = new Date(process.env.CREATED_VIA_SINCE || CREATED_VIA_DEFAULT);
+if (Number.isNaN(_createdViaParsed.getTime())) {
+  // Invalid Date makes every comparison false, silently deleting the legacy
+  // bucket and reporting pre-rollout articles as genuine manual creations —
+  // exactly the inflation the bucket exists to prevent. Warn once at boot.
+  console.warn(`[contentChoices] CREATED_VIA_SINCE="${process.env.CREATED_VIA_SINCE}" is not a valid date — using ${CREATED_VIA_DEFAULT}`);
+}
+const CREATED_VIA_SINCE = Number.isNaN(_createdViaParsed.getTime())
+  ? new Date(CREATED_VIA_DEFAULT)
+  : _createdViaParsed;
 
 /**
  * How an article came to exist, with genuinely-unattributed articles held apart.
@@ -86,7 +96,9 @@ function sourceOf(doc) {
 async function getKeywordLedger() {
   const docs = await Content.find(
     { ...LIVE, targetKeywords: { $exists: true, $ne: [] } },
-    { targetKeywords: 1, createdVia: 1, workspaceNumber: 1, score: 1, createdAt: 1 }
+    // workspaceId, not workspaceNumber: Content declares no workspaceNumber
+    // path, so mongoose stripped it and this column read 0 for every keyword.
+    { targetKeywords: 1, createdVia: 1, workspaceId: 1, score: 1, createdAt: 1 }
   ).lean();
 
   const byKey = new Map();
@@ -113,7 +125,7 @@ async function getKeywordLedger() {
       }
       row.spellings.set(display, (row.spellings.get(display) || 0) + 1);
       row.articles += 1;
-      if (d.workspaceNumber != null) row.workspaces.add(d.workspaceNumber);
+      if (d.workspaceId != null) row.workspaces.add(String(d.workspaceId));
       row.sources[source] = (row.sources[source] || 0) + 1;
       if (typeof d.score === 'number' && d.score > 0) {
         row.scoreSum += d.score;
@@ -131,6 +143,9 @@ async function getKeywordLedger() {
       workspaces: r.workspaces.size,
       sources: r.sources,
       avgScore: r.scored ? Math.round(r.scoreSum / r.scored) : null,
+      // The average covers only scored articles; without this the denominator
+      // is invisible (plan §9.0 — every figure names its own).
+      scored: r.scored,
       lastCreated: r.lastCreated,
     }))
     .sort((a, b) => b.articles - a.articles || a.keyword.localeCompare(b.keyword));
@@ -362,21 +377,23 @@ async function getGenerationSettings() {
     ]),
     GenerationSnapshot.aggregate([
       { $match: { impersonatedBy: null, voiceId: { $ne: null } } },
-      { $group: { _id: '$voiceId', runs: { $sum: 1 }, articles: { $addToSet: '$contentId' } } },
+      // Two-stage group rather than $addToSet: accumulating every distinct
+      // contentId in one document is unbounded memory on the one collection
+      // that never expires, and hits the 16MB group-doc ceiling eventually.
+      { $group: { _id: { voiceId: '$voiceId', contentId: '$contentId' }, runs: { $sum: 1 } } },
+      { $group: { _id: '$_id.voiceId', runs: { $sum: '$runs' }, articles: { $sum: 1 } } },
       { $sort: { runs: -1 } },
-      { $limit: 50 },
     ]),
     GenerationSnapshot.aggregate([
       { $match: { impersonatedBy: null, avatarId: { $ne: null } } },
-      { $group: { _id: '$avatarId', runs: { $sum: 1 }, articles: { $addToSet: '$contentId' } } },
+      { $group: { _id: { avatarId: '$avatarId', contentId: '$contentId' }, runs: { $sum: 1 } } },
+      { $group: { _id: '$_id.avatarId', runs: { $sum: '$runs' }, articles: { $sum: 1 } } },
       { $sort: { runs: -1 } },
-      { $limit: 50 },
     ]),
     GenerationSnapshot.aggregate([
       { $match: { impersonatedBy: null, commandName: { $ne: null } } },
       { $group: { _id: '$commandName', runs: { $sum: 1 } } },
       { $sort: { runs: -1 } },
-      { $limit: 50 },
     ]),
   ]);
 
@@ -388,8 +405,10 @@ async function getGenerationSettings() {
     maxIterations: { sent: t?.iterSent ?? 0, changed: t?.iterChanged ?? 0 },
     withVoice: t?.withVoice ?? 0,
     withAvatar: t?.withAvatar ?? 0,
-    byVoice: byVoice.map((v) => ({ voiceId: v._id, runs: v.runs, articles: v.articles.length })),
-    byAvatar: byAvatar.map((v) => ({ avatarId: v._id, runs: v.runs, articles: v.articles.length })),
+    // No $limit: the export contract promises full tables, and a silently
+    // truncated list is indistinguishable from a short one. The UI shows a head.
+    byVoice: byVoice.map((v) => ({ voiceId: v._id, runs: v.runs, articles: v.articles })),
+    byAvatar: byAvatar.map((v) => ({ avatarId: v._id, runs: v.runs, articles: v.articles })),
     byCommand: byCommand.map((v) => ({ command: v._id, runs: v.runs })),
     // Capture starts with Phase 7 — runs before it left no snapshot, so a small
     // `runs` next to a large article count is history, not inactivity.

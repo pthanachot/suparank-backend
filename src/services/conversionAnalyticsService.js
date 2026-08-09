@@ -39,12 +39,28 @@
 
 const ObservationEvent = require('../models/ObservationEvent');
 const Subscription = require('../models/Subscription');
-const { resolveRange, RAW_HORIZON_DAYS } = require('./usageAnalyticsService');
-
-const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const { resolveRange } = require('./usageAnalyticsService');
+const { RAW_HORIZON_DAYS } = require('../models/ObservationEvent');
+const { weekStart } = require('./retentionAnalyticsService');
 
 /** Distinct non-null values from an $addToSet result. */
 const distinct = (arr) => new Set((arr ?? []).filter((v) => v != null).map(String)).size;
+
+/**
+ * What counts as having converted.
+ *
+ * `incomplete` is Stripe's status for a checkout whose first payment never
+ * completed — the org never paid, so counting it inflates the exact number
+ * this funnel exists to produce (platformAdminService makes the same exclusion
+ * for the same reason). Everything else counts: `trialing` and `past_due` are
+ * live subscriptions that every entitlement check in this codebase already
+ * treats as paid, and `canceled` converted once — excluding it would make
+ * historical windows silently shrink as customers churn.
+ */
+const CONVERTED = { planId: { $ne: 'free' }, status: { $nin: ['incomplete'] } };
+
+/** One label for one concept: "we don't know which surface this came from". */
+const UNKNOWN_SURFACE = '(unknown)';
 
 /**
  * Which wall, for whom. Rows are (action × tier × slot × limit), each with the
@@ -106,10 +122,7 @@ async function getUpgradeFunnel(from, to) {
     orgsForEvents(['quota_denied'], from, to),
     orgsForEvents(['upgrade_clicked'], from, to),
     orgsForEvents(['checkout_started'], from, to),
-    Subscription.distinct('organizationId', {
-      createdAt: { $gte: from, $lt: to },
-      planId: { $ne: 'free' },
-    }),
+    Subscription.distinct('organizationId', { ...CONVERTED, createdAt: { $gte: from, $lt: to } }),
   ]);
 
   return {
@@ -141,22 +154,22 @@ async function getSurfaces(from, to) {
       { $sort: { count: -1 } },
     ]),
     Subscription.aggregate([
-      { $match: { createdAt: { $gte: from, $lt: to }, planId: { $ne: 'free' } } },
+      { $match: { ...CONVERTED, createdAt: { $gte: from, $lt: to } } },
       { $group: { _id: '$surface', count: { $sum: 1 } } },
       { $sort: { count: -1 } },
     ]),
   ]);
 
-  const subscribedBySurface = new Map(subs.map((s) => [s._id || '(not captured)', s.count]));
+  const subscribedBySurface = new Map(subs.map((s) => [s._id || UNKNOWN_SURFACE, s.count]));
   const surfaces = new Set([
-    ...intentRows.map((r) => r._id || '(unattributed)'),
+    ...intentRows.map((r) => r._id || UNKNOWN_SURFACE),
     ...subscribedBySurface.keys(),
   ]);
 
   return [...surfaces].map((surface) => ({
     surface,
-    checkoutsStarted: intentRows.find((r) => (r._id || '(unattributed)') === surface)?.count ?? 0,
-    orgsStartingCheckout: distinct(intentRows.find((r) => (r._id || '(unattributed)') === surface)?.orgs),
+    checkoutsStarted: intentRows.find((r) => (r._id || UNKNOWN_SURFACE) === surface)?.count ?? 0,
+    orgsStartingCheckout: distinct(intentRows.find((r) => (r._id || UNKNOWN_SURFACE) === surface)?.orgs),
     subscribed: subscribedBySurface.get(surface) ?? 0,
   })).sort((a, b) => b.subscribed - a.subscribed || b.checkoutsStarted - a.checkoutsStarted);
 }
@@ -171,29 +184,38 @@ async function getSurfaces(from, to) {
  * would need its own rollup events. Raw-only means the 90-day horizon applies.
  */
 async function getConsentTrend(from, to) {
+  // Grouped by DAY server-side (nothing unbounded crosses the wire), then
+  // folded into Monday-start weeks in JS using the same weekStart() the
+  // retention panels use.
+  //
+  // Deliberately not $dateTrunc: it defaults to SUNDAY-start weeks, so this
+  // trend was bucketing a day off from the cohort grid rendered directly below
+  // it on the same page — two week definitions on one screen. It also requires
+  // MongoDB 5.0+, which nothing else here does.
   const rows = await ObservationEvent.aggregate([
     { $match: { createdAt: { $gte: from, $lt: to }, event: 'consent_choice', impersonatedBy: null } },
     {
       $group: {
         _id: {
-          week: { $dateTrunc: { date: '$createdAt', unit: 'week' } },
+          day: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
           accepted: '$payload.analytics',
         },
         count: { $sum: 1 },
       },
     },
-    { $sort: { '_id.week': 1 } },
   ]);
 
   const byWeek = new Map();
   for (const r of rows) {
-    const key = r._id.week?.toISOString() ?? 'unknown';
-    const entry = byWeek.get(key) ?? { week: r._id.week, accepted: 0, declined: 0 };
+    const wk = weekStart(new Date(`${r._id.day}T00:00:00.000Z`));
+    const key = wk.getTime();
+    const entry = byWeek.get(key) ?? { week: wk, accepted: 0, declined: 0 };
     if (r._id.accepted === true) entry.accepted += r.count;
     else entry.declined += r.count;
     byWeek.set(key, entry);
   }
-  return [...byWeek.values()];
+  // $group returns no order; sort explicitly rather than relying on insertion.
+  return [...byWeek.values()].sort((a, b) => a.week - b.week);
 }
 
 async function getConversion({ days = 28, from: rawFrom, to: rawTo } = {}) {

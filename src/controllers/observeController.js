@@ -45,6 +45,55 @@ async function orgForWorkspace(workspaceNumber) {
   return orgId;
 }
 
+/**
+ * Fallback org for events fired OUTSIDE a /workspace/<n>/ route (Wave 5 §9 P3-1).
+ *
+ * upgrade_clicked, checkout_started, settings_tab_viewed and the onboarding
+ * events all come from routes with no workspace segment, so the sink can't
+ * infer a workspaceNumber and every one of them was landing with a null org —
+ * silently zeroing the org-denominated conversion funnel and, worse, writing
+ * null attribution durably into the daily rollups.
+ *
+ * This does NOT reintroduce the spoofing hole the workspace derivation closed.
+ * Nothing here comes from the request body: activeWorkspaceId is written only
+ * by the authorization-checked activate endpoint, and the personal-org fallback
+ * is looked up by the authenticated user's own id.
+ *
+ * Known ambiguity: a user in several orgs who is working in org B while their
+ * last activated workspace belongs to org A attributes to A. The UI's "active
+ * org" is client-side only (localStorage), so there is no server-side signal to
+ * do better today; persisting an active organization would remove the guess.
+ */
+const User = require('../models/User');
+const Organization = require('../models/Organization');
+const USER_ORG_CACHE = new Map(); // userId → { orgId: string|null, at: ms }
+
+async function orgForUser(userId) {
+  if (!userId) return null;
+  const key = String(userId);
+  const now = Date.now();
+  const hit = USER_ORG_CACHE.get(key);
+  if (hit && now - hit.at < ORG_CACHE_TTL_MS) return hit.orgId;
+  let orgId = null;
+  try {
+    const u = await User.findById(userId).select('activeWorkspaceId').lean();
+    if (u?.activeWorkspaceId) {
+      const w = await Workspace.findById(u.activeWorkspaceId).select('organizationId').lean();
+      orgId = w?.organizationId ? String(w.organizationId) : null;
+    }
+    if (!orgId) {
+      // Every user has exactly one of these (orgBootstrapService guarantees it).
+      const personal = await Organization.findOne({ ownerId: userId, isPersonal: true }).select('_id').lean();
+      orgId = personal?._id ? String(personal._id) : null;
+    }
+  } catch {
+    orgId = hit ? hit.orgId : null;
+  }
+  if (USER_ORG_CACHE.size >= ORG_CACHE_MAX) USER_ORG_CACHE.clear();
+  USER_ORG_CACHE.set(key, { orgId, at: now });
+  return orgId;
+}
+
 // Coerce a string-or-number id to a finite number, else null. The editor's
 // workspaceNumber/contentNumber props are strings, so a strict typeof check
 // would drop them.
@@ -100,8 +149,12 @@ async function ingestObservations(req, res) {
     const wsNums = [...new Set(docs.map((d) => d.workspaceNumber).filter((n) => n != null))];
     const orgByWs = new Map();
     for (const n of wsNums) orgByWs.set(n, await orgForWorkspace(n));
+    // One lookup for the whole batch: every doc here belongs to the same
+    // authenticated user, and events off a workspace route still need an org.
+    const needsFallback = docs.some((d) => d.workspaceNumber == null);
+    const fallbackOrg = needsFallback ? await orgForUser(userId) : null;
     for (const d of docs) {
-      d.organizationId = d.workspaceNumber != null ? orgByWs.get(d.workspaceNumber) : null;
+      d.organizationId = d.workspaceNumber != null ? orgByWs.get(d.workspaceNumber) : fallbackOrg;
     }
 
     if (docs.length) {

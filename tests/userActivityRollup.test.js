@@ -86,21 +86,47 @@ test('events with no user are skipped — they belong to no cohort', async () =>
   assert.equal(rows, 0);
 });
 
-test('the first run backfills the whole raw horizon, not just 3 days', async () => {
+test('the first run covers the whole raw horizon, not just 3 days', async () => {
   const u = oid();
   await seed('editor_opened', { userId: u, ago: 1 });
   await seed('editor_opened', { userId: u, ago: 45 });  // older than the nightly window
 
   const r = await runDailyRollup({ days: 3 });
-  assert.equal(r.userDays, 90, 'an empty collection triggers the backfill');
+  assert.equal(r.repairedUserDays, 1, 'the out-of-window day is repaired');
   // Without it, the 45-day-old day would expire unrolled and that history is gone.
   assert.equal(await UserActivityRollup.countDocuments({ userId: u }), 2);
 });
 
-test('subsequent runs use the short trailing window', async () => {
+test('a run that already covered everything repairs nothing', async () => {
   const u = oid();
   await seed('editor_opened', { userId: u, ago: 1 });
-  await runDailyRollup({ days: 3 });          // backfills
+  await runDailyRollup({ days: 3 });
   const second = await runDailyRollup({ days: 3 });
-  assert.equal(second.userDays, 3, 'populated collection means no repeat backfill');
+  assert.equal(second.repairedUserDays, 0, 'no gaps left to find');
+  assert.equal(await UserActivityRollup.countDocuments({ userId: u }), 1, 'and nothing duplicated');
+});
+
+test('an INTERRUPTED backfill is repaired on the next run, not stranded', async () => {
+  // The failure the old emptiness check could not survive: a first pass that
+  // wrote some rows and died. Those rows made the collection non-empty, so
+  // every later run fell back to 3 days and the rest expired unrolled.
+  const u = oid();
+  for (const ago of [1, 20, 40, 60]) await seed('editor_opened', { userId: u, ago });
+  await rollupUserActivityDay(new Date(Date.now() - 20 * DAY_MS)); // partial progress
+
+  assert.equal(await UserActivityRollup.countDocuments({}), 1, 'collection is non-empty');
+  const r = await runDailyRollup({ days: 3 });
+  assert.equal(r.repairedUserDays, 2, 'the 40- and 60-day-old days are found');
+  assert.equal(await UserActivityRollup.countDocuments({ userId: u }), 4, 'all four days now rolled');
+});
+
+test('a day whose only activity is excluded is not re-detected forever', async () => {
+  // Impersonated / user-less events legitimately produce no rollup row. If the
+  // repair query used a different filter from the lane it repairs, that day
+  // would look like a gap on every run, for ever.
+  await seed('editor_opened', { userId: oid(), ago: 30, impersonatedBy: String(oid()) });
+  const r = await runDailyRollup({ days: 3 });
+  assert.equal(r.repairedUserDays, 0);
+  const again = await runDailyRollup({ days: 3 });
+  assert.equal(again.repairedUserDays, 0, 'and still zero the next night');
 });

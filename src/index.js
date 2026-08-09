@@ -680,7 +680,10 @@ const observationRollupForCron = require('./services/observationRollupService');
 cron.schedule('40 3 * * *', async () => {
   try {
     const r = await observationRollupForCron.runDailyRollup({ days: 3 });
-    console.log(`[cron] observe rollup COMPLETE: ${r.rows} row(s) across ${r.days} day(s)`);
+    console.log(
+      `[cron] observe rollup COMPLETE: ${r.rows} row(s) across ${r.days} day(s)` +
+      ` · user activity: ${r.userRows} row(s) across ${r.userDays} day(s)`
+    );
   } catch (err) {
     console.error('[cron] observe rollup error:', err.message);
   }

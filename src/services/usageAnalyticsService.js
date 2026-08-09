@@ -95,6 +95,61 @@ function since(days) {
   return new Date(Date.now() - days * DAY_MS);
 }
 
+// Raw ObservationEvent TTLs at 90 days; ObservationDailyRollup never expires.
+// A window is therefore only "complete" for raw-backed panels if it starts
+// inside the horizon — see resolveRange.
+const RAW_HORIZON_DAYS = 90;
+
+/**
+ * Resolve a requested window into concrete bounds plus honest coverage info
+ * (Wave 5 Phase 2, plan §9.0).
+ *
+ * `source` decides the horizon, NOT the request: 'rollup' panels serve any
+ * range because the rollups have no TTL; 'raw' panels can only see the last
+ * RAW_HORIZON_DAYS, so a longer request is clamped and reported as partial
+ * rather than silently under-reporting.
+ *
+ * Throws RangeError on invalid input so the controller can answer 400 — a
+ * malformed date must not quietly fall back to a default window and hand the
+ * caller numbers for a period they didn't ask about.
+ */
+function resolveRange({ days, from, to, source = 'raw', now = new Date() } = {}) {
+  let start;
+  let end = now;
+
+  if (from != null || to != null) {
+    if (from == null || to == null) throw new RangeError('from and to must be supplied together');
+    start = new Date(from);
+    end = new Date(to);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+      throw new RangeError('from and to must be ISO dates');
+    }
+    if (start >= end) throw new RangeError('from must be before to');
+    // A window ending in the future isn't wrong, it's just empty out there.
+    if (end > now) end = now;
+    if (start >= end) throw new RangeError('from must be in the past');
+  } else {
+    const d = Math.max(1, Math.min(3650, parseInt(days, 10) || 28));
+    start = new Date(end.getTime() - d * DAY_MS);
+  }
+
+  const requestedFrom = start;
+  const horizonStart = new Date(now.getTime() - RAW_HORIZON_DAYS * DAY_MS);
+  const truncated = source === 'raw' && requestedFrom < horizonStart;
+  if (truncated) start = horizonStart;
+
+  return {
+    from: start,
+    to: end,
+    requestedFrom,
+    days: Math.max(1, Math.round((end - start) / DAY_MS)),
+    source,
+    // The UI hatches the uncovered span and the export writes a `partial:` note.
+    truncated,
+    rawAvailableFrom: source === 'raw' ? horizonStart : null,
+  };
+}
+
 /** Distinct-actor + volume snapshot for one time window. */
 async function windowStats(from, to) {
   const rows = await ObservationEvent.aggregate([
@@ -116,16 +171,19 @@ async function windowStats(from, to) {
   };
 }
 
-async function getOverview({ days = 28 } = {}) {
-  const now = new Date();
-  const from = since(days);
-  const prevFrom = new Date(from.getTime() - days * DAY_MS);
+async function getOverview({ days = 28, from: rawFrom, to: rawTo } = {}) {
+  const range = resolveRange({ days, from: rawFrom, to: rawTo, source: 'raw' });
+  const { from, to } = range;
+  // The comparison window is the same length immediately before this one, so a
+  // custom range compares like-for-like rather than against a fixed 28 days.
+  const span = to - from;
+  const prevFrom = new Date(from.getTime() - span);
 
   const [current, previous, byEvent, consentRows] = await Promise.all([
-    windowStats(from, now),
+    windowStats(from, to),
     windowStats(prevFrom, from),
     ObservationEvent.aggregate([
-      { $match: { createdAt: { $gte: from }, impersonatedBy: null } },
+      { $match: { createdAt: { $gte: from, $lt: to }, impersonatedBy: null } },
       { $group: { _id: '$event', count: { $sum: 1 }, users: { $addToSet: '$userId' } } },
       { $sort: { count: -1 } },
     ]),
@@ -133,7 +191,7 @@ async function getOverview({ days = 28 } = {}) {
       // V4-2 review fix: same impersonation filter as every other query —
       // this is the one metric whose entire job is precision about who is
       // being counted, and it was the only aggregation missing the filter.
-      { $match: { createdAt: { $gte: from }, event: 'consent_choice', impersonatedBy: null } },
+      { $match: { createdAt: { $gte: from, $lt: to }, event: 'consent_choice', impersonatedBy: null } },
       { $group: { _id: '$payload.analytics', count: { $sum: 1 } } },
     ]),
   ]);
@@ -151,14 +209,18 @@ async function getOverview({ days = 28 } = {}) {
   }
 
   return {
-    days,
+    days: range.days,
+    range,
     current,
     previous,
     lanes,
     // The [C]-lane correction denominator (F1): what share of choosing users
     // the client lane can even see. Signed-in choices only.
     consent,
-    topEvents: byEvent.slice(0, 12).map((r) => ({
+    // Every event, sorted desc — the UI slices for display, but the Copy-for-AI
+    // export must carry the full table (§9 Phase 2), and it reads this object
+    // rather than re-fetching. Bounded by the registry size, so it stays small.
+    topEvents: byEvent.map((r) => ({
       event: r._id,
       lane: EVENTS[r._id]?.lane || 'unknown',
       count: r.count,
@@ -167,8 +229,9 @@ async function getOverview({ days = 28 } = {}) {
   };
 }
 
-async function getFunnels({ days = 28 } = {}) {
-  const from = since(days);
+async function getFunnels({ days = 28, from: rawFrom, to: rawTo } = {}) {
+  const range = resolveRange({ days, from: rawFrom, to: rawTo, source: 'raw' });
+  const { from, to } = range;
   const results = [];
   for (const f of FUNNELS) {
     const allEvents = [
@@ -176,7 +239,7 @@ async function getFunnels({ days = 28 } = {}) {
     ];
     const actorField = f.denom === 'workspaces' ? '$workspaceNumber' : '$userId';
     const rows = await ObservationEvent.aggregate([
-      { $match: { createdAt: { $gte: from }, event: { $in: allEvents }, impersonatedBy: null } },
+      { $match: { createdAt: { $gte: from, $lt: to }, event: { $in: allEvents }, impersonatedBy: null } },
       { $group: { _id: '$event', actors: { $addToSet: actorField }, count: { $sum: 1 } } },
     ]);
     const byEvent = new Map(rows.map((r) => [r._id, r]));
@@ -201,23 +264,25 @@ async function getFunnels({ days = 28 } = {}) {
       })),
     });
   }
-  return { days, mode: 'stage-reach', funnels: results };
+  return { days: range.days, range, mode: 'stage-reach', funnels: results };
 }
 
 /** Daily activity series from the durable rollups (optionally one event). */
-async function getSeries({ days = 28, event = null } = {}) {
-  const from = since(days);
+async function getSeries({ days = 28, event = null, from: rawFrom, to: rawTo } = {}) {
+  // source:'rollup' — these rows never expire, so this panel honours any
+  // requested range instead of being clamped to the raw 90-day horizon.
+  const range = resolveRange({ days, from: rawFrom, to: rawTo, source: 'rollup' });
   // V4-3 review fix: the rollup collection also carries the AuditLog
   // billing/lifecycle lane (source:'audit') — "daily events" must not quietly
   // include billing bookkeeping. The audit lane gets its own view later.
-  const match = { day: { $gte: from }, source: 'observation' };
+  const match = { day: { $gte: range.from, $lt: range.to }, source: 'observation' };
   if (event) match.event = event;
   const rows = await ObservationDailyRollup.aggregate([
     { $match: match },
     { $group: { _id: '$day', count: { $sum: '$count' } } },
     { $sort: { _id: 1 } },
   ]);
-  return { days, event, series: rows.map((r) => ({ day: r._id, count: r.count })) };
+  return { days: range.days, range, event, series: rows.map((r) => ({ day: r._id, count: r.count })) };
 }
 
-module.exports = { getOverview, getFunnels, getSeries, FUNNELS };
+module.exports = { getOverview, getFunnels, getSeries, resolveRange, FUNNELS, RAW_HORIZON_DAYS };

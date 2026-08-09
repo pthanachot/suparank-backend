@@ -14,6 +14,33 @@ const { isSupportedLanguage, isSelectableLanguage } = require('../config/locales
 // Workspace is resolved by the permissions middleware (resolveWorkspaceWithRole)
 // and available as req.workspace.
 
+// ─── Wave 5 Phase 6 (§9): approved-outline sanitising ──────────────────────
+// approvedOutline lands in a Mixed column, which accepts anything the client
+// sends. These caps keep a stored outline recognisably an outline and stop a
+// crafted payload bloating every later read of the document.
+const OUTLINE_EDIT_DEPTHS = ['unedited', 'renamed', 'sections-changed', 'heavy'];
+const MAX_SECTIONS = 60;
+const MAX_CHILDREN = 30;
+const MAX_HEADING = 300;
+
+const nonNegInt = (v) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : null);
+const heading = (v) => (typeof v === 'string' ? v.slice(0, MAX_HEADING) : '');
+
+/** Keep only the outline shape: h1, sections[].h2, sections[].children[].h3. */
+function sanitizeOutline(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const sections = Array.isArray(raw.sections) ? raw.sections.slice(0, MAX_SECTIONS) : [];
+  return {
+    h1: heading(raw.h1),
+    sections: sections.map((s) => ({
+      h2: heading(s?.h2),
+      children: (Array.isArray(s?.children) ? s.children.slice(0, MAX_CHILDREN) : []).map((c) => ({
+        h3: heading(c?.h3),
+      })),
+    })),
+  };
+}
+
 // ─── LIST CONTENTS (summaries) ─────────────────────────────────
 
 const listContents = async (req, res) => {
@@ -198,6 +225,45 @@ const updateContent = async (req, res) => {
     for (const field of allowedFields) {
       if (req.body[field] !== undefined) {
         updates[field] = req.body[field];
+      }
+    }
+
+    // Wave 5 Phase 6 (§9): the approved outline and the citability snapshot are
+    // NOT in allowedFields on purpose. Both are client-supplied and two of them
+    // land in Mixed columns, so they are reshaped here instead of stored as
+    // sent — a Mixed field will accept literally anything, including a payload
+    // large enough to bloat every subsequent read of the document.
+    if (req.body.approvedOutline !== undefined) {
+      updates.approvedOutline = sanitizeOutline(req.body.approvedOutline);
+    }
+    if (req.body.outlineEdit !== undefined) {
+      const e = req.body.outlineEdit || {};
+      const depth = OUTLINE_EDIT_DEPTHS.includes(e.depth) ? e.depth : null;
+      // A classification we don't recognise is dropped rather than stored:
+      // a junk value would read as a real edit-depth bucket in the dashboard.
+      if (depth) {
+        updates.outlineEdit = {
+          depth,
+          sectionsBefore: nonNegInt(e.sectionsBefore),
+          sectionsAfter: nonNegInt(e.sectionsAfter),
+          headingsRenamed: nonNegInt(e.headingsRenamed),
+          at: new Date(), // server clock — never trust a client timestamp
+        };
+      }
+    }
+    if (req.body.citabilitySnapshot !== undefined) {
+      const c = req.body.citabilitySnapshot || {};
+      const total = nonNegInt(c.total);
+      if (total !== null) {
+        const covered = Math.min(nonNegInt(c.covered) ?? 0, total);
+        updates.citabilitySnapshot = {
+          // Recomputed from covered/total rather than trusting the sent score,
+          // so the ratio and the score can never disagree.
+          score: total > 0 ? Math.round((covered / total) * 100) : 0,
+          covered,
+          total,
+          at: new Date(),
+        };
       }
     }
 

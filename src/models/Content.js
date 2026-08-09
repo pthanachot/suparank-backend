@@ -325,6 +325,38 @@ const contentSchema = new mongoose.Schema(
       default: null,
     },
 
+    // Wave 5 Phase 6 (§9): the outline the human actually approved, and how far
+    // it moved from what the engine proposed.
+    //
+    // Kept separately from recommendedOutline because that field is overwritten
+    // by every re-analysis and every regenerate — before this, the user's edit
+    // was flattened into a prompt string and then discarded outright, so "how
+    // much do people correct our outlines" was unanswerable and the human's
+    // version of their own article structure was lost.
+    //
+    // outlineEdit.depth is classified AT APPROVE TIME against the outline that
+    // was on screen; diffing later against recommendedOutline could compare the
+    // approval to an outline the user never saw.
+    approvedOutline: { type: mongoose.Schema.Types.Mixed, default: null },
+    outlineEdit: {
+      depth: { type: String, enum: ['unedited', 'renamed', 'sections-changed', 'heavy'], default: null },
+      sectionsBefore: { type: Number, default: null },
+      sectionsAfter: { type: Number, default: null },
+      headingsRenamed: { type: Number, default: null },
+      at: { type: Date, default: null },
+    },
+
+    // Wave 5 Phase 6 (§9): how many of the engine's AEO phrases the finished
+    // article actually uses. The editor already computes this on every render
+    // and threw it away; persisting it at done-mark turns "did the suggestion
+    // get adopted" from unanswerable into a number.
+    citabilitySnapshot: {
+      score: { type: Number, default: null, min: 0, max: 100 },
+      covered: { type: Number, default: null, min: 0 },
+      total: { type: Number, default: null, min: 0 },
+      at: { type: Date, default: null },
+    },
+
     // Scheduling
     publishedAt: Date,
     scheduledAt: Date,

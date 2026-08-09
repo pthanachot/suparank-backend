@@ -78,7 +78,10 @@ const EVENTS = Object.freeze({
   image_generated: { lane: 'client', description: 'AI image generation attempted from ImageBlock {ok}' },
   plan_action: { lane: 'client', description: 'Plan decision {action: approve|reject|reopen} — discrete twin of plan_approval_rate' },
   sidebar_panel_opened: { lane: 'client', description: 'Sidebar panel/tab opened {tab} — one event, five tab-state hooks' },
-  internal_link_inserted: { lane: 'client', description: 'Internal-link suggestion inserted' },
+  internal_link_inserted: { lane: 'client', description: 'Internal-link suggestion inserted {targetUrl, anchor}' },
+  // Wave 5 Phase 6: the outline review is the one place a human visibly
+  // corrects the engine, and until now approving it recorded nothing.
+  outline_approved: { lane: 'client', description: 'Outline review approved {depth, sections}' },
   track_keyword_clicked: { lane: 'client', description: 'Track-keyword card {stage: intent|confirmed}' },
 
   // ── Wave 3 (§4a): shell + feature-area client events ───────────────────

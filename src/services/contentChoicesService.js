@@ -28,6 +28,23 @@ const Content = require('../models/Content');
 const AiTrackerPrompt = require('../models/AiTrackerPrompt');
 const KeywordResearchHistory = require('../models/KeywordResearchHistory');
 
+/**
+ * Soft-deleted articles must not count anywhere (P5-2). Deletion sets
+ * status:'archived' via updateMany, which bypasses the status enum, so the
+ * value is easy to miss when reading the model — every query here filters it.
+ */
+const LIVE = { status: { $ne: 'archived' } };
+
+/**
+ * $size throws if its argument isn't an array, and `benchmark` and
+ * `aiAnswerAnalysis` are Schema.Types.Mixed — nothing guarantees their shape.
+ * One malformed document would 500 the whole endpoint for every admin (P5-1),
+ * so array-ness is checked before counting.
+ */
+const safeSize = (path) => ({
+  $cond: [{ $isArray: `$${path}` }, { $size: `$${path}` }, 0],
+});
+
 // Every content type the wizard can set, so the export can show the ones
 // nobody picks — a zero is the actionable number when pruning wizard options.
 const CONTENT_TYPES = [
@@ -67,7 +84,7 @@ function sourceOf(doc) {
  */
 async function getKeywordLedger() {
   const docs = await Content.find(
-    { targetKeywords: { $exists: true, $ne: [] } },
+    { ...LIVE, targetKeywords: { $exists: true, $ne: [] } },
     { targetKeywords: 1, createdVia: 1, workspaceNumber: 1, score: 1, createdAt: 1 }
   ).lean();
 
@@ -120,7 +137,7 @@ async function getKeywordLedger() {
 
 /** How articles start, and how many keywords people actually give them. */
 async function getCreationShape() {
-  const docs = await Content.find({}, { createdVia: 1, createdAt: 1, targetKeywords: 1 }).lean();
+  const docs = await Content.find(LIVE, { createdVia: 1, createdAt: 1, targetKeywords: 1 }).lean();
 
   const sources = {};
   const perArticle = { 0: 0, 1: 0, 2: 0, 3: 0, '4-5': 0 };
@@ -137,6 +154,7 @@ async function getCreationShape() {
 /** Distribution of a single field, as {value: count}. */
 async function distribution(field, { includeEmptyAs = '(unset)' } = {}) {
   const rows = await Content.aggregate([
+    { $match: LIVE },
     { $group: { _id: `$${field}`, count: { $sum: 1 } } },
     { $sort: { count: -1 } },
   ]);
@@ -155,7 +173,7 @@ async function distribution(field, { includeEmptyAs = '(unset)' } = {}) {
  */
 async function getWordCountChoice() {
   const docs = await Content.find(
-    { targetWordCount: { $gt: 0 } },
+    { ...LIVE, targetWordCount: { $gt: 0 } },
     { targetWordCount: 1, 'aiFormatData.recommendedStructure.targetWordCount': 1 }
   ).lean();
 
@@ -183,13 +201,13 @@ async function getWordCountChoice() {
  */
 async function getEngineOffer() {
   const rows = await Content.aggregate([
-    { $match: { analysisStatus: 'ready' } },
+    { $match: { ...LIVE, analysisStatus: 'ready' } },
     {
       $project: {
-        nlpTerms: { $size: { $ifNull: ['$benchmark.topNlpTerms', []] } },
-        related: { $size: { $ifNull: ['$relatedSearches', []] } },
-        paa: { $size: { $ifNull: ['$peopleAlsoAsk', []] } },
-        aeoGroups: { $size: { $ifNull: ['$aiAnswerAnalysis.query_groups', []] } },
+        nlpTerms: safeSize('benchmark.topNlpTerms'),
+        related: safeSize('relatedSearches'),
+        paa: safeSize('peopleAlsoAsk'),
+        aeoGroups: safeSize('aiAnswerAnalysis.query_groups'),
       },
     },
     {
@@ -212,6 +230,86 @@ async function getEngineOffer() {
     avgPeopleAlsoAsk: round(r?.paa),
     avgAeoQueryGroups: round(r?.aeoGroups),
     currentStateOnly: true,
+  };
+}
+
+/**
+ * Tier 2 (Phase 6): what the human did with what the engine offered.
+ *
+ * Every figure names its own denominator — "of articles that reached this
+ * point", never "of all articles" — because adoption measured against a
+ * population that was never offered anything is meaningless (§9.0).
+ */
+async function getAdoption() {
+  const [outlineRows, citability, gscRows] = await Promise.all([
+    Content.aggregate([
+      { $match: { ...LIVE, 'outlineEdit.depth': { $ne: null } } },
+      { $group: { _id: '$outlineEdit.depth', count: { $sum: 1 } } },
+    ]),
+    Content.aggregate([
+      { $match: { ...LIVE, 'citabilitySnapshot.total': { $gt: 0 } } },
+      {
+        $group: {
+          _id: null,
+          articles: { $sum: 1 },
+          covered: { $sum: '$citabilitySnapshot.covered' },
+          total: { $sum: '$citabilitySnapshot.total' },
+          // Bands rather than an average: one article using 12 of 14 phrases
+          // and another using 0 is a different story from two using 6.
+          none: { $sum: { $cond: [{ $eq: ['$citabilitySnapshot.covered', 0] }, 1, 0] } },
+          most: {
+            $sum: {
+              $cond: [
+                { $gte: [{ $divide: ['$citabilitySnapshot.covered', '$citabilitySnapshot.total'] }, 0.5] },
+                1, 0,
+              ],
+            },
+          },
+        },
+      },
+    ]),
+    Content.aggregate([
+      { $match: LIVE },
+      {
+        $group: {
+          _id: null,
+          // Articles where GSC actually offered something can't be recovered —
+          // the offer isn't stored — so this reports acceptance only, and the
+          // denominator is named as such rather than implied.
+          withApplied: { $sum: { $cond: [{ $gt: [safeSize('appliedGscQueries'), 0] }, 1, 0] } },
+          withTracked: { $sum: { $cond: [{ $gt: [safeSize('trackedPrompts'), 0] }, 1, 0] } },
+        },
+      },
+    ]),
+  ]);
+
+  const outlineByDepth = {};
+  for (const r of outlineRows) outlineByDepth[r._id] = r.count;
+  const outlineTotal = Object.values(outlineByDepth).reduce((a, b) => a + b, 0);
+  const c = citability[0];
+
+  return {
+    outline: {
+      // Denominator: outline approvals recorded, NOT all articles. Approvals
+      // only exist from Phase 6 onward — earlier ones were never captured.
+      approvals: outlineTotal,
+      byDepth: outlineByDepth,
+      keptAsIs: outlineByDepth.unedited ?? 0,
+      capturedSince: 'phase-6',
+    },
+    aeoPhrases: {
+      // Denominator: articles marked done that had phrases offered.
+      articlesWithPhrases: c?.articles ?? 0,
+      phrasesOffered: c?.total ?? 0,
+      phrasesUsed: c?.covered ?? 0,
+      articlesUsingNone: c?.none ?? 0,
+      articlesUsingMost: c?.most ?? 0,
+    },
+    accepted: {
+      articlesWithGscApplied: gscRows[0]?.withApplied ?? 0,
+      articlesWithTrackedKeywords: gscRows[0]?.withTracked ?? 0,
+      note: 'acceptance only — what GSC offered is not stored, so no offer denominator exists',
+    },
   };
 }
 
@@ -243,7 +341,7 @@ async function getKeywordActivity() {
 }
 
 async function getContentChoices() {
-  const [ledger, creation, contentType, language, country, device, wordCount, offer, activity] =
+  const [ledger, creation, contentType, language, country, device, wordCount, offer, activity, adoption] =
     await Promise.all([
       getKeywordLedger(),
       getCreationShape(),
@@ -254,6 +352,7 @@ async function getContentChoices() {
       getWordCountChoice(),
       getEngineOffer(),
       getKeywordActivity(),
+      getAdoption(),
     ]);
 
   // Types nobody picks are the actionable ones when pruning the wizard, so the
@@ -271,10 +370,11 @@ async function getContentChoices() {
     settings: { contentType: contentTypeFull, language, country, device, wordCount },
     engineOffer: offer,
     keywordActivity: activity,
+    adoption,
   };
 }
 
 module.exports = {
   getContentChoices, getKeywordLedger, getCreationShape, getWordCountChoice,
-  getEngineOffer, getKeywordActivity, CONTENT_TYPES, sourceOf,
+  getEngineOffer, getKeywordActivity, getAdoption, CONTENT_TYPES, sourceOf,
 };

@@ -6,6 +6,7 @@ const Avatar = require('../models/Avatar');
 const CreditTransaction = require('../models/CreditTransaction');
 const Plan = require('../models/Plan');
 const AgentUsageLog = require('../models/AgentUsageLog');
+const GenerationSnapshot = require('../models/GenerationSnapshot');
 const { blocksToMarkdown } = require('../services/blocksToMarkdown');
 const { benchmarkToContentBrief, buildAvailableLinks, buildAllowlistUrls } = require('../services/benchmarkToContentBrief');
 const { buildResearchOutlineMd, buildSeoTargetsMd, buildContentAuditMd } = require('../services/contextFileGenerators');
@@ -458,6 +459,31 @@ async function persistUsage(req, content, tap, source, runMeta = {}) {
   }).catch((err) => {
     // Never throw past the SSE response — observability hygiene only.
     console.warn('[usage-tap] persist failed', err.message);
+  });
+
+  // Wave 5 Phase 7 (§9): the durable half. AgentUsageLog above TTLs at 90 days
+  // and stays deliberately narrow, so the SETTINGS that produced this run —
+  // which were previously handed to the engine and dropped — are written here
+  // instead, with no expiry. Raw values only: whether a value equals today's
+  // default is a read-time judgement, not something to freeze into the row.
+  GenerationSnapshot.create({
+    contentId: content._id,
+    workspaceId: content.workspaceId,
+    organizationId: content.organizationId || null,
+    userId: req?.user?.userId || null,
+    impersonatedBy: req?.user?.impersonatedBy ? String(req.user.impersonatedBy) : null,
+    voiceId,
+    avatarId: req?.body?.avatarId ? String(req.body.avatarId) : null,
+    // Absent stays null: "didn't send one" is different from "sent the default",
+    // and only the second says a human looked at the control.
+    targetScore: Number.isFinite(req?.body?.targetScore) ? req.body.targetScore : null,
+    maxIterations: Number.isFinite(req?.body?.maxIterations) ? req.body.maxIterations : null,
+    commandName: req?.body?.commandName ? String(req.body.commandName).slice(0, 80) : null,
+    runMode: req?.body?.mode ? String(req.body.mode).slice(0, 40) : null,
+    source,
+    runId: runMeta.runId || '',
+  }).catch((err) => {
+    console.warn('[generation-snapshot] persist failed', err.message);
   });
 
   // Wave 0 review (F3): the aborted-zero rows admitted above must NOT reach

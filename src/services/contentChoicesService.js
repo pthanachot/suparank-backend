@@ -27,6 +27,7 @@
 const Content = require('../models/Content');
 const AiTrackerPrompt = require('../models/AiTrackerPrompt');
 const KeywordResearchHistory = require('../models/KeywordResearchHistory');
+const GenerationSnapshot = require('../models/GenerationSnapshot');
 
 /**
  * Soft-deleted articles must not count anywhere (P5-2). Deletion sets
@@ -313,6 +314,89 @@ async function getAdoption() {
   };
 }
 
+/**
+ * Tier 3 (Phase 7): the settings that produced each AI run.
+ *
+ * DEFAULTS IN FORCE — the editor's own initial values (EditorChatBar):
+ *   targetScore 75, maxIterations 5   · in force since 2026-08-09 (Phase 7)
+ * Snapshots store raw values, never a "kept the default" verdict, so changing
+ * these constants reinterprets history correctly instead of leaving old rows
+ * judged under rules that no longer apply. If they change, add the new value
+ * and its date here rather than editing the line above.
+ */
+const RUN_DEFAULTS = { targetScore: 75, maxIterations: 5 };
+
+async function getGenerationSettings() {
+  const [totals, byVoice, byAvatar, byCommand] = await Promise.all([
+    GenerationSnapshot.aggregate([
+      { $match: { impersonatedBy: null } },
+      {
+        $group: {
+          _id: null,
+          runs: { $sum: 1 },
+          // "Sent and differs from the default" is the only thing that counts
+          // as changing it. A run that sent nothing tells us nothing about the
+          // control, so it is tracked separately rather than read as agreement.
+          scoreSent: { $sum: { $cond: [{ $ne: ['$targetScore', null] }, 1, 0] } },
+          scoreChanged: {
+            $sum: {
+              $cond: [
+                { $and: [{ $ne: ['$targetScore', null] }, { $ne: ['$targetScore', RUN_DEFAULTS.targetScore] }] },
+                1, 0,
+              ],
+            },
+          },
+          iterSent: { $sum: { $cond: [{ $ne: ['$maxIterations', null] }, 1, 0] } },
+          iterChanged: {
+            $sum: {
+              $cond: [
+                { $and: [{ $ne: ['$maxIterations', null] }, { $ne: ['$maxIterations', RUN_DEFAULTS.maxIterations] }] },
+                1, 0,
+              ],
+            },
+          },
+          withVoice: { $sum: { $cond: [{ $ne: ['$voiceId', null] }, 1, 0] } },
+          withAvatar: { $sum: { $cond: [{ $ne: ['$avatarId', null] }, 1, 0] } },
+        },
+      },
+    ]),
+    GenerationSnapshot.aggregate([
+      { $match: { impersonatedBy: null, voiceId: { $ne: null } } },
+      { $group: { _id: '$voiceId', runs: { $sum: 1 }, articles: { $addToSet: '$contentId' } } },
+      { $sort: { runs: -1 } },
+      { $limit: 50 },
+    ]),
+    GenerationSnapshot.aggregate([
+      { $match: { impersonatedBy: null, avatarId: { $ne: null } } },
+      { $group: { _id: '$avatarId', runs: { $sum: 1 }, articles: { $addToSet: '$contentId' } } },
+      { $sort: { runs: -1 } },
+      { $limit: 50 },
+    ]),
+    GenerationSnapshot.aggregate([
+      { $match: { impersonatedBy: null, commandName: { $ne: null } } },
+      { $group: { _id: '$commandName', runs: { $sum: 1 } } },
+      { $sort: { runs: -1 } },
+      { $limit: 50 },
+    ]),
+  ]);
+
+  const t = totals[0];
+  return {
+    runs: t?.runs ?? 0,
+    defaults: RUN_DEFAULTS,
+    targetScore: { sent: t?.scoreSent ?? 0, changed: t?.scoreChanged ?? 0 },
+    maxIterations: { sent: t?.iterSent ?? 0, changed: t?.iterChanged ?? 0 },
+    withVoice: t?.withVoice ?? 0,
+    withAvatar: t?.withAvatar ?? 0,
+    byVoice: byVoice.map((v) => ({ voiceId: v._id, runs: v.runs, articles: v.articles.length })),
+    byAvatar: byAvatar.map((v) => ({ avatarId: v._id, runs: v.runs, articles: v.articles.length })),
+    byCommand: byCommand.map((v) => ({ command: v._id, runs: v.runs })),
+    // Capture starts with Phase 7 — runs before it left no snapshot, so a small
+    // `runs` next to a large article count is history, not inactivity.
+    capturedSince: 'phase-7',
+  };
+}
+
 /** Keyword activity that happens after an article exists. */
 async function getKeywordActivity() {
   const [gsc, tracked, promptSources, research] = await Promise.all([
@@ -341,7 +425,7 @@ async function getKeywordActivity() {
 }
 
 async function getContentChoices() {
-  const [ledger, creation, contentType, language, country, device, wordCount, offer, activity, adoption] =
+  const [ledger, creation, contentType, language, country, device, wordCount, offer, activity, adoption, generation] =
     await Promise.all([
       getKeywordLedger(),
       getCreationShape(),
@@ -353,6 +437,7 @@ async function getContentChoices() {
       getEngineOffer(),
       getKeywordActivity(),
       getAdoption(),
+      getGenerationSettings(),
     ]);
 
   // Types nobody picks are the actionable ones when pruning the wizard, so the
@@ -371,10 +456,11 @@ async function getContentChoices() {
     engineOffer: offer,
     keywordActivity: activity,
     adoption,
+    generation,
   };
 }
 
 module.exports = {
   getContentChoices, getKeywordLedger, getCreationShape, getWordCountChoice,
-  getEngineOffer, getKeywordActivity, getAdoption, CONTENT_TYPES, sourceOf,
+  getEngineOffer, getKeywordActivity, getAdoption, getGenerationSettings, CONTENT_TYPES, sourceOf, RUN_DEFAULTS,
 };

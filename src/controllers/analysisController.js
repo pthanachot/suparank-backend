@@ -488,23 +488,40 @@ async function analyzeWithRetry(analyzeBody, preset, meta = {}) {
 /**
  * Email the "analysis ready" notice. Best-effort; never throws.
  *
- * Called only for the FIRST analysis of a piece — see the call site for why.
+ * Sent at most ONCE per piece, on its first successful analysis. That is
+ * enforced here, by an atomic claim on content.analysisReadyEmailedAt, rather
+ * than by trusting the caller — the previous design keyed off a `firstRun` flag
+ * threaded from whichever route started the run, so the wizard's step-1 fallback
+ * (POST /analyze, which passes no opts) produced a genuine first analysis with
+ * no email and no log line to explain it.
+ *
  * Gates, in the order every other transactional email applies them:
  *   1. the system-wide kill switch (admin Settings),
- *   2. the recipient's own emailNotifications preference,
- *   3. an address to send to.
+ *   2. an address to send to,
+ *   3. the recipient's own emailNotifications preference,
+ *   4. a template that actually rendered,
+ *   5. the exactly-once claim.
+ * Every one of them logs a reason code; none returns silently.
  *
  * `orgId` drives the Phase 11 sender identity and the Invariant I1 base URL, so
  * a white-label agency's client gets their branding and their domain, not ours.
  */
 async function emailAnalysisReady(content, userId, link, ws) {
+  // Every gate below used to `return` silently, so "no email and no log" was
+  // indistinguishable from "never called" — the exact ambiguity that made a
+  // missing email un-diagnosable from the logs. Reason codes only: the
+  // recipient address is deliberately absent from these lines.
+  const skip = (reason) =>
+    console.log(`[analysis] analysis_ready skipped (${reason}) for ${content._id}`);
+
   try {
     const { getSettings } = require('../services/systemSettingsService');
-    if (getSettings().emailNotificationsEnabled === false) return;
+    if (getSettings().emailNotificationsEnabled === false) return skip('system kill switch');
 
     const User = require('../models/User');
     const recipient = await User.findById(userId).select('email profile preferences').lean();
-    if (!recipient?.email || recipient.preferences?.emailNotifications === false) return;
+    if (!recipient?.email) return skip('recipient has no address');
+    if (recipient.preferences?.emailNotifications === false) return skip('user preference off');
 
     const orgId = ws?.organizationId || null;
 
@@ -532,9 +549,30 @@ async function emailAnalysisReady(content, userId, link, ws) {
     // The subject embeds the escaped title; a Subject is plain text and must
     // read "“Alex's post” is ready", not "“Alex&#39;s post”".
     if (emailOptions.subject) emailOptions.subject = subjectSafe(emailOptions.subject);
-    if (!emailOptions.subject || !emailOptions.html) return;
+    if (!emailOptions.subject || !emailOptions.html) return skip('template resolved empty');
 
-    await sendEmail(emailOptions);
+    // Exactly-once, claimed ATOMICALLY and BEFORE the send. Two runs can be in
+    // flight for one piece (POST /analyze 409s only on 'analyzing', so it will
+    // happily start a second run over a 'pending' one), and both would see the
+    // same never-analyzed state. Whoever wins this findOneAndUpdate sends; the
+    // loser matches no document and stops here.
+    const claimed = await Content.findOneAndUpdate(
+      { _id: content._id, analysisReadyEmailedAt: null },
+      { $set: { analysisReadyEmailedAt: new Date() } }
+    );
+    if (!claimed) return skip('already emailed');
+
+    try {
+      await sendEmail(emailOptions);
+    } catch (sendErr) {
+      // Release the claim: the send is best-effort, but a transport blip must
+      // not permanently bar the author from ever being told.
+      await Content.updateOne(
+        { _id: content._id },
+        { $set: { analysisReadyEmailedAt: null } }
+      );
+      throw sendErr;
+    }
     console.log(`[analysis] analysis_ready email sent to ${recipient.email} for ${content._id}`);
   } catch (err) {
     console.error('[analysis] analysis_ready email failed (non-fatal):', err.message);
@@ -548,7 +586,7 @@ async function emailAnalysisReady(content, userId, link, ws) {
 // creator. That fallback is exact for the initial auto-analysis (creator IS
 // the triggerer); on a teammate's retry it notifies the creator, which is
 // acceptable for v1 (see NOTIFICATION-SYSTEM-PLAN.md).
-async function notifyAnalysisOutcome(content, opts, ready) {
+async function notifyAnalysisOutcome(content, opts, ready, wasNeverAnalyzed = false) {
   try {
     if (!content) return; // outer catch may fire before content is loaded
     const userId = opts?.bill?.userId || content.userId;
@@ -575,19 +613,23 @@ async function notifyAnalysisOutcome(content, opts, ready) {
       // transactional email (webhook, credits, scan): same source event, its
       // own delivery, its own gates.
       //
-      // ONLY the analysis that runs automatically on content creation emails.
-      // The two creation paths opt in explicitly with `firstRun`; every other
-      // entry point is a button the user just pressed (POST /analyze, re-score,
-      // free retry) and is therefore someone sitting in the editor watching the
-      // score. Emailing those would put several messages a day in an active
-      // writer's inbox — the fastest way to get the sending domain filtered,
-      // which would take password resets down with it.
+      // ONLY a piece's first successful analysis emails. Re-analysing must stay
+      // silent: an active writer re-scoring all day would otherwise collect
+      // several messages a day, the fastest way to get the sending domain
+      // filtered, which would take password resets down with it.
       //
-      // This is opt-IN rather than inferred on purpose. The first cut keyed off
-      // `!opts.bill`, which is wrong: `bill` means "charge for this", not "the
-      // user asked for this", so POST /analyze and the free transient-retry
-      // both slipped through as auto-runs.
-      if (opts?.firstRun) await emailAnalysisReady(content, userId, link, ws);
+      // "First" is decided from CONTENT STATE (`wasNeverAnalyzed`, captured
+      // before this run wrote analyzedAt), not from which route started the run.
+      // Two earlier attempts keyed off the caller and both leaked: `!opts.bill`
+      // treated "don't charge" as "user didn't ask", and the `firstRun` flag was
+      // only threaded by the two creation paths — so the wizard's step-1
+      // fallback (POST /analyze, no opts) ran a genuine first analysis and
+      // silently sent nothing. Anything that starts a first run now emails,
+      // including routes nobody has written yet.
+      //
+      // emailAnalysisReady enforces at-most-once itself, so a double start
+      // cannot double-send.
+      if (wasNeverAnalyzed) await emailAnalysisReady(content, userId, link, ws);
     } else {
       await notificationService.emit({
         userId,
@@ -611,6 +653,13 @@ async function runAnalysis(contentId, opts = {}) {
   try {
     content = await Content.findById(contentId);
     if (!content) return;
+
+    // Read BEFORE this run writes analyzedAt further down — by the time the
+    // outcome is notified, every run looks like it has been analyzed. This is
+    // what makes "first analysis" a property of the piece rather than of the
+    // route that happened to start it. A failed first attempt leaves analyzedAt
+    // unset, so the retry that finally succeeds still counts as the first.
+    const wasNeverAnalyzed = !content.analyzedAt;
 
     const keywords = content.targetKeywords;
     if (!keywords || keywords.length === 0) {
@@ -979,7 +1028,7 @@ async function runAnalysis(contentId, opts = {}) {
     // control jumps to that catch, which flips the status to 'failed' and sends
     // the failed notification instead — exactly one outcome notification per
     // run, always matching the final persisted analysisStatus.
-    await notifyAnalysisOutcome(content, opts, true);
+    await notifyAnalysisOutcome(content, opts, true, wasNeverAnalyzed);
   } catch (err) {
     // Do NOT read err.message blindly: a thrown non-Error (string, plain object)
     // would make this line throw from inside the catch, rejecting the promise of

@@ -262,6 +262,14 @@ const contentSchema = new mongoose.Schema(
     },
     analyzedAt: Date,
 
+    // Exactly-once marker for the "analysis ready" email. Claimed atomically
+    // BEFORE the send (analysisController.emailAnalysisReady) so two concurrent
+    // runs on the same piece cannot both mail the author — /analyze only 409s
+    // on 'analyzing', not 'pending', so a double start is reachable.
+    // `default: null` matters: the claim filters on `analysisReadyEmailedAt: null`,
+    // which in Mongo also matches documents predating this field.
+    analysisReadyEmailedAt: { type: Date, default: null },
+
     benchmark: {
       type: mongoose.Schema.Types.Mixed,
       default: null,

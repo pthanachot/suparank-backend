@@ -180,10 +180,11 @@ const createContent = async (req, res) => {
     // billing exactly. Every other creation path keeps the auto-trigger.
     if (!deferAnalysis && content.targetKeywords && content.targetKeywords.length > 0) {
       await Content.findByIdAndUpdate(content._id, { $set: { analysisStatus: 'pending' } });
-      // firstRun: this analysis was started FOR the user, not BY them, so they
-      // may well have navigated away — it is the one analysis that also emails.
-      // Every other entry point is a button they just pressed.
-      startAnalysis(content._id, { firstRun: true });
+      // This analysis was started FOR the user, not BY them, so they may well
+      // have navigated away — hence the "analysis ready" email. No flag is
+      // threaded for it: runAnalysis decides from the content's own state
+      // (analyzedAt unset = first run), so every entry point behaves the same.
+      startAnalysis(content._id);
     }
 
     // Track article creation against tier quota
@@ -391,11 +392,12 @@ const updateContent = async (req, res) => {
         { _id: content._id, analysisStatus: 'idle' },
         { $set: { analysisStatus: 'pending' } },
       );
-      // firstRun for the same reason as the creation auto-trigger above: this
-      // IS that analysis, just deferred by the wizard. The idle→pending claim
-      // is atomic and the auto-trigger only fires when it did NOT defer, so
-      // exactly one of the two paths ever runs per piece — no double email.
-      if (claimed) startAnalysis(content._id, { firstRun: true });
+      // Same as the creation auto-trigger above: this IS that analysis, just
+      // deferred by the wizard, so it emails for the same reason. Double-send
+      // is prevented in emailAnalysisReady by an atomic claim rather than by
+      // reasoning about which path ran — the wizard's step-1 fallback can also
+      // start this piece's first analysis, through POST /analyze.
+      if (claimed) startAnalysis(content._id);
     }
 
     // Autosave fires every ~1.5s while typing — dedupe to one entry per

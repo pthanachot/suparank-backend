@@ -32,6 +32,8 @@ src/routes/devRoutes.js
 !/scripts/preflightImage.js
 !/scripts/preflightDb.js
 !/scripts/previewEmails.js
+!/scripts/smoke-telemetry-backend.js
+!/scripts/smoke-telemetry-server.js
 
 # Rendered email previews (scripts/previewEmails.js output) — build artifact
 /.preview/

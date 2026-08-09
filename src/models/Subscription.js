@@ -34,6 +34,13 @@ const subscriptionSchema = new mongoose.Schema(
       enum: ['active', 'canceled', 'past_due', 'trialing', 'incomplete'],
       default: 'active',
     },
+    // Wave 5 Phase 3 (§9 F4): which in-app surface produced this subscription —
+    // the `?src=` on the upgrade link, carried through checkout into Stripe
+    // metadata. Stripe keeps it too, but only the AuditLog held it locally and
+    // that TTLs at 180 days, so attribution older than half a year became
+    // unanswerable without calling Stripe. Written once, at acquisition: later
+    // plan changes must not overwrite where the customer originally came from.
+    surface: { type: String, default: null },
     currentPeriodStart: Date,
     currentPeriodEnd: Date,
     cancelAtPeriodEnd: { type: Boolean, default: false },

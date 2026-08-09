@@ -305,6 +305,15 @@ async function fulfillCreditPackPurchase(session) {
   console.log(`[credits] Credit pack fulfilled: org=${organizationId} pack=${creditPackId} credits=${credits} session=${session.id}`);
 }
 
+/**
+ * Sanitise the acquisition surface arriving from Stripe metadata (Wave 5 §9 F4).
+ * Same shape the checkout writer enforces; anything else becomes null rather
+ * than seeding an attribution table with arbitrary strings from a webhook body.
+ */
+function cleanSurface(raw) {
+  return typeof raw === 'string' && /^[a-z0-9][a-z0-9-]{0,39}$/.test(raw) ? raw : null;
+}
+
 async function handleSubscriptionUpdated(stripeSub) {
   let sub = await Subscription.findOne({
     stripeSubscriptionId: stripeSub.id,
@@ -323,6 +332,7 @@ async function handleSubscriptionUpdated(stripeSub) {
         stripeSubscriptionId: stripeSub.id,
         planId,
         status: stripeSub.status,
+        surface: cleanSurface(stripeSub.metadata?.surface),
       });
       console.log(`Creating missing subscription record: org=${organizationId} sub=${stripeSub.id}`);
     } else {
@@ -345,6 +355,14 @@ async function handleSubscriptionUpdated(stripeSub) {
   const prevCancelAtPeriodEnd = sub.cancelAtPeriodEnd;
 
   if (planId) sub.planId = planId;
+
+  // Acquisition surface is write-once: fill it if we never captured one (a doc
+  // created before this field existed, or by a path without metadata), but never
+  // let a later plan change rewrite where the customer originally came from.
+  if (!sub.surface) {
+    const s = cleanSurface(stripeSub.metadata?.surface);
+    if (s) sub.surface = s;
+  }
 
   const subItem = stripeSub.items.data[0];
   sub.status = stripeSub.status;

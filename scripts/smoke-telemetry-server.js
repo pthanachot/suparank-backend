@@ -88,6 +88,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     adminToken: mint(aid, 'smoke-admin@test.dev', asess),
     userId: 990001, adminId: 990002, workspaceNumber: 9001,
     orgId: String(orgId), rolledRows: rolled.rows,
+    // So a seeding script can attach to the same in-memory database and add
+    // fixtures the HTTP surface has no way to create (quota denials, billing rows).
+    mongoUri: process.env.MONGODB_URI,
   };
   fs.writeFileSync(SESSION_FILE, JSON.stringify(out, null, 2));
   console.log(`SMOKE BACKEND READY on :4599 — rolled ${rolled.rows} rollup rows; tokens in ${SESSION_FILE}`);

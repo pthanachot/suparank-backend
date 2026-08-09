@@ -13,6 +13,7 @@
  */
 
 const usageAnalytics = require('../services/usageAnalyticsService');
+const conversionAnalytics = require('../services/conversionAnalyticsService');
 
 /** Only forward a query param when it was actually supplied. */
 const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
@@ -51,4 +52,12 @@ async function getUsageSeries(req, res) {
   }
 }
 
-module.exports = { getUsageOverview, getUsageFunnels, getUsageSeries };
+async function getUsageConversion(req, res) {
+  try {
+    res.json(await conversionAnalytics.getConversion(rangeArgs(req.query)));
+  } catch (err) {
+    fail(res, err, 'conversion');
+  }
+}
+
+module.exports = { getUsageOverview, getUsageFunnels, getUsageSeries, getUsageConversion };

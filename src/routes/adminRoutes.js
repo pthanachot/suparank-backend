@@ -42,6 +42,7 @@ router.get('/usage/funnels', adminMiddleware, adminUsageController.getUsageFunne
 router.get('/usage/series', adminMiddleware, adminUsageController.getUsageSeries);
 router.get('/usage/conversion', adminMiddleware, adminUsageController.getUsageConversion);
 router.get('/usage/retention', adminMiddleware, adminUsageController.getUsageRetention);
+router.get('/usage/content', adminMiddleware, adminUsageController.getUsageContent);
 const adminEmailsGone = (req, res) =>
   res.status(410).json({
     error:

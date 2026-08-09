@@ -15,6 +15,7 @@
 const usageAnalytics = require('../services/usageAnalyticsService');
 const conversionAnalytics = require('../services/conversionAnalyticsService');
 const retentionAnalytics = require('../services/retentionAnalyticsService');
+const contentChoices = require('../services/contentChoicesService');
 
 /** Only forward a query param when it was actually supplied. */
 const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
@@ -71,4 +72,17 @@ async function getUsageRetention(req, res) {
   }
 }
 
-module.exports = { getUsageOverview, getUsageFunnels, getUsageSeries, getUsageConversion, getUsageRetention };
+async function getUsageContent(req, res) {
+  try {
+    // No range: this reports product state (what exists), not a TTL'd event
+    // stream, so every article counts regardless of when it was created.
+    res.json(await contentChoices.getContentChoices());
+  } catch (err) {
+    fail(res, err, 'content');
+  }
+}
+
+module.exports = {
+  getUsageOverview, getUsageFunnels, getUsageSeries,
+  getUsageConversion, getUsageRetention, getUsageContent,
+};

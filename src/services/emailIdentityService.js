@@ -14,7 +14,7 @@
 const flagService = require('./flagService');
 
 function platformFromAddress() {
-  const defaultFrom = process.env.EMAIL_FROM || 'SupaRank <no-reply@suparank.com>';
+  const defaultFrom = process.env.EMAIL_FROM || 'SupaRank <no-reply@suparank.ai>';
   return defaultFrom.match(/<(.+)>/)?.[1] || 'no-reply@suparank.ai';
 }
 

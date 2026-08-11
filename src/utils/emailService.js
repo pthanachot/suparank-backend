@@ -43,7 +43,7 @@ transporter.verify().then(() => {
  * email still goes out.
  */
 const sendEmail = async ({ to, subject, html, text, fromName, replyTo, orgId }) => {
-  const defaultFrom = process.env.EMAIL_FROM || 'SupaRank <no-reply@suparank.com>';
+  const defaultFrom = process.env.EMAIL_FROM || 'SupaRank <no-reply@suparank.ai>';
   let from = fromName
     ? `${fromName} <${defaultFrom.match(/<(.+)>/)?.[1] || 'no-reply@suparank.ai'}>`
     : defaultFrom;
@@ -81,6 +81,13 @@ const sendEmail = async ({ to, subject, html, text, fromName, replyTo, orgId }) 
     html,
     ...(textBody && { text: textBody }),
     ...(replyTo && { replyTo }),
+    // Brevo adds an open-tracking pixel and rewrites every link through
+    // sendibt3.com unless told otherwise. On password resets and verification
+    // codes that trades trust for analytics nobody reads: an unfamiliar
+    // redirect domain inside security mail, two alt-less images, and ~1.3
+    // SpamAssassin points (measured on mail-tester, 2026-08-11). Brevo-specific
+    // header, so it is left off the privateemail support transport.
+    ...(!useSupportTransport && { headers: { 'X-Mailin-track': '0' } }),
   };
 
   try {

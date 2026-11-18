@@ -12,7 +12,8 @@ const systemSettingsSchema = new mongoose.Schema(
     emailNotificationsEnabled: { type: Boolean, default: true },
     rateLimit: {
       windowMs: { type: Number, default: null }, // null → built-in default (15 min)
-      max: { type: Number, default: null }, // null → env-based default
+      max: { type: Number, default: null }, // per-USER bucket; null → env-based default
+      ipMax: { type: Number, default: null }, // per-IP (anonymous) bucket; null → env-based default
     },
     // DEPRECATED (Phase 2): admin identity is now env-only (ADMIN_EMAILS +
     // ADMIN_EMAILS_2..5). Field retained for backward compat with existing

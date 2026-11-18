@@ -100,6 +100,18 @@ describe('updateSystemSettings validation', () => {
     assert.equal((await put({ rateLimit: { max: 0 } })).statusCode, 400);
   });
 
+  // QA N2: the per-IP bucket override apiRateLimit reads (rateLimit.ipMax).
+  it('accepts rateLimit.ipMax as a positive integer or null, rejects anything else', async () => {
+    for (const bad of [0, -5, 1.5, '100', true]) {
+      assert.equal((await put({ rateLimit: { ipMax: bad } })).statusCode, 400, JSON.stringify(bad));
+    }
+    assert.equal(state.updateCalls.length, 0);
+    assert.equal((await put({ rateLimit: { ipMax: 250 } })).statusCode, 200);
+    assert.deepEqual(state.updateCalls[0], { 'rateLimit.ipMax': 250 });
+    assert.equal((await put({ rateLimit: { ipMax: null } })).statusCode, 200);
+    assert.deepEqual(state.updateCalls[1], { 'rateLimit.ipMax': null });
+  });
+
   it('rejects retentionCount outside 1..100 and empty directory strings', async () => {
     assert.equal((await put({ backup: { retentionCount: 0 } })).statusCode, 400);
     assert.equal((await put({ backup: { retentionCount: 101 } })).statusCode, 400);

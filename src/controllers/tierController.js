@@ -83,9 +83,15 @@ const getTierInfo = async (req, res) => {
     const now = new Date();
     const monthPeriod = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
 
-    const [monthlyUsage, userLifetimeUsage] = await Promise.all([
+    // QA B42: credits are deducted at the ORG level (creditService.preDeduct
+    // increments UsageTracker{org, period: getPeriod(creditLimitType)}), so a
+    // lifetime credit limit (Free) lives on the org's 'lifetime' row, not the
+    // per-user tracker the other lifetime counters use. Reading the user row
+    // made creditsUsed read 0 forever on Free.
+    const [monthlyUsage, userLifetimeUsage, orgLifetimeUsage] = await Promise.all([
       UsageTracker.getUsage(orgId, monthPeriod),
       UserUsageTracker.getUsage(req.user.userId),
+      UsageTracker.getUsage(orgId, 'lifetime'),
     ]);
 
     // Extra seats from active subscription
@@ -112,10 +118,13 @@ const getTierInfo = async (req, res) => {
 
     // Build usage response keyed by counter name
     // Lifetime quotas are now user-level, so read from userLifetimeUsage.
+    // Org-level counters: incremented per org even when the limit is lifetime.
+    const ORG_LEVEL_COUNTERS = new Set(['creditsUsed']);
     function usageEntry(counterKey, limitKey, limitTypeKey) {
       const limit = config[limitKey];
       const limitType = config[limitTypeKey] || 'monthly';
-      const source = limitType === 'lifetime' ? userLifetimeUsage : monthlyUsage;
+      const lifetimeSource = ORG_LEVEL_COUNTERS.has(counterKey) ? orgLifetimeUsage : userLifetimeUsage;
+      const source = limitType === 'lifetime' ? lifetimeSource : monthlyUsage;
       const used = source?.[counterKey] ?? 0;
       return {
         used,

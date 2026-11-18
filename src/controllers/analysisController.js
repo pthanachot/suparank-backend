@@ -29,6 +29,12 @@ async function resolveContent(req, res) {
   return content;
 }
 
+// A finite, non-negative engine statistic, else 0.
+function statNumber(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
 // Curate benchmark: map engine content_brief to scorer-compatible format
 function curateBenchmark(brief) {
   if (!brief) return null;
@@ -53,8 +59,10 @@ function curateBenchmark(brief) {
     avgInternalLinks: stats.avg_internal_links || 0,
     avgExternalLinks: stats.avg_external_links || 0,
     avgImages: stats.avg_images || 0,
-    avgTitleLength: 0,
-    avgDescLength: 0,
+    // QA B41: the engine now reports these (optional; absent on older builds
+    // and on cached analyses → 0, the previous hard-coded value).
+    avgTitleLength: statNumber(stats.avg_title_length),
+    avgDescLength: statNumber(stats.avg_desc_length),
     avgKeywordDensity: stats.avg_keyword_density || 0,
     keywordInH2Rate: stats.keyword_in_h2_rate || 0,
     keywordInFirst100Rate: stats.keyword_in_first100_rate || 0,
@@ -62,7 +70,7 @@ function curateBenchmark(brief) {
     avgTableCount: stats.avg_tables || 0,
     avgFaqCount: stats.avg_faqs || 0,
     avgParagraphs: stats.avg_paragraphs || 0,
-    avgSentenceLength: 0,
+    avgSentenceLength: statNumber(stats.avg_sentence_length),
     avgReadingLevel: stats.avg_reading_level || 0,
     topNlpTerms: terms.map((t) => ({
       term: t.term,

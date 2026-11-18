@@ -3174,7 +3174,7 @@ const getThread = async (req, res) => {
     const content = await resolveContent(req, res);
     if (!content) return;
     const page = Math.max(0, parseInt(req.query.page, 10) || 0);
-    const history = await threadService.getThreadHistory(content._id, { page });
+    const history = await threadService.getThreadHistory(content._id, { page, viewerUserId: req.user?.userId || null });
     return res.json(history);
   } catch (err) {
     console.error('[threads] getThread error:', err);

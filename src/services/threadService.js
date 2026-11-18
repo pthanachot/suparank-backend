@@ -191,12 +191,56 @@ async function markSteersApplied(threadId, sinceMs) {
 }
 
 /**
+ * QA Nov 2026 (B43, N3): the CLIENT shape of one thread message.
+ *
+ * Threads are shared per document by design (CONVERSATION-THREADS-PLAN D1:
+ * "One shared thread per content", and the agent's warm engine session — the
+ * conversation memory — is per document too, so a per-user split would not be
+ * private anyway). What must not be shared is what the API used to return
+ * verbatim: the raw ENGINEERED prompt (a slash command's full instruction
+ * block, not what the user saw), the model id, token counts and the author's
+ * userId. Replay/continuation reads the full row server-side
+ * (getReplayPayload), never this.
+ *
+ *   user rows       text = displayText = what the bubble showed (the label for
+ *                   a slash command, else the typed prompt)
+ *   assistant rows  text = the reply (it was shown in full)
+ *   compaction      text = '' (the summary is model-facing; the UI draws a
+ *                   divider)
+ *   meta            allowlist only: channel, docWrites, stopReason, turns,
+ *                   runId, sessionId, applied, commandName
+ *   mine            true when the viewer authored the row (no userId leaves)
+ */
+const CLIENT_META_KEYS = ['channel', 'docWrites', 'stopReason', 'turns', 'runId', 'sessionId', 'applied', 'commandName'];
+
+function toClientThreadMessage(m, viewerUserId = null) {
+  const meta = {};
+  const src = (m && m.meta) || {};
+  for (const k of CLIENT_META_KEYS) {
+    if (src[k] !== undefined && src[k] !== null) meta[k] = src[k];
+  }
+  let text = '';
+  if (m.kind === 'user') text = m.displayText || m.text || '';
+  else if (m.kind === 'assistant') text = m.text || '';
+  const author = src.userId != null ? String(src.userId) : null;
+  return {
+    seq: m.seq,
+    kind: m.kind,
+    text,
+    displayText: m.kind === 'user' ? text : '',
+    meta,
+    mine: !!(viewerUserId && author && author === String(viewerUserId)),
+    createdAt: m.createdAt,
+  };
+}
+
+/**
  * Read a page of the active thread's messages for the history view.
  * Newest-first pagination (page 0 = most recent), each page returned in
  * ascending seq order ready to render. READ path — throws propagate to the
  * route handler (it has its own error envelope).
  */
-async function getThreadHistory(contentId, { page = 0, pageSize = 50 } = {}) {
+async function getThreadHistory(contentId, { page = 0, pageSize = 50, viewerUserId = null } = {}) {
   const thread = await AiThread.findOne(
     { contentId, status: 'active', ownerUserId: null },
     null,
@@ -229,14 +273,8 @@ async function getThreadHistory(contentId, { page = 0, pageSize = 50 } = {}) {
       turnBudget: THREAD_TURN_BUDGET,
       turnsRemaining: Math.max(0, THREAD_TURN_BUDGET - turnsUsed),
     },
-    messages: messages.map((m) => ({
-      seq: m.seq,
-      kind: m.kind,
-      text: m.text,
-      displayText: m.displayText,
-      meta: m.meta,
-      createdAt: m.createdAt,
-    })),
+    // Client DTO only — never the stored row (see toClientThreadMessage).
+    messages: messages.map((m) => toClientThreadMessage(m, viewerUserId)),
     hasMore,
   };
 }
@@ -1046,6 +1084,7 @@ module.exports = {
   appendMessage,
   markSteersApplied,
   getThreadHistory,
+  toClientThreadMessage,
   startNewThread,
   estimateTokens,
   shapeThreadForReplay,

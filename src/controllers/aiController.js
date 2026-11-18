@@ -15,8 +15,10 @@ const writingEngine = require('../services/writingEngine');
 const { toGoPlan } = require('../services/planSerializer');
 const imageStorage = require('../services/imageStorage');
 const creditService = require('../services/creditService');
-const { resolveCredits, agentRunCredits } = require('../config/creditRules');
+const { resolveCredits } = require('../config/creditRules');
 const { classifyAgentRun, isPlanArticleWrite, resolveAgentRun } = require('../config/agentBilling');
+const { computeSettlement } = require('../services/billing/computeSettlement');
+const { claimArticleSlot, checkPendingRoom } = require('../services/articleQuotaService');
 const systemSettings = require('../services/systemSettingsService');
 const UsageTracker = require('../models/UsageTracker');
 const UserUsageTracker = require('../models/UserUsageTracker');
@@ -229,6 +231,11 @@ function makeUsageTap() {
   let buffer = '';
   let inputTokens = 0;
   let outputTokens = 0;
+  // QA B04: the LARGEST single-turn input, alongside the sum. Each loop turn
+  // re-sends the prompt, tools and document, so the sum grows with the turn
+  // count rather than with the message — pricing chat on it pushed almost
+  // every reply past the 8K line. The sum stays for analytics/COGS.
+  let maxTurnInputTokens = 0;
   let model = '';
   let docWrites = 0;
   // W4-c prerequisite: capture the run's terminal metadata from the complete
@@ -336,7 +343,9 @@ function makeUsageTap() {
             // writing-engine api.Usage json tags. Accept camelCase too for
             // resilience. (Pre-fix this read only camelCase and silently
             // captured 0 for every turn.)
-            inputTokens += Number(ev.usage.input_tokens ?? ev.usage.inputTokens) || 0;
+            const turnIn = Number(ev.usage.input_tokens ?? ev.usage.inputTokens) || 0;
+            inputTokens += turnIn;
+            if (turnIn > maxTurnInputTokens) maxTurnInputTokens = turnIn;
             outputTokens += Number(ev.usage.output_tokens ?? ev.usage.outputTokens) || 0;
             // The engine tags the serving model on the usage event; keep the last.
             if (ev.model) model = ev.model;
@@ -355,7 +364,7 @@ function makeUsageTap() {
       }
     },
     snapshot() {
-      return { inputTokens, outputTokens, model, docWrites, stopReason, images, imageModel };
+      return { inputTokens, outputTokens, maxTurnInputTokens, model, docWrites, stopReason, images, imageModel };
     },
     // Threads Phase 1: the run's full assistant text (all text turns joined),
     // with the last complete.fullText as fallback ("Cancelled" is deliberately
@@ -555,9 +564,28 @@ async function persistUsage(req, content, tap, source, runMeta = {}) {
   }
 }
 
+/**
+ * Close a run's credit reservation at the amount computeSettlement decided.
+ * 0 goes through refund() (the group ends 'refunded', the clearest ledger
+ * state for "this run cost nothing"); anything else through settle(), which
+ * refunds the difference. Both atomically claim the pending group, so a
+ * repeat call (or the orphan sweep) can never refund twice. Fire-and-forget,
+ * like the call sites it replaces: the response has already streamed.
+ */
+function closeReservation(txId, credits, label) {
+  if (!txId) return;
+  const op = credits > 0
+    ? creditService.settle(txId, credits)
+    : creditService.refund(txId);
+  Promise.resolve(op).catch((e) =>
+    console.error(`[credit] ${label} ${credits > 0 ? 'settle' : 'refund'} failed:`, e.message)
+  );
+}
+
 // ─── Article count-gate (Phase 6, money#1) ───────────────────
 // "Regeneration consumes a slot on all tiers" (product decision). The FIRST
-// successful generation on a doc is covered by the content-creation counter;
+// successful generation on a doc is covered by the article's own slot (counted
+// once, when the article is first put to work — articleQuotaService, QA B24);
 // every RE-generation decrements the article allowance (Free: 3 lifetime,
 // paid: monthly). Failed/aborted runs never count — the counter moves on
 // COMPLETION, alongside the credit settle.
@@ -569,8 +597,15 @@ async function persistUsage(req, content, tap, source, runMeta = {}) {
 
 async function checkArticleAllowance(req, content) {
   const isFirstGen = !content.articleGeneratedAt;
+  // QA B24: the first generation is covered by the article's slot — but the
+  // slot is now counted when the article is first put to work, not at create.
+  // A document still 'pending' (never analyzed: e.g. a blank doc going
+  // straight to Auto-write) has NOT been counted, so this first generation
+  // IS its count and must pass the limit check like a regeneration does.
+  const slotPending = content.articleQuotaState === 'pending';
+  const coveredFirstGen = isFirstGen && !slotPending;
   const orgId = req.creditContext?.orgId || req.workspace?.organizationId || null;
-  if (!orgId) return { isFirstGen, blocked: false, quotaCtx: null };
+  if (!orgId) return { isFirstGen, slotPending, blocked: false, quotaCtx: null };
 
   const { tier, config } = await tierService.getOrgTierConfig(orgId);
   const limit = config?.maxArticlesPerMonth;
@@ -579,9 +614,9 @@ async function checkArticleAllowance(req, content) {
   const isUserLevel = !!(limitType === 'lifetime' && req.user?.userId);
   const quotaCtx = { orgId, userId: req.user?.userId, counterKey: 'articlesCreated', period, isUserLevel };
 
-  // First generation on this doc: covered by the creation count — no check,
-  // no decrement (the completion handler stamps articleGeneratedAt instead).
-  if (isFirstGen || limit == null) return { isFirstGen, blocked: false, quotaCtx };
+  // First generation on an already-counted doc: covered by its slot — no
+  // check, no decrement (the completion handler stamps articleGeneratedAt).
+  if (coveredFirstGen || limit == null) return { isFirstGen, slotPending, blocked: false, quotaCtx };
 
   const used = isUserLevel
     ? await UserUsageTracker.getCount(req.user.userId, 'articlesCreated')
@@ -591,6 +626,7 @@ async function checkArticleAllowance(req, content) {
     const isFree = tier === 'free';
     return {
       isFirstGen,
+      slotPending,
       blocked: true,
       payload: {
         error: isFree
@@ -602,7 +638,7 @@ async function checkArticleAllowance(req, content) {
       },
     };
   }
-  return { isFirstGen, blocked: false, quotaCtx };
+  return { isFirstGen, slotPending, blocked: false, quotaCtx };
 }
 
 /**
@@ -628,7 +664,11 @@ async function commitArticleGeneration(content, gate) {
         articleGeneratedPlanId: cur.mode === 'execute' ? (cur.activePlanId || null) : null,
       },
     });
-    if (!gate.isFirstGen && gate.quotaCtx) {
+    // QA B24: a not-yet-counted article is counted HERE, once (atomic claim;
+    // a no-op if its analysis already counted it, and for pre-change docs).
+    // The limit was checked before the run, so no re-check.
+    const slot = await claimArticleSlot(content, { enforce: false });
+    if (!slot.counted && !gate.isFirstGen && gate.quotaCtx) {
       await tierService.incrementQuota(gate.quotaCtx);
     }
   } catch (e) {
@@ -1072,7 +1112,47 @@ async function setupSession(content, { avatarId, reuseSession, secondary, memory
     `total=${Date.now() - tSetup}ms skipped=[${skipped.join(',')}] ${JSON.stringify(timings)}`
   );
 
-  return { sessionId, markdown };
+  // QA N5/B34: non-fatal degradations the client should hear about. Today
+  // only the context file system (CFS): outside plan mode the run proceeds
+  // without the context tools, and that used to be visible only in our logs.
+  const warnings = [];
+  if (results[4].status === 'fulfilled' && results[4].value?.cfsUnavailable) {
+    warnings.push(CONTEXT_UNAVAILABLE_WARNING);
+  }
+  return { sessionId, markdown, warnings };
+}
+
+// SSE event shapes for a context-file-system (CFS) failure (QA N5/B34).
+// chat / agent (degraded run continues):
+const CONTEXT_UNAVAILABLE_WARNING = Object.freeze({
+  type: 'warning',
+  code: 'context_unavailable',
+  message: 'Some background context for this document could not be loaded, so the AI is working without your research notes and outline for this request.',
+});
+// plan mode (cannot run at all; the stream ends right after this event):
+const CONTEXT_UNAVAILABLE_PLAN_ERROR = Object.freeze({
+  type: 'error',
+  code: 'context_unavailable',
+  error: 'Plan mode is unavailable right now because the document context could not be loaded. Nothing was charged. Please try again in a few minutes.',
+});
+
+/** Write setup warnings as SSE events (after the 200 + headers went out). */
+function writeSetupWarnings(res, warnings) {
+  for (const w of warnings || []) {
+    try { res.write(`data: ${JSON.stringify(w)}\n\n`); } catch { /* client gone */ }
+  }
+}
+
+/**
+ * A setup failure the client should see as a clean SSE error rather than a
+ * raw 500 (QA N5/B34: plan-mode CFS failure). Returns true when handled.
+ */
+function answerSetupFailureAsSse(err, res) {
+  if (err?.code !== 'context_unavailable' || res.headersSent) return false;
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+  res.write(`data: ${JSON.stringify(CONTEXT_UNAVAILABLE_PLAN_ERROR)}\n\n`);
+  res.end();
+  return true;
 }
 
 /**
@@ -1322,8 +1402,14 @@ async function pushPlanModeContext(sessionId, content, timings = {}, hashes = {}
     // hash-skipped, so it 404s on every evicted reuse and is the likeliest push
     // to hit this.
     if (cause instanceof Error && cause.status) err.status = cause.status;
+    // QA N5/B34: a stable code so the run handlers can answer the client with
+    // a clean SSE error (friendly copy) instead of a raw 500 the UI stalls on.
+    err.code = 'context_unavailable';
     throw err;
   };
+  // Outside plan mode a CFS failure degrades the run instead of failing it;
+  // reported back to setupSession so the handler can warn the client.
+  let cfsUnavailable = false;
 
   const cfsTask = async () => {
     // CFS config — required for Go's context tools. NEVER hash-skipped: the
@@ -1335,6 +1421,7 @@ async function pushPlanModeContext(sessionId, content, timings = {}, hashes = {}
       'http://localhost:4001';
     if (!apiKey) {
       failures.push({ step: 'cfsConfig', error: 'INTERNAL_API_KEY not set — context tools will be unavailable' });
+      cfsUnavailable = true;
       throwIfPlanMode('cfsConfig', 'INTERNAL_API_KEY is not set');
       return;
     }
@@ -1357,6 +1444,7 @@ async function pushPlanModeContext(sessionId, content, timings = {}, hashes = {}
       }));
     } catch (err) {
       failures.push({ step: 'pushCFSConfig', error: err.message });
+      cfsUnavailable = true;
       throwIfPlanMode('cfsConfig', err);
     }
   };
@@ -1400,6 +1488,7 @@ async function pushPlanModeContext(sessionId, content, timings = {}, hashes = {}
   // an unmarked rejection here (a crash in one of the siblings) surfaces as a
   // logged failure and is then swallowed, exactly as it was before.
   if (fatal) throw fatal.reason;
+  return { cfsUnavailable };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1421,10 +1510,22 @@ const chat = async (req, res) => {
     if (!content) return;
 
     const { prompt, avatarId, displayLabel } = req.body;
+    // QA B33: text-deliverable commands (/meta-description) want the reply,
+    // never an edit. Strict boolean — anything else is a normal chat turn.
+    const replyOnly = req.body?.replyOnly === true;
     // trim(): a whitespace-only prompt would persist a blank thread row that
     // 400s every future compact AND seed (P3 lifecycle review BUG-2).
     if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
       return res.status(400).json({ error: 'prompt is required' });
+    }
+
+    // QA B24 follow-up: a chat turn that can write an uncounted (never
+    // analyzed) draft must pass the article limit like Auto-write does; the
+    // slot is counted below only if the turn actually wrote. replyOnly turns
+    // never write, so they are never blocked.
+    if (!replyOnly) {
+      const room = await checkPendingRoom(content);
+      if (!room.ok) return res.status(429).json(room.payload);
     }
 
     // Set up Writing Engine session. Threads P2: chat is STATELESS — a fresh
@@ -1432,7 +1533,7 @@ const chat = async (req, res) => {
     // single-flight lock), seeded from the durable thread by the setup fan-out
     // so it still has full conversation memory. `secondary` keeps it out of
     // the primary slot (pre-fix, every chat turn truncated agent memory).
-    const { sessionId } = await setupSession(content, { avatarId, secondary: true });
+    const { sessionId, warnings: setupWarnings } = await setupSession(content, { avatarId, secondary: true });
     // W2-b: poison the doc-write marker until this run completes cleanly — a
     // crashed run must not leave a stale 0 that would let the next setup skip
     // the document push while the engine's copy is ahead of the FE's.
@@ -1485,7 +1586,7 @@ const chat = async (req, res) => {
     // Start streaming request to the engine (Phase 4: tier preset → model set)
     const preset = await resolvePreset(req);
     const tConnect = Date.now();
-    const chatRes = await writingEngine.sendChatMessageStream(sessionId, prompt, abortCtrl.signal, preset);
+    const chatRes = await writingEngine.sendChatMessageStream(sessionId, prompt, abortCtrl.signal, preset, { replyOnly });
     console.log(`[timing] ai.chat engine-connect=${Date.now() - tConnect}ms (request+${Date.now() - tReq}ms)`);
 
     // Set up SSE headers for the client
@@ -1499,6 +1600,8 @@ const chat = async (req, res) => {
     // Raw byte pipe — forward Go engine SSE stream directly to the client.
     // All event transformation (document_diff → patch/draft) is now handled
     // client-side in EditorChatBar.tsx.
+    writeSetupWarnings(res, setupWarnings);
+
     const reader = chatRes.body.getReader();
     const usageTap = makeUsageTap();
 
@@ -1540,18 +1643,35 @@ const chat = async (req, res) => {
       }
     }
 
-    // Stream completed — settle to the ACTUAL chat cost. Table 2: ≤8K tokens = 1,
-    // above = 2. The gate reserved 2 (the max), so settle refunds 1 back on a
-    // small message; a large one settles at the full reserved 2.
+    // Stream completed — settle to the ACTUAL chat cost (computeSettlement):
+    // a reply that wrote nothing to the document is free; one that wrote is
+    // Table 2's ≤8K = 1 / above = 2, measured on the largest single turn. The
+    // gate reserved 2 (the max), so settle refunds the rest.
     if (creditTxId) {
-      const { inputTokens, outputTokens } = usageTap.snapshot();
-      const actual = resolveCredits('aiChatMessage', {
+      const snap = usageTap.snapshot();
+      const { credits, reason } = computeSettlement({
+        kind: 'chat',
+        reserved: req.creditContext?.estimatedCredits ?? 0,
+        stopReason: snap.stopReason,
+        // A replyOnly turn writes nothing by contract: the frontend does not
+        // apply its diffs, and the backend never persists engine documents
+        // (the editor's autosave is the only path to Mongo). So even an older
+        // engine that ignores reply_only and emits a document_diff bills 0.
+        wrote: !replyOnly && snap.docWrites > 0,
+        tokens: snap.maxTurnInputTokens,
         tier: req.creditContext?.tier,
-        tokens: (inputTokens || 0) + (outputTokens || 0),
       });
-      creditService.settle(creditTxId, actual).catch((e) =>
-        console.error('[credit] chat settle failed:', e.message)
-      );
+      if (reason !== 'chat') console.log(`[credit] chat settled ${credits} (${reason}) run=${runId}`);
+      closeReservation(creditTxId, credits, 'chat');
+      creditTxId = null;
+    }
+    // QA B24 follow-up: the first chat turn that writes an uncounted draft
+    // counts its article slot (atomic, once; a no-op for counted docs). A
+    // disconnected turn was refunded above and is not counted either.
+    if (!replyOnly && !clientDisconnected && usageTap.snapshot().docWrites > 0
+        && content.articleQuotaState === 'pending') {
+      claimArticleSlot(content, { enforce: false }).catch((e) =>
+        console.error('[article-quota] chat claim failed (non-fatal):', e.message));
     }
 
     console.log(`[timing] ai.chat stream-total=${Date.now() - tReq}ms`);
@@ -1568,9 +1688,12 @@ const chat = async (req, res) => {
       let finalText = usageTap.finalAssistantText();
       // Review BUG-2 (chat variant): a tool-only chat reply that edited the
       // doc but narrated nothing still gets an honest assistant row.
-      if (!finalText && !clientDisconnected && t.docWrites > 0) {
+      // QA B33: a replyOnly turn's diffs are never applied, so the thread
+      // must not claim edits either.
+      const appliedWrites = replyOnly ? 0 : t.docWrites;
+      if (!finalText && !clientDisconnected && appliedWrites > 0) {
         // Parenthetical reported speech — see the agent convergence note.
-        finalText = `(run summary: ${t.docWrites} document edit${t.docWrites === 1 ? '' : 's'} were applied)`;
+        finalText = `(run summary: ${appliedWrites} document edit${appliedWrites === 1 ? '' : 's'} were applied)`;
       }
       // Review CAVEAT-5: a client-aborted chat reply is partial — mark it.
       if (finalText && clientDisconnected) {
@@ -1583,7 +1706,7 @@ const chat = async (req, res) => {
           meta: {
             runId, sessionId, channel: 'chat',
             model: t.model, tokensIn: t.inputTokens, tokensOut: t.outputTokens,
-            docWrites: t.docWrites, stopReason: t.stopReason, turns: usageTap.turnCount(),
+            docWrites: appliedWrites, stopReason: t.stopReason, turns: usageTap.turnCount(),
           },
         }, content); // re-resolve target if the thread was archived mid-run
       } else {
@@ -1615,6 +1738,7 @@ const chat = async (req, res) => {
       return;
     }
     console.error('AI chat error:', err);
+    if (answerSetupFailureAsSse(err, res)) return;
     if (!res.headersSent) {
       // P2 (review CAVEAT-1): a seed-409 (busy warm session) surfaces as the
       // SAME SSE busy event the engine's own single-flight bounce produces —
@@ -1884,13 +2008,19 @@ const agent = async (req, res) => {
       if (articleGate.blocked) {
         return res.status(429).json(articleGate.payload);
       }
+    } else {
+      // QA B24 follow-up: a non-article run (freeform rewrite, slash command)
+      // can still write a never-counted draft end to end; it must pass the
+      // limit, and it counts the slot on completion if it wrote.
+      const room = await checkPendingRoom(content);
+      if (!room.ok) return res.status(429).json(room.payload);
     }
 
     // Set up Writing Engine session (reuse for conversation memory in freeform
     // mode). P2: memoryRun mirrors isFreeform — sequential runs are outside
     // the memory contract (D5): no seed (the engine wipes it), no marker.
     const isFreeform = safeMode === 'freeform';
-    const { sessionId, markdown: markdownBefore } = await setupSession(content, { avatarId, reuseSession: isFreeform, memoryRun: isFreeform });
+    const { sessionId, markdown: markdownBefore, warnings: setupWarnings } = await setupSession(content, { avatarId, reuseSession: isFreeform, memoryRun: isFreeform });
     // Complete the reservation placed above. Until this line the entry holds the
     // slot but matches no sessionId, so stop/stop-revert correctly report "no
     // matching run in flight" rather than acting on a run that has not started.
@@ -1987,6 +2117,7 @@ const agent = async (req, res) => {
       });
       // Emit session_init event so frontend knows the sessionId for mid-run actions
       res.write(`data: ${JSON.stringify({ type: 'session_init', sessionId })}\n\n`);
+      writeSetupWarnings(res, setupWarnings);
     }
 
     // Raw byte pipe — forward Go engine SSE stream directly to the client.
@@ -2060,7 +2191,10 @@ const agent = async (req, res) => {
         // there refunded the credits in full. A revert restores the document;
         // it cannot un-buy an image, so it does not excuse this either.
         const spentImages = (abortTotals.images || 0) > 0;
-        if (creditTxId && (!wroteBeforeAbort || revertNow) && !spentImages) {
+        // QA B04 (owner decision): a run that wrote NOTHING is free, images
+        // included. Only a run that wrote and then reverted still has to have
+        // bought no images to be refunded; otherwise it settles below.
+        if (creditTxId && (!wroteBeforeAbort || (revertNow && !spentImages))) {
           creditService.refund(creditTxId).catch((e) =>
             console.error('[credit] agent abort refund failed:', e.message)
           );
@@ -2098,43 +2232,28 @@ const agent = async (req, res) => {
     const wroteDocument = usageTap.snapshot().docWrites > 0;
 
     if (creditTxId) {
-      const reserved = req.creditContext?.estimatedCredits ?? 0;
-      // W4-b (review V1, user-chosen policy): a reverted run that WROTE settles
-      // to the small inlineAction price rather than a full refund. Full refund
-      // was a money leak — a hostile client could keep the streamed article in
-      // Mongo (which the FE owns via autosave) while paying nothing, unbounded.
-      // Charging inlineAction removes the "free" incentive (bounded by the
-      // credit pool) while keeping the honest revert cheap. A reverted run that
-      // never wrote is a plain stop → also inlineAction (matches the no-write
-      // articleGenerate branch). No article slot is consumed either way.
-      // Phase 3 exempts image runs: see the branch below.
-      let actual;
-      if (billingAction === 'imageGenerate') {
-        // Phase 3: priced on the images the engine actually produced, which is
-        // the ONLY branch that can settle an image run — it must come before
-        // the revert and no-write branches, not after.
-        //
-        // The reservation is the worst case (run base + the full allowance),
-        // so charging `reserved` would bill four images to a run that made
-        // one. Equally, a stop or a revert cannot fall through to the flat
-        // inlineAction price: reverting restores the document but cannot
-        // un-buy an image the provider already charged us for. Pricing off the
-        // count settles both — it floors at the run base when no image was
-        // made and rises only with real spend.
-        const imagesMade = usageTap.snapshot().images || 0;
-        actual = agentRunCredits('imageGenerate', {
-          tier: req.creditContext?.tier, images: imagesMade,
-        });
-      } else if (revertFinal) {
-        actual = resolveCredits('inlineAction', { tier: req.creditContext?.tier });
-      } else {
-        actual = (billingAction === 'articleGenerate' && !wroteDocument)
-          ? resolveCredits('inlineAction', { tier: req.creditContext?.tier })
-          : reserved;
-      }
-      creditService.settle(creditTxId, Math.min(actual, reserved)).catch((e) =>
-        console.error('[credit] agent settle failed:', e.message)
-      );
+      // computeSettlement owns the rules (see its header). In short:
+      //  - nothing written → 0, every class (QA B04 owner decision; this used
+      //    to settle a no-write articleGenerate to inlineAction and every other
+      //    no-write run to its full reservation);
+      //  - /image → run base + images actually produced (Phase 3);
+      //  - a reverted run that WROTE → inlineAction (W4-b review V1: a full
+      //    refund let a hostile client keep the streamed article for free);
+      //  - otherwise the flat reservation.
+      // No article slot is consumed by a revert or a no-write run either way.
+      const snap = usageTap.snapshot();
+      const { credits, reason } = computeSettlement({
+        kind: 'agent',
+        billingClass: billingAction,
+        reserved: req.creditContext?.estimatedCredits ?? 0,
+        stopReason: snap.stopReason,
+        wrote: wroteDocument,
+        images: snap.images || 0,
+        reverted: revertFinal,
+        tier: req.creditContext?.tier,
+      });
+      if (reason !== 'reserved') console.log(`[credit] agent settled ${credits} (${reason}) class=${billingAction} run=${runId}`);
+      closeReservation(creditTxId, credits, 'agent');
       creditTxId = null;
     }
 
@@ -2144,6 +2263,10 @@ const agent = async (req, res) => {
     // inlineAction, not an article delivery, so no slot is consumed.
     if (articleGate && wroteDocument && !revertFinal) {
       await commitArticleGeneration(content, articleGate);
+    } else if (!articleGate && wroteDocument && !revertFinal && content.articleQuotaState === 'pending') {
+      // QA B24 follow-up: see the pre-run checkPendingRoom above.
+      await claimArticleSlot(content, { enforce: false }).catch((e) =>
+        console.error('[article-quota] agent claim failed (non-fatal):', e.message));
     }
     if (revertFinal && wroteDocument) {
       // Names the class rather than asserting inlineAction: an /image revert is
@@ -2266,14 +2389,20 @@ const agent = async (req, res) => {
       // usageTap is null when the throw beat the stream (bad content, engine
       // unreachable) — nothing was generated, so the full refund is right.
       const imagesMade = usageTap ? (usageTap.snapshot().images || 0) : 0;
-      if (billingAction === 'imageGenerate' && imagesMade > 0) {
-        const reserved = req.creditContext?.estimatedCredits ?? 0;
-        const actual = agentRunCredits('imageGenerate', {
-          tier: req.creditContext?.tier, images: imagesMade,
+      // QA B04: only a run that actually WROTE keeps its image charge here;
+      // a thrown run that wrote nothing is free (computeSettlement rule 2).
+      const wroteBeforeThrow = usageTap ? usageTap.snapshot().docWrites > 0 : false;
+      if (billingAction === 'imageGenerate' && imagesMade > 0 && wroteBeforeThrow) {
+        const { credits } = computeSettlement({
+          kind: 'agent',
+          billingClass: billingAction,
+          reserved: req.creditContext?.estimatedCredits ?? 0,
+          stopReason: usageTap.snapshot().stopReason,
+          wrote: true,
+          images: imagesMade,
+          tier: req.creditContext?.tier,
         });
-        creditService.settle(creditTxId, Math.min(actual, reserved)).catch((e) =>
-          console.error('[credit] agent error settle failed:', e.message)
-        );
+        closeReservation(creditTxId, credits, 'agent error');
       } else {
         creditService.refund(creditTxId).catch((e) =>
           console.error('[credit] agent error refund failed:', e.message)
@@ -2287,6 +2416,7 @@ const agent = async (req, res) => {
       return;
     }
     console.error('AI agent error:', err);
+    if (answerSetupFailureAsSse(err, res)) return;
     if (!res.headersSent) {
       // P2 (review CAVEAT-1): seed-409 → the engine-shaped SSE busy event the
       // FE already understands (see the chat handler note).

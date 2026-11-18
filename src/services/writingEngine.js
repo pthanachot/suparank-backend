@@ -157,11 +157,17 @@ async function pushImageStyle(sessionId, style, signal) {
  * @param {AbortSignal} [signal] - optional signal to abort the stream when the client disconnects
  * @returns {Promise<Response>} The raw fetch response (SSE stream)
  */
-async function sendChatMessageStream(sessionId, prompt, signal, preset) {
+// opts.replyOnly (QA B33): a text-deliverable turn (/meta-description etc.)
+// whose answer is the reply itself. Forwarded as `reply_only` so the engine
+// runs the turn without document-mutating tools. Omitted when false, so an
+// older engine sees a byte-identical body.
+async function sendChatMessageStream(sessionId, prompt, signal, preset, opts = {}) {
+  const payload = { prompt };
+  if (opts.replyOnly === true) payload.reply_only = true;
   const res = await fetch(`${WRITING_ENGINE_URL}/api/session/${sessionId}/chat`, {
     method: 'POST',
     headers: engineHeaders(preset ? { 'X-Model-Preset': preset } : {}),
-    body: JSON.stringify({ prompt }),
+    body: JSON.stringify(payload),
     signal,
   });
   if (!res.ok) {

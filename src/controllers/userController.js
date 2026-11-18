@@ -125,7 +125,7 @@ const updateProfile = async (req, res) => {
             ? sendEmail(emailOptions)
             : sendEmail({
                 to: user.email,
-                subject: 'Verify your new email — SupaRank',
+                subject: 'SupaRank: Verify your new email',
                 html: `
                   <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
                     <h2 style="color: #111; margin-bottom: 16px;">Verify your new email</h2>

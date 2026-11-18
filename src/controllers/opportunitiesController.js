@@ -254,7 +254,7 @@ function buildAgentGoal(opp) {
   if (opp.source === 'gsc_decay') {
     const forQuery = q ? ` for the query "${q}"` : '';
     const target = q ? 'the sections that target this query' : 'its core sections';
-    return `This published article is losing search traffic${forQuery}. Refresh it: update stale facts and dates, strengthen ${target}, and add depth where competitors now cover more — the goal is to recover lost rankings.`;
+    return `This published article is losing search traffic${forQuery}. Refresh it: update stale facts and dates, strengthen ${target}, and add depth where competitors now cover more. The goal is to recover lost rankings.`;
   }
   const p = opp.metrics?.position;
   const imp = opp.metrics?.impressions;

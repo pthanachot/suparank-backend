@@ -630,8 +630,8 @@ async function checkArticleAllowance(req, content) {
       blocked: true,
       payload: {
         error: isFree
-          ? `You've used all ${limit} articles included in the free plan (regenerating an article uses a slot). Upgrade to keep writing — paid plans start at 20 articles per month.`
-          : `You've reached your plan's monthly article limit (${used} of ${limit} used — regenerations count too). Your allowance resets next billing cycle, or upgrade for a higher limit.`,
+          ? `You've used all ${limit} articles included in the free plan (regenerating an article uses a slot). Upgrade to keep writing. Paid plans start at 20 articles per month.`
+          : `You've reached your plan's monthly article limit (${used} of ${limit} used, regenerations count too). Your allowance resets next billing cycle, or upgrade for a higher limit.`,
         code: 'ARTICLE_LIMIT_REACHED',
         quota: { used, limit, tier, limitKey: 'maxArticlesPerMonth', limitType },
         upgradeUrl: '/pricing',
@@ -1040,7 +1040,7 @@ async function setupSession(content, { avatarId, reuseSession, secondary, memory
         // surfaced as the engine's friendly busy bounce at run start; keep
         // that UX — rewrite the message and let the handler map err.status.
         if (err.status === 409) {
-          err.message = 'Another AI run is still working on this document — wait for it to finish (or stop it), then try again.';
+          err.message = 'Another AI run is still working on this document. Wait for it to finish (or stop it), then try again.';
         }
         throw err;
       }
@@ -1862,7 +1862,7 @@ const agent = async (req, res) => {
         console.warn(`[agent] refusing image-capable run content=${content.contentNumber}: `
           + 'engine image storage is ephemeral and the backend has no B2 fallback');
         return res.status(503).json({
-          error: 'Image generation is unavailable right now — this server has nowhere durable to store images, so they would stop loading within the hour. Your document is unchanged.',
+          error: 'Image generation is unavailable right now. This server has nowhere durable to store images, so they would stop loading within the hour. Your document is unchanged.',
           code: 'IMAGE_STORAGE_UNAVAILABLE',
         });
       }
@@ -1930,7 +1930,7 @@ const agent = async (req, res) => {
           + `existing=${live.runId} incoming=${runId}`);
         runRegistryKey = null; // that entry is not ours — the finally must not free it
         return res.status(409).json({
-          error: 'Another AI run is still working on this document — wait for it to finish (or stop it), then try again.',
+          error: 'Another AI run is still working on this document. Wait for it to finish (or stop it), then try again.',
           code: 'busy',
         });
       }
@@ -3018,7 +3018,7 @@ const clarifyAnswer = async (req, res) => {
     const content = await resolveContent(req, res);
     if (!content) return;
     if (!sessionBoundToContent(content._id.toString(), sessionId)) {
-      return res.status(409).json({ error: 'Session does not match this content (it may have expired — restart the chat)' });
+      return res.status(409).json({ error: 'Session does not match this content (it may have expired). Restart the chat.' });
     }
     // W2-b (review Gap A, defensive): answering resumes the paused agent loop.
     // Its writes stream back on the ORIGINAL run's SSE (whose completion
@@ -3073,7 +3073,7 @@ const steer = async (req, res) => {
     // Tenancy: same rule as clarifyAnswer — the sessionId must be bound to
     // THIS content, so a caller can't steer another content's run.
     if (!sessionBoundToContent(content._id.toString(), sessionId)) {
-      return res.status(409).json({ error: 'Session does not match this content (it may have expired — restart the chat)' });
+      return res.status(409).json({ error: 'Session does not match this content (it may have expired). Restart the chat.' });
     }
     const result = await writingEngine.steer(sessionId, message.trim());
     // Threads Phase 1: steers are user input — without this they vanish from
@@ -3123,7 +3123,7 @@ const stopRevert = async (req, res) => {
     }
     const entry = activeAgentRuns.get(content._id.toString());
     if (!entry || entry.sessionId !== sessionId) {
-      return res.status(409).json({ error: 'No matching agent run is in flight — the run may have already finished. Use "Revert this run" instead.' });
+      return res.status(409).json({ error: 'No matching agent run is in flight. The run may have already finished. Use "Revert this run" instead.' });
     }
     entry.revertIntent = true;
     // W4-c-2: a socket close no longer aborts the engine (detached runs keep
@@ -3159,7 +3159,7 @@ const stopRun = async (req, res) => {
     }
     const entry = activeAgentRuns.get(content._id.toString());
     if (!entry || entry.sessionId !== sessionId) {
-      return res.status(409).json({ error: 'No matching agent run is in flight — the run may have already finished.' });
+      return res.status(409).json({ error: 'No matching agent run is in flight. The run may have already finished.' });
     }
     if (typeof entry.abort === 'function') entry.abort();
     return res.json({ status: 'ok' });
@@ -3256,7 +3256,7 @@ const planConfirm = async (req, res) => {
     const content = await resolveContent(req, res);
     if (!content) return;
     if (!sessionBoundToContent(content._id.toString(), sessionId)) {
-      return res.status(409).json({ error: 'Session does not match this content (it may have expired — restart the chat)' });
+      return res.status(409).json({ error: 'Session does not match this content (it may have expired). Restart the chat.' });
     }
     // W2-b (review Gap A, defensive): see clarifyAnswer — the resumed run's
     // writes are recorded by its own stream completion; the poison guards
@@ -3270,7 +3270,7 @@ const planConfirm = async (req, res) => {
     // injected pseudo-message that D3's capture never sees). After-success.
     {
       const steps = Array.isArray(selectedSteps) && selectedSteps.length
-        ? ` — steps: ${selectedSteps.slice(0, 20).join(', ')}`
+        ? ` (steps: ${selectedSteps.slice(0, 20).join(', ')})`
         : '';
       const runId = activeAgentRuns.get(content._id.toString())?.runId || '';
       const thread = await threadService.getOrCreateActiveThread(content, req.user?.userId);
@@ -3333,7 +3333,7 @@ const newThread = async (req, res) => {
     // register in activeAgentRuns, and agent runs leave it before their
     // convergence append.
     if (activeAgentRuns.has(content._id.toString()) || threadWriteLocks.has(content._id.toString())) {
-      return res.status(409).json({ error: 'An AI run is in progress on this document — stop it (or let it finish) before starting a new conversation.' });
+      return res.status(409).json({ error: 'An AI run is in progress on this document. Stop it (or let it finish) before starting a new conversation.' });
     }
     const thread = await threadService.startNewThread(content, req.user?.userId);
     if (thread && thread.disabled) {
@@ -3398,7 +3398,7 @@ const activateThread = async (req, res) => {
     // P4 review BUG-2: threadWriteLocks covers chat runs (never in the
     // registry) and the agent tail window (registry deleted pre-append).
     if (activeAgentRuns.has(content._id.toString()) || threadWriteLocks.has(content._id.toString())) {
-      return res.status(409).json({ error: 'An AI run is in progress on this document — stop it (or let it finish) before switching conversations.' });
+      return res.status(409).json({ error: 'An AI run is in progress on this document. Stop it (or let it finish) before switching conversations.' });
     }
     const thread = await threadService.activateThread(content, threadId);
     if (thread && thread.disabled) {
@@ -3408,7 +3408,7 @@ const activateThread = async (req, res) => {
     // retryable 503 — never tell the user their conversation "doesn't exist"
     // because Mongo hiccuped (or the bounded activate retry lost).
     if (thread && thread.error) {
-      return res.status(503).json({ error: 'Could not switch conversations right now — please try again.' });
+      return res.status(503).json({ error: 'Could not switch conversations right now. Please try again.' });
     }
     if (!thread) {
       return res.status(404).json({ error: 'Conversation not found' });
@@ -3472,7 +3472,7 @@ const renameThread = async (req, res) => {
       return res.status(400).json({ error: 'Invalid conversation id' });
     }
     if (activeAgentRuns.has(content._id.toString()) || threadWriteLocks.has(content._id.toString())) {
-      return res.status(409).json({ error: 'An AI run is in progress on this document — stop it (or let it finish) before renaming conversations.' });
+      return res.status(409).json({ error: 'An AI run is in progress on this document. Stop it (or let it finish) before renaming conversations.' });
     }
     const thread = await threadService.renameThread(content, threadId, req.body?.title);
     if (thread && thread.disabled) {
@@ -3485,7 +3485,7 @@ const renameThread = async (req, res) => {
       return res.status(400).json({ error: 'A conversation name cannot be empty' });
     }
     if (thread && thread.error) {
-      return res.status(503).json({ error: 'Could not rename the conversation right now — please try again.' });
+      return res.status(503).json({ error: 'Could not rename the conversation right now. Please try again.' });
     }
     if (!thread) {
       return res.status(404).json({ error: 'Conversation not found' });
@@ -3522,14 +3522,14 @@ const deleteThread = async (req, res) => {
       return res.status(400).json({ error: 'Invalid conversation id' });
     }
     if (activeAgentRuns.has(content._id.toString()) || threadWriteLocks.has(content._id.toString())) {
-      return res.status(409).json({ error: 'An AI run is in progress on this document — stop it (or let it finish) before deleting conversations.' });
+      return res.status(409).json({ error: 'An AI run is in progress on this document. Stop it (or let it finish) before deleting conversations.' });
     }
     const result = await threadService.deleteThread(content, threadId);
     if (result && result.disabled) {
       return res.status(409).json({ error: 'Conversation threads are not enabled' });
     }
     if (result && result.error) {
-      return res.status(503).json({ error: 'Could not delete the conversation right now — please try again.' });
+      return res.status(503).json({ error: 'Could not delete the conversation right now. Please try again.' });
     }
     if (!result) {
       return res.status(404).json({ error: 'Conversation not found' });

@@ -49,7 +49,7 @@ function _emptyEntry(workspace) {
 async function aggregateWorkspaceUsage(orgId, period) {
   const resolvedPeriod = period || reportService.currentPeriod();
   if (!reportService.isValidPeriod(resolvedPeriod)) {
-    const err = new Error('Invalid period — expected YYYY-MM');
+    const err = new Error('Invalid period: expected YYYY-MM');
     err.status = 400;
     throw err;
   }

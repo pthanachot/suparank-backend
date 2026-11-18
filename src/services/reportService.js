@@ -802,7 +802,7 @@ async function _computeDeltas(data, workspaceId, period) {
  */
 async function generateSnapshot(workspaceId, period, { commentary } = {}) {
   if (!isValidPeriod(period)) {
-    const err = new Error('Invalid period — expected YYYY-MM');
+    const err = new Error('Invalid period: expected YYYY-MM');
     err.status = 400;
     throw err;
   }
@@ -927,7 +927,7 @@ function _validateCommentary(commentary) {
  */
 async function updateCommentary(workspaceId, period, commentary) {
   if (!isValidPeriod(period)) {
-    const err = new Error('Invalid period — expected YYYY-MM');
+    const err = new Error('Invalid period: expected YYYY-MM');
     err.status = 400;
     throw err;
   }

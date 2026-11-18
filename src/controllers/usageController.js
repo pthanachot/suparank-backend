@@ -36,7 +36,7 @@ const getWorkspaceUsage = async (req, res) => {
     // silently defaulting. Absent period → current month (service default).
     const period = req.query.period;
     if (period !== undefined && !reportService.isValidPeriod(period)) {
-      return res.status(400).json({ error: 'Invalid period — expected YYYY-MM' });
+      return res.status(400).json({ error: 'Invalid period: expected YYYY-MM' });
     }
 
     const report = await usageService.aggregateWorkspaceUsage(org._id, period);

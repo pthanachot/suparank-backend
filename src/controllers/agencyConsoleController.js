@@ -28,7 +28,7 @@ async function _gate(req, res) {
 function _period(req, res) {
   const period = req.query.period;
   if (period !== undefined && !reportService.isValidPeriod(period)) {
-    res.status(400).json({ error: 'Invalid period — expected YYYY-MM' });
+    res.status(400).json({ error: 'Invalid period: expected YYYY-MM' });
     return { bad: true };
   }
   return { period };

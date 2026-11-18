@@ -32,7 +32,7 @@ function _serialize(snapshot) {
 async function _findSnapshotForPeriod(req, res) {
   const { period } = req.params;
   if (!reportService.isValidPeriod(period)) {
-    res.status(400).json({ error: 'Invalid period — expected YYYY-MM' });
+    res.status(400).json({ error: 'Invalid period: expected YYYY-MM' });
     return null;
   }
   const snapshot = await ReportSnapshot.findOne({
@@ -40,7 +40,7 @@ async function _findSnapshotForPeriod(req, res) {
     period,
   });
   if (!snapshot) {
-    res.status(404).json({ error: 'No report for this period — generate it first' });
+    res.status(404).json({ error: 'No report for this period. Generate it first.' });
     return null;
   }
   return snapshot;

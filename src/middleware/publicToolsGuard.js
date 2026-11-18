@@ -50,7 +50,7 @@ function publicToolsGuard({ toolId, maxPerDay, cacheInput, validate }) {
       if (await publicToolsService.budgetExhausted()) {
         return res.status(503).json({
           degraded: true,
-          message: "Today's free-tool capacity is used up — come back tomorrow, or sign up free to run it from your account.",
+          message: "Today's free-tool capacity is used up. Come back tomorrow, or sign up free to run it from your account.",
         });
       }
 

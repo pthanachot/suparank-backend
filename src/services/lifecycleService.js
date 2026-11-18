@@ -344,8 +344,8 @@ async function _deactivateDomains(orgId) {
     // Stop host→org resolution regardless (resolveOrgByHost only matches 'active').
     d.status = 'suspended';
     d.statusDetail = cfCleared
-      ? 'Agency offboarded — domain deactivated'
-      : 'Agency offboarded — Cloudflare hostname cleanup pending';
+      ? 'Agency offboarded: domain deactivated'
+      : 'Agency offboarded: Cloudflare hostname cleanup pending';
     if (cfCleared) d.cloudflareId = '';
     await d.save();
   }

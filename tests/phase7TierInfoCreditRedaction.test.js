@@ -22,6 +22,8 @@ const UserCredit = require('../src/models/UserCredit');
 const UserUsageTracker = require('../src/models/UserUsageTracker');
 const tierService = require('../src/services/tierService');
 const seatService = require('../src/services/seatService');
+const Site = require('../src/models/Site');
+const Sitemap = require('../src/models/Sitemap');
 
 const real = {};
 for (const [k, o, m] of [
@@ -34,6 +36,9 @@ for (const [k, o, m] of [
   ['creditFindOne', Credit, 'findOne'], ['userCreditFindOne', UserCredit, 'findOne'],
   ['getOrgTierConfig', tierService, 'getOrgTierConfig'], ['getTierConfig', tierService, 'getTierConfig'],
   ['seatUsage', seatService, 'getSeatUsage'],
+  // getTierInfo also reports site/sitemap meters; without these stubs the real
+  // models cast 'org1' to an ObjectId and the handler 500s.
+  ['siteCount', Site, 'countDocuments'], ['sitemapCount', Sitemap, 'countDocuments'],
 ]) real[k] = [o, m, o[m]];
 after(() => { for (const k in real) { const [o, m, fn] = real[k]; o[m] = fn; } });
 
@@ -60,6 +65,8 @@ beforeEach(() => {
   Workspace.countDocuments = async () => 0;
   Avatar.countDocuments = async () => 0;
   BrandVoice.countDocuments = async () => 0;
+  Site.countDocuments = async () => 0;
+  Sitemap.countDocuments = async () => 0;
   UsageTracker.getUsage = async () => ({});
   UserUsageTracker.getUsage = async () => ({});
   Credit.findOne = () => lean({ subscriptionCredits: 2500, generalCredits: 100, subscriptionCreditsExpireAt: null });

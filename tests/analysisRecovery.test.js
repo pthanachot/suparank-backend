@@ -117,8 +117,10 @@ test('a swept row is eligible for the free retry, not a paid re-run', async () =
   );
 });
 
-// Guards the inverse: a genuine engine failure stays paid-only, so the sweep's
-// tag can't be mistaken for "every failure is free".
+// Guards the inverse: a content-level failure (the keyword has no SERP) stays
+// paid-only, so the sweep's tag can't be mistaken for "every failure is free".
+// (QA B40: an engine 500 USED to be the example here; server-side 5xx failures
+// are now free — see analysisErrors.test.js.)
 test('a non-transient failure is still refused by the free retry', async () => {
   const saved = Content.findByNumber;
   Content.findByNumber = async () => ({
@@ -126,7 +128,8 @@ test('a non-transient failure is still refused by the free retry', async () => {
     contentNumber: 5,
     locked: false,
     analysisStatus: 'failed',
-    analysisError: 'engine returned 500',
+    analysisError: 'We could not find search results for this keyword. Try a different or broader keyword.',
+    analysisErrorCode: 'no_serp_results',
     targetKeywords: ['chicken farming'],
   });
   const res = mkRes();

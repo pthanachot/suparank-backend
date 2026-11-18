@@ -726,6 +726,8 @@ app.get('/health', async (req, res) => {
     // the host itself is in the boot log line "MongoDB connected: …".
     expectedHostMatch: db.expectedHostMatch,
     engine,
+    // QA N5/B34: credential/config PRESENCE, booleans only (never values).
+    config: require('./config/configStatus').configStatus(),
     uptime: Math.floor(process.uptime()),
   });
 });

@@ -77,7 +77,7 @@ function _unavailableError(detail) {
  */
 async function generatePdf(reportId) {
   if (_activePdfCount >= MAX_CONCURRENT_PDF) {
-    const err = new Error('PDF generation busy — try again shortly');
+    const err = new Error('PDF generation busy. Try again shortly.');
     err.status = 429;
     throw err;
   }
@@ -143,8 +143,8 @@ async function _generatePdf(reportId) {
     );
     if (reportState !== 'ready') {
       const err = new Error(
-        `Report page failed to render (state: ${reportState || 'unknown'}) — ` +
-          'the share token may be invalid or the report data failed to load.'
+        `Report page failed to render (state: ${reportState || 'unknown'}). ` +
+          'The share token may be invalid or the report data failed to load.'
       );
       err.status = 502;
       throw err;

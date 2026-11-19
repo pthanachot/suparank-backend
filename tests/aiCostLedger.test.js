@@ -31,7 +31,47 @@ const REAL_MODELS = [
   'claude-haiku-4-5-20251001', 'google/gemini-2.5-flash', 'google/gemini-2.5-flash-lite',
   'anthropic/claude-sonnet-4', 'anthropic/claude-sonnet-4:thinking', 'moonshotai/kimi-k2-0905',
   'moonshotai/kimi-k2.6', 'xiaomi/mimo-v2-flash', 'google/gemini-3-flash-preview', 'google/gemini-2.5-pro',
+  // Current Claude IDs (balanced/premium presets, engine fallbacks), and the
+  // engine's classify model. Unpriced, every premium run booked $0 COGS.
+  'anthropic/claude-sonnet-5.5', 'anthropic/claude-opus-5.5', 'anthropic/claude-haiku-5.5',
+  'openai/gpt-5.4-nano', 'xiaomi/mimo-v2.5',
 ];
+
+// Every model the writing engine can actually be configured with (base roles,
+// every preset, and its reporting-only modelPricing map) must be in the
+// registry, and at the same price, or the ledger books it as $0 or at a stale
+// rate. Reads the sibling repo's models.json when it is checked out next to
+// this one (skips otherwise, e.g. in a lone backend checkout).
+test('registry covers and agrees with writing-engine models.json', (t) => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const file = path.join(__dirname, '..', '..', 'writing-engine', 'models.json');
+  if (!fs.existsSync(file)) { t.skip('writing-engine checkout not present'); return; }
+  const cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const prices = {};
+  for (const role of Object.values(cfg.models || {})) {
+    if (role && role.model && role.priceInputPerM != null) {
+      prices[role.model] = { in: role.priceInputPerM, out: role.priceOutputPerM };
+    }
+  }
+  for (const [id, p] of Object.entries(cfg.modelPricing || {})) {
+    prices[id] = { in: p.priceInputPerM, out: p.priceOutputPerM };
+  }
+  const used = new Set(Object.keys(prices));
+  for (const role of Object.values(cfg.models || {})) if (role && role.model) used.add(role.model);
+  for (const preset of Object.values(cfg.presets || {})) {
+    for (const [k, v] of Object.entries(preset)) if (!k.startsWith('$') && typeof v === 'string') used.add(v);
+  }
+  for (const id of used) {
+    const r = costFor(id, 1_000_000, 1_000_000, id.includes('image') ? { images: 1 } : {});
+    assert.ok(r.known, `writing-engine model ${id} is not in the backend registry`);
+    const p = prices[id];
+    if (p && !id.includes('image')) {
+      const want = p.in + p.out;
+      assert.ok(Math.abs(r.costUsd - want) < 1e-9, `${id}: registry prices 1M/1M at $${r.costUsd}, models.json at $${want}`);
+    }
+  }
+});
 
 test('registry prices every real model non-zero', () => {
   for (const m of REAL_MODELS) {

@@ -29,10 +29,10 @@ test('inline-edit route is registered as POST with the same gate chain as chat',
   const chat = findRoute('ai/chat');
   assert.ok(inline, 'inline-edit route should be registered');
   assert.ok(chat, 'chat route should be registered');
-  // rwr, rf('aiChat'), rp('aiChat','use'), rc('aiChat', est), handler == 5.
-  // Identical count to chat → identical feature/permission/credit gating, so
-  // user-facing credit behavior is unchanged.
-  assert.strictEqual(inline.route.stack.length, 5, 'inline-edit should have 5 handlers');
+  // rwr, rf('aiChat'), rp('aiChat','use'), rejectIfDone, rc('aiChat', est), handler == 6.
+  // Identical count to chat → identical feature/permission/done/credit gating,
+  // so user-facing credit behavior is unchanged.
+  assert.strictEqual(inline.route.stack.length, 6, 'inline-edit should have 6 handlers');
   assert.strictEqual(
     inline.route.stack.length,
     chat.route.stack.length,

@@ -158,7 +158,7 @@ describe('generateReport commentary branching (Phase 5)', () => {
 
   it('propagates service-level 400s (invalid period) from the fast path', async () => {
     reportService.updateCommentary = async () => {
-      const err = new Error('Invalid period — expected YYYY-MM');
+      const err = new Error('Invalid period: expected YYYY-MM');
       err.status = 400;
       throw err;
     };

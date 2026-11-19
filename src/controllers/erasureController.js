@@ -52,7 +52,7 @@ async function eraseWorkspace(req, res) {
       return res.status(500).json({
         erased: false,
         partial: true,
-        error: 'Erasure incomplete — some data could not be deleted; retry to complete',
+        error: 'Erasure incomplete. Some data could not be deleted. Retry to complete.',
         counts,
       });
     }
@@ -101,7 +101,7 @@ async function eraseOrg(req, res) {
       return res.status(500).json({
         erased: false,
         partial: true,
-        error: 'Erasure incomplete — some data could not be deleted; retry to complete',
+        error: 'Erasure incomplete. Some data could not be deleted. Retry to complete.',
         counts,
       });
     }

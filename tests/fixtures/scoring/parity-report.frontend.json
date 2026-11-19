@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-08-09T13:49:21.279Z",
+  "generatedAt": "2026-11-18T05:35:47.732Z",
   "runner": "frontend/scoreContent.ts",
   "drafts": [
     {
@@ -335,7 +335,7 @@
           "status": "poor"
         },
         "Readability": {
-          "yourValue": 44,
+          "yourValue": 46,
           "score": 70,
           "status": "good"
         },

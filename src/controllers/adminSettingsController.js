@@ -50,15 +50,21 @@ const updateSystemSettings = async (req, res) => {
     }
 
     if (rateLimit !== undefined) {
-      const { windowMs, max } = rateLimit || {};
+      const { windowMs, max, ipMax } = rateLimit || {};
       if (windowMs !== undefined && windowMs !== null && (!Number.isInteger(windowMs) || windowMs < 1000)) {
         return res.status(400).json({ error: 'rateLimit.windowMs must be an integer >= 1000 (ms) or null' });
       }
       if (max !== undefined && max !== null && (!Number.isInteger(max) || max < 1)) {
         return res.status(400).json({ error: 'rateLimit.max must be a positive integer or null' });
       }
+      // QA N2: the per-IP (anonymous) bucket's override. Without it here the
+      // knob apiRateLimit reads could never be set.
+      if (ipMax !== undefined && ipMax !== null && (!Number.isInteger(ipMax) || ipMax < 1)) {
+        return res.status(400).json({ error: 'rateLimit.ipMax must be a positive integer or null' });
+      }
       if (windowMs !== undefined) patch['rateLimit.windowMs'] = windowMs;
       if (max !== undefined) patch['rateLimit.max'] = max;
+      if (ipMax !== undefined) patch['rateLimit.ipMax'] = ipMax;
     }
 
     if (backup !== undefined) {

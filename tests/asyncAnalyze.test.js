@@ -139,7 +139,10 @@ describe('runAnalysis async job protocol', () => {
     await runAnalysis('c1');
     const s = lastStatus();
     assert.equal(s.analysisStatus, 'failed');
-    assert.match(s.analysisError || '', /job lost/);
+    // QA B09: a stable code + friendly copy, never the raw engine text.
+    assert.equal(s.analysisErrorCode, 'server_restart');
+    assert.match(s.analysisError || '', /^transient: /, 'a lost job is our fault → free retry');
+    assert.doesNotMatch(s.analysisError || '', /job lost|engine/i);
   });
 
   it('job failed → analysis fails with the job error', async () => {
@@ -150,7 +153,8 @@ describe('runAnalysis async job protocol', () => {
     await runAnalysis('c1');
     const s = lastStatus();
     assert.equal(s.analysisStatus, 'failed');
-    assert.match(s.analysisError || '', /could not crawl/);
+    assert.equal(s.analysisErrorCode, 'no_sources');
+    assert.doesNotMatch(s.analysisError || '', /could not crawl/, 'raw engine text stays in the logs');
   });
 
   it('transient analyze failure (context deadline) retries and succeeds — resubmits, ends ready', async () => {

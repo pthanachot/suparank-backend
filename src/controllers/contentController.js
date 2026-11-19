@@ -10,6 +10,43 @@ const tierService = require('../services/tierService');
 const { pruneVersions } = require('../services/versionRetention');
 const costLedger = require('../services/costLedgerService');
 const { isSupportedLanguage, isSelectableLanguage } = require('../config/locales');
+const { claimArticleSlot, quotaCtxFromReq } = require('../services/articleQuotaService');
+const { sanitizeBlocks, sanitizeVersions } = require('../utils/sanitizeBlockHtml');
+const {
+  parseBaseRevision, parseWriter, revisionFilter, revisionUpdate, conflictBody, RevisionInputError,
+} = require('../services/contentRevision');
+const { presentAnalysisError } = require('../services/analysisErrors');
+const { doneLockBody, isReopen, touchesContent, changesContent } = require('../services/doneLock');
+
+/**
+ * The ONE client shape of a content document (GET, PUT, POST and the 409
+ * revision_conflict body all use it):
+ *   - per-user favorite state stripped (never leaves the API),
+ *   - internal article-quota bookkeeping stripped,
+ *   - old public B2 image URLs migrated,
+ *   - analysis error presented as code + friendly copy (never raw engine text),
+ *   - `revision` always present (0 for rows that predate it).
+ */
+function toClientContent(doc) {
+  if (!doc) return doc;
+  const obj = typeof doc.toObject === 'function' ? doc.toObject() : { ...doc };
+  // eslint-disable-next-line no-unused-vars
+  const { favoritedBy, articleQuotaCtx, lastWriter, ...rest } = obj;
+  if (Array.isArray(rest.blocks)) {
+    rest.blocks = rest.blocks.map((block) => {
+      if (block && block.type === 'img' && block.src) {
+        const migrated = imageStorage.migratePublicUrl(block.src);
+        if (migrated) return { ...block, src: migrated };
+      }
+      return block;
+    });
+  }
+  const presented = presentAnalysisError(rest);
+  rest.analysisError = presented.analysisError;
+  rest.analysisErrorCode = presented.analysisErrorCode;
+  rest.revision = Number(rest.revision) || 0;
+  return rest;
+}
 
 // Workspace is resolved by the permissions middleware (resolveWorkspaceWithRole)
 // and available as req.workspace.
@@ -80,20 +117,10 @@ const getContent = async (req, res) => {
       return res.status(403).json({ error: 'This content is locked. Upgrade your plan to regain access.', locked: true });
     }
 
-    // Migrate old public B2 URLs to new /api/b2-image/ path format
-    if (content.blocks && Array.isArray(content.blocks)) {
-      for (const block of content.blocks) {
-        if (block.type === 'img' && block.src) {
-          const migrated = imageStorage.migratePublicUrl(block.src);
-          if (migrated) block.src = migrated;
-        }
-      }
-    }
-
-    // Strip per-user favorite state — the editor doesn't use it and it would
-    // otherwise expose which members starred this doc.
-    const { favoritedBy, ...rest } = content.toObject();
-    res.json({ content: rest });
+    // toClientContent: migrates old public B2 URLs to the /api/b2-image/ path
+    // format, strips per-user favorite state (it would expose which members
+    // starred this doc), and carries `revision` for the B03 save contract.
+    res.json({ content: toClientContent(content) });
   } catch (err) {
     console.error('getContent error:', err.message);
     res.status(500).json({ error: 'Failed to fetch content' });
@@ -143,6 +170,12 @@ const createContent = async (req, res) => {
       retainedVersions = pruneVersions(retainedVersions, config?.contentVersionHistoryDays);
     }
 
+    const articleQuotaCtx = quotaCtxFromReq(req.tierQuota, req.body.quotaSource);
+    // QA N1: never persist executable markup in block text (see
+    // utils/sanitizeBlockHtml). Versions too — a restore puts them back.
+    const cleanBlocks = sanitizeBlocks(blocks || []).blocks;
+    retainedVersions = sanitizeVersions(retainedVersions).versions;
+
     const content = await Content.create({
       userId: req.user.userId,
       workspaceId: workspace._id,
@@ -150,7 +183,7 @@ const createContent = async (req, res) => {
       title,
       slug,
       description,
-      blocks: blocks || [],
+      blocks: cleanBlocks,
       targetKeywords: targetKeywords || [],
       targetPageUrl: targetPageUrl || '',
       strikingSnapshot: (strikingSnapshot && strikingSnapshot.positionAtStart != null)
@@ -166,6 +199,11 @@ const createContent = async (req, res) => {
       platform,
       versions: retainedVersions,
       createdOnPlan,
+      // QA B24: the article slot is CHECKED here (requireQuota) but COUNTED
+      // when the article is first put to work — see articleQuotaService.
+      ...(articleQuotaCtx
+        ? { articleQuotaState: 'pending', articleQuotaCtx }
+        : { articleQuotaState: 'exempt' }),
       // Wave 1 (§4c-5): entry-path attribution, enum-guarded (client-supplied).
       createdVia: ['blank', 'url', 'keyword', 'template'].includes(req.body.createdVia)
         ? req.body.createdVia
@@ -178,19 +216,26 @@ const createContent = async (req, res) => {
     // content.contentType when calling the engine); it then starts analysis via
     // the updateContent startAnalysis directive, which mirrors this trigger's
     // billing exactly. Every other creation path keeps the auto-trigger.
+    let analysisBlocked = null;
     if (!deferAnalysis && content.targetKeywords && content.targetKeywords.length > 0) {
-      await Content.findByIdAndUpdate(content._id, { $set: { analysisStatus: 'pending' } });
-      // This analysis was started FOR the user, not BY them, so they may well
-      // have navigated away — hence the "analysis ready" email. No flag is
-      // threaded for it: runAnalysis decides from the content's own state
-      // (analyzedAt unset = first run), so every entry point behaves the same.
-      startAnalysis(content._id);
+      // Starting the analysis is what counts the article (QA B24). The limit
+      // was checked by requireQuota a moment ago; the claim re-checks it only
+      // to close the window where concurrent creates all passed that check.
+      const slot = await claimArticleSlot(content);
+      if (slot.ok) {
+        await Content.findByIdAndUpdate(content._id, { $set: { analysisStatus: 'pending' } });
+        content.analysisStatus = 'pending';
+        // This analysis was started FOR the user, not BY them, so they may well
+        // have navigated away — hence the "analysis ready" email. No flag is
+        // threaded for it: runAnalysis decides from the content's own state
+        // (analyzedAt unset = first run), so every entry point behaves the same.
+        startAnalysis(content._id);
+      } else {
+        analysisBlocked = slot.payload;
+      }
     }
-
-    // Track article creation against tier quota
-    if (req.tierQuota) {
-      await tierService.incrementQuota(req.tierQuota);
-    }
+    // QA B24: NO article count here any more. An abandoned setup wizard used to
+    // burn a lifetime slot on an empty draft.
 
     auditService.fromReq(req, {
       action: 'content.create',
@@ -201,7 +246,7 @@ const createContent = async (req, res) => {
     // No favoritedBy strip here (unlike getContent/updateContent): nobody can
     // have starred a document that did not exist a moment ago, so the field is
     // always [] and carries no information about any member.
-    res.status(201).json({ content });
+    res.status(201).json({ content: toClientContent(content), ...(analysisBlocked ? { analysisBlocked } : {}) });
   } catch (err) {
     console.error('createContent error:', err.message);
     res.status(500).json({ error: 'Failed to create content' });
@@ -213,6 +258,17 @@ const createContent = async (req, res) => {
 const updateContent = async (req, res) => {
   try {
     const workspace = req.workspace;
+
+    // QA B03: optimistic concurrency (services/contentRevision).
+    let baseRevision;
+    let writer;
+    try {
+      baseRevision = parseBaseRevision(req.body);
+      writer = parseWriter(req.body);
+    } catch (e) {
+      if (e instanceof RevisionInputError) return res.status(400).json({ error: e.message, code: 'INVALID_BASE_REVISION' });
+      throw e;
+    }
 
     const allowedFields = [
       'title', 'slug', 'description', 'blocks', 'targetKeywords',
@@ -278,6 +334,44 @@ const updateContent = async (req, res) => {
     ) {
       const { config } = await tierService.getOrgTierConfig(workspace.organizationId);
       updates.versions = pruneVersions(updates.versions, config?.contentVersionHistoryDays);
+    }
+
+    // QA N1: sanitize block HTML before anything else touches it. Server-side
+    // defence in depth for the editor's innerHTML render; a clean document is
+    // returned byte-identical, so ordinary autosaves are unaffected.
+    if (Array.isArray(updates.blocks)) {
+      const r = sanitizeBlocks(updates.blocks);
+      if (r.changed) console.warn(`[sanitize] stripped unsafe markup from content ${req.params.contentNumber} blocks`);
+      updates.blocks = r.blocks;
+    }
+    if (Array.isArray(updates.versions)) {
+      const r = sanitizeVersions(updates.versions);
+      if (r.changed) console.warn(`[sanitize] stripped unsafe markup from content ${req.params.contentNumber} versions`);
+      updates.versions = r.versions;
+    }
+
+    const docFilter = { workspaceId: workspace._id, contentNumber: Number(req.params.contentNumber) };
+
+    // Done lock (services/doneLock). Checked after sanitising (the stored copy
+    // is the sanitised form) and before any image is rehosted, so a refused
+    // save uploads nothing. Reopening ("status" away from done) always passes.
+    // doneGuarded adds `status != done` to the write itself, which closes the
+    // race where another tab marks the article done between this read and the
+    // write below.
+    let doneGuarded = false;
+    if (touchesContent(updates) && !isReopen(updates)) {
+      // Projection + { lean } as arguments (not .select().lean()), so the
+      // controller tests' plain async findOne stubs work unchanged.
+      const st = await Content.findOne(docFilter, { status: 1 }, { lean: true });
+      if (st && st.status === 'done') {
+        const current = await Content.findOne(docFilter, { title: 1, slug: 1, description: 1, blocks: 1 }, { lean: true });
+        if (current && changesContent(Content, current, updates)) {
+          return res.status(409).json(doneLockBody('edit'));
+        }
+        // Identical content (an autosave of score/versions): save it as usual.
+      } else {
+        doneGuarded = true;
+      }
     }
 
     // Copy any base64 / engine-hosted images to B2 before saving.
@@ -364,14 +458,33 @@ const updateContent = async (req, res) => {
       }
     }
 
-    const content = await Content.findOneAndUpdate(
-      { workspaceId: workspace._id, contentNumber: Number(req.params.contentNumber) },
-      { $set: updates },
+    const writeOnce = (guardDone) => Content.findOneAndUpdate(
+      { ...docFilter, ...revisionFilter(baseRevision, writer), ...(guardDone ? { status: { $ne: 'done' } } : {}) },
+      revisionUpdate(updates, writer),
       { new: true, runValidators: true }
     );
+    let content = await writeOnce(doneGuarded);
+
+    if (!content && doneGuarded) {
+      // The done guard, not the revision, may be what stopped the write: the
+      // article was marked done after the check above. Refuse a real change;
+      // an identical body (nothing to protect) is written without the guard.
+      const now = await Content.findOne(docFilter, { status: 1, title: 1, slug: 1, description: 1, blocks: 1 }, { lean: true });
+      if (now && now.status === 'done') {
+        if (changesContent(Content, now, updates)) return res.status(409).json(doneLockBody('edit'));
+        content = await writeOnce(false);
+      }
+    }
 
     if (!content) {
-      return res.status(404).json({ error: 'Content not found' });
+      // No match: either the document is gone, or (with a baseRevision) a
+      // newer save landed first. Tell those apart with one read.
+      const current = (baseRevision !== null || doneGuarded) ? await Content.findOne(docFilter) : null;
+      if (!current) return res.status(404).json({ error: 'Content not found' });
+      if (current.locked) {
+        return res.status(403).json({ error: 'This content is locked. Upgrade your plan to regain access.', locked: true });
+      }
+      return res.status(409).json(conflictBody(toClientContent(current), current.lastWriter));
     }
 
     // startAnalysis directive (wizard Content Type step): kick off the deferred
@@ -381,23 +494,36 @@ const updateContent = async (req, res) => {
     // exactly as it was when creation auto-triggered it). Guarded to the
     // never-analyzed state so it cannot restart or double-run an analysis; the
     // directive itself is not in allowedFields, so nothing persists.
+    let analysisBlocked = null;
     if (req.body.startAnalysis === true &&
         content.analysisStatus === 'idle' &&
         content.targetKeywords && content.targetKeywords.length > 0) {
-      // Atomic claim: only one concurrent request can flip idle → pending.
-      // The status check above is a stale read — a double-clicked Continue or
-      // a second wizard tab could both pass it and start two engine runs.
-      // Losing claimants match no document and do nothing.
-      const claimed = await Content.findOneAndUpdate(
-        { _id: content._id, analysisStatus: 'idle' },
-        { $set: { analysisStatus: 'pending' } },
-      );
-      // Same as the creation auto-trigger above: this IS that analysis, just
-      // deferred by the wizard, so it emails for the same reason. Double-send
-      // is prevented in emailAnalysisReady by an atomic claim rather than by
-      // reasoning about which path ran — the wizard's step-1 fallback can also
-      // start this piece's first analysis, through POST /analyze.
-      if (claimed) startAnalysis(content._id);
+      // QA B24: this is where a wizard-created article is COUNTED (exactly
+      // once — the slot claim is atomic and a no-op for counted/legacy docs).
+      // Over the limit → the analysis is not started, the save still stands,
+      // and the response carries analysisBlocked (same body as the 429).
+      const slot = await claimArticleSlot(content);
+      if (!slot.ok) {
+        analysisBlocked = slot.payload;
+      } else {
+        // Atomic claim: only one concurrent request can flip idle → pending.
+        // The status check above is a stale read — a double-clicked Continue or
+        // a second wizard tab could both pass it and start two engine runs.
+        // Losing claimants match no document and do nothing.
+        const claimed = await Content.findOneAndUpdate(
+          { _id: content._id, analysisStatus: 'idle' },
+          { $set: { analysisStatus: 'pending' } },
+        );
+        // Same as the creation auto-trigger above: this IS that analysis, just
+        // deferred by the wizard, so it emails for the same reason. Double-send
+        // is prevented in emailAnalysisReady by an atomic claim rather than by
+        // reasoning about which path ran — the wizard's step-1 fallback can also
+        // start this piece's first analysis, through POST /analyze.
+        if (claimed) {
+          content.analysisStatus = 'pending';
+          startAnalysis(content._id);
+        }
+      }
     }
 
     // Autosave fires every ~1.5s while typing — dedupe to one entry per
@@ -418,9 +544,8 @@ const updateContent = async (req, res) => {
       },
       dedupeMinutes: significant ? 0 : 30,
     });
-    // Same strip as getContent — per-user favorite state never leaves the API.
-    const { favoritedBy, ...rest } = content.toObject();
-    res.json({ content: rest });
+    // Same shape as getContent (favorites stripped, revision included).
+    res.json({ content: toClientContent(content), ...(analysisBlocked ? { analysisBlocked } : {}) });
   } catch (err) {
     console.error('updateContent error:', err.message);
     res.status(500).json({ error: 'Failed to update content' });

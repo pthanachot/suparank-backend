@@ -71,7 +71,7 @@ async function _restoreDomains(orgId, report) {
       }
     }
     d.status = 'pending_dns';
-    d.statusDetail = 'Restored — re-verifying DNS to reactivate the branded host';
+    d.statusDetail = 'Restored: re-verifying DNS to reactivate the branded host';
     d.cloudflareId = ''; // verifyDomain re-creates it
     await d.save();
     report.domainsReset += 1;

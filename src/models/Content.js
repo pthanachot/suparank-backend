@@ -253,6 +253,11 @@ const contentSchema = new mongoose.Schema(
       default: 'idle',
     },
     analysisError: { type: String, default: '' },
+    // QA B09/B40: stable machine code for a failed analysis (see
+    // services/analysisErrors). analysisError holds FRIENDLY copy only, with
+    // the legacy 'transient: ' prefix when the retry is free. '' when not failed
+    // and on rows written before this field existed.
+    analysisErrorCode: { type: String, default: '' },
     // Per-URL competitor-crawl failures surfaced by the engine's /analyze
     // (SSRF rejection, timeout, 4xx, empty body) — these explain WHY a
     // requested competitor page is absent from the benchmark.
@@ -420,6 +425,36 @@ const contentSchema = new mongoose.Schema(
     // execute-mode runs under a plan whose id differs from this stamp classify
     // as the plan's article write (agentBilling.isPlanArticleWrite).
     articleGeneratedPlanId: { type: mongoose.Schema.Types.ObjectId, ref: 'Plan', default: null },
+
+    // QA B24: the article allowance is CHECKED at create but COUNTED once, when
+    // the article is first put to work (analysis started, or its first AI
+    // generation) — so an abandoned setup wizard no longer burns a lifetime
+    // slot. See services/articleQuotaService.
+    //   'pending' → created under a quota, not counted yet
+    //   'counted' → counted (articleCountedAt says when)
+    //   'exempt'  → created with no quota context (nothing to count)
+    //   absent    → created BEFORE this change: already counted at create,
+    //               so it must never be counted again. Deliberately NO
+    //               default: a default would hydrate legacy rows as 'pending'
+    //               and count them a second time.
+    articleQuotaState: { type: String, enum: ['pending', 'counted', 'exempt'] },
+    // The requireQuota context captured at create (org/user, user-level vs
+    // org-level, quotaSource, client-billed workspace), replayed at count time.
+    articleQuotaCtx: { type: mongoose.Schema.Types.Mixed, default: undefined },
+    articleCountedAt: { type: Date, default: undefined },
+
+    // QA B03: optimistic-concurrency revision of the document body. Bumped on
+    // every server-side write of the content (PUT /content/:n). A save that
+    // carries a stale baseRevision gets 409 revision_conflict instead of
+    // silently overwriting a collaborator. Existing rows read as 0.
+    revision: { type: Number, default: 0, min: 0 },
+    // Who made the last revision-bumping write: the client's editor-session id
+    // and its per-PUT counter (services/contentRevision parseWriter). Lets one
+    // tab's overlapping saves supersede each other without a false 409.
+    lastWriter: {
+      type: new mongoose.Schema({ id: String, seq: Number }, { _id: false }),
+      default: undefined,
+    },
   },
   { timestamps: true }
 );

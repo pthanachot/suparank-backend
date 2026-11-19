@@ -9,6 +9,10 @@ const { engineFetch } = require('../services/analysisEngine');
 const { resolveLocale } = require('../config/locales');
 const { recordObservation } = require('./observeController');
 const notificationService = require('../services/notificationService');
+const {
+  ANALYSIS_ERROR_CODES, classifyAnalysisFailure, failureFields, presentAnalysisError,
+} = require('../services/analysisErrors');
+const { claimArticleSlot } = require('../services/articleQuotaService');
 
 // Workspace resolved by permissions middleware (req.workspace).
 // This helper finds the content within that workspace.
@@ -27,6 +31,12 @@ async function resolveContent(req, res) {
     return null;
   }
   return content;
+}
+
+// A finite, non-negative engine statistic, else 0.
+function statNumber(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
 // Curate benchmark: map engine content_brief to scorer-compatible format
@@ -53,8 +63,10 @@ function curateBenchmark(brief) {
     avgInternalLinks: stats.avg_internal_links || 0,
     avgExternalLinks: stats.avg_external_links || 0,
     avgImages: stats.avg_images || 0,
-    avgTitleLength: 0,
-    avgDescLength: 0,
+    // QA B41: the engine now reports these (optional; absent on older builds
+    // and on cached analyses → 0, the previous hard-coded value).
+    avgTitleLength: statNumber(stats.avg_title_length),
+    avgDescLength: statNumber(stats.avg_desc_length),
     avgKeywordDensity: stats.avg_keyword_density || 0,
     keywordInH2Rate: stats.keyword_in_h2_rate || 0,
     keywordInFirst100Rate: stats.keyword_in_first100_rate || 0,
@@ -62,7 +74,7 @@ function curateBenchmark(brief) {
     avgTableCount: stats.avg_tables || 0,
     avgFaqCount: stats.avg_faqs || 0,
     avgParagraphs: stats.avg_paragraphs || 0,
-    avgSentenceLength: 0,
+    avgSentenceLength: statNumber(stats.avg_sentence_length),
     avgReadingLevel: stats.avg_reading_level || 0,
     topNlpTerms: terms.map((t) => ({
       term: t.term,
@@ -437,14 +449,15 @@ function isRetryableEngineError(message) {
   );
 }
 
+// QA B40: "transient" (free manual retry) now means SERVER-SIDE, not just
+// "timed out". Provider auth/credential failures (an OpenRouter 401), rate
+// limits and any engine/provider 5xx are our problem, not the customer's —
+// they used to fall through to the paid /reanalyze. The classification lives
+// in services/analysisErrors so the stored code, the copy and this predicate
+// can never disagree.
 function isTransientEngineError(message) {
   if (!message) return false;
-  const m = String(message).toLowerCase();
-  return (
-    isRetryableEngineError(message) ||
-    m.includes('job lost') || m.includes('engine restarted') ||
-    m.includes('polling budget') || m.includes('did not finish within')
-  );
+  return ANALYSIS_ERROR_CODES[classifyAnalysisFailure(message)].retryFree;
 }
 
 const ANALYZE_MAX_RETRIES = 2;
@@ -667,13 +680,13 @@ async function runAnalysis(contentId, opts = {}) {
       // the editor shows "not analyzed" instead of a scary error. The trigger /
       // reanalyze routes 400 before this; this is the defensive fallback.
       await Content.findByIdAndUpdate(contentId, {
-        $set: { analysisStatus: 'idle', analysisError: '' },
+        $set: { analysisStatus: 'idle', analysisError: '', analysisErrorCode: '' },
       });
       return;
     }
 
     await Content.findByIdAndUpdate(contentId, {
-      $set: { analysisStatus: 'analyzing', analysisError: '' },
+      $set: { analysisStatus: 'analyzing', analysisError: '', analysisErrorCode: '' },
     });
 
     // Phase 4: resolve the org tier once → model preset for the engine pipeline
@@ -813,13 +826,12 @@ async function runAnalysis(contentId, opts = {}) {
         throw new Error(`Engine returned ${analyzeRes.status}: ${errBody}`);
       }
     } catch (err) {
-      console.error('[analysis] analyze failed:', err.message);
-      // Phase 1: tag transient (our-fault) failures so the editor offers a free
-      // retry instead of a dead-end "failed".
-      const prefix = isTransientEngineError(err.message) ? 'transient: ' : '';
-      await Content.findByIdAndUpdate(contentId, {
-        $set: { analysisStatus: 'failed', analysisError: prefix + err.message },
-      });
+      // QA B09: the raw engine error is for the logs only. The row stores a
+      // stable code + friendly copy ('transient: ' prefixed when the retry is
+      // free — see services/analysisErrors for the format).
+      const failure = failureFields(err && err.message);
+      console.error(`[analysis] analyze failed (${failure.analysisErrorCode}) for ${contentId}:`, err && err.message);
+      await Content.findByIdAndUpdate(contentId, { $set: failure });
       await notifyAnalysisOutcome(content, opts, false);
       return;
     }
@@ -949,6 +961,7 @@ async function runAnalysis(contentId, opts = {}) {
     const updates = {
       analysisStatus: 'ready',
       analysisError: '',
+      analysisErrorCode: '',
       analyzedAt: new Date(),
       driftDetected: null, // Rec 10: a fresh analysis clears any drift flag
       benchmark: curateBenchmark(contentBrief),
@@ -1037,8 +1050,10 @@ async function runAnalysis(contentId, opts = {}) {
     // analysis at 'analyzing' too.
     const msg = (err && err.message) || String(err);
     console.error('[analysis] unexpected error:', msg);
+    // An exception escaping the pipeline is a bug on our side, whatever its
+    // text says: always a free retry, never the raw message (QA B09/B40).
     await Content.findByIdAndUpdate(contentId, {
-      $set: { analysisStatus: 'failed', analysisError: msg },
+      $set: failureFields(msg, 'server_error'),
     }).catch(() => {});
     // `content` may be undefined here (if the initial findById threw);
     // notifyAnalysisOutcome guards for that and no-ops. Only one failed path
@@ -1092,10 +1107,7 @@ const recoverInterruptedAnalyses = async () => {
   const result = await Content.updateMany(
     { analysisStatus: { $in: ['pending', 'analyzing'] } },
     {
-      $set: {
-        analysisStatus: 'failed',
-        analysisError: 'transient: Analysis interrupted by server restart',
-      },
+      $set: failureFields('Analysis interrupted by server restart', 'server_restart'),
     }
   );
   return (result && result.modifiedCount) || 0;
@@ -1116,6 +1128,13 @@ const triggerAnalysis = async (req, res) => {
     // letting it become a scary "failed" analysis.
     if (!content.targetKeywords || content.targetKeywords.length === 0) {
       return res.status(400).json({ error: 'Add a target keyword to run the research.' });
+    }
+
+    // QA B24: starting an analysis is what counts a not-yet-counted article
+    // (exactly once; a no-op for counted and pre-change documents).
+    {
+      const slot = await claimArticleSlot(content);
+      if (!slot.ok) return res.status(429).json(slot.payload);
     }
 
     await Content.findByIdAndUpdate(content._id, {
@@ -1161,7 +1180,10 @@ const getBenchmark = async (req, res) => {
 
     res.json({
       analysisStatus: content.analysisStatus,
-      analysisError: content.analysisError || '',
+      // QA B09: analysisError (legacy 'transient: ' + copy), analysisErrorCode,
+      // analysisErrorMessage and analysisRetryFree. Never the raw engine text,
+      // including for rows stored before this change.
+      ...presentAnalysisError(content),
       analyzedAt: content.analyzedAt || null,
       // Whether this draft was started from an existing page (URL import /
       // striking-distance "optimize"). The setup wizard reads it to hide the
@@ -1210,8 +1232,15 @@ const reanalyze = async (req, res) => {
       return res.status(400).json({ error: 'Add a target keyword to run the research.' });
     }
 
+    // QA B24: starting an analysis is what counts a not-yet-counted article
+    // (exactly once; a no-op for counted and pre-change documents).
+    {
+      const slot = await claimArticleSlot(content);
+      if (!slot.ok) return res.status(429).json(slot.payload);
+    }
+
     await Content.findByIdAndUpdate(content._id, {
-      $set: { analysisStatus: 'pending', analysisError: '' },
+      $set: { analysisStatus: 'pending', analysisError: '', analysisErrorCode: '' },
     });
 
     // Track audit usage before starting re-analysis (re-analysis consumes the
@@ -1248,12 +1277,21 @@ const retryAnalysis = async (req, res) => {
     if (content.analysisStatus === 'analyzing') {
       return res.status(409).json({ error: 'Analysis already in progress' });
     }
-    if (content.analysisStatus !== 'failed' || !String(content.analysisError || '').startsWith('transient:')) {
-      return res.status(409).json({ error: 'Nothing to retry for free — run a fresh analysis instead.' });
+    // presentAnalysisError also classifies rows stored before the code field
+    // existed, so an old provider-401 failure gets its free retry too.
+    if (content.analysisStatus !== 'failed' || !presentAnalysisError(content).analysisRetryFree) {
+      return res.status(409).json({ error: 'Nothing to retry for free. Run a fresh analysis instead.' });
+    }
+
+    // QA B24: starting an analysis is what counts a not-yet-counted article
+    // (exactly once; a no-op for counted and pre-change documents).
+    {
+      const slot = await claimArticleSlot(content);
+      if (!slot.ok) return res.status(429).json(slot.payload);
     }
 
     await Content.findByIdAndUpdate(content._id, {
-      $set: { analysisStatus: 'pending', analysisError: '' },
+      $set: { analysisStatus: 'pending', analysisError: '', analysisErrorCode: '' },
     });
 
     // No opts.bill → not charged on success; no incrementQuota → truly free.

@@ -123,7 +123,7 @@ async function visibilityCheck(req, res, next) {
       // Our failure, not theirs — give the check back (best-effort).
       await publicToolsService.refundRateLimit(req.ip, req.publicTool.toolId).catch(() => {});
       return res.status(502).json({
-        error: `${engine} did not answer — try again in a minute.`,
+        error: `${engine} did not answer. Try again in a minute.`,
       });
     }
 
@@ -206,7 +206,7 @@ async function contentBrief(req, res, next) {
       const detail = await discoverRes.text().catch(() => '');
       console.warn(`[public-tools] content-brief discover failed: ${discoverRes.status} ${detail.slice(0, 200)}`);
       await publicToolsService.refundRateLimit(req.ip, req.publicTool.toolId).catch(() => {});
-      return res.status(502).json({ error: 'SERP research is unavailable right now — try again in a minute.' });
+      return res.status(502).json({ error: 'SERP research is unavailable right now. Try again in a minute.' });
     }
     const discover = await discoverRes.json();
     const candidates = Array.isArray(discover.candidates) ? discover.candidates : [];
@@ -247,7 +247,7 @@ async function contentBrief(req, res, next) {
         })
         .catch(() => {});
       await publicToolsService.refundRateLimit(req.ip, req.publicTool.toolId).catch(() => {});
-      return res.status(502).json({ error: 'Outline generation is unavailable right now — try again in a minute.' });
+      return res.status(502).json({ error: 'Outline generation is unavailable right now. Try again in a minute.' });
     }
     const outline = await outlineRes.json();
 
@@ -396,7 +396,7 @@ async function shareOfVoice(req, res, next) {
 
     if (matrix.every((m) => !m.ok)) {
       await publicToolsService.refundRateLimit(req.ip, req.publicTool.toolId).catch(() => {});
-      return res.status(502).json({ error: 'No AI engine answered — try again in a minute.' });
+      return res.status(502).json({ error: 'No AI engine answered. Try again in a minute.' });
     }
 
     const sov = computeSov(matrix);

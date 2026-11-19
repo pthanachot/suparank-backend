@@ -22,7 +22,7 @@ const SYSTEM_TRIGGERS = [
   // Auth
   {
     id: 'welcome',
-    preheader: 'Your workspace is ready — here is where to start.',
+    preheader: 'Your workspace is ready. Here is where to start.',
     name: 'Welcome Email',
     description: 'Sent when a new user signs up',
     category: 'auth',
@@ -68,7 +68,7 @@ const SYSTEM_TRIGGERS = [
   // Billing
   {
     id: 'payment_confirmation',
-    preheader: 'Payment received — your {{planName}} plan is active.',
+    preheader: 'Payment received. Your {{planName}} plan is active.',
     name: 'Payment Confirmation',
     description: 'Sent after successful payment',
     category: 'billing',
@@ -86,7 +86,7 @@ const SYSTEM_TRIGGERS = [
   },
   {
     id: 'payment_failed',
-    preheader: 'We could not process your payment — action needed.',
+    preheader: 'We could not process your payment. Action needed.',
     name: 'Payment Failed',
     description: 'Notification of failed payment',
     category: 'billing',
@@ -137,7 +137,7 @@ const SYSTEM_TRIGGERS = [
     preheader: 'Your on-page score for “{{contentTitle}}” is ready.',
     name: 'Content Analysis Ready',
     description:
-      'Sent when the first analysis of a newly created piece finishes. Re-scores notify in-app only — the person who pressed re-score is already in the app.',
+      'Sent when the first analysis of a newly created piece finishes. Re-scores notify in-app only. The person who pressed re-score is already in the app.',
     category: 'content',
     variables: [
       'userName',
@@ -403,7 +403,7 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
     variables: ['userName', 'loginUrl', 'brandName', 'supportEmail', 'logoUrl', 'primaryColor', 'preheader'],
   },
   verify_email: {
-    subject: '{{brandName}} — Verify your email',
+    subject: '{{brandName}}: Verify your email',
     html: wrapTemplate(`
   ${BRAND_HEADER}
   <h2 style="color:#111827;margin-bottom:16px;">Verify your email</h2>
@@ -417,7 +417,7 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
     variables: ['code', 'expiresIn', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
   },
   verify_email_link: {
-    subject: '{{brandName}} — Verify your email',
+    subject: '{{brandName}}: Verify your email',
     html: wrapTemplate(`
   ${BRAND_HEADER}
   <h2 style="color:#111827;margin-bottom:16px;">Verify your email</h2>
@@ -429,7 +429,7 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
     variables: ['userName', 'verifyUrl', 'brandName', 'logoUrl', 'primaryColor', 'preheader'],
   },
   password_reset: {
-    subject: '{{brandName}} — Reset your password',
+    subject: '{{brandName}}: Reset your password',
     html: wrapTemplate(`
   ${BRAND_HEADER}
   <h2 style="color:#111827;margin-bottom:16px;">Reset your password</h2>
@@ -600,7 +600,7 @@ const ORIGINAL_DEFAULT_TEMPLATES = {
 
   <!-- Header -->
   <h1 style="font-size:20px;font-weight:700;margin:0 0 6px 0;">AI Tracker Scan Complete</h1>
-  <p style="color:#6B7280;font-size:14px;margin:0 0 24px 0;">Hi {{userName}} &mdash; <strong>{{domain}}</strong> was scanned on {{scanDate}}.</p>
+  <p style="color:#6B7280;font-size:14px;margin:0 0 24px 0;">Hi {{userName}}, <strong>{{domain}}</strong> was scanned on {{scanDate}}.</p>
 
   <!-- Key Metrics -->
   <h2 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:{{primaryColor}};margin:0 0 8px 0;padding-bottom:6px;border-bottom:2px solid {{primaryColor}};">Key Metrics</h2>

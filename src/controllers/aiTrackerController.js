@@ -322,7 +322,7 @@ function generatePromptSuggestions(scanResult, prevResult) {
         return display ? display.name : p.platformId;
       });
     if (lostPlatforms.length > 0) {
-      suggestions.push(`Lost mentions on ${lostPlatforms.join(', ')} — refresh and expand your content`);
+      suggestions.push(`Lost mentions on ${lostPlatforms.join(', ')}: refresh and expand your content`);
     }
   }
 
@@ -337,14 +337,14 @@ function generatePromptSuggestions(scanResult, prevResult) {
         const display = PLATFORM_DISPLAY.find((d) => d.platformId === p.platformId);
         return display ? display.name : p.platformId;
       });
-    suggestions.push(`Not cited on ${uncitedNames.join(', ')} despite mention — add structured data and source links`);
+    suggestions.push(`Not cited on ${uncitedNames.join(', ')} despite mention: add structured data and source links`);
   }
 
   // ── Citation gained/lost ──
   if (prevResult && cited.length > prevCited.length) {
-    suggestions.push('Citations growing — keep content fresh and add more authoritative sources');
+    suggestions.push('Citations growing: keep content fresh and add more authoritative sources');
   } else if (prevResult && prevCited.length > 0 && cited.length < prevCited.length) {
-    suggestions.push('Lost citations since last scan — update content with recent data and statistics');
+    suggestions.push('Lost citations since last scan: update content with recent data and statistics');
   }
 
   // ── Sentiment-based suggestions ──
@@ -354,9 +354,9 @@ function generatePromptSuggestions(scanResult, prevResult) {
   if (sentimentScores.length > 0) {
     const avgSentiment = sentimentScores.reduce((s, v) => s + v, 0) / sentimentScores.length;
     if (avgSentiment < 40) {
-      suggestions.push('Negative sentiment detected — address common complaints and highlight positive outcomes');
+      suggestions.push('Negative sentiment detected: address common complaints and highlight positive outcomes');
     } else if (avgSentiment < 60) {
-      suggestions.push('Neutral sentiment — add case studies and testimonials to improve brand perception');
+      suggestions.push('Neutral sentiment: add case studies and testimonials to improve brand perception');
     }
   }
 
@@ -367,7 +367,7 @@ function generatePromptSuggestions(scanResult, prevResult) {
   if (positions.length > 0) {
     const avgPos = positions.reduce((s, v) => s + v, 0) / positions.length;
     if (avgPos > 6) {
-      suggestions.push('Low ranking position — create more comprehensive, authoritative content on this topic');
+      suggestions.push('Low ranking position: create more comprehensive, authoritative content on this topic');
     }
   }
 

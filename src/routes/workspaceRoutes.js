@@ -20,7 +20,7 @@ const { requirePermission } = require('../middleware/permissions.policy');
 const { requireQuota: rq } = require('../middleware/tierEnforcement');
 const { requireCredits: rc } = require('../middleware/creditGate');
 const { resolveCredits, agentRunCredits } = require('../config/creditRules');
-const { rejectIfLocked, contentLockResolver } = require('../middleware/lockGuard');
+const { rejectIfLocked, contentLockResolver, rejectIfDone } = require('../middleware/lockGuard');
 const rateLimit = require('express-rate-limit');
 
 // W5-b: ghost-text autocomplete fires on every typing pause, so it is EXCLUDED
@@ -152,8 +152,8 @@ router.post('/:workspaceNumber/content/:contentNumber/retry-analysis', rwr, rf('
 // entirely client-side in the editor (scoreContent.ts). Term counts still come
 // from the engine via /score-terms below.
 router.post('/:workspaceNumber/content/:contentNumber/score-terms', rwr, rf('analysis'), rp('analysis', 'use'), analysisController.scoreTerms);
-router.post('/:workspaceNumber/content/:contentNumber/import-url', rwr, requirePermission('ai.generate'), rc('importUrl', estFixed('importUrl')), analysisController.importUrl);
-router.post('/:workspaceNumber/content/:contentNumber/internal-links', rwr, requirePermission('ai.generate'), rc('internalLinks', estFixed('internalLinks')), analysisController.internalLinks);
+router.post('/:workspaceNumber/content/:contentNumber/import-url', rwr, requirePermission('ai.generate'), rejectIfDone(), rc('importUrl', estFixed('importUrl')), analysisController.importUrl);
+router.post('/:workspaceNumber/content/:contentNumber/internal-links', rwr, requirePermission('ai.generate'), rejectIfDone(), rc('internalLinks', estFixed('internalLinks')), analysisController.internalLinks);
 router.post('/:workspaceNumber/content/:contentNumber/readability-check', rwr, rf('analysis'), rp('analysis', 'use'), analysisController.readabilityCheck);
 router.post('/:workspaceNumber/content/:contentNumber/regenerate-outline', rwr, rf('analysis'), requirePermission('ai.generate'), rc('briefOutline', estFixed('briefOutline')), analysisController.regenerateOutline);
 
@@ -178,24 +178,26 @@ router.delete('/:workspaceNumber/reports/:period/share', rwr, rp('members', 'man
 router.get('/:workspaceNumber/reports/:period/pdf', rwr, rp('analysis', 'read'), reportController.downloadPdf);
 
 // AI writing under content: /api/workspace/:workspaceNumber/content/:contentNumber/ai/...
-router.post('/:workspaceNumber/content/:contentNumber/ai/chat', rwr, rf('aiChat'), requirePermission('ai.generate'), rc('aiChat', estChat), aiController.chat);
-router.post('/:workspaceNumber/content/:contentNumber/ai/agent', rwr, rf('aiChat'), requirePermission('ai.generate'), rc('aiAgent', estAgent), aiController.agent);
-router.post('/:workspaceNumber/content/:contentNumber/ai/generate-image', rwr, rf('aiChat'), requirePermission('ai.generate'), rc('imageGenerate', estFixed('imageGenerate')), aiController.generateImage);
-router.post('/:workspaceNumber/content/:contentNumber/ai/inline-edit', rwr, rf('aiChat'), requirePermission('ai.generate'), rc('aiChat', estChat), aiController.inlineEdit);
+// rejectIfDone (QA gap, server half of B28): no AI work starts on an article
+// marked done. Before rc, so a refused run never holds credits.
+router.post('/:workspaceNumber/content/:contentNumber/ai/chat', rwr, rf('aiChat'), requirePermission('ai.generate'), rejectIfDone(), rc('aiChat', estChat), aiController.chat);
+router.post('/:workspaceNumber/content/:contentNumber/ai/agent', rwr, rf('aiChat'), requirePermission('ai.generate'), rejectIfDone(), rc('aiAgent', estAgent), aiController.agent);
+router.post('/:workspaceNumber/content/:contentNumber/ai/generate-image', rwr, rf('aiChat'), requirePermission('ai.generate'), rejectIfDone(), rc('imageGenerate', estFixed('imageGenerate')), aiController.generateImage);
+router.post('/:workspaceNumber/content/:contentNumber/ai/inline-edit', rwr, rf('aiChat'), requirePermission('ai.generate'), rejectIfDone(), rc('aiChat', estChat), aiController.inlineEdit);
 // W5-b ghost text: the FLYWEIGHT AI route. Per-user limiter FIRST (shed
 // over-limit calls before the workspace query). Feature-gated + the SAME v4
 // policy (ai.generate) as chat/agent/inline-edit so authorization can't drift —
 // it calls a paid model into the user's doc. Both gates are CACHED (~free). NO
 // credit gate (rc): it is free (COGS-ledger only). No doc push either — see
 // setupSessionAutocomplete.
-router.post('/:workspaceNumber/content/:contentNumber/ai/autocomplete', autocompleteLimiter, rwr, rf('aiChat'), requirePermission('ai.generate'), aiController.autocomplete);
+router.post('/:workspaceNumber/content/:contentNumber/ai/autocomplete', autocompleteLimiter, rwr, rf('aiChat'), requirePermission('ai.generate'), rejectIfDone({ quiet: true }), aiController.autocomplete);
 router.post('/:workspaceNumber/content/:contentNumber/ai/upload-image', rwr, rp('content', 'update'), aiController.uploadImage);
 // R18: rehost a picked image-search result to B2 (SSRF-hardened). Gated like
 // upload-image (content:update, no credit gate) — it's a content mutation with
 // no LLM cost, not an AI feature.
 router.post('/:workspaceNumber/content/:contentNumber/ai/rehost-image', rwr, rp('content', 'update'), aiController.rehostImage);
-router.post('/:workspaceNumber/content/:contentNumber/ai/clarify-answer', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.clarifyAnswer);
-router.post('/:workspaceNumber/content/:contentNumber/ai/plan-confirm', rwr, rf('aiChat'), rp('aiChat', 'use'), aiController.planConfirm);
+router.post('/:workspaceNumber/content/:contentNumber/ai/clarify-answer', rwr, rf('aiChat'), rp('aiChat', 'use'), rejectIfDone(), aiController.clarifyAnswer);
+router.post('/:workspaceNumber/content/:contentNumber/ai/plan-confirm', rwr, rf('aiChat'), rp('aiChat', 'use'), rejectIfDone(), aiController.planConfirm);
 // W4-a/b/c: mid-run side-channels + run status. Gated like the confirm family
 // (no rc credit gate: steering tokens ride the run's own usage tap; stop-revert
 // and run-status consume nothing).
@@ -225,13 +227,15 @@ router.delete('/:workspaceNumber/content/:contentNumber/ai/threads/:threadId', r
 // The 'aiChat' resource only defines a 'use' action (configPermissions), and
 // approve/reopen spend credits + trigger agent execution, so every route —
 // including the GETs — requires 'use'; membership alone is insufficient.
-router.post('/:workspaceNumber/content/:contentNumber/plan/enter', rwr, rf('aiChat'), rp('aiChat', 'use'), planController.enter);
-router.post('/:workspaceNumber/content/:contentNumber/plan/fast', rwr, rf('aiChat'), rp('aiChat', 'use'), planController.fast);
+// rejectIfDone on the four that start or resume AI work (enter/fast/approve/
+// reopen); reading, patching and rejecting a plan stay open on a done article.
+router.post('/:workspaceNumber/content/:contentNumber/plan/enter', rwr, rf('aiChat'), rp('aiChat', 'use'), rejectIfDone(), planController.enter);
+router.post('/:workspaceNumber/content/:contentNumber/plan/fast', rwr, rf('aiChat'), rp('aiChat', 'use'), rejectIfDone(), planController.fast);
 router.get('/:workspaceNumber/content/:contentNumber/plan', rwr, rf('aiChat'), rp('aiChat', 'use'), planController.get);
 router.patch('/:workspaceNumber/content/:contentNumber/plan', rwr, rf('aiChat'), rp('aiChat', 'use'), planController.patch);
-router.post('/:workspaceNumber/content/:contentNumber/plan/approve', rwr, rf('aiChat'), rp('aiChat', 'use'), planController.approve);
+router.post('/:workspaceNumber/content/:contentNumber/plan/approve', rwr, rf('aiChat'), rp('aiChat', 'use'), rejectIfDone(), planController.approve);
 router.post('/:workspaceNumber/content/:contentNumber/plan/reject', rwr, rf('aiChat'), rp('aiChat', 'use'), planController.reject);
-router.post('/:workspaceNumber/content/:contentNumber/plan/reopen', rwr, rf('aiChat'), rp('aiChat', 'use'), planController.reopen);
+router.post('/:workspaceNumber/content/:contentNumber/plan/reopen', rwr, rf('aiChat'), rp('aiChat', 'use'), rejectIfDone(), planController.reopen);
 router.post('/:workspaceNumber/content/:contentNumber/plan/continue', rwr, rf('aiChat'), rp('aiChat', 'use'), planController.continueResume);
 router.get('/:workspaceNumber/content/:contentNumber/plan/history', rwr, rf('aiChat'), rp('aiChat', 'use'), planController.history);
 router.get('/:workspaceNumber/content/:contentNumber/plan/estimate', rwr, rf('aiChat'), rp('aiChat', 'use'), planController.estimate);

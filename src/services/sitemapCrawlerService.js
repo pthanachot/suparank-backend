@@ -671,8 +671,8 @@ async function crawlSite(sitemapId, { maxPages = DEFAULT_MAX_PAGES } = {}) {
           pagesProcessed = 0;
         } else {
           const reason = error === 'timeout'
-            ? `Cannot reach ${baseDomain} — connection timed out after ${REQUEST_TIMEOUT_MS / 1000}s`
-            : `Cannot reach ${baseDomain} — ${error || `HTTP ${statusCode} with no HTML content`}`;
+            ? `Cannot reach ${baseDomain}: connection timed out after ${REQUEST_TIMEOUT_MS / 1000}s`
+            : `Cannot reach ${baseDomain}: ${error || `HTTP ${statusCode} with no HTML content`}`;
 
           const failCount = (sitemap.crawlFailCount || 0) + 1;
           await Sitemap.updateOne({ _id: sitemapId }, {

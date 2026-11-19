@@ -28,21 +28,31 @@ const MODELS = {
   'google/gemini-2.5-flash-image':  { provider: 'openrouter', in: 0.30,  out: 2.50, flat: 0.039 }, // Nano-Banana, ~$0.039/image
   'google/gemini-2.5-pro':          { provider: 'openrouter', in: 1.25,  out: 10.00 },
   'perplexity/sonar':               { provider: 'openrouter', in: 1.00,  out: 1.00 },
+  // Current Claude IDs used by the balanced/premium presets (writing-engine
+  // models.json) and the engine's Claude fallbacks. Prices from the live
+  // OpenRouter catalogue, 2026-11-18. Before these were added every premium
+  // run was booked as an unknown model at $0.
+  'anthropic/claude-sonnet-5.5':    { provider: 'openrouter', in: 2.00,  out: 10.00 },
+  'anthropic/claude-opus-5.5':      { provider: 'openrouter', in: 4.00,  out: 20.00 },
+  'anthropic/claude-haiku-5.5':     { provider: 'openrouter', in: 0.10,  out: 0.50 },
+  // Retired by OpenRouter (Nov 2026); kept so historical ledger rows and any
+  // stale MODEL_* env override still price instead of reading $0.
   'anthropic/claude-sonnet-4':          { provider: 'openrouter', in: 3.00,  out: 15.00 },
   'anthropic/claude-sonnet-4:thinking': { provider: 'openrouter', in: 3.00,  out: 15.00 },
   'anthropic/claude-opus-4':            { provider: 'openrouter', in: 15.00, out: 75.00 },
   'anthropic/claude-opus-4:thinking':   { provider: 'openrouter', in: 15.00, out: 75.00 },
   'anthropic/claude-haiku-4':           { provider: 'openrouter', in: 1.00,  out: 5.00 },
-  'moonshotai/kimi-k2.6':           { provider: 'openrouter', in: 0.60,  out: 2.50 }, // VERIFY
+  'moonshotai/kimi-k2.6':           { provider: 'openrouter', in: 0.65,  out: 3.41 }, // live catalogue 2026-11-18
 
   // ─── OpenRouter — engine (Go) pipeline ───────────────────────────────
   // Engine's own pricing table lives at engine/internal/openrouter/cost.go;
   // keep these aligned with it (its computed cost arrives as costUsdOverride,
   // so a drift here only affects registry-priced fallbacks, not totals).
   'xiaomi/mimo-v2-flash':           { provider: 'openrouter', in: 0.10,  out: 0.40 }, // deprecated on OpenRouter; kept for historical ledger rows
-  'xiaomi/mimo-v2.5':               { provider: 'openrouter', in: 0.10,  out: 0.40 }, // successor to mimo-v2-flash; VERIFY exact pricing
-  'google/gemini-3-flash-preview':  { provider: 'openrouter', in: 0.15,  out: 0.60 },
-  'anthropic/claude-haiku-4-5':     { provider: 'openrouter', in: 0.80,  out: 4.00 },
+  'xiaomi/mimo-v2.5':               { provider: 'openrouter', in: 0.40,  out: 2.00 }, // successor to mimo-v2-flash; live catalogue 2026-11-18
+  'google/gemini-3-flash-preview':  { provider: 'openrouter', in: 0.50,  out: 3.00 }, // live catalogue 2026-11-18 (was 0.15/0.60)
+  'openai/gpt-5.4-nano':            { provider: 'openrouter', in: 0.20,  out: 1.25 }, // engine classify steps 2c/4/5b
+  'anthropic/claude-haiku-4-5':     { provider: 'openrouter', in: 0.80,  out: 4.00 }, // retired; historical rows only
 
   // ─── OpenRouter — audits + tracker analyzer + pipeline brains (Node/Go) ──
   // Kimi K2 (0905) — confirmed as our "K2.5". Powers content audits, the AI-tracker

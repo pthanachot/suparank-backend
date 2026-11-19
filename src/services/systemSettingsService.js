@@ -11,7 +11,9 @@ const { DEFAULT_DISABLED_AGENT_COMMANDS } = require('../config/agentBilling');
 const DEFAULTS = Object.freeze({
   maintenanceMode: false,
   emailNotificationsEnabled: true,
-  rateLimit: { windowMs: null, max: null },
+  // max = per-USER bucket, ipMax = per-IP (anonymous) bucket — see
+  // middleware/apiRateLimit. null → env-based default.
+  rateLimit: { windowMs: null, max: null, ipMax: null },
   adminEmails: [],
   backup: { directory: null, retentionCount: 7 },
   disabledAgentCommands: DEFAULT_DISABLED_AGENT_COMMANDS,
@@ -27,6 +29,7 @@ function toPlain(doc) {
     rateLimit: {
       windowMs: doc.rateLimit?.windowMs ?? null,
       max: doc.rateLimit?.max ?? null,
+      ipMax: doc.rateLimit?.ipMax ?? null,
     },
     adminEmails: Array.isArray(doc.adminEmails) ? doc.adminEmails : [],
     backup: {

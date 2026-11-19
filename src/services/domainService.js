@@ -236,7 +236,7 @@ async function _checkCname(hostname) {
     } catch {
       return {
         ok: false,
-        detail: `CNAME record for ${hostname} not found (${err.code || err.message}) — expected CNAME to ${expected}`,
+        detail: `CNAME record for ${hostname} not found (${err.code || err.message}). Expected CNAME to ${expected}`,
       };
     }
   }
@@ -280,7 +280,7 @@ async function verifyDomain(domainId) {
   } catch (err) {
     console.error('[domainService] legal-gate lookup failed:', err.message);
     // Fail closed on activation-critical checks
-    domain.statusDetail = 'Could not verify branding settings — try again shortly.';
+    domain.statusDetail = 'Could not verify branding settings. Try again shortly.';
     await domain.save();
     return domain;
   }
@@ -306,7 +306,7 @@ async function verifyDomain(domainId) {
         domain.cloudflareId = created.id || '';
       }
       domain.status = 'pending_ssl';
-      domain.statusDetail = 'DNS verified — SSL certificate is being provisioned';
+      domain.statusDetail = 'DNS verified. SSL certificate is being provisioned.';
       // Poll once right away; certs are often ready within seconds
       if (domain.cloudflareId) {
         const info = await cloudflareService.getCustomHostname(domain.cloudflareId);
@@ -323,7 +323,7 @@ async function verifyDomain(domainId) {
   } else {
     domain.status = 'pending_ssl';
     domain.statusDetail =
-      'Cloudflare not configured — hostname verified, SSL provisioning pending platform setup';
+      'Cloudflare not configured. Hostname verified, SSL provisioning pending platform setup.';
   }
 
   await domain.save();

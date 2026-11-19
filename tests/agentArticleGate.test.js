@@ -139,14 +139,12 @@ test('image counts are clamped — no Infinity or negative can reach the ledger'
   assert.equal(huge.snapshot().images, 500, 'absurd counts clamp to a sane ceiling');
 });
 
-// A run stopped mid-generation must NOT be refunded once images exist.
-//
-// Slash commands generate every image BEFORE embedding any, so "no document
-// write yet" was true for a run that had already bought eight images: hitting
-// Stop refunded the credits in full while the provider had really billed us.
-// The engine now reports the running image total per turn (not only at the
-// end), so the count survives the abort that kills the stream.
-test('a stopped run that already generated images is NOT refunded', async () => {
+// QA Nov 2026 (B04, owner decision): a run that writes NOTHING to the document
+// charges 0 credits, images included. This used to be the opposite (a stop
+// after images were bought kept the charge); the owner chose "no write, no
+// charge" as the product rule. /image ships disabled, so the exposure is
+// bounded to deployments that enable it.
+test('a stopped run that generated images but wrote nothing is refunded', async () => {
   const { captured } = await runAgent({
     content: baseContent({ mode: 'draft', activePlanId: null }),
     quota: { tier: 'professional', limit: 50, limitType: 'monthly', used: 1 },
@@ -160,8 +158,8 @@ test('a stopped run that already generated images is NOT refunded', async () => 
     ],
     abortAfterLast: true, // the user hits Stop here
   });
-  assert.equal(captured.refunded, 0,
-    'images are unrecoverable spend — a stop after generating them must not refund');
+  assert.equal(captured.refunded, 1, 'nothing was written, so nothing is charged');
+  assert.equal(captured.settle, null);
 });
 
 // ─── Phase 3: an image run settles to the images it actually made ───
@@ -198,13 +196,28 @@ test('a completed image run is billed per image, not the whole reservation', asy
     'one image must settle to base + one image — not to the four-image reservation');
 });
 
-test('an image run that made nothing settles to the run base alone', async () => {
+test('an image run that made nothing and wrote nothing is free', async () => {
   const { captured } = await runAgent({
     content: baseContent({ mode: 'draft', activePlanId: null }),
     quota: { tier: 'professional', limit: 50, limitType: 'monthly', used: 1 },
     ...IMAGE_RUN,
     events: [
       { type: 'usage', usage: { input_tokens: 100, output_tokens: 50 } },
+      { type: 'complete', completion: { stopReason: 'done' } },
+    ],
+  });
+  assert.equal(captured.settle, null, 'a no-write run never settles to a charge');
+  assert.equal(captured.refunded, 1, 'it is refunded in full');
+});
+
+test('an image run that wrote but made no image settles to the run base alone', async () => {
+  const { captured } = await runAgent({
+    content: baseContent({ mode: 'draft', activePlanId: null }),
+    quota: { tier: 'professional', limit: 50, limitType: 'monthly', used: 1 },
+    ...IMAGE_RUN,
+    events: [
+      { type: 'usage', usage: { input_tokens: 100, output_tokens: 50 } },
+      { type: 'document_diff', patches: [] },
       { type: 'complete', completion: { stopReason: 'done' } },
     ],
   });
@@ -228,7 +241,7 @@ test('a run that spends the whole allowance settles at the reservation', async (
     'four images is exactly the reservation — nothing is refunded and nothing is lost');
 });
 
-test('a stopped image run pays for the images it already bought', async () => {
+test('a stopped image run that WROTE pays for the images it already bought', async () => {
   // The stop path used to fall through to the flat inlineAction price, which
   // handed back three images the provider had already billed.
   const { captured } = await runAgent({
@@ -238,6 +251,7 @@ test('a stopped image run pays for the images it already bought', async () => {
     events: [
       { type: 'usage', usage: { input_tokens: 100, output_tokens: 50 } },
       imageUsage(3),
+      { type: 'document_diff', patches: [] },
     ],
     abortAfterLast: true,
   });
@@ -532,6 +546,15 @@ async function runAgent({ content, quota, events, creditContext, body, abortAfte
   // Models / services touched by resolveContent + setupSession + the gate
   stub(Content, 'findByNumber', async () => content);
   stub(Content, 'findByIdAndUpdate', async (_id, update) => { captured.stamped = update?.$set ?? update; return {}; });
+  // QA B24: the article-slot claim (articleQuotaService). Wins only while the
+  // doc is still 'pending', exactly like the real atomic filter.
+  captured.slotClaims = 0;
+  stub(Content, 'findOneAndUpdate', async (filter) => {
+    if (filter?.articleQuotaState !== 'pending' || content.articleQuotaState !== 'pending') return null;
+    content.articleQuotaState = 'counted';
+    captured.slotClaims++;
+    return { _id: content._id, articleQuotaCtx: content.articleQuotaCtx };
+  });
   stub(Workspace, 'findById', () => ({ select: () => ({ lean: async () => ({ organizationId: 'org1', workspaceNumber: 1 }) }) }));
   stub(BrandVoice, 'findOne', () => ({ lean: async () => null }));
   stub(Avatar, 'findOne', () => ({ lean: async () => null }));
@@ -640,8 +663,8 @@ test('E2E: plan-execute re-gen under the limit that WRITES → stamps plan id + 
   assert.equal(captured.incremented, 1, 're-generation consumed one slot');
 });
 
-// 3 — no write settles down, no slot
-test('E2E: plan-execute run that does NOT write → settles to inlineAction (2), no stamp, no slot', async () => {
+// 3 — no write is free, no slot (QA B04: used to settle down to inlineAction)
+test('E2E: plan-execute run that does NOT write → refunded in full, no stamp, no slot', async () => {
   const { captured } = await runAgent({
     content: baseContent(),
     quota: { tier: 'professional', limit: 50, limitType: 'monthly', used: 10 },
@@ -652,7 +675,8 @@ test('E2E: plan-execute run that does NOT write → settles to inlineAction (2),
     ],
   });
   assert.equal(captured.preDeduct, 100, 'reserved the articleGenerate estimate');
-  assert.deepEqual(captured.settle, { txId: 'tx1', actual: 2 }, 'settled down to inlineAction');
+  assert.equal(captured.settle, null, 'a no-write run is not settled to a charge');
+  assert.equal(captured.refunded, 1, 'refunded in full');
   assert.equal(captured.stamped, null, 'no generation stamp');
   assert.equal(captured.incremented, 0, 'no slot consumed');
 });
@@ -737,7 +761,7 @@ test('E2E: client aborts BEFORE any write → full refund, no settle, no stamp, 
 });
 
 // 8 — MAJOR-3 fix: a no-op mutation (document_update) is not an article
-test('E2E: run emitting only document_update (failed/reverted edits) → settle-down, no stamp, no slot', async () => {
+test('E2E: run emitting only document_update (failed/reverted edits) → free, no stamp, no slot', async () => {
   const { captured } = await runAgent({
     content: baseContent(),
     quota: { tier: 'professional', limit: 50, limitType: 'monthly', used: 10 },
@@ -747,7 +771,8 @@ test('E2E: run emitting only document_update (failed/reverted edits) → settle-
       { type: 'document_update' }, // tool ran, doc byte-identical
     ],
   });
-  assert.deepEqual(captured.settle, { txId: 'tx1', actual: 2 }, 'settled down — nothing was applied');
+  assert.equal(captured.settle, null, 'nothing was applied');
+  assert.equal(captured.refunded, 1, 'refunded in full');
   assert.equal(captured.stamped, null);
   assert.equal(captured.incremented, 0);
 });
@@ -885,4 +910,43 @@ test('E2E: freeform forwards no tools, and the plan write keeps its nil whitelis
   assert.equal(planWrite.res.statusCode, 200, 'the plan-approve write must not be refused');
   assert.equal(planWrite.captured.startAgent.allowedTools, undefined);
   assert.equal(planWrite.captured.startAgent.mode, 'sequential');
+});
+
+// ─── QA B24: deferred article counting ──────────────────────
+
+const PENDING = {
+  articleQuotaState: 'pending',
+  articleQuotaCtx: { orgId: 'org1', userId: 'u1', isUserLevel: true, orgCounted: true, lifetime: true, quotaSource: null, workspaceId: null },
+};
+
+test('B24: first generation on a never-counted (pending) doc at the limit is refused', async () => {
+  const { res, captured } = await runAgent({
+    content: baseContent({ articleGeneratedAt: null, articleGeneratedPlanId: null, ...PENDING }),
+    quota: { tier: 'free', limit: 3, limitType: 'lifetime', used: 3 },
+    events: [{ type: 'document_diff', patches: [] }],
+  });
+  assert.equal(res.statusCode, 429, 'this generation IS the article count, so it must fit the limit');
+  assert.equal(res.jsonBody.code, 'ARTICLE_LIMIT_REACHED');
+  assert.equal(captured.preDeduct, null);
+});
+
+test('B24: first generation on a pending doc counts the slot exactly once', async () => {
+  const { captured } = await runAgent({
+    content: baseContent({ articleGeneratedAt: null, articleGeneratedPlanId: null, ...PENDING }),
+    quota: { tier: 'free', limit: 3, limitType: 'lifetime', used: 2 },
+    events: [{ type: 'document_diff', patches: [] }],
+  });
+  assert.equal(captured.slotClaims, 1, 'the pending slot was claimed');
+  assert.equal(captured.incremented, 1, 'counted once (the claim), not twice');
+});
+
+test('B24: first generation on an already-counted doc stays covered (no count, even at the limit)', async () => {
+  const { res, captured } = await runAgent({
+    content: baseContent({ articleGeneratedAt: null, articleGeneratedPlanId: null, articleQuotaState: 'counted' }),
+    quota: { tier: 'free', limit: 3, limitType: 'lifetime', used: 3 },
+    events: [{ type: 'document_diff', patches: [] }],
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(captured.slotClaims, 0);
+  assert.equal(captured.incremented, 0);
 });

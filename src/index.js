@@ -46,8 +46,16 @@ const systemSettingsService = require('./services/systemSettingsService');
 
 const app = express();
 
-// Trust proxy for production
-app.set('trust proxy', 1);
+// Trust the proxy hops in front of us so req.ip is the BROWSER's address
+// (QA N2). Browser traffic arrives via the Next.js server, which appends the
+// client address as the last X-Forwarded-For entry; with one trusted hop
+// Express takes exactly that entry. Set TRUST_PROXY_HOPS when another proxy
+// (a load balancer) also sits in front of this server.
+const TRUST_PROXY_HOPS = (() => {
+  const n = parseInt(process.env.TRUST_PROXY_HOPS, 10);
+  return Number.isFinite(n) && n >= 0 ? n : 1;
+})();
+app.set('trust proxy', TRUST_PROXY_HOPS);
 
 // Connect to MongoDB, recover dead scans, then sync config from seed files
 connectDB()
@@ -173,42 +181,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// Rate limiting — skip the internal API. Internal traffic comes from the Go
-// writing-engine (server-to-server, authenticated by INTERNAL_API_KEY) and
-// can legitimately make many CFS reads per plan-mode turn. Throttling it
-// like user traffic would intermittently break plan mode.
-//
-// Uses req.originalUrl (always the full pathname) rather than req.path
-// (which depends on Express's mount-stripping behavior). (Bug 4 from M2
-// second-round review.)
-const ENV_DEFAULT_MAX = process.env.NODE_ENV === 'production' ? 100 : 1000;
-function buildApiLimiter() {
-  const rl = systemSettingsService.getSettings().rateLimit || {};
-  return rateLimit({
-    // windowMs is fixed at construction — express-rate-limit only re-evaluates
-    // `max` per request, so the limiter is rebuilt on settings change.
-    windowMs: rl.windowMs || 15 * 60 * 1000,
-    max: () => systemSettingsService.getSettings().rateLimit?.max || ENV_DEFAULT_MAX,
-    standardHeaders: true,
-    legacyHeaders: false,
-    // Skip server-to-server engine traffic, and W5-b ghost-text autocomplete —
-    // it fires on every typing pause, so throttling it by this per-IP bucket
-    // would 429 the whole app for one active writer. It has its OWN per-user
-    // limiter in workspaceRoutes (autocompleteLimiter). Match the /ai/autocomplete
-    // suffix on originalUrl (with or without a query string).
-    skip: (req) => req.originalUrl.startsWith('/api/internal/') ||
-      // The notification bell polls every ~90s per tab and has its own per-user
-      // limiter (notificationRoutes) — counting it in this per-IP bucket would
-      // 429 a whole NATed office for one active user.
-      req.originalUrl.startsWith('/api/notifications') ||
-      // Wave 0 (§3.1): telemetry batches all arrive via the Next proxy on ONE
-      // shared IP — one busy editor session would burn this bucket and 429 the
-      // whole app for every user. /api/observe has its own per-user limiter in
-      // observeRoutes (observeLimiter), same pattern as the bell.
-      req.originalUrl.startsWith('/api/observe') ||
-      /\/ai\/autocomplete(?:\?|$)/.test(req.originalUrl),
-  });
-}
+// Rate limiting — see middleware/apiRateLimit (QA N2/B36): keyed per USER
+// when a valid access token is present, per IP otherwise, with a JSON 429
+// { error: 'rate_limited', message, retryAfter } + Retry-After. Internal
+// engine traffic, the notification bell, telemetry and autocomplete are
+// skipped (each has its own limiter or is server-to-server).
+const { buildApiLimiter: buildApiLimiterFrom } = require('./middleware/apiRateLimit');
+const buildApiLimiter = () => buildApiLimiterFrom(() => systemSettingsService.getSettings());
 let apiLimiter = buildApiLimiter();
 // Rebuild only when windowMs actually changes — `max` is already read
 // per-request, and every rebuild resets the in-memory hit counters, so
@@ -726,6 +705,8 @@ app.get('/health', async (req, res) => {
     // the host itself is in the boot log line "MongoDB connected: …".
     expectedHostMatch: db.expectedHostMatch,
     engine,
+    // QA N5/B34: credential/config PRESENCE, booleans only (never values).
+    config: require('./config/configStatus').configStatus(),
     uptime: Math.floor(process.uptime()),
   });
 });

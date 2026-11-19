@@ -101,9 +101,15 @@ test('unknown surface is a single row, not two spellings of the same gap', async
 
 // ── P3-5: consent weeks must match the cohort grid on the same screen ─────
 test('the consent trend buckets on Monday, like retention', async () => {
-  // 2026-08-09 is a Sunday. $dateTrunc would have opened a new week here;
-  // Monday-start keeps it with the preceding Monday, matching the grid below it.
-  const sunday = new Date('2026-08-09T10:00:00.000Z');
+  // A Sunday. $dateTrunc would have opened a new week here; Monday-start keeps
+  // it with the preceding Monday, matching the grid below it. Relative to the
+  // real clock (getConversion's window is "the last 28 days"): the most recent
+  // Sunday at least a day ago, so it is always inside the window. A fixed date
+  // made this test fail once it aged out of the window.
+  const sunday = new Date(Date.now() - DAY_MS);
+  while (sunday.getUTCDay() !== 0) sunday.setUTCDate(sunday.getUTCDate() - 1);
+  sunday.setUTCHours(10, 0, 0, 0);
+  if (sunday.getTime() > Date.now()) sunday.setUTCDate(sunday.getUTCDate() - 7);
   await ObservationEvent.collection.insertOne({
     event: 'consent_choice', userId: oid(), organizationId: null, workspaceNumber: null,
     impersonatedBy: null, payload: { analytics: true }, createdAt: sunday, updatedAt: sunday,

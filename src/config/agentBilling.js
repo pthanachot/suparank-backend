@@ -321,7 +321,7 @@ function resolveAgentRun(body = {}, content = null, disabledCommands = DEFAULT_D
   if (Array.isArray(disabledCommands) && disabledCommands.includes(name)) {
     return {
       ok: false, status: 403, code: 'COMMAND_DISABLED',
-      error: `/${name} is switched off at the moment, so it can't run. Your document is unchanged — type / to see what's available.`,
+      error: `/${name} is switched off at the moment, so it can't run. Your document is unchanged. Type / to see what's available.`,
     };
   }
   if (tools.length === 0) {

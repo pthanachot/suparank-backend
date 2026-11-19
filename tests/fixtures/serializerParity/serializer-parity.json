@@ -1,5 +1,5 @@
 {
-  "comment": "Phase 10/11/12 (CHANGE-PERCEPTION-AND-CRUD-PLAN): serializer parity between suparank components/editor/utils.ts blocksToMarkdown (ENGINE audience) and backend src/services/blocksToMarkdown.js. IDENTICAL COPY lives at backend/tests/fixtures/serializerParity/serializer-parity.json — separate git repos; edit BOTH or the parity silently stops being checked. Deliberate spice: the cta url contains '->' (pins the '>'-escape), the faq answer is multi-line with a list (pins raw-line answers + the sr:/faq terminator), the img caption contains quotes (pins title escaping), the table has a piped header cell and explicit alignment (pins cell escaping + the separator row). QA B26: f9-f11 pin checklist items (GFM task markers, inline markup inside) next to a plain bullet.",
+  "comment": "Phase 10/11/12 (CHANGE-PERCEPTION-AND-CRUD-PLAN): serializer parity between suparank components/editor/utils.ts blocksToMarkdown (ENGINE audience) and backend src/services/blocksToMarkdown.js. IDENTICAL COPY lives at backend/tests/fixtures/serializerParity/serializer-parity.json — separate git repos; edit BOTH or the parity silently stops being checked. Deliberate spice: the cta url contains '->' (pins the '>'-escape), the faq answer is multi-line with a list (pins raw-line answers + the sr:/faq terminator), the img caption contains quotes (pins title escaping), the table has a piped header cell and explicit alignment (pins cell escaping + the separator row). QA B26: f9-f11 pin checklist items (GFM task markers, inline markup inside) next to a plain bullet; f12 is a PLAIN bullet whose text starts with \"[ ] \" (escaped as \"\\[ ] \" so it stays plain).",
   "blocks": [
     {
       "id": "f1",
@@ -86,7 +86,12 @@
       "id": "f11",
       "type": "li",
       "text": "A plain bullet"
+    },
+    {
+      "id": "f12",
+      "type": "li",
+      "text": "[ ] Literal brackets, not a task"
     }
   ],
-  "engineMarkdown": "# Guide\n\nIntro text\n\n<!-- sr:toc -->\n\n<!-- sr:cta {\"buttonText\":\"Get started\",\"url\":\"https://x.com/a?b=1&c-\\u003e2\"} -->\n\nOutro\n\n<!-- sr:faq -->\n\n## FAQ\n\n### Is it free?\n\nYes, the basic plan is free.\n\n- One seat included\n\n<!-- sr:/faq -->\n\n![revenue](/chart.png \"Q1 \\\"gross\\\" revenue\")\n\n| Plan | Cost \\| seat |\n| :--- | ---: |\n| Basic | 0 |\n\n- [ ] Pick a **plan**\n\n- [x] Invite the team\n\n- A plain bullet"
+  "engineMarkdown": "# Guide\n\nIntro text\n\n<!-- sr:toc -->\n\n<!-- sr:cta {\"buttonText\":\"Get started\",\"url\":\"https://x.com/a?b=1&c-\\u003e2\"} -->\n\nOutro\n\n<!-- sr:faq -->\n\n## FAQ\n\n### Is it free?\n\nYes, the basic plan is free.\n\n- One seat included\n\n<!-- sr:/faq -->\n\n![revenue](/chart.png \"Q1 \\\"gross\\\" revenue\")\n\n| Plan | Cost \\| seat |\n| :--- | ---: |\n| Basic | 0 |\n\n- [ ] Pick a **plan**\n\n- [x] Invite the team\n\n- A plain bullet\n\n- \\[ ] Literal brackets, not a task"
 }

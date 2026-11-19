@@ -46,6 +46,20 @@ function taskMarker(b) {
   return b.checked ? '[x] ' : '[ ] ';
 }
 
+/** GFM task marker at the start of a bullet's text ("[ ]", "[x]", "[X]"). */
+const TASK_MARKER_RE = /^\[( |x|X)\](?:[ \t]+[\s\S]*)?$/;
+
+/**
+ * QA B26: a PLAIN bullet whose markdown text starts with a task marker gets a
+ * backslash so parsers keep it a plain bullet (bullets like that predate
+ * checklists). Mirror of the frontend's escapeLiteralTaskMarker.
+ * @param {string} mdText
+ * @returns {string}
+ */
+function escapeLiteralTaskMarker(mdText) {
+  return TASK_MARKER_RE.test(mdText) ? '\\' + mdText : mdText;
+}
+
 /**
  * Escape double quotes for safe embedding in an HTML attribute.
  * @param {string} s
@@ -80,7 +94,9 @@ function blocksToMarkdown(blocks) {
       case 'li':
         // QA B26: checklist items carry the GFM task marker. Mirror of the
         // frontend serializer; the parity fixture pins it.
-        lines.push('  '.repeat(b.indent || 0) + '- ' + taskMarker(b) + text);
+        // A plain bullet whose text merely starts with "[ ] " is escaped
+        // ("- \[ ] text") so it does not come back as a checklist item.
+        lines.push('  '.repeat(b.indent || 0) + '- ' + (taskMarker(b) ? taskMarker(b) + text : escapeLiteralTaskMarker(text)));
         break;
 
       case 'ol':
@@ -230,4 +246,4 @@ function blocksToMarkdown(blocks) {
   return lines.join('\n').trim();
 }
 
-module.exports = { blocksToMarkdown, htmlInlineToMd, stripHtml, taskMarker };
+module.exports = { blocksToMarkdown, htmlInlineToMd, stripHtml, taskMarker, escapeLiteralTaskMarker, TASK_MARKER_RE };

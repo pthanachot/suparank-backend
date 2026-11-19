@@ -443,3 +443,41 @@ test('AT-2: spoofing down lands on finite-pool pricing; unknown lands on the gat
   assert.equal(unknown, 'articleGenerate');
   assert.equal(resolveCredits(unknown, { tier: 'professional' }), 100);
 });
+
+// ─── Phase 5: per-command edit policy ───────────────────────
+
+test('resolveAgentRun: /grammar runs under "proofread", /humanize under "rewrite"; the body cannot set or drop either', () => {
+  const g = resolveAgentRun({ mode: 'sequential', commandName: 'grammar', editPolicy: 'none' }, null, []);
+  assert.equal(g.ok, true);
+  assert.equal(g.editPolicy, 'proofread');
+  const h = resolveAgentRun({ mode: 'sequential', commandName: 'humanize', editPolicy: 'proofread' }, null, []);
+  assert.equal(h.editPolicy, 'rewrite', '/humanize gets its own policy, whatever the body says');
+  const t = resolveAgentRun({ mode: 'sequential', commandName: 'title', editPolicy: 'proofread' }, null, []);
+  assert.equal(t.editPolicy, undefined, 'commands without a policy get none, whatever the body says');
+  const f = resolveAgentRun({ mode: 'freeform', editPolicy: 'proofread' }, null, []);
+  assert.equal(f.editPolicy, undefined);
+});
+
+test('every COMMAND_EDIT_POLICY entry names a real command with EditTool, and a policy the engine knows', () => {
+  const { COMMAND_EDIT_POLICY } = require('../src/config/agentBilling');
+  for (const [name, policy] of Object.entries(COMMAND_EDIT_POLICY)) {
+    assert.ok(COMMAND_TOOLS[name], `${name} is a known command`);
+    assert.ok(COMMAND_TOOLS[name].includes('EditTool'), `${name} edits with EditTool`);
+    assert.ok(['proofread', 'rewrite'].includes(policy), 'the engine knows only "proofread" and "rewrite" (internal/tools/edit/policy.go)');
+  }
+});
+
+test('startAgent forwards editPolicy to the engine only when set', async () => {
+  const writingEngine = require('../src/services/writingEngine');
+  const realFetch = global.fetch;
+  const bodies = [];
+  global.fetch = async (_url, opts) => { bodies.push(JSON.parse(opts.body)); return { ok: true, body: null, text: async () => '' }; };
+  try {
+    await writingEngine.startAgent('s1', 'goal', 75, 3, undefined, ['EditTool'], 'sequential', null, false, 0, 'proofread');
+    await writingEngine.startAgent('s1', 'goal', 75, 3, undefined, ['EditTool'], 'sequential', null, false, 0);
+  } finally {
+    global.fetch = realFetch;
+  }
+  assert.equal(bodies[0].editPolicy, 'proofread');
+  assert.equal('editPolicy' in bodies[1], false);
+});

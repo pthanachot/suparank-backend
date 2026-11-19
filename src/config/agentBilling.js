@@ -145,6 +145,25 @@ const COMMAND_TOOLS = {
 };
 
 /**
+ * Phase 5: per-command EditTool policy, enforced by the writing engine
+ * (internal/tools/edit/policy.go). Like the tool whitelist, the server picks
+ * it from the command name; the request body cannot set it.
+ *
+ * "proofread" (/grammar): an edit must be a correction. The engine refuses
+ * spelling-variant swaps (colour → color), dash/quote restyling, optional
+ * serial commas, and multi-word rewrites, telling the model why. Measured on
+ * the free tier, /grammar edited 61% of paragraphs that had no errors.
+ *
+ * "rewrite" (/humanize): wording may change freely, but an edit may not add a
+ * link or a number the replaced text did not have (the eval caught a made-up
+ * example.com citation).
+ */
+const COMMAND_EDIT_POLICY = {
+  grammar: 'proofread',
+  humanize: 'rewrite',
+};
+
+/**
  * Commands that opt in to the engine's autonomous post-agent image pass.
  *
  * INTENTIONALLY EMPTY. The pass is a second, independent image pipeline: it
@@ -343,11 +362,12 @@ function resolveAgentRun(body = {}, content = null, disabledCommands = DEFAULT_D
     allowedTools: tools.slice(),
     imagePass: COMMAND_IMAGE_PASS.has(name),
     imageBudget: COMMAND_IMAGE_BUDGET.has(name) ? IMAGE_BUDGET_PER_RUN : 0,
+    editPolicy: lookupCommand(COMMAND_EDIT_POLICY, name) || undefined,
   };
 }
 
 module.exports = {
-  COMMAND_BILLING, COMMAND_TOOLS, COMMAND_IMAGE_PASS, COMMAND_IMAGE_BUDGET,
+  COMMAND_BILLING, COMMAND_TOOLS, COMMAND_IMAGE_PASS, COMMAND_IMAGE_BUDGET, COMMAND_EDIT_POLICY,
   IMAGE_BUDGET_PER_RUN, DEFAULT_DISABLED_AGENT_COMMANDS,
   classifyAgentRun, isPlanArticleWrite, resolveAgentRun, canonicalMode,
 };

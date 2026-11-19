@@ -4,6 +4,7 @@ const router = express.Router();
 require('../middleware/validateIdParams')(router);
 const brandVoiceController = require('../controllers/brandVoiceController');
 const { authenticateToken } = require('../middleware/auth');
+const requestTiming = require('../services/requestTiming');
 
 // Multer config: memory storage, 10MB limit, PDF/DOCX/TXT only
 const upload = multer({
@@ -95,7 +96,9 @@ router.post(
         }
         return res.status(400).json({ error: err.message || 'File upload failed' });
       }
-      next();
+      // multer continues from a busboy stream event, outside the request's
+      // timing context (QA B32 Server-Timing); re-enter it for the handler.
+      requestTiming.resume(req, () => next());
     });
   },
   brandVoiceController.uploadAvatarFile

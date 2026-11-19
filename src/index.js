@@ -8,6 +8,12 @@ const cookieParser = require('cookie-parser');
 
 dotenv.config();
 
+// QA B32: Server-Timing (app + Mongo time and query count) on /api responses.
+// The Mongoose plugin must be registered before ANY model is compiled, so
+// this stays above every require that can load a model.
+const requestTiming = require('./services/requestTiming');
+requestTiming.installMongoosePlugin();
+
 // Fail-fast on missing env vars so config issues surface at deploy time
 // instead of as opaque 500s on the first request. Names match what the
 // codebase actually reads (middleware/auth.js uses ACCESS_TOKEN_SECRET,
@@ -170,12 +176,17 @@ app.use(require('./middleware/mongoSanitize'));
 // interesting numbers are the [timing] lines from aiController (setup pushes,
 // time-to-first-engine-byte) that break the total down.
 const REQUEST_TIMING_MIN_MS = parseInt(process.env.REQUEST_TIMING_MIN_MS || '250', 10);
+// QA B32: Server-Timing header + per-request Mongo time/query count. Mounted
+// AFTER body parsing on purpose: raw-body's stream callbacks would drop the
+// AsyncLocalStorage context it runs requests in.
+app.use('/api/', requestTiming.middleware);
 app.use((req, res, next) => {
   const t0 = Date.now();
   res.on('finish', () => {
     const ms = Date.now() - t0;
     if (ms >= REQUEST_TIMING_MIN_MS) {
-      console.log(`[timing] ${req.method} ${req.originalUrl} ${res.statusCode} ${ms}ms`);
+      const db = req._srTiming ? ` db=${req._srTiming.dbMs.toFixed(0)}ms/${req._srTiming.dbOps}q` : '';
+      console.log(`[timing] ${req.method} ${req.originalUrl} ${res.statusCode} ${ms}ms${db}`);
     }
   });
   next();

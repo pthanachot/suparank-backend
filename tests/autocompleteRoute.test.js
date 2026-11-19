@@ -30,8 +30,8 @@ function findRoute(fragment, method = 'post') {
 test('autocomplete route is registered as POST', () => {
   const ac = findRoute('ai/autocomplete');
   assert.ok(ac, 'autocomplete route should be registered');
-  // limiter + rwr + rf('aiChat') + rp('aiChat','use') + handler = 5.
-  assert.strictEqual(ac.route.stack.length, 5, 'autocomplete should have 5 handlers (incl. its own limiter, no credit gate)');
+  // limiter + rwr + rf('aiChat') + rp('aiChat','use') + rejectIfDone(quiet) + handler = 6.
+  assert.strictEqual(ac.route.stack.length, 6, 'autocomplete should have 6 handlers (incl. its own limiter, done guard, no credit gate)');
 });
 
 test('autocomplete has one MORE handler than the credit-free upload-image route but is still gated', () => {

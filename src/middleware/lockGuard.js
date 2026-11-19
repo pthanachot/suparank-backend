@@ -6,6 +6,7 @@
  */
 
 const Content = require('../models/Content');
+const { doneLockBody } = require('../services/doneLock');
 
 /**
  * Factory: creates middleware that rejects if the target resource is locked.
@@ -73,7 +74,42 @@ function contentLockResolver(req) {
     .lean();
 }
 
+/**
+ * Refuse to START AI work on an article marked done (the server half of the
+ * editor's B28 lock; see services/doneLock). Mount it AFTER the permission
+ * checks and BEFORE requireCredits, so a refused run never holds credits.
+ *
+ * `quiet: true` is for ghost-text autocomplete: a refusal there answers like
+ * "no suggestion" (200 { completion: '' }) instead of an error the editor
+ * would surface on every typing pause.
+ *
+ * Fails open on a lookup error, like rejectIfLocked: this is a workflow lock,
+ * not an access control, and a DB hiccup must not block every AI request.
+ */
+function rejectIfDone({ quiet = false } = {}) {
+  const guard = async (req, res, next) => {
+    try {
+      const workspaceId = req.workspace?._id;
+      const contentNumber = Number(req.params.contentNumber);
+      if (!workspaceId || !Number.isFinite(contentNumber)) return next();
+      const doc = await Content.findOne({ workspaceId, contentNumber }, { status: 1 }, { lean: true });
+      if (doc && doc.status === 'done') {
+        if (quiet) return res.json({ completion: '' });
+        return res.status(409).json(doneLockBody('ai'));
+      }
+      next();
+    } catch (err) {
+      console.error('[lockGuard] Error checking done status:', err.message);
+      next();
+    }
+  };
+  // Marker for the route-wiring tests (which routes carry the done guard).
+  guard.doneGuard = quiet ? 'quiet' : true;
+  return guard;
+}
+
 module.exports = {
   rejectIfLocked,
   contentLockResolver,
+  rejectIfDone,
 };

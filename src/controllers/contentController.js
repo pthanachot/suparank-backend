@@ -16,6 +16,7 @@ const {
   parseBaseRevision, parseWriter, revisionFilter, revisionUpdate, conflictBody, RevisionInputError,
 } = require('../services/contentRevision');
 const { presentAnalysisError } = require('../services/analysisErrors');
+const { doneLockBody, isReopen, touchesContent, changesContent } = require('../services/doneLock');
 
 /**
  * The ONE client shape of a content document (GET, PUT, POST and the 409
@@ -349,6 +350,30 @@ const updateContent = async (req, res) => {
       updates.versions = r.versions;
     }
 
+    const docFilter = { workspaceId: workspace._id, contentNumber: Number(req.params.contentNumber) };
+
+    // Done lock (services/doneLock). Checked after sanitising (the stored copy
+    // is the sanitised form) and before any image is rehosted, so a refused
+    // save uploads nothing. Reopening ("status" away from done) always passes.
+    // doneGuarded adds `status != done` to the write itself, which closes the
+    // race where another tab marks the article done between this read and the
+    // write below.
+    let doneGuarded = false;
+    if (touchesContent(updates) && !isReopen(updates)) {
+      // Projection + { lean } as arguments (not .select().lean()), so the
+      // controller tests' plain async findOne stubs work unchanged.
+      const st = await Content.findOne(docFilter, { status: 1 }, { lean: true });
+      if (st && st.status === 'done') {
+        const current = await Content.findOne(docFilter, { title: 1, slug: 1, description: 1, blocks: 1 }, { lean: true });
+        if (current && changesContent(Content, current, updates)) {
+          return res.status(409).json(doneLockBody('edit'));
+        }
+        // Identical content (an autosave of score/versions): save it as usual.
+      } else {
+        doneGuarded = true;
+      }
+    }
+
     // Copy any base64 / engine-hosted images to B2 before saving.
     if (imageStorage.isEnabled()) {
       // One cache per request, keyed by the ORIGINAL src. The same image
@@ -433,17 +458,28 @@ const updateContent = async (req, res) => {
       }
     }
 
-    const docFilter = { workspaceId: workspace._id, contentNumber: Number(req.params.contentNumber) };
-    const content = await Content.findOneAndUpdate(
-      { ...docFilter, ...revisionFilter(baseRevision, writer) },
+    const writeOnce = (guardDone) => Content.findOneAndUpdate(
+      { ...docFilter, ...revisionFilter(baseRevision, writer), ...(guardDone ? { status: { $ne: 'done' } } : {}) },
       revisionUpdate(updates, writer),
       { new: true, runValidators: true }
     );
+    let content = await writeOnce(doneGuarded);
+
+    if (!content && doneGuarded) {
+      // The done guard, not the revision, may be what stopped the write: the
+      // article was marked done after the check above. Refuse a real change;
+      // an identical body (nothing to protect) is written without the guard.
+      const now = await Content.findOne(docFilter, { status: 1, title: 1, slug: 1, description: 1, blocks: 1 }, { lean: true });
+      if (now && now.status === 'done') {
+        if (changesContent(Content, now, updates)) return res.status(409).json(doneLockBody('edit'));
+        content = await writeOnce(false);
+      }
+    }
 
     if (!content) {
       // No match: either the document is gone, or (with a baseRevision) a
       // newer save landed first. Tell those apart with one read.
-      const current = baseRevision !== null ? await Content.findOne(docFilter) : null;
+      const current = (baseRevision !== null || doneGuarded) ? await Content.findOne(docFilter) : null;
       if (!current) return res.status(404).json({ error: 'Content not found' });
       if (current.locked) {
         return res.status(403).json({ error: 'This content is locked. Upgrade your plan to regain access.', locked: true });

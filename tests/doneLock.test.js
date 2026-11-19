@@ -448,6 +448,44 @@ describe('updateContent done lock (real MongoDB)', () => {
     }
   });
 
+  // Independent-review fix (finding 1): Mark done rehosted an image, the tab
+  // kept the pre-upload src, and its next autosave echoed it.
+  test('done + an image still at its pre-upload src (data URI) is the same image: saved, body not rewritten, nothing uploaded', async () => {
+    const hosted = '/api/b2-image/images/final.png';
+    const n = await makeDoc({ blocks: [{ id: 'h', type: 'h1', text: 'T' }, { id: 'im', type: 'img', src: hosted, alt: 'a' }] });
+    const res = await put(n, { blocks: [{ id: 'h', type: 'h1', text: 'T' }, { id: 'im', type: 'img', src: 'data:image/png;base64,AAAA', alt: 'a' }], score: 12 });
+    assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+    assert.equal(uploads, 0, 'an unchanged body on a done article is not rehosted');
+    const after = await read(n);
+    assert.equal(after.blocks[1].src, hosted, 'the hosted image is kept');
+    assert.equal(after.score, 12);
+  });
+
+  test('done + a pre-upload image that is NOT the stored one (other block id, or new block) is a change', async () => {
+    const hosted = '/api/b2-image/images/final.png';
+    const n = await makeDoc({ blocks: [{ id: 'im', type: 'img', src: hosted, alt: 'a' }] });
+    const swapped = await put(n, { blocks: [{ id: 'other', type: 'img', src: 'data:image/png;base64,AAAA', alt: 'a' }] });
+    assert.equal(swapped.statusCode, 409);
+    const added = await put(n, { blocks: [{ id: 'im', type: 'img', src: hosted, alt: 'a' }, { id: 'im2', type: 'img', src: 'data:image/png;base64,BBBB', alt: 'b' }] });
+    assert.equal(added.statusCode, 409);
+    assert.equal(uploads, 0);
+  });
+
+  test('race + pre-upload image: marked done after the check; the same image is not a change (200, stored copy kept)', async () => {
+    const hosted = '/api/b2-image/images/final.png';
+    const n = await makeDoc({ status: 'draft', blocks: [{ id: 'im', type: 'img', src: hosted, alt: 'a' }] });
+    const res = await racePut(n, { blocks: [{ id: 'im', type: 'img', src: 'data:image/png;base64,AAAA', alt: 'a' }], score: 4 });
+    assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+    const after = await read(n);
+    assert.equal(after.status, 'done');
+    assert.equal(after.blocks[0].src, hosted, 'the rehosted upload from the refused body was not written');
+  });
+
+  test('dropContent removes only the content fields', () => {
+    const { dropContent } = require('../src/services/doneLock');
+    assert.deepEqual(dropContent({ blocks: [], title: 't', slug: 's', description: 'd', score: 1, versions: [], status: 'done' }), { score: 1, versions: [], status: 'done' });
+  });
+
   test('a stale-revision save on a DRAFT is still an ordinary revision conflict', async () => {
     const n = await makeDoc({ status: 'draft' });
     const res = await put(n, { title: 'x', baseRevision: 42 });

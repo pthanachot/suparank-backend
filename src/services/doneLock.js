@@ -62,11 +62,34 @@ function castBlocks(Model, blocks) {
 }
 
 /**
+ * An image the client still holds by its pre-upload source (a data: URI or a
+ * temporary engine URL) while the stored copy already has the rehosted URL:
+ * the same image, waiting on a rewrite the client never adopted (e.g. "Mark
+ * as done" rehosted it and an autosave then echoed the old src). Compare it
+ * as the stored src. Only used to decide "unchanged"; an unchanged body on a
+ * done article is never written (see dropContent), so this cannot be used to
+ * swap an image.
+ */
+function alignPendingImages(nextBlocks, prevBlocks, pendingRehost) {
+  if (!pendingRehost || !Array.isArray(nextBlocks) || !Array.isArray(prevBlocks)) return nextBlocks;
+  return nextBlocks.map((b, i) => {
+    const p = prevBlocks[i];
+    if (b && p && b.type === 'img' && p.type === 'img' && b.id === p.id
+      && typeof b.src === 'string' && pendingRehost(b.src)
+      && typeof p.src === 'string' && !pendingRehost(p.src)) {
+      return { ...b, src: p.src };
+    }
+    return b;
+  });
+}
+
+/**
  * Does this update change the article's content compared with `current`
  * (a lean or hydrated Content with the CONTENT_FIELDS selected)?
  * Only fields present in the update are compared.
+ * opts.pendingRehost(src): true for a src the save path would rehost.
  */
-function changesContent(Model, current, updates) {
+function changesContent(Model, current, updates, opts = {}) {
   for (const f of ['title', 'slug', 'description']) {
     if (updates[f] === undefined) continue;
     const next = updates[f] === null ? '' : String(updates[f]);
@@ -74,11 +97,18 @@ function changesContent(Model, current, updates) {
     if (next !== prev) return true;
   }
   if (updates.blocks !== undefined) {
-    const next = canonical(castBlocks(Model, updates.blocks));
-    const prev = canonical(castBlocks(Model, current.blocks));
-    if (next !== prev) return true;
+    const prevBlocks = castBlocks(Model, current.blocks);
+    const nextBlocks = alignPendingImages(castBlocks(Model, updates.blocks), prevBlocks, opts.pendingRehost);
+    if (canonical(nextBlocks) !== canonical(prevBlocks)) return true;
   }
   return false;
+}
+
+/** Remove the content fields from an update (an unchanged body on a done
+ *  article is not written: nothing to protect, nothing to rehost). */
+function dropContent(updates) {
+  for (const f of CONTENT_FIELDS) delete updates[f];
+  return updates;
 }
 
 module.exports = {
@@ -88,5 +118,6 @@ module.exports = {
   isReopen,
   touchesContent,
   changesContent,
+  dropContent,
   canonical,
 };

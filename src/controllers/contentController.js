@@ -16,7 +16,22 @@ const {
   parseBaseRevision, parseWriter, revisionFilter, revisionUpdate, conflictBody, RevisionInputError,
 } = require('../services/contentRevision');
 const { presentAnalysisError } = require('../services/analysisErrors');
-const { doneLockBody, isReopen, touchesContent, changesContent } = require('../services/doneLock');
+const { doneLockBody, isReopen, touchesContent, changesContent, dropContent } = require('../services/doneLock');
+
+/** A src the save path would rehost (data URI or temporary engine URL). */
+const pendingRehost = (src) => typeof src === 'string'
+  && (src.startsWith('data:image/') || imageStorage.looksLikeEngineImageUrl(src));
+
+/**
+ * Done lock: the stored copy as a client holds it, so a body that merely
+ * echoes what GET returned is never mistaken for an edit. GET migrates old
+ * public image URLs (toClientContent) and every save runs the sanitizer, so
+ * an old document stored before either existed compares in that same form.
+ */
+function asClientSees(current) {
+  const c = toClientContent(current);
+  return { ...c, blocks: Array.isArray(c.blocks) ? sanitizeBlocks(c.blocks).blocks : c.blocks };
+}
 
 /**
  * The ONE client shape of a content document (GET, PUT, POST and the 409
@@ -365,14 +380,19 @@ const updateContent = async (req, res) => {
       const st = await Content.findOne(docFilter, { status: 1 }, { lean: true });
       if (st && st.status === 'done') {
         const current = await Content.findOne(docFilter, { title: 1, slug: 1, description: 1, blocks: 1 }, { lean: true });
-        if (current && changesContent(Content, current, updates)) {
+        if (current && changesContent(Content, asClientSees(current), updates, { pendingRehost })) {
           return res.status(409).json(doneLockBody('edit'));
         }
-        // Identical content (an autosave of score/versions): save it as usual.
+        // Unchanged content (an autosave of score/versions): save the rest,
+        // never the body, so nothing on a done article is rewritten.
+        dropContent(updates);
       } else {
         doneGuarded = true;
       }
     }
+    // Rehosting (below) rewrites img src in place; the race check after the
+    // write must compare the body as the client sent it.
+    const sentBlocks = doneGuarded && Array.isArray(updates.blocks) ? updates.blocks.map((b) => ({ ...b })) : undefined;
 
     // Copy any base64 / engine-hosted images to B2 before saving.
     if (imageStorage.isEnabled()) {
@@ -471,7 +491,9 @@ const updateContent = async (req, res) => {
       // an identical body (nothing to protect) is written without the guard.
       const now = await Content.findOne(docFilter, { status: 1, title: 1, slug: 1, description: 1, blocks: 1 }, { lean: true });
       if (now && now.status === 'done') {
-        if (changesContent(Content, now, updates)) return res.status(409).json(doneLockBody('edit'));
+        const asSent = sentBlocks ? { ...updates, blocks: sentBlocks } : updates;
+        if (changesContent(Content, asClientSees(now), asSent, { pendingRehost })) return res.status(409).json(doneLockBody('edit'));
+        dropContent(updates);
         content = await writeOnce(false);
       }
     }

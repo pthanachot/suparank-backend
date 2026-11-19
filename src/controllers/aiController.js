@@ -2100,7 +2100,7 @@ const agent = async (req, res) => {
     const { safeIterations, safeTargetScore } = clampAgentBudget(maxIterations, targetScore);
     const tConnect = Date.now();
     const agentRes = await writingEngine.startAgent(
-      sessionId, goal, safeTargetScore, safeIterations, abortCtrl.signal, enforcedTools, safeMode, agentPreset, runGate.imagePass, runGate.imageBudget
+      sessionId, goal, safeTargetScore, safeIterations, abortCtrl.signal, enforcedTools, safeMode, agentPreset, runGate.imagePass, runGate.imageBudget, runGate.editPolicy
     );
     console.log(`[timing] ai.agent engine-connect=${Date.now() - tConnect}ms (request+${Date.now() - tReq}ms)`);
 

@@ -189,8 +189,13 @@ async function sendChatMessageStream(sessionId, prompt, signal, preset, opts = {
  * @param {string[]} [allowedTools] - restrict agent to only these tools (e.g. ["EditTool"])
  * @returns {Promise<Response>} The raw fetch response (SSE stream)
  */
-async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5, signal, allowedTools, mode, preset, imagePass = false, imageBudget = 0) {
+async function startAgent(sessionId, goal, targetScore = 75, maxIterations = 5, signal, allowedTools, mode, preset, imagePass = false, imageBudget = 0, editPolicy = undefined) {
   const payload = { goal, targetScore, maxIterations };
+  // Phase 5: the command's EditTool policy (COMMAND_EDIT_POLICY), e.g.
+  // "proofread" for /grammar. Absent = no extra limits.
+  if (editPolicy) {
+    payload.editPolicy = editPolicy;
+  }
   if (allowedTools?.length > 0) {
     payload.allowedTools = allowedTools;
   }

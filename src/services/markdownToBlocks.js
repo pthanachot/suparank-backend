@@ -151,28 +151,38 @@ function markdownToBlocks(markdown) {
       continue;
     }
 
-    // Unordered list items: - item or * item
-    if (/^[-*]\s+/.test(trimmed)) {
-      const itemText = trimmed.replace(/^[-*]\s+/, '');
+    // Unordered list items: - item or * item. Leading spaces are nesting
+    // (two per level, as the serializer writes them); without this a nested
+    // item fell through to a paragraph with "- " in its text.
+    const ul = /^(\s*)[-*]\s+/.exec(trimmed);
+    if (ul) {
+      const indent = Math.floor(ul[1].length / 2);
+      const itemText = trimmed.slice(ul[0].length);
       // QA B26: "- [ ] item" / "- [x] item" is a checklist item (mirror of
       // the frontend's parseTaskMarker).
       const task = /^\[( |x|X)\](?:[ \t]+([\s\S]*))?$/.exec(itemText);
+      // "- \[ ] text" is a plain bullet whose text starts with "[ ]".
+      const literal = !task && itemText.startsWith('\\[') && /^\[( |x|X)\](?:[ \t]+[\s\S]*)?$/.test(itemText.slice(1));
       blocks.push({
         id: nextId(),
         type: 'li',
-        text: mdInlineToHtml(task ? (task[2] || '') : itemText),
+        text: mdInlineToHtml(task ? (task[2] || '') : (literal ? itemText.slice(1) : itemText)),
         ...(task ? { checked: task[1] !== ' ' } : {}),
+        ...(indent > 0 ? { indent } : {}),
       });
       i++;
       continue;
     }
 
-    // Ordered list items: 1. item
-    if (/^\d+\.\s+/.test(trimmed)) {
+    // Ordered list items: 1. item (leading spaces = nesting, as above)
+    const ol = /^(\s*)\d+\.\s+/.exec(trimmed);
+    if (ol) {
+      const indent = Math.floor(ol[1].length / 2);
       blocks.push({
         id: nextId(),
         type: 'ol',
-        text: mdInlineToHtml(trimmed.replace(/^\d+\.\s+/, '')),
+        text: mdInlineToHtml(trimmed.slice(ol[0].length)),
+        ...(indent > 0 ? { indent } : {}),
       });
       i++;
       continue;
@@ -280,8 +290,8 @@ function markdownToBlocks(markdown) {
       i < lines.length &&
       lines[i].trimEnd() !== '' &&
       !lines[i].trimEnd().match(/^#{1,6}\s/) &&
-      !lines[i].trimEnd().match(/^[-*]\s+/) &&
-      !lines[i].trimEnd().match(/^\d+\.\s+/) &&
+      !lines[i].trimEnd().match(/^\s*[-*]\s+/) &&
+      !lines[i].trimEnd().match(/^\s*\d+\.\s+/) &&
       !lines[i].trimEnd().startsWith('> ') &&
       !lines[i].trimEnd().startsWith('```') &&
       !lines[i].trimEnd().match(/^(-{3,}|_{3,}|\*{3,})$/) &&

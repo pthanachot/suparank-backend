@@ -42,6 +42,26 @@ describe('serializers', () => {
     assert.deepEqual(back.map((b) => [b.text, b.checked]), [['', false], ['Caps', true], ['[x]tight', undefined]]);
   });
 
+  test('a plain bullet starting with "[ ]" is escaped and parsed back as a plain bullet', () => {
+    const md = blocksToMarkdown([li('a', '[ ] Buy milk'), li('b', '[x] Done already')]);
+    assert.equal(md, '- \\[ ] Buy milk\n\n- \\[x] Done already');
+    const back = markdownToBlocks(md);
+    assert.deepEqual(back.map((b) => [b.text, b.checked]), [['[ ] Buy milk', undefined], ['[x] Done already', undefined]]);
+  });
+
+  test('nested list items (two spaces per level) are list items, not paragraphs', () => {
+    const back = markdownToBlocks('- [ ] a\n\n  - [x] b\n\n    - c\n\n1. one\n\n  1. nested');
+    assert.deepEqual(back.map((b) => [b.type, b.text, b.checked, b.indent]), [
+      ['li', 'a', false, undefined], ['li', 'b', true, 1], ['li', 'c', undefined, 2],
+      ['ol', 'one', undefined, undefined], ['ol', 'nested', undefined, 1],
+    ]);
+  });
+
+  test('CRLF parses like LF', () => {
+    const back = markdownToBlocks('- [ ] One\r\n- [x] Two\r\n');
+    assert.deepEqual(back.map((b) => [b.text, b.checked]), [['One', false], ['Two', true]]);
+  });
+
   test('context-file markdown keeps the state', () => {
     assert.equal(blockToMarkdownMinimal(li('a', 'Do <b>it</b>', true)), '- [x] Do it');
     assert.equal(blockToMarkdownMinimal(li('a', 'Plain')), '- Plain');

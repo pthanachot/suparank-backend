@@ -411,6 +411,43 @@ describe('updateContent done lock (real MongoDB)', () => {
     assert.notEqual((await read(n)).blocks[0].text, 'after done');
   });
 
+  // Review fix: old documents. GET hands the client a transformed copy (old
+  // image URLs migrated; the save path sanitizes), so echoing it back must not
+  // count as an edit of a done article.
+  async function makeLegacyDone(blocks) {
+    const contentNumber = seq++;
+    await Content.collection.insertOne({
+      userId: USER, workspaceId: WS, contentNumber, title: 'Legacy', slug: 'legacy', description: 'm',
+      blocks, status: 'done', revision: 0, createdAt: new Date(), updatedAt: new Date(),
+    });
+    return contentNumber;
+  }
+
+  test('legacy unsanitized markup: echoing the stored copy is not an edit; a real edit still is', async () => {
+    const raw = [{ id: 'p', type: 'p', text: 'Hi <img src=x onerror="alert(1)"> there <a href="javascript:alert(2)">x</a>' }];
+    const n = await makeLegacyDone(raw);
+    const echo = await put(n, { blocks: raw, score: 9 });
+    assert.equal(echo.statusCode, 200, JSON.stringify(echo.body));
+    const edit = await put(n, { blocks: [{ id: 'p', type: 'p', text: 'Different' }] });
+    assert.equal(edit.statusCode, 409);
+    assert.equal(edit.body.code, 'ARTICLE_DONE');
+  });
+
+  test('legacy image URL: the migrated src GET returns is not an edit; another src is', async () => {
+    stub(imageStorage, 'migratePublicUrl', (src) => (src === 'https://old-bucket.example/images/a.png' ? '/api/b2-image/images/a.png' : null));
+    try {
+      const n = await makeLegacyDone([{ id: 'i', type: 'img', src: 'https://old-bucket.example/images/a.png', alt: 'a' }]);
+      const echo = await put(n, { blocks: [{ id: 'i', type: 'img', src: '/api/b2-image/images/a.png', alt: 'a' }], score: 3 });
+      assert.equal(echo.statusCode, 200, JSON.stringify(echo.body));
+      const swap = await put(n, { blocks: [{ id: 'i', type: 'img', src: '/api/b2-image/images/b.png', alt: 'a' }] });
+      assert.equal(swap.statusCode, 409);
+    } finally {
+      const i = saved.findIndex(([o, k]) => o === imageStorage && k === 'migratePublicUrl');
+      const [o, k, v] = saved.splice(i, 1)[0];
+      o[k] = v;
+    }
+  });
+
   test('a stale-revision save on a DRAFT is still an ordinary revision conflict', async () => {
     const n = await makeDoc({ status: 'draft' });
     const res = await put(n, { title: 'x', baseRevision: 42 });

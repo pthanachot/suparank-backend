@@ -155,10 +155,19 @@ userSchema.methods.invalidateTokens = async function () {
 };
 
 // Update last active
+// Called (fire-and-forget) on every authenticated request. Throttled to one
+// write a minute per user and written as a single-field update: a full
+// save() per request was a write on every API call, and a whole-document
+// save racing another save of the same user could overwrite its changes.
+const LAST_ACTIVE_THROTTLE_MS = 60 * 1000;
 userSchema.methods.updateLastActive = function () {
-  this.lastActive = new Date();
-  return this.save();
+  const now = Date.now();
+  const prev = this.lastActive instanceof Date ? this.lastActive.getTime() : 0;
+  if (prev && now - prev < LAST_ACTIVE_THROTTLE_MS) return Promise.resolve(this);
+  this.lastActive = new Date(now);
+  return this.constructor.updateOne({ _id: this._id }, { $set: { lastActive: this.lastActive } }).exec();
 };
+userSchema.statics.LAST_ACTIVE_THROTTLE_MS = LAST_ACTIVE_THROTTLE_MS;
 
 // Defense-in-depth: strip sensitive fields from any serialization (res.json,
 // JSON.stringify, etc.) so a future controller that accidentally passes a

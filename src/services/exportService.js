@@ -129,12 +129,19 @@ function renderBlocksHtml(blocks = []) {
     const type = blocks[i].type;
     if (type === 'li' || type === 'ol') {
       const tag = type === 'ol' ? 'ol' : 'ul';
+      // QA B26: a checklist is its own list (never merged with bullets), as
+      // GitHub-style task list items with a disabled checkbox.
+      const isTask = (b) => b.type === 'li' && typeof b.checked === 'boolean';
+      const task = isTask(blocks[i]);
       const items = [];
-      while (i < blocks.length && blocks[i].type === type) {
-        items.push(`  <li>${blocks[i].text || ''}</li>`);
+      while (i < blocks.length && blocks[i].type === type && isTask(blocks[i]) === task) {
+        const b = blocks[i];
+        items.push(task
+          ? `  <li class="task-list-item"><input type="checkbox" disabled${b.checked ? ' checked' : ''}> ${b.text || ''}</li>`
+          : `  <li>${b.text || ''}</li>`);
         i++;
       }
-      out.push(`<${tag}>\n${items.join('\n')}\n</${tag}>`);
+      out.push(task ? `<ul class="contains-task-list">\n${items.join('\n')}\n</ul>` : `<${tag}>\n${items.join('\n')}\n</${tag}>`);
     } else {
       out.push(renderBlockHtml(blocks[i]));
       i++;

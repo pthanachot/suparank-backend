@@ -153,10 +153,15 @@ function markdownToBlocks(markdown) {
 
     // Unordered list items: - item or * item
     if (/^[-*]\s+/.test(trimmed)) {
+      const itemText = trimmed.replace(/^[-*]\s+/, '');
+      // QA B26: "- [ ] item" / "- [x] item" is a checklist item (mirror of
+      // the frontend's parseTaskMarker).
+      const task = /^\[( |x|X)\](?:[ \t]+([\s\S]*))?$/.exec(itemText);
       blocks.push({
         id: nextId(),
         type: 'li',
-        text: mdInlineToHtml(trimmed.replace(/^[-*]\s+/, '')),
+        text: mdInlineToHtml(task ? (task[2] || '') : itemText),
+        ...(task ? { checked: task[1] !== ' ' } : {}),
       });
       i++;
       continue;

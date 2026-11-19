@@ -17,6 +17,7 @@ const {
 } = require('../services/contentRevision');
 const { presentAnalysisError } = require('../services/analysisErrors');
 const { doneLockBody, isReopen, touchesContent, changesContent, dropContent } = require('../services/doneLock');
+const { taskMarker } = require('../services/blocksToMarkdown');
 
 /** A src the save path would rehost (data URI or temporary engine URL). */
 const pendingRehost = (src) => typeof src === 'string'
@@ -730,7 +731,7 @@ function blocksToText(blocks) {
     if (b.type === 'h4') return '#### ' + text;
     if (b.type === 'h5') return '##### ' + text;
     if (b.type === 'h6') return '###### ' + text;
-    if (b.type === 'li') return '- ' + text;
+    if (b.type === 'li') return '- ' + taskMarker(b) + text; // QA B26: keep checklist state
     if (b.type === 'ol') return '1. ' + text;
     if (b.type === 'quote') return '> ' + text;
     if (b.type === 'faq' && b.faqItems) return b.faqItems.map((f) => `**Q: ${f.question}**\nA: ${f.answer}`).join('\n');

@@ -54,7 +54,10 @@ test('the backend PARSER treats anchor lines as zero-word non-blocks (review fix
   // still counts — and this parser has its own h2+h3+answer faq collapse
   // (one-paragraph answers, its established shape), so the trailing list item
   // sits outside the collapsed block.
-  assert.deepStrictEqual(types, ['h1', 'p', 'p', 'faq', 'li', 'img', 'table'], 'expected only the real prose blocks');
+  assert.deepStrictEqual(types, ['h1', 'p', 'p', 'faq', 'li', 'img', 'table', 'li', 'li', 'li'], 'expected only the real prose blocks');
+  // QA B26: the parser reads the task markers back (and leaves a plain bullet plain).
+  assert.deepStrictEqual(parsed.slice(-3).map((b) => b.checked), [false, true, undefined]);
+  assert.deepStrictEqual(parsed.slice(-3).map((b) => b.text), ['Pick a <strong>plan</strong>', 'Invite the team', 'A plain bullet']);
 });
 
 test('the backend parser TERMINATES on image lines (pre-existing infinite loop, fixed in P12)', () => {

@@ -73,6 +73,10 @@ const blockSchema = new mongoose.Schema(
     // the image loads does not strand it un-sized (which is exactly what
     // strict mode did to caption/indent/toggleData above).
     autoSize: Boolean,
+    // QA B26: checklist item. Only on `li` blocks; a boolean makes the bullet
+    // a checkbox (absent = ordinary bullet). Without it here, strict mode
+    // stripped the field on save and every checklist came back as bullets.
+    checked: Boolean,
     faqItems: [faqItemSchema],
     ctaData: ctaDataSchema,
     tableData: tableDataSchema,

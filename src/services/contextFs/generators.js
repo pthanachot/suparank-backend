@@ -14,6 +14,7 @@
 
 const anchors = require('./anchors');
 const slug = require('./slug');
+const { taskMarker } = require('../blocksToMarkdown');
 
 const ANCHORS_VERSION = 1;
 
@@ -877,7 +878,7 @@ function blockToMarkdownMinimal(b) {
     case 'h5': return `##### ${t}`;
     case 'h6': return `###### ${t}`;
     case 'p': return t;
-    case 'li': return `- ${t}`;
+    case 'li': return `- ${taskMarker(b)}${t}`; // QA B26: checklist items keep their state
     case 'ol': return `1. ${t}`;
     case 'quote': return `> ${t}`;
     case 'img': return b.src ? `![${b.alt || ''}](${b.src})` : '';

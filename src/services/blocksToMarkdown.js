@@ -35,6 +35,18 @@ function stripHtml(html) {
 }
 
 /**
+ * QA B26: the markdown task marker for a checklist item ("[ ] " / "[x] "),
+ * or "" for an ordinary bullet. A checklist item is an `li` whose `checked`
+ * is a boolean.
+ * @param {{type?: string, checked?: boolean}} b
+ * @returns {string}
+ */
+function taskMarker(b) {
+  if (!b || b.type !== 'li' || typeof b.checked !== 'boolean') return '';
+  return b.checked ? '[x] ' : '[ ] ';
+}
+
+/**
  * Escape double quotes for safe embedding in an HTML attribute.
  * @param {string} s
  * @returns {string}
@@ -66,7 +78,9 @@ function blocksToMarkdown(blocks) {
       }
 
       case 'li':
-        lines.push('  '.repeat(b.indent || 0) + '- ' + text);
+        // QA B26: checklist items carry the GFM task marker. Mirror of the
+        // frontend serializer; the parity fixture pins it.
+        lines.push('  '.repeat(b.indent || 0) + '- ' + taskMarker(b) + text);
         break;
 
       case 'ol':
@@ -216,4 +230,4 @@ function blocksToMarkdown(blocks) {
   return lines.join('\n').trim();
 }
 
-module.exports = { blocksToMarkdown, htmlInlineToMd, stripHtml };
+module.exports = { blocksToMarkdown, htmlInlineToMd, stripHtml, taskMarker };

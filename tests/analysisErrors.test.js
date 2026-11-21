@@ -45,7 +45,6 @@ test('content problems stay paid (a retry with the same input cannot help)', () 
     'could not crawl any competitor pages': 'no_sources',
     'Engine returned 502: AI analysis failed — no citations or crawlable sources': 'no_sources',
     'Engine returned 400: keywords are required': 'invalid_request',
-    'something nobody anticipated': 'unknown',
   };
   for (const [raw, code] of Object.entries(cases)) {
     assert.equal(classifyAnalysisFailure(raw), code, raw);
@@ -144,4 +143,38 @@ test('getBenchmark never sends the raw stored error', async () => {
   assert.equal(res.body.analysisErrorCode, 'provider_auth');
   assert.equal(res.body.analysisRetryFree, true);
   assert.doesNotMatch(JSON.stringify(res.body), /openrouter|User not found/);
+});
+
+// ── QA B40 follow-up (Nov 21): an unclassifiable failure is ours ──
+
+test('an unrecognised engine failure is a free retry, with no-em-dash copy', () => {
+  for (const raw of ['something nobody anticipated', '', 'pipeline: unexpected state 7']) {
+    assert.equal(classifyAnalysisFailure(raw), 'unknown', raw);
+    assert.equal(free(raw), true, `${JSON.stringify(raw)} should be free`);
+  }
+  const msg = ANALYSIS_ERROR_CODES.unknown.message;
+  assert.match(msg, /on our side/);
+  assert.match(msg, /free/);
+  assert.doesNotMatch(msg, /—/);
+});
+
+test('every customer-caused code stays paid, every other code is free', () => {
+  const paid = Object.entries(ANALYSIS_ERROR_CODES).filter(([, s]) => !s.retryFree).map(([c]) => c).sort();
+  assert.deepEqual(paid, ['invalid_request', 'no_serp_results', 'no_sources']);
+});
+
+test('stored unknown failure: client view offers the free retry, and the route accepts it', async () => {
+  const fields = failureFields('pipeline: unexpected state 7');
+  assert.equal(fields.analysisErrorCode, 'unknown');
+  const view = presentAnalysisError({ analysisStatus: 'failed', ...fields });
+  assert.equal(view.analysisRetryFree, true);
+  assert.ok(view.analysisError.startsWith('transient:'), 'the sidebar keys "Retry (free)" off this prefix');
+  const r = await callRetry({ analysisStatus: 'failed', ...fields });
+  assert.equal(r.statusCode, 200);
+  assert.equal(r.body.analysisStatus, 'pending');
+});
+
+test('a legacy row with unrecognised text (no code) is also a free retry', async () => {
+  const r = await callRetry({ analysisStatus: 'failed', analysisError: 'weird legacy text' });
+  assert.equal(r.statusCode, 200);
 });

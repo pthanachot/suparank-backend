@@ -13,7 +13,7 @@ const seatService = require('../services/seatService');
 const systemSettings = require('../services/systemSettingsService');
 const Site = require('../models/Site');
 const Sitemap = require('../models/Sitemap');
-const { ACTIVE_ACTIONS } = require('../config/creditCosts');
+const { ACTIVE_ACTIONS, CHAT_RESERVE_TOKENS } = require('../config/creditCosts');
 const { resolveCredits, agentRunCostShape, FREE_SAMPLE_POOL_CREDITS } = require('../config/creditRules');
 
 /**
@@ -219,7 +219,11 @@ const getTierInfo = async (req, res) => {
     // Free-bundle actions correctly resolve to 0.
     const creditCosts = {};
     for (const action of ACTIVE_ACTIONS) {
-      try { creditCosts[action] = resolveCredits(action, { tier }); } catch { /* skip unresolvable */ }
+      // QA B42: chat is quoted at what the route RESERVES (its upper tier), not
+      // its floor, so "~N ⚡" means "settles at or below N" like every other
+      // price, and the menu's affordability check matches the server's 402.
+      const ctx = action === 'aiChatMessage' ? { tier, tokens: CHAT_RESERVE_TOKENS } : { tier };
+      try { creditCosts[action] = resolveCredits(action, ctx); } catch { /* skip unresolvable */ }
     }
 
     // Phase 3: actions whose AGENT-RUN price is not the single number above.

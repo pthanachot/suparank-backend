@@ -64,9 +64,13 @@ const CODES = Object.freeze({
     retryFree: false,
     message: 'This page could not be analyzed with its current setup. Check the target keyword and try again.',
   },
+  // QA B40 follow-up: a failure we cannot classify is still ours. Every cause
+  // a customer can trigger (no results, no crawlable sources, a refused
+  // input) has its own code above, so an unrecognised engine message is a
+  // server-side failure and must not route to the paid re-analysis.
   unknown: {
-    retryFree: false,
-    message: 'Something went wrong while analyzing this page. Please try again in a moment.',
+    retryFree: true,
+    message: 'Something went wrong on our side while analyzing this page. Trying again is free.',
   },
 });
 

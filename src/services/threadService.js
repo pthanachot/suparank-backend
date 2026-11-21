@@ -220,7 +220,13 @@ function toClientThreadMessage(m, viewerUserId = null) {
     if (src[k] !== undefined && src[k] !== null) meta[k] = src[k];
   }
   let text = '';
-  if (m.kind === 'user') text = m.displayText || m.text || '';
+  if (m.kind === 'user') {
+    // A slash command stores its engineered goal in `text`. Rows written
+    // without a displayText (older clients, or a client that omitted the
+    // label) must still not leak it: show the command name instead.
+    const cmd = typeof src.commandName === 'string' ? src.commandName.trim() : '';
+    text = m.displayText || (cmd ? `/${cmd.replace(/^\//, '')}` : (m.text || ''));
+  }
   else if (m.kind === 'assistant') text = m.text || '';
   const author = src.userId != null ? String(src.userId) : null;
   return {

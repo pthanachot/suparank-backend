@@ -18,7 +18,7 @@ function _sendArchive(res, filename, buffer) {
 /** GET /:workspaceNumber/export — requires resolved workspace + read access. */
 async function exportWorkspace(req, res) {
   try {
-    const { filename, buffer } = await exportService.exportWorkspaceArchive(req.workspace._id);
+    const { filename, buffer } = await exportService.exportWorkspaceArchive(req.workspace._id, { viewerUserId: req.user?.userId || null });
     auditService.fromReq(req, {
       action: 'data.workspace_exported',
       resourceId: req.workspace._id,
@@ -47,7 +47,7 @@ async function exportOrg(req, res) {
       return res.status(403).json({ error: 'You do not have access to a full-organization export' });
     }
 
-    const { filename, buffer } = await exportService.exportOrgArchive(org._id);
+    const { filename, buffer } = await exportService.exportOrgArchive(org._id, { viewerUserId: req.user?.userId || null });
     auditService.record({
       organizationId: org._id,
       userId: req.user?.userId,

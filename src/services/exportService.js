@@ -37,6 +37,7 @@ const ClientSubscription = require('../models/ClientSubscription');
 const { blocksToMarkdown } = require('./blocksToMarkdown');
 const brandService = require('./brandService');
 const { createTarGz } = require('../utils/tar');
+const { toClientThreadMessage } = require('./threadService');
 
 // ─── helpers ────────────────────────────────────────────────────────
 
@@ -169,11 +170,24 @@ ${renderBlocksHtml(blocks || [])}
 
 // ─── per-workspace serialisation ────────────────────────────────────
 
+/** QA B43: thread fields safe to hand to any reader of the export. */
+function exportThreadSummary(t) {
+  return {
+    id: String(t._id),
+    contentId: t.contentId != null ? String(t.contentId) : null,
+    title: t.title || '',
+    status: t.status,
+    messageCount: t.messageCount || 0,
+    createdAt: t.createdAt,
+    lastMessageAt: t.lastMessageAt,
+  };
+}
+
 /**
  * Return an array of { name, data } tar entries for one workspace. `prefix`
  * (e.g. 'workspaces/acme-<id>/') namespaces entries inside an org-level export.
  */
-async function serializeWorkspace(workspaceId, prefix = '') {
+async function serializeWorkspace(workspaceId, prefix = '', opts = {}) {
   const entries = [];
   const p = prefix;
 
@@ -229,10 +243,15 @@ async function serializeWorkspace(workspaceId, prefix = '') {
   const threads = contentIds.length ? await AiThread.find({ contentId: { $in: contentIds } }).lean() : [];
   for (const t of threads) {
     if (!t.messageCount) continue; // empty artifacts — nothing to port
-    const messages = await AiThreadMessage.find({ threadId: t._id }).sort({ seq: 1 }).lean();
+    const rows = await AiThreadMessage.find({ threadId: t._id }).sort({ seq: 1 }).lean();
     const c = threadContents.find((x) => String(x._id) === String(t.contentId));
     const cDir = c ? `${c.contentNumber}-${slugify(c.title || c.slug)}${c._locked ? '-locked' : ''}` : String(t.contentId);
-    entries.push({ name: `${p}conversations/${cDir}/${t._id}.json`, data: json({ thread: t, messages }) });
+    // QA B43: the export is readable by any workspace member with read access,
+    // so it gets the same client shape as GET /ai/thread: typed prompts and
+    // replies (the portable personal data), never the engineered command
+    // prompt, model, token counts or other members' userIds.
+    const messages = rows.map((m) => toClientThreadMessage(m, opts.viewerUserId || null));
+    entries.push({ name: `${p}conversations/${cDir}/${t._id}.json`, data: json({ thread: exportThreadSummary(t), messages }) });
   }
 
   // ── reports ──
@@ -279,7 +298,7 @@ async function serializeWorkspace(workspaceId, prefix = '') {
 
 // ─── per-org serialisation ──────────────────────────────────────────
 
-async function serializeOrg(orgId) {
+async function serializeOrg(orgId, opts = {}) {
   const entries = [];
 
   const org = await Organization.findById(orgId)
@@ -302,7 +321,7 @@ async function serializeOrg(orgId) {
 
   for (const ws of workspaces) {
     const wsPrefix = `workspaces/${slugify(ws.name)}-${ws._id}/`;
-    const wsEntries = await serializeWorkspace(ws._id, wsPrefix);
+    const wsEntries = await serializeWorkspace(ws._id, wsPrefix, opts);
     entries.push(...wsEntries);
   }
 
@@ -321,16 +340,16 @@ async function serializeOrg(orgId) {
 
 // ─── archive builders ───────────────────────────────────────────────
 
-async function exportWorkspaceArchive(workspaceId) {
+async function exportWorkspaceArchive(workspaceId, opts = {}) {
   const ws = await Workspace.findById(workspaceId).select('name workspaceNumber').lean();
-  const entries = await serializeWorkspace(workspaceId);
+  const entries = await serializeWorkspace(workspaceId, '', opts);
   const filename = `workspace-${ws?.workspaceNumber || workspaceId}-${slugify(ws?.name)}.tar.gz`;
   return { filename, buffer: createTarGz(entries) };
 }
 
-async function exportOrgArchive(orgId) {
+async function exportOrgArchive(orgId, opts = {}) {
   const org = await Organization.findById(orgId).select('slug').lean();
-  const entries = await serializeOrg(orgId);
+  const entries = await serializeOrg(orgId, opts);
   const filename = `org-${slugify(org?.slug)}-export.tar.gz`;
   return { filename, buffer: createTarGz(entries) };
 }

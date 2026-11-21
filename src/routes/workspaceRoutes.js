@@ -20,6 +20,7 @@ const { requirePermission } = require('../middleware/permissions.policy');
 const { requireQuota: rq } = require('../middleware/tierEnforcement');
 const { requireCredits: rc } = require('../middleware/creditGate');
 const { resolveCredits, agentRunCredits } = require('../config/creditRules');
+const { CHAT_RESERVE_TOKENS } = require('../config/creditCosts');
 const { rejectIfLocked, contentLockResolver, rejectIfDone } = require('../middleware/lockGuard');
 const rateLimit = require('express-rate-limit');
 
@@ -45,7 +46,7 @@ const autocompleteLimiter = rateLimit({
 // The gate passes { tier } as the 2nd arg. Pre-flight estimates for variable
 // actions are conservative (max) and reconciled to actual by the controller.
 const estAudit = (_req, { tier }) => resolveCredits('contentAudit', { tier });
-const estChat = (_req, { tier }) => resolveCredits('aiChatMessage', { tier, tokens: 8001 }); // reserve 2, settle down
+const estChat = (_req, { tier }) => resolveCredits('aiChatMessage', { tier, tokens: CHAT_RESERVE_TOKENS }); // reserve 2, settle down
 // Agent runs are classified per-command (see agentBilling.js): slash commands
 // price as their mapped action (edit passes 25/2, image per-image); Auto-write,
 // unknown commands, and plan-execute writes price as articleGenerate (100,

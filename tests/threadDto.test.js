@@ -68,3 +68,85 @@ test('getThreadHistory maps every row through the DTO', async () => {
     for (const [o, k, v] of saved) o[k] = v;
   }
 });
+
+// ── QA B43 follow-up (Nov 21): legacy rows and the data export ──
+
+test('legacy command row with no displayText shows /<command>, never the engineered goal', () => {
+  const dto = toClientThreadMessage({
+    seq: 4, kind: 'user', text: ENGINEERED, displayText: '',
+    meta: { userId: 'u-author', channel: 'agent', commandName: 'auto-optimize' },
+  }, 'u-viewer');
+  assert.equal(dto.text, '/auto-optimize');
+  assert.equal(dto.displayText, '/auto-optimize');
+  assert.doesNotMatch(JSON.stringify(dto), /RULES|internal instructions/);
+});
+
+test('a commandName that already carries the slash is not doubled', () => {
+  const dto = toClientThreadMessage({ seq: 5, kind: 'user', text: ENGINEERED, displayText: '', meta: { commandName: '/title' } });
+  assert.equal(dto.text, '/title');
+});
+
+test('a typed agent prompt (empty commandName) is returned as typed', () => {
+  const dto = toClientThreadMessage({ seq: 6, kind: 'user', text: 'tighten the intro', displayText: '', meta: { commandName: '' } });
+  assert.equal(dto.text, 'tighten the intro');
+});
+
+test('workspace export: conversations use the client shape (no engineered prompt, model, tokens or userIds)', async () => {
+  const exportService = require('../src/services/exportService');
+  const Content = require('../src/models/Content');
+  const Workspace = require('../src/models/Workspace');
+  const AiTracker = require('../src/models/AiTracker');
+  const ReportSnapshot = require('../src/models/ReportSnapshot');
+  const KeywordResearchHistory = require('../src/models/KeywordResearchHistory');
+  const BrandVoice = require('../src/models/BrandVoice');
+  const saved = [
+    [Workspace, 'findById', Workspace.findById], [Content, 'find', Content.find], [AiThread, 'find', AiThread.find],
+    [AiThreadMessage, 'find', AiThreadMessage.find], [AiTracker, 'find', AiTracker.find], [ReportSnapshot, 'find', ReportSnapshot.find],
+    [KeywordResearchHistory, 'find', KeywordResearchHistory.find], [BrandVoice, 'find', BrandVoice.find],
+  ];
+  const lean = (val) => ({ select() { return this; }, sort() { return this; }, lean: async () => val });
+  Workspace.findById = () => lean({ _id: 'w1', workspaceNumber: 42, name: 'WS' });
+  Content.find = (f) => lean(f && f.locked === true ? [] : [{ _id: 'c1', contentNumber: 7, title: 'My Post', blocks: [] }]);
+  AiThread.find = () => lean([{
+    _id: 'T1', contentId: 'c1', title: 'Optimize', status: 'active', messageCount: 3,
+    ownerUserId: null, tokenEstimate: 52000, engineSessionId: 'sess-internal', createdAt: new Date(0), lastMessageAt: new Date(1),
+  }]);
+  AiThreadMessage.find = () => lean([
+    { seq: 0, kind: 'user', text: ENGINEERED, displayText: '/auto-optimize', meta: { userId: 'u-other', commandName: 'auto-optimize', model: 'm' } },
+    { seq: 1, kind: 'assistant', text: 'Optimized.', meta: { userId: 'u-other', model: 'google/gemini-2.5-flash', tokensIn: 9000, tokensOut: 300, costUsd: 0.02 } },
+    { seq: 2, kind: 'user', text: 'thanks, now shorten it', displayText: '', meta: { userId: 'u-me' } },
+  ]);
+  AiTracker.find = () => lean([]); ReportSnapshot.find = () => lean([]);
+  KeywordResearchHistory.find = () => lean([]); BrandVoice.find = () => lean([]);
+  try {
+    const entries = await exportService.serializeWorkspace('w1', '', { viewerUserId: 'u-me' });
+    const conv = entries.find((e) => e.name.startsWith('conversations/'));
+    assert.ok(conv, 'conversation still exported (portability)');
+    const raw = conv.data.toString();
+    for (const leak of [/RULES|internal instructions/, /gemini|"model"/, /tokensIn|tokensOut|costUsd|tokenEstimate/, /u-other|u-me|userId/, /sess-internal|engineSessionId/]) {
+      assert.doesNotMatch(raw, leak);
+    }
+    const parsed = JSON.parse(raw);
+    assert.deepEqual(parsed.messages.map((m) => m.text), ['/auto-optimize', 'Optimized.', 'thanks, now shorten it']);
+    assert.deepEqual(parsed.messages.map((m) => m.mine), [false, false, true], 'the exporter can still tell their own prompts apart');
+    assert.equal(parsed.thread.title, 'Optimize');
+    assert.equal(parsed.thread.messageCount, 3);
+  } finally {
+    for (const [o, k, v] of saved) o[k] = v;
+  }
+});
+
+test('export controller passes the requesting user as the viewer', async () => {
+  const exportService = require('../src/services/exportService');
+  const exportController = require('../src/controllers/exportController');
+  const real = exportService.exportWorkspaceArchive;
+  let seen = null;
+  exportService.exportWorkspaceArchive = async (id, opts) => { seen = { id, opts }; return { filename: 'f.tar.gz', buffer: Buffer.from('x') }; };
+  const res = { setHeader() {}, status() { return this; }, json() { return this; }, send() { return this; } };
+  try {
+    await exportController.exportWorkspace({ workspace: { _id: 'w1' }, user: { userId: 'u-me' }, headers: {}, ip: '127.0.0.1' }, res);
+    assert.deepEqual(seen, { id: 'w1', opts: { viewerUserId: 'u-me' } });
+  } finally {
+    exportService.exportWorkspaceArchive = real;
+  }
+});

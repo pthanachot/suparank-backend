@@ -192,8 +192,9 @@ test('classification: our-side failures are free, content problems are not', () 
     ['Engine returned 502: no SERP results for keyword', 'no_serp_results', false],
     ['Engine returned 502: could not crawl any competitor page (fetch failed with status 403)', 'no_sources', false],
     ['Engine returned 400: invalid request body', 'invalid_request', false],
-    ['something odd', 'unknown', false],
-    ['', 'unknown', false],
+    // QA B40 follow-up: an unclassifiable failure is ours, so a free retry.
+    ['something odd', 'unknown', true],
+    ['', 'unknown', true],
   ];
   for (const [msg, code, free] of cases) {
     assert.equal(classifyAnalysisFailure(msg), code, msg);

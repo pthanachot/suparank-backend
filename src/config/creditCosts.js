@@ -206,6 +206,12 @@ const ACTIVE_ACTIONS = Object.keys(CREDIT_COSTS).filter((k) => CREDIT_COSTS[k].a
 /** The Free "core loop" fixed-bundle actions (deduct 0 for Free, count-gated). */
 const FIXED_BUNDLE_ACTIONS = Object.keys(CREDIT_COSTS).filter((k) => CREDIT_COSTS[k].fixedBundleFree);
 
+// QA B42 follow-up: a chat is RESERVED at its upper tier (above 8K tokens)
+// and settles at or below it. The route's pre-flight and the price the editor
+// shows ("~N ⚡", whose tilde means "settles at or below") must both use this,
+// or the menu quotes 1 while the server holds 2 and 402s a 1-credit balance.
+const CHAT_RESERVE_TOKENS = 8001;
+
 module.exports = {
-  CREDIT_COSTS, ACTIVE_ACTIONS, FIXED_BUNDLE_ACTIONS, IMAGE_MAX_BILLED_IMAGES,
+  CREDIT_COSTS, ACTIVE_ACTIONS, FIXED_BUNDLE_ACTIONS, IMAGE_MAX_BILLED_IMAGES, CHAT_RESERVE_TOKENS,
 };

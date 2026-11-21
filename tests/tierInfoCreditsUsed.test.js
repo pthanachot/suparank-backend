@@ -73,3 +73,39 @@ test('monthly credit limit still reads the month row', async () => {
   assert.equal(res.statusCode, 200, JSON.stringify(res.body));
   assert.equal(res.body.usage.creditsUsed.used, 5);
 });
+
+// ── QA B42 follow-up (Nov 21): the chat price the editor shows ──
+const { resolveCredits } = require('../src/config/creditRules');
+const { CHAT_RESERVE_TOKENS } = require('../src/config/creditCosts');
+const { computeSettlement } = require('../src/services/billing/computeSettlement');
+
+test('tier-info quotes chat at its reservation (2), not its floor (1)', async () => {
+  for (const tier of ['free', 'standard']) {
+    const res = await tierInfo({ tier, creditsPerMonth: 3000, creditLimitType: 'monthly' });
+    assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+    const reserve = resolveCredits('aiChatMessage', { tier, tokens: CHAT_RESERVE_TOKENS });
+    assert.equal(reserve, 2, 'the route reserves the >8K tier');
+    assert.equal(res.body.creditCosts.aiChatMessage, reserve, `${tier}: menu price must equal what the route holds`);
+  }
+});
+
+test('the chat route pre-flight uses the same shared reservation', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, '../src/routes/workspaceRoutes.js'), 'utf8');
+  assert.match(src, /const estChat = [^\n]*tokens: CHAT_RESERVE_TOKENS/);
+  assert.doesNotMatch(src, /tokens: 8001/, 'no second copy of the reserve size');
+});
+
+test('"~2" is honest: every chat settles at or below the quoted price', () => {
+  const quoted = resolveCredits('aiChatMessage', { tier: 'standard', tokens: CHAT_RESERVE_TOKENS });
+  const runs = [
+    { wrote: false, tokens: 30000 }, // answer only, e.g. /meta-description
+    { wrote: true, tokens: 4000 },
+    { wrote: true, tokens: 30000 },
+    { wrote: true, tokens: 1e9 },
+  ];
+  for (const r of runs) {
+    const { credits } = computeSettlement({ kind: 'chat', billingClass: 'aiChatMessage', reserved: quoted, tier: 'standard', ...r });
+    assert.ok(credits <= quoted, `${JSON.stringify(r)} settled ${credits} > ${quoted}`);
+  }
+  assert.equal(computeSettlement({ kind: 'chat', billingClass: 'aiChatMessage', reserved: quoted, tier: 'standard', wrote: false, tokens: 30000 }).credits, 0);
+});
